@@ -146,6 +146,7 @@ gm.REMOTE_STREAMING = os.getenv("OMNIGIBSON_REMOTE_STREAMING", None)
 # What port the webrtc and http servers should run on. This is only used if REMOTE_STREAMING is set to "webrtc"
 gm.HTTP_PORT = os.getenv("OMNIGIBSON_HTTP_PORT", 8211)
 gm.WEBRTC_PORT = os.getenv("OMNIGIBSON_WEBRTC_PORT", 49100)
+gm.PUBLIC_IP = os.getenv("OMNIGIBSON_PUBLIC_IP", "172.22.224.37") # for webrtc streaming remote server
 
 # Whether to use numpy or torch controller backend. Numpy is significantly faster and should be used
 # for single-threaded (i.e.: non-large scale parallelized env) purposes

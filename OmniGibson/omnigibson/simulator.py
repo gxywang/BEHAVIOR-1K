@@ -274,7 +274,7 @@ def _launch_app():
     # Default Livestream settings
     if gm.REMOTE_STREAMING:
         app.set_setting("/app/window/drawMouse", True)
-        app.set_setting("/app/livestream/proto", "ws")
+        app.set_setting("/app/livestream/proto", "websocket")
         app.set_setting("/app/livestream/websocket/framerate_limit", 120)
         app.set_setting("/ngx/enabled", False)
 
@@ -288,14 +288,16 @@ def _launch_app():
         if gm.REMOTE_STREAMING == "native":
             # Enable Native Livestream extension
             # Default App: Streaming Client from the Omniverse Launcher
-            lazy.isaacsim.core.utils.extensions.enable_extension("omni.kit.livestream.native")
+            app.set_setting("/app/livestream/publicEndpointAddress", gm.PUBLIC_IP)
+            app.set_setting("/app/livestream/port", gm.WEBRTC_PORT)
+            lazy.isaacsim.core.utils.extensions.enable_extension("omni.kit.livestream.webrtc")
             print(f"Now streaming on {ip} via Omniverse Streaming Client")
         elif gm.REMOTE_STREAMING == "webrtc":
             # Enable WebRTC Livestream extension
-            app.set_setting("/exts/omni.services.transport.server.http/port", gm.HTTP_PORT)
+            app.set_setting("/app/livestream/publicEndpointAddress", gm.PUBLIC_IP)
             app.set_setting("/app/livestream/port", gm.WEBRTC_PORT)
-            lazy.isaacsim.core.utils.extensions.enable_extension("omni.services.streamclient.webrtc")
-            print(f"Now streaming on: http://{ip}:{gm.HTTP_PORT}/streaming/webrtc-client?server={ip}")
+            lazy.isaacsim.core.utils.extensions.enable_extension("omni.kit.livestream.webrtc")
+            print(f"Now streaming on: http://{ip}:{gm.HTTP_PORT}/?server={ip}")
         else:
             raise ValueError(
                 f"Invalid REMOTE_STREAMING option {gm.REMOTE_STREAMING}. Must be one of None, native, webrtc."
