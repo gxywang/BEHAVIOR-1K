@@ -8,3 +8,9 @@
 - on streaming client, connect to server `172.22.224.37` for `shenlong-gpu-01`
   - for `campus-cluster`'s `shenlong` partition: `172.29.128.5`
   - for `shenlong-gpu-02`: `172.22.224.85`
+
+## Dataset info
+- robot: R1Pro
+- action_frequency: 30
+- physics_frequency: 120
+- rendering_frequency: 30
