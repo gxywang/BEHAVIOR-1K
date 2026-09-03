@@ -113,9 +113,24 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
     to `~/tiptop-services/M2T2`; override with `TIPTOP_DIR` / `M2T2_DIR`. The laptop also has copies in
     `~/tiptop-services/bin/` that are not in git.
 
+## R1Pro specifics
+
+- Planner config: `TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml`; use `TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40`
+  (128 particles left too few feasible pick+place samples for the 11-joint chain).
+- The embodiment assets under `tiptop/tiptop/embodiments/assets/r1pro/` are committed; only the Rerun meshes are not:
+  run `pixi run python scripts/make_r1pro_embodiment.py --copy-meshes` in `tiptop/` on a machine that has the
+  OmniGibson robot assets (any machine with the sim datasets), or accept a mesh-less robot in Rerun.
+- Regenerating the embodiment needs the OmniGibson robot assets; re-validate with `scripts/check_r1pro_embodiment.py`
+  against a fresh simulator probe (scratch script `probe_r1pro.py` in the session notes; prints joint order, eef and
+  camera poses at sampled configurations).
+- VRAM on the laptop during an Rs_int episode: about 9.5 GB total with both services idle (Isaac + scene ~5 GB).
+- Never attach `seg_instance` to a robot-mounted camera in this Isaac build (segfault after ~35 steps); the bridge
+  captures through an external shadow camera. Keep the robot camera rgb-only.
+
 ## Files
 
-- Bridge (this directory): `protocol.py`, `client.py`, `scene.py`, `executor.py`, `run.py`, `scripts/`,
+- Bridge (this directory): `protocol.py`, `client.py`, `scene.py`, `executor.py`, `run.py`, `r1pro.py`, `scripts/`,
   tests in `OmniGibson/tests/test_tiptop_protocol.py`.
-- Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/config/tiptop_sim_panda.yml`,
-  `install/install-curobo.sh`, `install/install-cutamp.sh`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.
+- Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/config/tiptop_sim_{panda,r1pro}.yml`,
+  `tiptop/embodiments/` (R1Pro), `scripts/make_r1pro_embodiment.py`, `install/install-curobo.sh`,
+  `install/install-cutamp.sh`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.

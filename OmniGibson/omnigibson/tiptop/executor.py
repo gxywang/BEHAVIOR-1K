@@ -178,8 +178,12 @@ def check_success(sim, atoms: list[dict]) -> dict:
         elif pred == "holding" and len(args) == 1:
             a = sim.objects.get(args[0])
             grasping = str(sim.robot.is_grasping())
-            lifted = bool(a is not None and a.aabb[0][2].item() > sim.base_pose()[0][2].item() + 0.05)
-            results[key] = {"success": lifted, "is_grasping": grasping}
+            # lifted relative to where the object rested at capture time (the base may be on the floor, not the table)
+            z0 = getattr(sim, "capture_object_aabb_min_z", {}).get(args[0])
+            if z0 is None and a is not None:
+                z0 = sim.base_pose()[0][2].item()
+            lifted = bool(a is not None and a.aabb[0][2].item() > z0 + 0.05)
+            results[key] = {"success": lifted, "is_grasping": grasping, "aabb_min_z_at_capture": z0}
         else:
             results[key] = {"success": None, "reason": "unsupported predicate"}
     results["all"] = bool(atoms) and all(v.get("success") for k, v in results.items() if k != "all")

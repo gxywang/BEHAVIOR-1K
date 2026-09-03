@@ -55,13 +55,30 @@ class TiptopClient:
             log.info(f"waiting for tiptop-server at {self.uri} ...")
             time.sleep(5.0)
 
+    def fetch_metadata(self) -> dict:
+        """Connect, read the server's metadata frame and disconnect (embodiment details before capturing)."""
+        ws = connect(self.uri, compression=None, max_size=None, open_timeout=30.0, close_timeout=5.0)
+        try:
+            self.metadata = unpackb(ws.recv(timeout=60.0))
+        finally:
+            ws.close()
+        log.info(f"tiptop-server metadata: {self.metadata}")
+        return self.metadata
+
+    def check_embodiment(self) -> None:
+        """Validate robot_type / dof against what this client will execute; adopt dof from the embodiment metadata."""
+        emb = self.metadata.get("embodiment") or {}
+        if self.expected_dof is None and emb.get("joint_names"):
+            self.expected_dof = len(emb["joint_names"])
+        self._check_metadata({})
+
     def _check_metadata(self, request: dict) -> None:
         """Refuse to execute plans made for another embodiment; warn when gt_* keys would be ignored."""
         robot_type, dof = self.metadata.get("robot_type"), self.metadata.get("dof")
         if self.expected_robot_type and robot_type not in (None, self.expected_robot_type):
             raise TiptopPlanningError(
                 f"tiptop-server plans for robot_type={robot_type!r} but this client executes on {self.expected_robot_type!r}; "
-                f"start the server with --config tiptop/config/tiptop_sim_panda.yml"
+                f"start the server with the matching --config tiptop/config/tiptop_sim_*.yml"
             )
         if self.expected_dof and dof not in (None, self.expected_dof):
             raise TiptopPlanningError(f"tiptop-server dof={dof} does not match the {self.expected_dof}-DoF arm")
@@ -116,7 +133,7 @@ class SimStateStream:
     """Streams the simulator's robot joints and object poses to the server so its Rerun view follows the sim.
 
     Protocol (additive, tiptop fork >= 6a790df+): after the metadata frame, the client sends msgpack dicts
-    {"type": "sim_state", "t": s, "q": (7,) arm rad, "q_gripper": finger opening m,
+    {"type": "sim_state", "t": s, "q": (dof,) planned joints in the server's joint order, "q_gripper": finger opening m,
      "objects": {label: (4,4) base-frame transform relative to the pose at capture}}
     until it closes the connection. The server logs them into its current Rerun recording. Any failure only
     disables the stream; execution never depends on it.

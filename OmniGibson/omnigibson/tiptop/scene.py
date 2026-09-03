@@ -153,6 +153,8 @@ class TiptopSim:
     """Owns the OmniGibson environment and produces TiPToP observations / executes joint targets."""
 
     OPEN, CLOSE = 1.0, -1.0  # MultiFingerGripperController binary: command >= 0 opens, < 0 closes
+    expect_table_z = 0.0  # validate_capture: expected table top height in the base frame (None = no table check)
+    mask_labels_as_invalid = ()  # instance labels whose pixels get depth 0 (e.g. the robot seen by its own camera)
 
     def __init__(self, config: dict):
         self.config = config
@@ -241,11 +243,15 @@ class TiptopSim:
         return self.last_obs["external"][CAMERA_NAME]["rgb"][..., :3].cpu().numpy().astype(np.uint8)
 
     # ---------------------------------------------------------------- observation
-    def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
-        """Render and assemble a TiPToP request (plus extras for H5/validation) in the robot base frame."""
+    def _capture_obs(self) -> tuple[dict, dict]:
+        """One rendered frame with rgb, depth_linear and seg_instance from the capture camera."""
         for _ in range(3):
             og.sim.render()
-        obs, info = self.cam.get_obs()
+        return self.cam.get_obs()
+
+    def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
+        """Render and assemble a TiPToP request (plus extras for H5/validation) in the robot base frame."""
+        obs, info = self._capture_obs()
         rgb = obs["rgb"][..., :3].cpu().numpy().astype(np.uint8)
         depth = obs["depth_linear"].cpu().numpy().astype(np.float32)
         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
@@ -253,6 +259,12 @@ class TiptopSim:
         seg = obs["seg_instance"].cpu().numpy()
         id_to_name = {int(k): str(v) for k, v in info["seg_instance"].items()}
         intrinsics = self.cam.intrinsic_matrix.cpu().numpy().astype(np.float32)
+        for label in self.mask_labels_as_invalid:
+            ids = [i for i, n in id_to_name.items() if n == label]
+            if ids:
+                masked = np.isin(seg, ids)
+                depth[masked] = 0.0
+                log.info(f"masked {int(masked.sum())} pixels of {label!r} out of the depth")
 
         cam_pos, cam_quat = self.cam.get_position_orientation()  # world, USD camera axes
         cam_quat_cv = T.quat_multiply(cam_quat, th.tensor([1.0, 0.0, 0.0, 0.0]))  # 180 deg about camera x -> OpenCV
@@ -267,6 +279,7 @@ class TiptopSim:
 
         object_poses_base = {}
         self.capture_object_mats_base = {}
+        self.capture_object_aabb_min_z = {name: float(obj.aabb[0][2]) for name, obj in self.objects.items()}
         for name, obj in self.objects.items():
             pos_b, quat_b = self.to_base(*obj.get_position_orientation())
             self.capture_object_mats_base[name] = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
@@ -329,10 +342,12 @@ class TiptopSim:
             report[f"{name}_pixels"] = int(mask.sum())
         problems = []
         table_z = report["table_z_base_median"]
-        if not np.isfinite(table_z):
+        if self.expect_table_z is None:
+            pass  # scene-based embodiments have no synthetic table at a known base height
+        elif not np.isfinite(table_z):
             problems.append("table is not visible in the instance segmentation (no valid depth pixels)")
-        elif abs(table_z) > 0.02:
-            problems.append(f"table top is at base z={table_z:.3f} m, expected ~0")
+        elif abs(table_z - self.expect_table_z) > 0.02:
+            problems.append(f"table top is at base z={table_z:.3f} m, expected ~{self.expect_table_z}")
         for name in extras["object_poses_base"]:
             if report[f"{name}_centroid_error_xy_m"] > 0.06:
                 problems.append(

@@ -33,9 +33,52 @@ def parse_goal(goal: str) -> list[dict]:
     return atoms
 
 
+EXPECTED_ROBOT_TYPE = {"franka": "panda", "r1pro": "r1pro_left"}
+EXPECTED_DOF = {"franka": 7, "r1pro": None}  # r1pro: set from the server's embodiment metadata in check_embodiment()
+
+
 def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out-dir", required=True, help="directory for outputs (created)")
-    p.add_argument("--objects", default="mug,bowl", help="comma-separated object presets")
+    p.add_argument(
+        "--embodiment",
+        default="franka",
+        choices=sorted(EXPECTED_ROBOT_TYPE),
+        help="franka: tabletop Panda; r1pro: BEHAVIOR scene",
+    )
+    p.add_argument(
+        "--objects", default="mug,bowl", help="comma-separated object presets (franka only; r1pro uses --spawn)"
+    )
+    r1 = p.add_argument_group("r1pro", "BEHAVIOR-1K R1Pro in a BEHAVIOR scene (navigation assumed done)")
+    r1.add_argument("--scene-model", default="Rs_int")
+    r1.add_argument("--rooms", default=None, help="comma-separated load_room_types (default: whole scene)")
+    r1.add_argument("--near", default=None, help="furniture name to stand next to, e.g. breakfast_table_skczfi_0")
+    r1.add_argument(
+        "--side",
+        default="auto",
+        choices=["auto", "-x", "+x", "-y", "+y"],
+        help="which side of --near to stand on; write --side=-x",
+    )
+    r1.add_argument("--standoff", type=float, default=0.30, help="gap between robot footprint and the furniture (m)")
+    r1.add_argument(
+        "--robot-pose", type=float, nargs=3, default=None, metavar=("X", "Y", "YAW"), help="explicit base pose"
+    )
+    r1.add_argument(
+        "--spawn",
+        action="append",
+        default=[],
+        metavar="PRESET:SUPPORT[:DX,DY]",
+        help="drop a preset object onto furniture",
+    )
+    r1.add_argument("--scene-objects", default="", help="comma-separated names of existing scene objects to manipulate")
+    r1.add_argument("--camera", default="head", choices=["head", "wrist"])
+    r1.add_argument(
+        "--not-load",
+        default="ceilings",
+        help="comma-separated object categories left out of the scene (e.g. straight_chair)",
+    )
+    r1.add_argument(
+        "--head-aperture", type=float, default=40.0, help="head camera horizontal aperture (mm); eval uses 40"
+    )
     p.add_argument("--task", default=DEFAULT_TASK)
     p.add_argument(
         "--goal", default=DEFAULT_GOAL, help="goal atoms, e.g. 'on(mug,bowl)'; used for gt_atoms and success checks"
@@ -53,7 +96,83 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
 
 
-def build_sim(args):
+def parse_spawns(specs) -> list[tuple[str, str, float, float]]:
+    """'PRESET:SUPPORT[:DX,DY]' -> (preset, support, dx, dy); validated before Isaac Sim starts."""
+    spawns = []
+    for spec in specs:
+        parts = spec.split(":")
+        try:
+            if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
+                raise ValueError
+            dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) == 3 else (0.0, 0.0)
+        except ValueError:
+            raise SystemExit(
+                f"--spawn {spec!r}: expected PRESET:SUPPORT or PRESET:SUPPORT:DX,DY (e.g. mug:table_x_0:-0.2,0.15)"
+            )
+        spawns.append((parts[0], parts[1], dx, dy))
+    return spawns
+
+
+def build_r1pro_sim(args, embodiment: dict | None):
+    from omnigibson.tiptop.r1pro import ROBOT_TYPE, R1ProSim, load_embodiment_meta, make_r1pro_env_config
+
+    spawns = parse_spawns(args.spawn)
+    cfg = make_r1pro_env_config(
+        scene_model=args.scene_model,
+        load_room_types=[r for r in (args.rooms or "").split(",") if r],
+        spawn_presets=[sp[0] for sp in spawns],
+        grasping_mode=args.grasping_mode,
+        camera=args.camera,
+        head_aperture_mm=args.head_aperture,
+        not_load_object_categories=[c for c in args.not_load.split(",") if c],
+    )
+    sim = R1ProSim(cfg, camera=args.camera)
+    if args.robot_pose:
+        sim.place_robot(*args.robot_pose)
+    elif args.near:
+        sim.place_robot_near(args.near, side=args.side, standoff=args.standoff, ignore_names=[sp[0] for sp in spawns])
+    else:
+        log.warning("no --near / --robot-pose: the robot stays where the scene put it")
+    for preset, support, dx, dy in spawns:
+        sim.place_on(preset, support, dx, dy)
+    sim.track(*[n for n in args.scene_objects.split(",") if n])
+    if args.scene:
+        with open(args.scene) as f:
+            poses = json.load(f)["extras"]["object_poses_world"]
+        sim.apply_object_poses({k: v for k, v in poses.items() if k in sim.objects})
+        log.info(f"applied object poses from {args.scene}")
+    if args.finger_max_effort is not None:
+        sim.set_finger_max_effort(args.finger_max_effort)
+    if embodiment is None:
+        embodiment = load_embodiment_meta()
+        log.info(f"posture from {embodiment['robot_type']} meta file (no server metadata / plan provenance)")
+    else:
+        if embodiment.get("robot_type") != ROBOT_TYPE:
+            raise ValueError(f"embodiment {embodiment.get('robot_type')!r} is not {ROBOT_TYPE!r}")
+        try:  # best effort: warn when the submodule's generated meta drifted from what the server/plan carries
+            local = load_embodiment_meta(ROBOT_TYPE)
+            if (
+                local["locked_joints"] != embodiment["locked_joints"]
+                or local["joint_names"] != embodiment["joint_names"]
+            ):
+                log.warning(
+                    "server/plan embodiment differs from the local tiptop submodule's meta file; using the former"
+                )
+        except FileNotFoundError:
+            pass
+    sim.apply_posture(
+        embodiment["locked_joints"],
+        embodiment["q_home"],
+        settle_steps=args.settle_steps,
+        joint_names=embodiment["joint_names"],
+    )
+    sim.hold(args.settle_steps, sim.OPEN)
+    return sim
+
+
+def build_sim(args, embodiment: dict | None = None):
+    if args.embodiment == "r1pro":
+        return build_r1pro_sim(args, embodiment)
     from omnigibson.tiptop.scene import TiptopSim, make_env_config
 
     objects = [o.strip() for o in args.objects.split(",") if o.strip()]
@@ -184,21 +303,39 @@ def main(argv=None):
     exit_code = 0
     try:
         t0 = time.time()
-        sim = build_sim(args)
+        client = None
+        if args.cmd == "live":
+            from omnigibson.tiptop.client import TiptopClient
+
+            # the server's embodiment metadata (locked posture, home pose) shapes the scene, so fetch it first
+            client = TiptopClient(
+                args.host,
+                args.port,
+                expected_robot_type=EXPECTED_ROBOT_TYPE[args.embodiment],
+                expected_dof=EXPECTED_DOF[args.embodiment],
+            )
+            client.wait_for_server()
+            metadata = client.fetch_metadata()
+            client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
+            sim = build_sim(args, embodiment=metadata.get("embodiment"))
+        elif args.cmd == "replay":
+            with open(args.plan) as f:
+                plan_json = json.load(f)
+            sim = build_sim(args, embodiment=plan_json.get("embodiment"))  # provenance saved by `live`
+        else:
+            sim = build_sim(args)
         log.info(f"scene ready in {time.time() - t0:.1f}s (sim dt {sim.dt:.4f}s)")
         if args.cmd == "capture":
             do_capture(sim, args, out_dir)
         elif args.cmd == "replay":
             plan = load_plan_json(args.plan)
+            if args.embodiment == "r1pro" and not plan_json.get("embodiment"):
+                log.warning("plan has no embodiment provenance; assuming it was made for the local tiptop embodiment")
             do_execute(sim, args, out_dir, plan, tag="replay", state_stream=open_state_stream(args.state_stream))
         elif args.cmd == "live":
-            from omnigibson.tiptop.client import TiptopClient
-
             request, extras = do_capture(sim, args, out_dir)
             if args.no_gt:
                 request = {k: v for k, v in request.items() if not k.startswith("gt_")}
-            client = TiptopClient(args.host, args.port)
-            client.wait_for_server()
             response = client.plan(request, timeout_s=args.plan_timeout)
             with open(out_dir / "server_response.json", "w") as f:
                 json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
@@ -206,6 +343,7 @@ def main(argv=None):
                 json.dump(
                     {
                         "version": response["plan"]["version"],
+                        "embodiment": response.get("embodiment") or client.metadata.get("embodiment"),
                         "q_init": response["plan"]["q_init"].tolist(),
                         "steps": [
                             dict(
@@ -229,7 +367,8 @@ def main(argv=None):
         log.exception("run failed")
         exit_code = 1
     finally:
-        og.shutdown()
+        if og.app is not None:  # og.shutdown() exits with status 0 when Isaac Sim was never launched
+            og.shutdown()
     sys.exit(exit_code)
 
 

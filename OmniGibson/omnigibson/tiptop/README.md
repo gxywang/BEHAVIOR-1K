@@ -18,7 +18,7 @@ contracts only; **nothing here imports `tiptop`, and TiPToP never imports OmniGi
 ```
 
 One request per episode: the simulator sends `{rgb, depth, intrinsics, world_from_cam, task, q_init}` (msgpack with
-numpy arrays), the server answers a JSON plan `{q_init, steps: [trajectory{positions (N,7), dt} | gripper{open|close}]}`,
+numpy arrays), the server answers a JSON plan `{q_init, steps: [trajectory{positions (N, dof), dt} | gripper{open|close}]}`,
 and the simulator executes it open loop. The same data can go through files (`obs.h5` → `tiptop-h5` → `tiptop_plan.json`).
 
 ### Where development goes
@@ -107,6 +107,56 @@ needs `GOOGLE_API_KEY` on the server).
 
 Outputs per run: `obs.h5`, `capture.json` (poses, intrinsics, validation), `*_result.json` (tracking errors, gripper
 events, success), `*.mp4` from the external camera.
+
+## R1Pro in a BEHAVIOR scene
+
+`--embodiment r1pro` runs the challenge robot inside a BEHAVIOR scene with its own head camera. Navigation is out of
+scope: `--near <furniture>` parks the robot flush with a piece of furniture on a free side (floor and room checked),
+`--spawn preset:furniture:dx,dy` drops preset objects onto it, `--scene-objects` adds existing scene objects.
+
+```bash
+TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
+    OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh                       # planner for the R1Pro
+OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.run live --embodiment r1pro --scene-model Rs_int \
+    --not-load ceilings,straight_chair --near breakfast_table_skczfi_0 --side=-x --standoff 0.0 \
+    --spawn mug:breakfast_table_skczfi_0:-0.17,0.35 --spawn bowl:breakfast_table_skczfi_0:-0.20,0.15 \
+    --task "put the mug in the bowl" --goal "on(mug,bowl)" --grasping-mode sticky --out-dir runs/r1pro
+```
+
+What the R1Pro path does differently (all in `r1pro.py`):
+
+- **Planner model.** TiPToP's `r1pro_left` embodiment (tiptop submodule, `tiptop/embodiments/`) is generated from the
+  same URDF and cuRobo collision spheres OmniGibson ships for the robot and validated against the simulator (URDF FK
+  within 0.03 deg / 0.0 mm over 25 random full-body configurations). It plans torso (4) + left arm (7); the right
+  arm and both grippers are locked. The server advertises joint names, locked values and the home pose in its
+  metadata and the simulator applies them before capturing, so both sides agree by construction.
+- **Frames.** World frame = `base_link` (`robot.get_position_orientation()`, floor level). Joint vectors are always
+  gathered by joint name: OmniGibson interleaves the two arms in its joint order.
+- **Cameras.** The head camera (`zed_link`, 720x720, aperture 40 mm as in the challenge) or the left wrist camera.
+  Instance segmentation attached to a robot-mounted camera leaks GPU memory and segfaults Isaac's synthetic-data graph
+  after ~35 steps, so the robot camera renders rgb only and an external "shadow" VisionSensor with identical
+  intrinsics is moved onto its pose for the capture frame. The robot's own pixels are removed from the depth.
+- **Body.** The base gets the evaluator's 250 kg mass; without it the leaning challenge torso posture tips the robot
+  over. The planned joint vector (torso + arm) drives the trunk and arm_left controllers, everything else holds.
+- **Reach.** With the torso locked at the challenge posture the arm only reaches 0.4-0.6 m ahead on its left, which
+  is why the torso is planned; stand with the target front-left and within ~0.6 m of the base.
+
+First verified episode (2026-09-02, Rs_int, `breakfast_table_skczfi_0`, mug into bowl, sticky grasping):
+
+| Stage | Result |
+|---|---|
+| Model validation | URDF FK vs simulator 0.0 mm / 0.03 deg over 25 configs; cuRobo FK == URDF FK |
+| Capture | head camera 720x720, robot pixels masked, object centroid check passed |
+| Planning | 25 of 256 particles feasible, cuTAMP 1.3 s, 4.9 s round trip, 7 trajectories / 748 waypoints |
+| Execution | tracking lag <= 0.005 rad on torso + arm, grasp detected, OnTop(bowl) true |
+
+Outputs: `runs/r1pro_10/{live.mp4, live_result.json, obs.h5, capture.json}` and the server's
+`tiptop_server_outputs/<timestamp>/` (with `tiptop.rrd` in `--rerun-mode save`).
+
+Tooling: `scripts/probe_r1pro.py` (runs Isaac Sim) writes the joint order and link/camera poses at sampled
+configurations that `tiptop/scripts/check_r1pro_embodiment.py` validates the planner model against; `replay --plan`
+reads the embodiment provenance that `live` stores in `tiptop_plan.json`, and `--scene capture.json` reuses settled
+object poses for both embodiments.
 
 ## Ground truth vs. Gemini
 
