@@ -11,7 +11,7 @@
 
 ## TiPToP submodule (branch `dev/tiptop`)
 - `tiptop/` is a git submodule: BEHAVIOR-1K only pins a tiptop commit (URL/branch in `.gitmodules`; `git submodule status` prefix `-` = not checked out, `+` = checkout differs from the pin)
-  - until the private repo exists, `.gitmodules` points at upstream `tiptop-robot/tiptop` (read-only for us); see "re-point" below
+  - `.gitmodules` points at the private repo `WenzhouDing/tiptop` (read access needed); upstream `tiptop-robot/tiptop` is only reachable through the `upstream` remote inside `tiptop/`
 - fresh clone: `git clone --recurse-submodules -b dev/tiptop https://github.com/gxywang/BEHAVIOR-1K.git`
   - existing clone / empty `tiptop/`: `git submodule update --init`
   - once the submodule points at the private repo you need read access to it for these to succeed; the rest of the clone works without it
@@ -28,10 +28,10 @@
   - on branches without `.gitmodules` (e.g. `main`) `tiptop/` shows as untracked (with `submodule.recurse true` its working tree is removed and restored on checkout); leave it alone and never `git clean -ffd` / `-ffdx` in BEHAVIOR-1K (`-fd` skips nested repos, the second `-f` deletes them)
 - move the pin to latest `main` without developing: `git -C tiptop checkout main && git -C tiptop pull --ff-only && git add tiptop && git commit -m "tiptop: bump"` (`git submodule update --remote tiptop` does the same fetch but leaves a detached HEAD)
 - `upload-pack: not our ref <sha>` / `Fetched in submodule path 'tiptop', but it did not contain <sha>`: the pinned commit is not on the URL your `tiptop/` uses; either the author forgot `git -C tiptop push`, or your URL is stale (next bullet)
-- re-point the submodule from upstream to the private repo (owner, once, after creating an EMPTY private repo on GitHub):
+- re-point the submodule from upstream to the private repo (done 2026-09-02 for `WenzhouDing/tiptop`; kept for reference):
   - `git submodule set-url tiptop https://github.com/<user>/tiptop.git && git -C tiptop push -u origin main --tags` (`set-url` also re-points `origin` inside `tiptop/`; `--tags` keeps the setuptools_scm versions)
   - `git add .gitmodules && git commit -m "tiptop: track private repo"`, and push this BEFORE the first pin that only exists in the private repo
   - everyone else, once that commit is on the remote: `git pull --no-recurse-submodules && git submodule sync tiptop && git submodule update --init` (a plain `git pull` aborts with `not our ref` because it tries to fetch the new pin from the old URL, and `sync` only sees the new URL after the `.gitmodules` change is merged, hence `--no-recurse-submodules` first, then `sync`, then `update`)
-  - push over ssh while `.gitmodules` stays https: `git -C tiptop remote set-url --push origin git@github.com:<user>/tiptop.git` (survives `git submodule sync`)
+  - use ssh while `.gitmodules` stays https (fetch and push, survives `git submodule sync`): `git -C tiptop config url."git@github.com:<user>/".insteadOf "https://github.com/<user>/"`
   - pull upstream tiptop-robot changes: `git -C tiptop remote add upstream https://github.com/tiptop-robot/tiptop.git` (once per clone; skip if `git -C tiptop remote -v` already lists `upstream`), then `git -C tiptop fetch upstream && git -C tiptop merge upstream/main`
   - CI: `.github/workflows/tests.yml` and `profiling.yml` check out with `submodules: true`; with a private submodule those checkouts fail unless the checkout step is given a token or ssh key with access
