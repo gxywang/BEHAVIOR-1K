@@ -172,26 +172,8 @@ def sample_scene(scene_model, robot_cfg, args):
     return episodes
 
 
-def main():
-    args = parse_args()
-    if args.num_episodes < 1:
-        raise ValueError("--num-episodes must be at least 1")
-    if args.min_distance > args.max_distance:
-        raise ValueError("--min-distance must be <= --max-distance")
-
-    seed_everything(args.seed)
-
-    with gm.unlocked():
-        gm.USE_GPU_DYNAMICS = False
-        gm.ENABLE_TRANSITION_RULES = False
-
-    robot_cfg = load_robot_config(args.robot_config)
-    try:
-        episodes = sample_scene(scene_model=args.scene, robot_cfg=robot_cfg, args=args)
-    finally:
-        og.shutdown()
-
-    output = Path(args.output).expanduser()
+def write_benchmark(path, args, robot_cfg, episodes):
+    output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w", encoding="utf-8") as f:
         json.dump(
@@ -210,6 +192,27 @@ def main():
 
     print(f"\nSaved {len(episodes)} episodes to:")
     print(f"  {output}")
+
+
+def main():
+    args = parse_args()
+    if args.num_episodes < 1:
+        raise ValueError("--num-episodes must be at least 1")
+    if args.min_distance > args.max_distance:
+        raise ValueError("--min-distance must be <= --max-distance")
+
+    seed_everything(args.seed)
+
+    with gm.unlocked():
+        gm.USE_GPU_DYNAMICS = False
+        gm.ENABLE_TRANSITION_RULES = False
+
+    robot_cfg = load_robot_config(args.robot_config)
+    try:
+        episodes = sample_scene(scene_model=args.scene, robot_cfg=robot_cfg, args=args)
+        write_benchmark(path=args.output, args=args, robot_cfg=robot_cfg, episodes=episodes)
+    finally:
+        og.shutdown()
 
 
 if __name__ == "__main__":
