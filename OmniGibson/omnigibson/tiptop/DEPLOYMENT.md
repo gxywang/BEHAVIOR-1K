@@ -89,7 +89,10 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    laptop uses an ssh `insteadOf` rewrite), `williamshen-nz/curobo`, `tiptop-robot/cuTAMP` (tag v0.0.6),
    `facebookresearch/segment-anything-2` at the locked commit; conda-forge and PyPI; huggingface.co via git-lfs
    (M2T2 weights, ~230 MB); dl.fbaipublicfiles.com (SAM-2 checkpoint, 900 MB, fetched into `tiptop/tiptop/.cache/`
-   on first use, only needed without ground-truth masks). `GOOGLE_API_KEY` is needed only for `--no-gt`.
+   on first use, only needed without ground-truth masks); huggingface.co for the Grounding DINO weights
+   (`IDEA-Research/grounding-dino-base`, ~900 MB into `~/.cache/huggingface`) that the server fetches and loads at
+   start-up when `perception.detector: grounding_dino` (both sim configs; `transformers` is in `pixi.lock`).
+   `GOOGLE_API_KEY` is only needed with `perception.detector: gemini`.
 7. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; cuRobo warms up MotionGen at server start (`/health` is 200 only afterwards).
 8. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display. Use `save`

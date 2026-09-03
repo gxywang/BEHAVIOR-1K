@@ -72,6 +72,9 @@ def add_common(p: argparse.ArgumentParser) -> None:
     r1.add_argument("--scene-objects", default="", help="comma-separated names of existing scene objects to manipulate")
     r1.add_argument("--camera", default="head", choices=["head", "wrist"])
     r1.add_argument(
+        "--no-look", action="store_true", help="capture in the ready posture instead of swinging the arm out of view"
+    )
+    r1.add_argument(
         "--not-load",
         default="ceilings",
         help="comma-separated object categories left out of the scene (e.g. straight_chair)",
@@ -127,6 +130,8 @@ def build_r1pro_sim(args, embodiment: dict | None):
         not_load_object_categories=[c for c in args.not_load.split(",") if c],
     )
     sim = R1ProSim(cfg, camera=args.camera)
+    if args.no_look:
+        sim.look_arm = None
     if args.robot_pose:
         sim.place_robot(*args.robot_pose)
     elif args.near:
@@ -280,7 +285,10 @@ def main(argv=None):
     p_live.add_argument("--host", default="localhost")
     p_live.add_argument("--port", type=int, default=8765)
     p_live.add_argument(
-        "--no-gt", action="store_true", help="do not send ground-truth masks (server then needs Gemini + SAM2)"
+        "--no-gt",
+        action="store_true",
+        help="competition-style perception: send only the task's object names and goal atoms, no ground-truth masks "
+        "(the server runs its detector + SAM2 on the image)",
     )
     p_live.add_argument("--plan-timeout", type=float, default=900.0)
     p_live.add_argument(
@@ -335,7 +343,7 @@ def main(argv=None):
         elif args.cmd == "live":
             request, extras = do_capture(sim, args, out_dir)
             if args.no_gt:
-                request = {k: v for k, v in request.items() if not k.startswith("gt_")}
+                request = {k: v for k, v in request.items() if k != "gt_masks"}
             response = client.plan(request, timeout_s=args.plan_timeout)
             with open(out_dir / "server_response.json", "w") as f:
                 json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)

@@ -92,12 +92,15 @@ def test_parse_plan_and_resample():
 
 def test_h5_roundtrip(tmp_path):
     req = _request()
+    req["robot_mask"] = np.zeros((12, 16), dtype=bool)
+    req["robot_mask"][2:4, 3:6] = True
     quat = [1.0, 0.0, 0.0, 0.0]
     save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], quat, extra={"note": {"a": 1}})
     back = load_observation_h5(tmp_path / "obs.h5")
     assert np.array_equal(back["rgb"], req["rgb"]) and np.allclose(back["depth"], req["depth"])
     assert back["gt_labels"] == ["mug", "bowl"] and back["gt_atoms"] == req["gt_atoms"]
     assert np.array_equal(back["gt_masks"].astype(bool), req["gt_masks"].astype(bool))
+    assert back["robot_mask"].dtype == bool and np.array_equal(back["robot_mask"], req["robot_mask"])
     import h5py
 
     with h5py.File(tmp_path / "obs.h5") as f:

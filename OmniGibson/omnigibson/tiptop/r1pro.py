@@ -31,6 +31,12 @@ ROBOT_NAME = "robot_r1"
 ROBOT_TYPE = "r1pro_left"
 CAMERA_LINKS = {"head": "zed_link", "wrist": "left_realsense_link"}
 SHADOW_CAM = "tiptop_cam"  # external sensor moved onto the robot camera's pose for each capture (see _capture_obs)
+# Capture posture: the ready posture with the left shoulder abducted so the arm swings out to the robot's left, out of
+# the head camera's view. In the ready posture the gripper sits in front of the table objects and hides most of them
+# (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
+# 0 robot pixels, no contact. Applied on top of q_home, joint name -> value.
+LOOK_ARM = {"left_arm_joint2": 2.0}
+LOOK_SETTLE_STEPS = 60
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
 WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so the shadow camera matches exactly
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
@@ -174,6 +180,7 @@ class R1ProSim(TiptopSim):
 
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)
+    look_arm = LOOK_ARM  # joint overrides on top of q_home for the capture; None: capture in the ready posture
 
     def __init__(self, config: dict, camera: str = "head"):
         self.config = config
@@ -345,6 +352,27 @@ class R1ProSim(TiptopSim):
             raise RuntimeError(
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
+
+    # ---------------------------------------------------------------- observation
+    def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
+        """Look with the arm out of the head camera's view, then return to the ready posture the plan starts from."""
+        if self.look_arm is None:
+            return super().capture(task, gt_labels=gt_labels, gt_atoms=gt_atoms)
+        ready = list(self.q_home)
+        unknown = set(self.look_arm) - set(self.planned_joints)
+        assert not unknown, f"look posture names joints the planner does not move: {unknown}"
+        look = [float(self.look_arm.get(j, v)) for j, v in zip(self.planned_joints, ready)]
+        self.hold(LOOK_SETTLE_STEPS, self.OPEN, q_arm=look)
+        request, extras = super().capture(task, gt_labels=gt_labels, gt_atoms=gt_atoms)
+        self.hold(LOOK_SETTLE_STEPS, self.OPEN, q_arm=ready)
+        q_ready = self.q_arm()
+        lag = float(np.abs(q_ready - np.asarray(ready)).max())
+        if lag > 0.03:
+            raise RuntimeError(f"arm did not return to the ready posture after the capture (max error {lag:.3f} rad)")
+        request["q_init"] = np.asarray(q_ready, dtype=np.float32)  # the plan starts here, not at the look posture
+        extras["q_look"] = [float(v) for v in look]
+        log.info(f"captured in the look posture; plan starts from the ready posture (max error {lag:.4f} rad)")
+        return request, extras
 
     # ---------------------------------------------------------------- stepping
     def action(self, q_arm, gripper: float) -> dict:

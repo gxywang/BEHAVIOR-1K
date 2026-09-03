@@ -107,8 +107,8 @@ choose *Following*, and check the selected recording. Start a viewer yourself on
 (`pixi run rerun`); a stray `rerun` of another version on `PATH` that already listens on port 9876 gets reused.
 
 Options: `--objects mug,bowl,apple,banana`, `--task`, `--goal "on(mug,bowl)"` (drives the ground-truth atoms and the
-success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: use Gemini + SAM2,
-needs `GOOGLE_API_KEY` on the server).
+success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: send just the object
+names and goal atoms, the server runs its detector + SAM2 on the image; see "Ground truth vs. detector").
 
 Outputs per run: `obs.h5`, `capture.json` (poses, intrinsics, validation), `*_result.json` (tracking errors, gripper
 events, success), `*.mp4` from the external camera.
@@ -163,12 +163,31 @@ configurations that `tiptop/scripts/check_r1pro_embodiment.py` validates the pla
 reads the embodiment provenance that `live` stores in `tiptop_plan.json`, and `--scene capture.json` reuses settled
 object poses for both embodiments.
 
-## Ground truth vs. Gemini
+## Ground truth vs. detector
 
-Without a `GOOGLE_API_KEY`, TiPToP cannot detect objects or parse the instruction (Gemini does both). The simulator
-therefore sends `gt_labels` / `gt_masks` (from OmniGibson instance segmentation) and `gt_atoms` (from `--goal`);
-the tiptop fork skips Gemini and SAM2 when these keys are present and runs everything else unchanged (M2T2 grasps,
-table RANSAC, convex hulls, cuTAMP, cuRobo). Drop the keys (`--no-gt`) to exercise the full open-vocabulary pipeline.
+Three perception modes, chosen by what the request carries:
+
+- **Ground truth** (default): `gt_labels` / `gt_masks` from OmniGibson's instance segmentation and `gt_atoms` from
+  `--goal`. The server skips detection and SAM2 and runs everything else unchanged (M2T2 grasps, table RANSAC,
+  convex hulls, cuTAMP, cuRobo). Fast and exact; for development only.
+- **Competition style** (`--no-gt`): only `gt_labels` and `gt_atoms`, i.e. the object names and the goal an agent
+  knows from the task definition, no masks. The server's detector (`perception.detector`, set to `grounding_dino`
+  in both sim configs: Grounding DINO base from Hugging Face, loaded together with SAM2 when the server starts) finds
+  one box per name in the head-camera RGB and SAM2 segments it. No `GOOGLE_API_KEY`. The capture also carries
+  `robot_mask`, the robot's own pixels (a self-filter; here from the simulator's segmentation, on a real robot
+  rendered from the kinematics): SAM2 gets them as negative prompts and they are removed from every mask, otherwise
+  a gripper in front of an object becomes "the mug" (mask IoU 0.33 without, 0.95 with; bowl 0.96). 0.3 s per frame
+  once warm, 2.7 GB VRAM for both models.
+- **Gemini** (`perception.detector: gemini`, the upstream default): Gemini detects the objects and translates the
+  task; needs `GOOGLE_API_KEY`; atoms sent with the request take precedence over its translation.
+
+The R1Pro looks before it reaches: the capture is taken with the left shoulder abducted (`LOOK_ARM` in
+[r1pro.py](r1pro.py), arm out of the head camera's view; mug 3881 px instead of 2005 behind the gripper), then
+the arm returns to the ready posture and the request's `q_init` is that posture, so the plan starts where the
+robot is. `--no-look` captures in the ready posture instead.
+
+Still privileged with `--no-gt`: the self-filter comes from the simulator's segmentation, and the names are scene
+object names (`mug`, `bowl`) that a task layer would map from the BDDL categories.
 
 ## Tests
 

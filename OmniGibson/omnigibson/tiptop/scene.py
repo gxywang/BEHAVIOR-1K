@@ -259,11 +259,13 @@ class TiptopSim:
         seg = obs["seg_instance"].cpu().numpy()
         id_to_name = {int(k): str(v) for k, v in info["seg_instance"].items()}
         intrinsics = self.cam.intrinsic_matrix.cpu().numpy().astype(np.float32)
+        robot_mask = np.zeros(depth.shape, dtype=bool)  # self-filter: the robot's own body seen by its camera
         for label in self.mask_labels_as_invalid:
             ids = [i for i, n in id_to_name.items() if n == label]
             if ids:
                 masked = np.isin(seg, ids)
                 depth[masked] = 0.0
+                robot_mask |= masked
                 log.info(f"masked {int(masked.sum())} pixels of {label!r} out of the depth")
 
         cam_pos, cam_quat = self.cam.get_position_orientation()  # world, USD camera axes
@@ -276,6 +278,8 @@ class TiptopSim:
             masks = np.stack([self.instance_mask(seg, id_to_name, label) for label in gt_labels])
             gt = {"labels": list(gt_labels), "masks": masks, "atoms": list(gt_atoms or [])}
         request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm(), gt=gt)
+        if robot_mask.any():
+            request["robot_mask"] = robot_mask  # the server keeps SAM2 off these pixels (occluding gripper)
 
         object_poses_base = {}
         self.capture_object_mats_base = {}

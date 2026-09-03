@@ -198,6 +198,8 @@ def save_observation_h5(path, request: dict, cam_pos_base, cam_quat_wxyz_ros, ex
             f.create_dataset("gt_masks", data=request["gt_masks"].astype(np.uint8), compression="gzip")
             f.create_dataset("gt_labels", data=np.array(request["gt_labels"], dtype=h5py.string_dtype()))
             f.create_dataset("gt_atoms", data=json.dumps(request["gt_atoms"]))
+        if "robot_mask" in request:
+            f.create_dataset("robot_mask", data=request["robot_mask"].astype(np.uint8), compression="gzip")
         for key, value in (extra or {}).items():
             f.attrs[key] = json.dumps(value) if isinstance(value, (dict, list)) else value
 
@@ -232,6 +234,8 @@ def load_observation_h5(path) -> dict:
             obs["gt_labels"] = [s.decode() if isinstance(s, bytes) else str(s) for s in f["gt_labels"][:]]
             atoms = f["gt_atoms"][()]
             obs["gt_atoms"] = json.loads(atoms.decode() if isinstance(atoms, bytes) else atoms)
+        if "robot_mask" in f:
+            obs["robot_mask"] = f["robot_mask"][:].astype(bool)
     return obs
 
 
