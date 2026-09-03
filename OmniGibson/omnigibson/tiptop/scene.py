@@ -11,11 +11,14 @@ import logging
 
 import numpy as np
 import torch as th
+import trimesh
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
+from omnigibson.tiptop.gt_masks import masks_from_geometry
 from omnigibson.tiptop.protocol import DROID_CAMERA_KWARGS, DROID_Q_INIT, build_request, depth_to_points
+from omnigibson.utils.usd_utils import mesh_prim_to_trimesh_mesh
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +158,7 @@ class TiptopSim:
     OPEN, CLOSE = 1.0, -1.0  # MultiFingerGripperController binary: command >= 0 opens, < 0 closes
     expect_table_z = 0.0  # validate_capture: expected table top height in the base frame (None = no table check)
     mask_labels_as_invalid = ()  # instance labels whose pixels get depth 0 (e.g. the robot seen by its own camera)
+    gt_mask_tol = 0.008  # geometry masks: surface distance (m) within which a depth pixel belongs to an object
 
     def __init__(self, config: dict):
         self.config = config
@@ -250,7 +254,12 @@ class TiptopSim:
         return self.cam.get_obs()
 
     def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
-        """Render and assemble a TiPToP request (plus extras for H5/validation) in the robot base frame."""
+        """Render and assemble a TiPToP request (plus extras for H5/validation) in the robot base frame.
+
+        ``gt_labels`` are request names, normally keys of ``self.objects``. With instance segmentation a label that is
+        not a tracked object falls back to the raw segmentation name; the geometry path (no ``seg_instance`` rendered)
+        needs the object's meshes and raises for such labels.
+        """
         obs, info = self._capture_obs()
         rgb = obs["rgb"][..., :3].cpu().numpy().astype(np.uint8)
         depth = obs["depth_linear"].cpu().numpy().astype(np.float32)
@@ -274,17 +283,37 @@ class TiptopSim:
         world_from_cam = T.pose2mat((cam_pos_b, cam_quat_b)).cpu().numpy().astype(np.float32)
 
         gt = None
-        if gt_labels and seg is None:
-            raise ValueError("ground-truth masks need instance segmentation; capture without gt_labels (--no-gt)")
-        if gt_labels:
+        if gt_labels and seg is not None:
             # labels are request names; tracked objects may carry a different simulator name (task objects)
-            masks = np.stack(
-                [
-                    self.instance_mask(seg, id_to_name, self.objects[label].name if label in self.objects else label)
-                    for label in gt_labels
-                ]
+            masks = []
+            for label in gt_labels:
+                sim_name = self.objects[label].name if label in self.objects else label
+                ids = [i for i, n in id_to_name.items() if n == sim_name]
+                masks.append(np.isin(seg, ids) if ids else np.zeros(depth.shape, dtype=bool))
+            masks = np.stack(masks)
+            source = "instance segmentation"
+        elif gt_labels:  # no seg_instance rendered (segfaults in house scenes): oracle masks from depth + meshes
+            masks = self.geometry_masks(depth, intrinsics, cam_pos, cam_quat_cv, gt_labels)
+            source = "geometry (depth + object meshes)"
+        if gt_labels:
+            # a task tracks every object it names, most of them out of view; send the visible ones, but the goal's
+            # objects must be in the frame
+            counts = {label: int(m.sum()) for label, m in zip(gt_labels, masks)}
+            visible = [label for label in gt_labels if counts[label]]
+            hidden = [label for label in gt_labels if not counts[label]]
+            needed = sorted({a for atom in (gt_atoms or []) for a in atom["args"] if a in hidden})
+            if needed:
+                self.last_capture_rgb = rgb  # for the caller to save alongside the error
+                raise ValueError(f"goal objects {needed} are not visible in the capture (empty masks)")
+            log.info(
+                f"ground-truth masks from {source}: pixels per label "
+                f"{ {label: counts[label] for label in visible} }; not in view: {hidden or 'none'}"
             )
-            gt = {"labels": list(gt_labels), "masks": masks, "atoms": list(gt_atoms or [])}
+            gt = {
+                "labels": visible,
+                "masks": masks[[gt_labels.index(l) for l in visible]],
+                "atoms": list(gt_atoms or []),
+            }
         request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm(), gt=gt)
         if robot_mask.any():
             request["robot_mask"] = robot_mask  # the server keeps SAM2 off these pixels (occluding gripper)
@@ -316,6 +345,47 @@ class TiptopSim:
             "sim_dt": self.dt,
         }
         return request, extras
+
+    def object_trimesh_world(self, name: str) -> trimesh.Trimesh:
+        """Every visual mesh of every link of ``self.objects[name]`` as one trimesh in the WORLD frame (current pose).
+
+        Links without visual meshes contribute their collision meshes. Poses come from the Fabric hierarchy, so the
+        result is current after teleports / set_position_orientation without a physics step.
+        """
+        parts = []
+        for link in self.objects[name].links.values():
+            # meta-link volumes (particleapplier, slicer, fluidsource, ...) sit in visual_meshes with purpose "guide":
+            # never rendered, so they must not claim depth pixels; collision meshes are all "guide" and stay unfiltered
+            geoms = {k: g for k, g in link.visual_meshes.items() if g.purpose != "guide"} or link.collision_meshes
+            for geom in geoms.values():
+                parts.append(
+                    mesh_prim_to_trimesh_mesh(
+                        geom.prim, include_normals=False, include_texcoord=False, world_frame=True
+                    )
+                )
+        if not parts:
+            raise ValueError(f"object {name!r} has no visual or collision meshes")
+        return trimesh.util.concatenate(parts)
+
+    def geometry_masks(
+        self, depth, intrinsics, cam_pos_world, cam_quat_cv_world, labels, tol: float | None = None
+    ) -> np.ndarray:
+        """(N, H, W) bool oracle masks for ``labels`` from the rendered depth and the objects' meshes.
+
+        Computed in the WORLD frame: the meshes come from ``object_trimesh_world`` and the camera pose is the world
+        pose of the OpenCV camera frame (same 180 deg-about-x conversion as the base-frame ``world_from_cam`` of the
+        request, minus the base transform), so no vertex transform into the base frame is needed. ``tol`` defaults to
+        ``self.gt_mask_tol`` (see ``masks_from_geometry`` for the contact-halo trade-off).
+        """
+        missing = [label for label in labels if label not in self.objects]
+        if missing:
+            raise ValueError(f"no tracked object for labels {missing} (tracked: {sorted(self.objects)})")
+        world_from_cam_w = T.pose2mat((cam_pos_world, cam_quat_cv_world)).cpu().numpy().astype(np.float64)
+        meshes = {label: self.object_trimesh_world(label) for label in labels}
+        masks = masks_from_geometry(
+            depth, intrinsics, world_from_cam_w, meshes, tol=self.gt_mask_tol if tol is None else tol
+        )
+        return np.stack([masks[label] for label in labels])  # all-False rows for objects out of view
 
     @staticmethod
     def instance_mask(seg: np.ndarray, id_to_name: dict, label: str) -> np.ndarray:

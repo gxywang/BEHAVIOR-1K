@@ -96,8 +96,20 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--no-gt",
         action="store_true",
-        help="competition-style perception: render rgb + depth only and send just the task's object names and goal "
-        "atoms, no ground-truth masks (the server runs its detector + SAM2 on the image)",
+        help="competition-style perception: send just the task's object names and goal atoms, no ground-truth masks "
+        "(the server runs its detector + SAM2 on the image)",
+    )
+    r1.add_argument(
+        "--rooms",
+        default=None,
+        help="comma-separated room instances to load with --activity (default: the evaluator's list for the task; "
+        "the house scene with all of them costs the client ~16 GB of RAM)",
+    )
+    r1.add_argument(
+        "--seg-instance",
+        action="store_true",
+        help="render Isaac instance segmentation on the capture camera; ground-truth masks otherwise come from object "
+        "geometry; the annotator segfaults in large BEHAVIOR scenes",
     )
     r1.add_argument(
         "--no-look", action="store_true", help="capture in the ready posture instead of swinging the arm out of view"
@@ -153,6 +165,8 @@ def build_r1pro_sim(args, embodiment: dict | None):
         from omnigibson.tiptop.r1pro import challenge_task_info
 
         scene_model, room_instances = challenge_task_info(args.activity)
+        if args.rooms:  # fewer rooms than the evaluator loads: a smaller scene for a 30 GB machine
+            room_instances = [r for r in args.rooms.split(",") if r]
         log.info(f"challenge task {args.activity}: scene {scene_model}, rooms {room_instances}")
     cfg = make_r1pro_env_config(
         scene_model=scene_model,
@@ -165,7 +179,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
         activity=args.activity,
         activity_instance_id=args.activity_instance,
         load_room_instances=room_instances,
-        segmentation=not getattr(args, "no_gt", False),  # competition mode: rgb + depth only, like the evaluator
+        segmentation=bool(getattr(args, "seg_instance", False)),  # the annotator is opt-in; masks come from geometry
     )
     sim = R1ProSim(cfg, camera=args.camera)
     if args.activity:
@@ -262,7 +276,14 @@ def do_capture(
         if hints:
             request["goal_hints"] = {k: [float(v) for v in vals] for k, vals in hints.items()}
     else:
-        request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
+        try:
+            request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
+        except ValueError:
+            if getattr(sim, "last_capture_rgb", None) is not None:  # what the camera saw when a goal object was missing
+                import imageio
+
+                imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
+            raise
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
@@ -336,7 +357,54 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict 
         f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
     )
     stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
-    return do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream)
+    return do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream, atoms=atoms)
+
+
+def choose_stage_spot(
+    sim, item: str, container: str, support: str, radius: float = 1.2, spacing: float = 0.09, max_spots: int = 8
+) -> tuple[float, float]:
+    """(dx, dy) on ``support`` for the container: the free spot near ``item`` a base pose reaches together with it.
+
+    Of the free spots within ``radius`` of the item's AABB center (a crowded table has none within 0.7 m; two
+    points 1.2 m apart can still both be within reach of a base between them), the closest ``max_spots`` that lie
+    ``spacing`` apart (adjacent grid cells are near-duplicates) are searched, closest first, and the one whose best base
+    pose scores lowest wins; the container's origin goes to the spot, as place_on does (its AABB center follows within its
+    origin-to-center offset), and the container and its contents, about to move, do not count as obstacles. With no
+    reachable spot the closest one is used, as free_spot_on(near=) did, so place_robot_for still reports the
+    rejections. One scene_aabbs() snapshot serves every search, so staging costs seconds, not one AABB query per
+    candidate pose.
+    """
+    t0 = time.time()
+    near = sim.scene_object(item).aabb_center.cpu().numpy()[:2].astype(np.float64)
+    spots = [(float(np.hypot(x - near[0], y - near[1])), x, y) for x, y, _ in sim.free_spots_on(container, support)]
+    spots = sorted(s for s in spots if s[0] <= radius)
+    tried = []
+    for s in spots:
+        if all(np.hypot(s[1] - t[1], s[2] - t[2]) >= spacing for t in tried):
+            tried.append(s)
+            if len(tried) >= max_spots:
+                break
+    ignore = [sim.scene_object(n) for n in (container, *sim.contents_of(container))]
+    aabbs = sim.scene_aabbs()
+    best = None
+    for d, x, y in tried:
+        pose, _ = sim.best_base_pose(near, (x, y), ignore=ignore, aabbs=aabbs)
+        if pose is not None and (best is None or pose[0] < best[0]):
+            best = (pose[0], d, x, y)
+    if best is None:
+        log.info(
+            f"staging {container} for {item}: no feasible spot ({len(tried)} of {len(spots)} spots within {radius} m "
+            f"searched, {time.time() - t0:.1f}s); falling back to the closest one"
+        )
+        return sim.free_spot_on(container, support, near=near)
+    score, d, x, y = best
+    lo, hi = [v.cpu().numpy() for v in sim.scene_object(support).aabb]
+    cx, cy = ((lo + hi) / 2)[:2].tolist()
+    log.info(
+        f"staging {container} for {item}: spot ({x:.2f}, {y:.2f}), {d:.2f} m from the item, base-pose score "
+        f"{score:.2f} (best of {len(tried)} of {len(spots)} spots within {radius} m, {time.time() - t0:.1f}s)"
+    )
+    return x - cx, y - cy
 
 
 def run_task(sim, args, client, out_dir: Path) -> dict:
@@ -346,6 +414,8 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
     reachable pose per transfer. Each transfer is one capture/plan/execute round; the item is verified with the
     task's own `inside` predicate and, on failure, the next unplaced item of that type is tried.
     """
+    import psutil  # ships with isaacsim-kernel; not an OmniGibson dependency, so imported here
+
     from omnigibson.tiptop.r1pro import bddl_category
 
     task = sim.env.task
@@ -366,6 +436,7 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
 
     placed, transfers, n = set(), [], 0
     type_failures = dict.fromkeys(items_by_type, 0)  # containers in a row a type failed for; skipped after 2
+    unreachable = set()  # items no base pose could reach together with a container: tried last from then on
     for basket in containers:
         home = sim.scene_object(basket).get_position_orientation()
         for cat, items in items_by_type.items():
@@ -381,6 +452,7 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
                     return min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1])
 
                 candidates.sort(key=edge_gap)
+            candidates.sort(key=lambda name: name in unreachable)  # stable: keeps the edge order within each group
             ok = False
             for item in candidates[: args.attempts_per_item]:
                 n += 1
@@ -390,8 +462,7 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
                 t0 = time.time()
                 try:
                     if args.stage_support:  # bring the container (with what it holds) next to this item
-                        near = sim.scene_object(item).aabb_center.cpu().numpy()[:2]
-                        dx, dy = sim.free_spot_on(basket, args.stage_support, near=near)
+                        dx, dy = choose_stage_spot(sim, item, basket, args.stage_support)
                         sim.place_on_with_contents(basket, args.stage_support, dx, dy)
                         sim.hold(args.settle_steps, sim.OPEN)
                     sim.place_robot_for(item, basket)
@@ -406,11 +477,15 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
                 except Exception as e:  # noqa: BLE001 - one failed transfer must not end the task
                     log.exception(f"transfer {n} {item} -> {basket} failed")
                     record["inside"], record["error"] = False, f"{type(e).__name__}: {e}"
+                    if isinstance(e, RuntimeError) and str(e).startswith("no base pose"):
+                        unreachable.add(item)  # mid-table; the next container's candidates start with the others
                 record["seconds"] = round(time.time() - t0, 1)
+                record["rss_gb"] = round(psutil.Process().memory_info().rss / 1e9, 2)  # the last run died at 14 GB
                 transfers.append(record)
                 log.info(
                     f"transfer {n}: {item} -> {basket}: "
-                    f"{'OK ' + str(record.get('placed')) if record['inside'] else 'failed'} ({record['seconds']}s)"
+                    f"{'OK ' + str(record.get('placed')) if record['inside'] else 'failed'} "
+                    f"({record['seconds']}s, rss {record['rss_gb']} GB)"
                 )
                 if record["inside"]:
                     placed.update(record["placed"])
@@ -427,10 +502,15 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
     return summary
 
 
-def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None) -> dict:
+def do_execute(
+    sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None, atoms: list[dict] | None = None
+) -> dict:
+    """Execute a plan and check the goal: the task's own with --activity (``atoms``, default --goal, then names the
+    objects whose AABBs are logged), else every --goal atom."""
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
+    atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
     video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4", fps=15, every=2)
     executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video, state_stream=state_stream)
@@ -442,9 +522,9 @@ def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None
     if getattr(args, "activity", None):
         success = sim.goal_status()
         success["all"] = success["success"]
-        # where the goal objects ended up relative to their targets (BDDL names from --goal)
+        # where the goal objects ended up relative to their targets (BDDL names)
         success["poses"] = {}
-        for atom in parse_goal(args.goal):
+        for atom in atoms:
             for name in atom["args"]:
                 try:
                     obj = sim.scene_object(name)

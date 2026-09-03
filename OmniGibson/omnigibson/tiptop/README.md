@@ -173,8 +173,22 @@ else the newly satisfied fraction of the best goal option; `forpairs` goals grou
 every grounded predicate is evaluated once and memoized). `--goal` uses BDDL names and predicates
 (`inside(candle.n.01_2,wicker_basket.n.01_2)`; `inside`/`ontop` become TiPToP's `on`), `--no-gt` sends only the
 categories (`candle`, `wicker basket`) so the detector finds every instance and the goal takes the largest one.
-Instance segmentation crashes Isaac after a couple of renders in these scenes, so task runs render rgb + depth only,
-which is also all the challenge allows.
+Instance segmentation crashes Isaac on the first render in these scenes, so captures render rgb + depth only
+(also all the challenge allows) and ground-truth masks come from geometry instead of the annotator
+([gt_masks.py](gt_masks.py): the depth pixels within 8 mm of an object's mesh at its current pose; `--seg-instance`
+opts back into the annotator where it works, e.g. Rs_int).
+
+`task` runs the whole `inside(item, container)` goal: per container, stage it on `--stage-support` at the free spot
+near the item that a base pose can reach together with it, stand there, capture, plan, execute, score with the task's
+own predicate; a type is skipped after failing for two containers in a row, and any unplaced item of the type that
+ends up inside counts. Each transfer's directory holds the capture, plan, video and result; `task_summary.json` has
+the per-transfer records (with the client's RSS, see DEPLOYMENT.md item 17) and the final goal status.
+
+```bash
+python -m omnigibson.tiptop.run task --embodiment r1pro --activity assembling_gift_baskets \
+    --stage-support table.n.02_1 --task "put the item in the wicker basket" --grasping-mode sticky \
+    --attempts-per-item 2 --host localhost --port 8765 --out-dir runs/gift_task
+```
 
 What replaces navigation for now: `--stand-for ITEM,TARGET` searches a base pose from which both objects are ahead,
 on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports an object (used to bring a
@@ -217,15 +231,18 @@ duplicate and nested detector boxes, the capture camera's temporal ghosting afte
 
 Three perception modes, chosen by what the request carries:
 
-- **Ground truth** (default): `gt_labels` / `gt_masks` from OmniGibson's instance segmentation and `gt_atoms` from
-  `--goal`. The server skips detection and SAM2 and runs everything else unchanged (M2T2 grasps, table RANSAC,
-  convex hulls, cuTAMP, cuRobo). Fast and exact; for development only.
+- **Ground truth** (default): `gt_labels` / `gt_masks` and `gt_atoms` from `--goal` (or the task). Masks come from
+  geometry, [gt_masks.py](gt_masks.py) (rendered depth against the objects' meshes; disjoint, IoU 0.90-0.96 against
+  the annotator on the Panda demo, the rest a 1-4 px table halo), or from OmniGibson's instance segmentation with
+  `--seg-instance`. Objects out of view are dropped from the request; a goal object out of view is an error. The
+  server skips detection and SAM2 and runs everything else unchanged (M2T2 grasps, table RANSAC, convex hulls,
+  cuTAMP, cuRobo). Fast and exact; for development only.
 - **Competition style** (`--no-gt`): only `gt_labels` and `gt_atoms`, i.e. the object names and the goal an agent
   knows from the task definition, no masks. The server's detector (`perception.detector`, set to `grounding_dino`
   in both sim configs: Grounding DINO base from Hugging Face, loaded together with SAM2 when the server starts) finds
   one box per name in the head-camera RGB and SAM2 segments it. No `GOOGLE_API_KEY`. The capture also carries
-  `robot_mask`, the robot's own pixels (a self-filter; here from the simulator's segmentation, on a real robot
-  rendered from the kinematics): SAM2 gets them as negative prompts and they are removed from every mask, otherwise
+  `robot_mask`, the robot's own pixels (a self-filter; here from the simulator's segmentation, so only with
+  `--seg-instance`; on a real robot rendered from the kinematics): SAM2 gets them as negative prompts and they are removed from every mask, otherwise
   a gripper in front of an object becomes "the mug" (mask IoU 0.33 without, 0.95 with; bowl 0.96). 0.3 s per frame
   once warm, 2.7 GB VRAM for both models.
 - **Gemini** (`perception.detector: gemini`, the upstream default): Gemini detects the objects and translates the

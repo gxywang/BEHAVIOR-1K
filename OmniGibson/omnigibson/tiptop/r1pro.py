@@ -44,6 +44,8 @@ WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so
 FLOOR_COVERINGS = ("floors", "ceilings", "paver", "carpet", "rug", "mat", "doormat", "tile")  # stood on, not avoided
 ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture is ~1.4
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
+CAMERA_MIN_DIST = 0.65  # nearer objects are cut by the head camera's bottom edge (it meets the table 0.55 m ahead)
+TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 
 
@@ -105,7 +107,8 @@ def make_r1pro_env_config(
 
     Spawned objects start high above the floor and are placed onto furniture by R1ProSim.place_on(). With
     ``activity`` the scene is a challenge task instance (BehaviorTask, pre-sampled objects, the evaluator's rooms).
-    ``segmentation=False`` renders rgb + depth only (what the challenge allows; no ground-truth masks, no robot mask).
+    ``segmentation=False`` renders rgb + depth only (what the challenge allows); ground-truth masks then come from
+    object geometry instead of the annotator, and the robot is not masked out of the depth.
 
     Cameras: the robot camera TiPToP uses renders rgb only (video); an external "shadow" VisionSensor with the same
     intrinsics provides rgb + depth_linear + seg_instance for the capture frame after being moved onto the robot
@@ -363,13 +366,8 @@ class R1ProSim(TiptopSim):
         pos_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
         return [float(v) for v in pos_b]
 
-    def free_spot_on(
-        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03, near=None
-    ):
-        """(dx, dy) from the support's center where ``name`` fits on top of it without overlapping anything.
-
-        Picks the spot with the most clearance, or the free spot closest to ``near`` (world xy) when given.
-        """
+    def _stage_geometry(self, name: str, support: str):
+        """Support AABB, the object's xy half extents and the AABBs of whatever else stands on the support's top."""
         obj, sup = self.scene_object(name), self.scene_object(support)
         lo, hi = [v.cpu().numpy() for v in sup.aabb]
         olo, ohi = [v.cpu().numpy() for v in obj.aabb]
@@ -385,7 +383,19 @@ class R1ProSim(TiptopSim):
             if ahi[0] < lo[0] or alo[0] > hi[0] or ahi[1] < lo[1] or alo[1] > hi[1]:
                 continue  # not over the support
             others.append((alo, ahi))
-        best = None
+        return lo, hi, hx, hy, others
+
+    def free_spots_on(
+        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03
+    ) -> list[tuple[float, float, float]]:
+        """Every (x, y, gap) in world xy where ``name`` fits on top of ``support`` without overlapping anything.
+
+        (x, y) is taken as the object's AABB center (a ``step`` grid over the top, ``edge`` in from its rim; place_on
+        puts the object's origin there), gap the clearance to the nearest other object on the support (at least
+        ``clearance``).
+        """
+        lo, hi, hx, hy, others = self._stage_geometry(name, support)
+        spots = []
         for x in np.arange(lo[0] + edge + hx, hi[0] - edge - hx + 1e-6, step):
             for y in np.arange(lo[1] + edge + hy, hi[1] - edge - hy + 1e-6, step):
                 gap = min(
@@ -397,15 +407,29 @@ class R1ProSim(TiptopSim):
                 )
                 if gap < clearance:
                     continue
-                score = -float(np.hypot(x - near[0], y - near[1])) if near is not None else gap
-                if best is None or score > best[0]:
-                    best = (score, x, y, gap)
-        if best is None:
+                spots.append((float(x), float(y), float(gap)))
+        return spots
+
+    def free_spot_on(
+        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03, near=None
+    ):
+        """(dx, dy) from the support's center where ``name`` fits on top of it without overlapping anything.
+
+        Picks the spot with the most clearance, or the free spot closest to ``near`` (world xy) when given.
+        """
+        spots = self.free_spots_on(name, support, clearance=clearance, edge=edge, step=step)
+        if not spots:
+            others = self._stage_geometry(name, support)[-1]
             raise RuntimeError(f"no free spot for {name} on {support} ({len(others)} objects on it)")
-        _, x, y, gap = best
-        center = (lo + hi) / 2
+        if near is not None:
+            near = np.asarray(near, dtype=np.float64)  # float64 like the grid (numpy >= 2 would narrow to float32)
+            x, y, gap = min(spots, key=lambda s: float(np.hypot(s[0] - near[0], s[1] - near[1])))
+        else:
+            x, y, gap = max(spots, key=lambda s: s[2])
+        lo, hi = [v.cpu().numpy() for v in self.scene_object(support).aabb]
+        cx, cy = ((lo + hi) / 2)[:2].tolist()
         log.info(f"free spot for {name} on {support}: ({x:.2f}, {y:.2f}), clearance {gap:.2f} m")
-        return float(x - center[0]), float(y - center[1])
+        return x - cx, y - cy
 
     def contents_of(self, container: str) -> list[str]:
         """Tracked task objects whose AABB center lies inside the container's AABB."""
@@ -501,15 +525,23 @@ class R1ProSim(TiptopSim):
         self.objects[name] = obj
         log.info(f"placed {name} on {support} at {np.round(pos.numpy(), 3).tolist()} (support top z={hi[2]:.3f})")
 
-    def _footprint_free(self, x: float, y: float, ignore) -> tuple[bool, str]:
-        """Floor under the whole footprint, inside a room, and no other object's AABB overlapping the footprint."""
+    def scene_aabbs(self) -> list[tuple]:
+        """(object, lo, hi) for every scene object but the robot: one AABB query each (the AABB is recomputed from
+        the collision meshes on every access, ~50 ms for a house scene), to reuse across footprint checks."""
+        return [(o, *[v.cpu().numpy() for v in o.aabb]) for o in self.env.scene.objects if o is not self.robot]
+
+    def _footprint_free(self, x: float, y: float, ignore, aabbs=None) -> tuple[bool, str]:
+        """Floor under the whole footprint, inside a room, and no other object's AABB overlapping the footprint.
+
+        ``aabbs``: a scene_aabbs() snapshot to test against (taken here otherwise; nothing moves during a search).
+        """
         r = ROBOT_FOOTPRINT
         corners = [(x + sx * r, y + sy * r) for sx in (-1, 1) for sy in (-1, 1)] + [(x, y)]
-        floors = [o for o in self.env.scene.objects if getattr(o, "category", "") == "floors"]
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        floors = [(lo, hi) for o, lo, hi in aabbs if getattr(o, "category", "") == "floors"]
         for cx, cy in corners:
             on_floor = False
-            for f in floors:
-                lo, hi = [v.cpu().numpy() for v in f.aabb]
+            for lo, hi in floors:
                 if lo[0] <= cx <= hi[0] and lo[1] <= cy <= hi[1]:
                     on_floor = True
                     break
@@ -523,10 +555,9 @@ class R1ProSim(TiptopSim):
                 room = "unknown"
             if room is None:
                 return False, "outside every room"
-        for obj in self.env.scene.objects:
+        for obj, lo, hi in aabbs:
             if obj is self.robot or obj in ignore or getattr(obj, "category", "") in FLOOR_COVERINGS:
                 continue
-            lo, hi = [v.cpu().numpy() for v in obj.aabb]
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > 20.0:
                 continue  # house-sized AABBs (merged walls, roof, ceilings) say nothing; the floor test handles walls
             if lo[2] > ROBOT_HEIGHT:
@@ -563,17 +594,21 @@ class R1ProSim(TiptopSim):
             return self.place_robot(x, y, yaw, note=f"{s} side of {support}")
         raise RuntimeError(f"no free side around {support}; pass --side or --robot-pose")
 
-    def place_robot_for(self, item: str, target: str, ignore_names=(), reach: float = 0.9) -> dict:
-        """Stand where ITEM and TARGET are both ahead and to the left, within the left arm's reach ("navigation done").
+    def best_base_pose(
+        self, p_item_xy, p_target_xy, ignore=(), reach: float = 0.9, aabbs=None
+    ) -> tuple[tuple | None, dict]:
+        """Best base pose with two points (world xy) both ahead and to the left, within the left arm's reach.
 
-        Candidates on rings around the two objects' midpoint, facing it; scored by the farther object's distance and
-        how far left both are, rejected when an object is behind the robot, well to its right, out of reach, or the
-        footprint is not free.
+        Candidates on rings around the two points' midpoint, facing it; scored by the farther point's distance and
+        how far left both are (lower is better), rejected when a point is behind the robot, well to its right, out of
+        reach, outside the head camera's view, or the footprint is not free (``ignore``: objects that do not count;
+        ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken here otherwise).
+        Returns ((score, x, y, yaw, dist, side) or None, rejection counts by reason).
         """
-        p_item = self.scene_object(item).aabb_center.cpu().numpy()[:2]
-        p_target = self.scene_object(target).aabb_center.cpu().numpy()[:2]
+        p_item, p_target = np.asarray(p_item_xy)[:2], np.asarray(p_target_xy)[:2]
         mid = (p_item + p_target) / 2
-        best, rejected = None, {}
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        best, rejected, footprint = None, {}, {}  # footprint: (x, y) -> _footprint_free result (yaw-independent)
         for radius in np.arange(0.35, 0.95, 0.05):
             for angle in np.arange(0.0, 2 * np.pi, np.pi / 18):
                 x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
@@ -589,16 +624,42 @@ class R1ProSim(TiptopSim):
                     if min(ahead) < 0.15 or min(side) < -0.3 or max(dist) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
+                    if min(dist) < CAMERA_MIN_DIST:  # below the head camera's frame (a cookie at 0.42 m: empty mask)
+                        rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
+                        continue
+                    # a container nearer than the item and in line with it hides the item (empty mask): keep their
+                    # bearings apart by the container's angular half-width plus a margin for the item
+                    bearing = [math.atan2(sd, ah) for ah, sd in zip(ahead, side)]
+                    apart = abs(bearing[0] - bearing[1])
+                    if dist[1] < dist[0] + 0.05 and apart < math.atan(TARGET_HALF_WIDTH / dist[1]) + math.atan(
+                        0.06 / dist[0]
+                    ):
+                        rejected["container hides the item"] = rejected.get("container hides the item", 0) + 1
+                        continue
                     if max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
                         rejected["outside camera view"] = rejected.get("outside camera view", 0) + 1
                         continue
                     score = max(dist) + 0.5 * max(0.0, 0.15 - min(side)) + 0.1 * abs(yaw_offset)
                     if best is None or score < best[0]:
-                        free, why = self._footprint_free(x, y, ignore_names)
+                        key = (float(x), float(y))
+                        if key not in footprint:
+                            footprint[key] = self._footprint_free(x, y, ignore, aabbs=aabbs)
+                        free, why = footprint[key]
                         if free:
                             best = (score, x, y, yaw, dist, side)
                         else:
                             rejected[why] = rejected.get(why, 0) + 1
+        return best, rejected
+
+    def place_robot_for(self, item: str, target: str, ignore_names=(), reach: float = 0.9) -> dict:
+        """Stand where ITEM and TARGET are both in the left arm's reach ("navigation done"): best pose + place_robot.
+
+        ignore_names: objects that do not count as obstacles, resolved like place_robot_near's (unknown names raise).
+        """
+        p_item = self.scene_object(item).aabb_center.cpu().numpy()[:2]
+        p_target = self.scene_object(target).aabb_center.cpu().numpy()[:2]
+        ignore = [self.scene_object(n) for n in ignore_names]
+        best, rejected = self.best_base_pose(p_item, p_target, ignore=ignore, reach=reach)
         if best is None:
             raise RuntimeError(
                 f"no base pose reaches both {item!r} and {target!r} within {reach} m (objects {np.round(p_item, 2)}, "

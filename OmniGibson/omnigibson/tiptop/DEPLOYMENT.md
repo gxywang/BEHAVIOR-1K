@@ -121,6 +121,14 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 16. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
     to `~/tiptop-services/M2T2`; override with `TIPTOP_DIR` / `M2T2_DIR`. The laptop also has copies in
     `~/tiptop-services/bin/` that are not in git.
+17. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
+    (2 GB swap) after 16 transfers: Isaac client 14 GB RSS, planner 4.4 GB, Rerun viewer 2.8 GB, M2T2 1.1 GB, plus
+    the desktop. The kernel killed the client, which shared VSCode's cgroup, and took the editor session with it.
+    Mitigations: the server now spawns the viewer with `--rerun-memory-limit 2GB` (Rerun's own default is 75% of
+    RAM, and `--no-state-stream` on the client keeps per-step state out of it entirely); run long clients in their own
+    cgroup with a cap and a high OOM score, e.g. `systemd-run --user --scope -p MemoryMax=18G choom -n 800 -- python
+    -m omnigibson.tiptop.run task ...`; give the box real swap (16 GB) before a long run; watch `rss_gb` in the
+    per-transfer log lines for growth.
 
 ## R1Pro specifics
 
