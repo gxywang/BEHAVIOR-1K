@@ -153,12 +153,8 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
     print(f"Robot: {robot_cfg['model']}")
 
     # Ensure OmniGibson appdata cache directory exists and is writable to avoid texture cache write errors
-    try:
-        appdata_cache = Path(gm.APPDATA_PATH) / "global" / "cache" / "texturecache"
-        appdata_cache.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        # best-effort; simulator will log errors if writes still fail
-        pass
+    appdata_cache = Path(gm.APPDATA_PATH) / "global" / "cache" / "texturecache"
+    appdata_cache.mkdir(parents=True, exist_ok=True)
 
     env = og.Environment(configs=cfg)
     episodes = []
