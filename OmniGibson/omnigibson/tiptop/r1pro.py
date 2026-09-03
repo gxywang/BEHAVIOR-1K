@@ -347,6 +347,102 @@ class R1ProSim(TiptopSim):
         terms = list(getattr(head, "terms", []))
         return f"{terms[0]}({', '.join(terms[1:])})" if terms else str(head)
 
+    def predicate_holds(self, name: str, *bddl_names: str) -> bool:
+        """Evaluate one grounded goal predicate (e.g. inside(item, container)) exactly as the challenge scorer does."""
+        task = self.env.task
+        terms = [name, *bddl_names]
+        for option in task.ground_goal_state_options:
+            for head in option:
+                if list(getattr(head, "terms", [])) == terms:
+                    return bool(head.evaluate(task._evaluate_predicate))
+        raise KeyError(f"{name}({', '.join(bddl_names)}) is not a goal predicate of this task")
+
+    def base_hint(self, name: str) -> list[float]:
+        """Where a scene/task object is, in the robot base frame (TiPToP's world frame)."""
+        obj = self.scene_object(name)
+        pos_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
+        return [float(v) for v in pos_b]
+
+    def free_spot_on(
+        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03, near=None
+    ):
+        """(dx, dy) from the support's center where ``name`` fits on top of it without overlapping anything.
+
+        Picks the spot with the most clearance, or the free spot closest to ``near`` (world xy) when given.
+        """
+        obj, sup = self.scene_object(name), self.scene_object(support)
+        lo, hi = [v.cpu().numpy() for v in sup.aabb]
+        olo, ohi = [v.cpu().numpy() for v in obj.aabb]
+        hx, hy = (ohi[0] - olo[0]) / 2, (ohi[1] - olo[1]) / 2
+        skip = {obj, sup, self.robot} | {self.scene_object(n) for n in self.contents_of(name)}
+        others = []
+        for other in self.env.scene.objects:
+            if other in skip:
+                continue
+            alo, ahi = [v.cpu().numpy() for v in other.aabb]
+            if ahi[2] < hi[2] - 0.02 or alo[2] > hi[2] + 0.6:
+                continue  # below the top or far above it
+            if ahi[0] < lo[0] or alo[0] > hi[0] or ahi[1] < lo[1] or alo[1] > hi[1]:
+                continue  # not over the support
+            others.append((alo, ahi))
+        best = None
+        for x in np.arange(lo[0] + edge + hx, hi[0] - edge - hx + 1e-6, step):
+            for y in np.arange(lo[1] + edge + hy, hi[1] - edge - hy + 1e-6, step):
+                gap = min(
+                    (
+                        max(alo[0] - (x + hx), (x - hx) - ahi[0], alo[1] - (y + hy), (y - hy) - ahi[1])
+                        for alo, ahi in others
+                    ),
+                    default=1.0,
+                )
+                if gap < clearance:
+                    continue
+                score = -float(np.hypot(x - near[0], y - near[1])) if near is not None else gap
+                if best is None or score > best[0]:
+                    best = (score, x, y, gap)
+        if best is None:
+            raise RuntimeError(f"no free spot for {name} on {support} ({len(others)} objects on it)")
+        _, x, y, gap = best
+        center = (lo + hi) / 2
+        log.info(f"free spot for {name} on {support}: ({x:.2f}, {y:.2f}), clearance {gap:.2f} m")
+        return float(x - center[0]), float(y - center[1])
+
+    def contents_of(self, container: str) -> list[str]:
+        """Tracked task objects whose AABB center lies inside the container's AABB."""
+        lo, hi = [v.cpu().numpy() for v in self.scene_object(container).aabb]
+        inside = []
+        for label, bddl in self.bddl_names.items():
+            if bddl == container:
+                continue
+            c = self.objects[label].aabb_center.cpu().numpy()
+            if np.all(c > lo) and np.all(c < hi):
+                inside.append(bddl)
+        return inside
+
+    def move_with_contents(self, container: str, position, orientation=None) -> None:
+        """Teleport a container and whatever sits inside it by the same offset (stand-in for carrying it)."""
+        obj = self.scene_object(container)
+        pos0, quat0 = obj.get_position_orientation()
+        delta = th.as_tensor(position, dtype=th.float32) - pos0
+        contents = self.contents_of(container)
+        for name in [container, *contents]:
+            o = self.scene_object(name)
+            p, q = o.get_position_orientation()
+            quat = q if name != container or orientation is None else th.as_tensor(orientation, dtype=th.float32)
+            o.set_position_orientation(position=p + delta, orientation=quat)
+            o.keep_still()
+        log.info(f"moved {container} with {contents} by {np.round(delta.numpy(), 3).tolist()}")
+
+    def place_on_with_contents(self, container: str, support: str, dx: float, dy: float, lift: float = 0.01) -> None:
+        """place_on() for a container that may already hold items: they travel with it."""
+        obj, sup = self.scene_object(container), self.scene_object(support)
+        lo, hi = [v.cpu().numpy() for v in sup.aabb]
+        olo, ohi = [v.cpu().numpy() for v in obj.aabb]
+        center = (lo + hi) / 2
+        pos = obj.get_position_orientation()[0].numpy()
+        z = hi[2] + lift + (pos[2] - olo[2])  # keep the object's own origin height above its bottom
+        self.move_with_contents(container, [center[0] + dx, center[1] + dy, z])
+
     def mark_goal_initial(self) -> None:
         """Remember which goal predicates already hold, as the challenge metric does (no credit for those)."""
         self.goal_initial = self._goal_values()

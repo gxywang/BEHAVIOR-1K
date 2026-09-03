@@ -244,7 +244,9 @@ def build_sim(args, embodiment: dict | None = None):
     return sim
 
 
-def do_capture(sim, args, out_dir: Path, atoms: list[dict] | None = None) -> tuple[dict, dict]:
+def do_capture(
+    sim, args, out_dir: Path, atoms: list[dict] | None = None, hints: dict | None = None
+) -> tuple[dict, dict]:
     from omnigibson.tiptop.protocol import save_observation_h5
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
@@ -257,6 +259,8 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict] | None = None) -> tup
     if no_gt:  # no segmentation rendered: send the names and the goal, no masks
         request, extras = sim.capture(args.task)
         request["gt_labels"], request["gt_atoms"] = list(labels), list(atoms)
+        if hints:
+            request["goal_hints"] = {k: [float(v) for v in vals] for k, vals in hints.items()}
     else:
         request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
     report = sim.validate_capture(request, extras)
@@ -301,9 +305,9 @@ def open_state_stream(hostport: str | None):
     return stream if stream.open() else None
 
 
-def live_round(sim, args, client, out_dir: Path, atoms: list[dict]) -> dict:
+def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict | None = None) -> dict:
     """Capture, ask the server for a plan for these atoms, save it and execute it."""
-    request, extras = do_capture(sim, args, out_dir, atoms=atoms)
+    request, extras = do_capture(sim, args, out_dir, atoms=atoms, hints=hints)
     if args.no_gt:
         request = {k: v for k, v in request.items() if k != "gt_masks"}
     response = client.plan(request, timeout_s=args.plan_timeout)
@@ -333,6 +337,94 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict]) -> dict:
     )
     stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
     return do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream)
+
+
+def run_task(sim, args, client, out_dir: Path) -> dict:
+    """Work through a challenge task's `inside` goal: every container gets one item of each type.
+
+    Navigation stand-ins: containers are teleported onto --stage-support one at a time, the base is teleported to a
+    reachable pose per transfer. Each transfer is one capture/plan/execute round; the item is verified with the
+    task's own `inside` predicate and, on failure, the next unplaced item of that type is tried.
+    """
+    from omnigibson.tiptop.r1pro import bddl_category
+
+    task = sim.env.task
+    pairs = []
+    for head in task.ground_goal_state_options[0]:
+        terms = list(getattr(head, "terms", []))
+        if terms and terms[0] == "inside" and len(terms) == 3:
+            pairs.append((terms[1], terms[2]))
+    if not pairs:
+        raise ValueError("task goal has no inside(item, container) predicates; nothing this driver can do")
+    containers = list(dict.fromkeys(c for _, c in pairs))
+    items_by_type = {}
+    for item, _ in pairs:
+        items_by_type.setdefault(bddl_category(item), []).append(item)
+    for cat in items_by_type:
+        items_by_type[cat] = list(dict.fromkeys(items_by_type[cat]))
+    log.info(f"task: {len(containers)} containers x {list(items_by_type)} ({len(pairs)} predicates)")
+
+    placed, transfers, n = set(), [], 0
+    type_failures = dict.fromkeys(items_by_type, 0)  # containers in a row a type failed for; skipped after 2
+    for basket in containers:
+        home = sim.scene_object(basket).get_position_orientation()
+        for cat, items in items_by_type.items():
+            if type_failures[cat] >= 2:
+                log.info(f"skipping {cat}: failed for the last {type_failures[cat]} containers")
+                continue
+            candidates = [i for i in items if i not in placed]
+            if args.stage_support:  # items near the table's edge are the ones a base pose can reach
+                lo, hi = [v.cpu().numpy() for v in sim.scene_object(args.stage_support).aabb]
+
+                def edge_gap(name):
+                    c = sim.scene_object(name).aabb_center.cpu().numpy()
+                    return min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1])
+
+                candidates.sort(key=edge_gap)
+            ok = False
+            for item in candidates[: args.attempts_per_item]:
+                n += 1
+                round_dir = out_dir / f"t{n:02d}_{bddl_category(item).replace(' ', '_')}_{basket.split('_')[-1]}"
+                round_dir.mkdir(parents=True, exist_ok=True)
+                record = {"item": item, "container": basket, "dir": str(round_dir)}
+                t0 = time.time()
+                try:
+                    if args.stage_support:  # bring the container (with what it holds) next to this item
+                        near = sim.scene_object(item).aabb_center.cpu().numpy()[:2]
+                        dx, dy = sim.free_spot_on(basket, args.stage_support, near=near)
+                        sim.place_on_with_contents(basket, args.stage_support, dx, dy)
+                        sim.hold(args.settle_steps, sim.OPEN)
+                    sim.place_robot_for(item, basket)
+                    sim.hold(args.settle_steps, sim.OPEN)
+                    atoms = [{"predicate": "inside", "args": [item, basket]}]
+                    _, tiptop_atoms = sim.tiptop_goal(atoms, category_level=bool(args.no_gt))
+                    hints = {lab: sim.base_hint(b) for lab, b in zip(tiptop_atoms[0]["args"], (item, basket))}
+                    live_round(sim, args, client, round_dir, atoms=atoms, hints=hints)
+                    # the goal names the category, so any item of this type that ended up inside counts
+                    now_inside = [i for i in items if i not in placed and sim.predicate_holds("inside", i, basket)]
+                    record["inside"], record["placed"] = bool(now_inside), now_inside
+                except Exception as e:  # noqa: BLE001 - one failed transfer must not end the task
+                    log.exception(f"transfer {n} {item} -> {basket} failed")
+                    record["inside"], record["error"] = False, f"{type(e).__name__}: {e}"
+                record["seconds"] = round(time.time() - t0, 1)
+                transfers.append(record)
+                log.info(
+                    f"transfer {n}: {item} -> {basket}: "
+                    f"{'OK ' + str(record.get('placed')) if record['inside'] else 'failed'} ({record['seconds']}s)"
+                )
+                if record["inside"]:
+                    placed.update(record["placed"])
+                    ok = True
+                    break
+            type_failures[cat] = 0 if ok else type_failures[cat] + 1
+        if args.stage_support:  # done with this container: back to the floor with its contents, freeing the table
+            sim.move_with_contents(basket, home[0], home[1])
+            sim.hold(args.settle_steps, sim.OPEN)
+    summary = {"transfers": transfers, "placed": sorted(placed), "task_goal": sim.goal_status()}
+    with open(out_dir / "task_summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    log.info(f"TASK RESULT: {len(placed)}/{len(pairs)} items placed, {summary['task_goal']}")
+    return summary
 
 
 def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None) -> dict:
@@ -402,6 +494,18 @@ def main(argv=None):
     p_live.add_argument(
         "--no-state-stream", action="store_true", help="do not mirror the executed sim state into the server's Rerun"
     )
+    p_task = sub.add_parser("task", help="work through a challenge task's whole inside(item, container) goal")
+    add_common(p_task)
+    p_task.add_argument("--host", default="localhost")
+    p_task.add_argument("--port", type=int, default=8765)
+    p_task.add_argument("--plan-timeout", type=float, default=900.0)
+    p_task.add_argument("--no-state-stream", action="store_true")
+    p_task.add_argument(
+        "--stage-support",
+        default=None,
+        help="BDDL name of the furniture each container is brought onto before it is filled (e.g. table.n.02_1)",
+    )
+    p_task.add_argument("--attempts-per-item", type=int, default=2, help="candidate items tried per type per container")
     args = parser.parse_args(argv)
 
     # OmniGibson installs its own handler on the "omnigibson" logger; give this sub-logger its own INFO stream
@@ -420,7 +524,7 @@ def main(argv=None):
     try:
         t0 = time.time()
         client = None
-        if args.cmd == "live":
+        if args.cmd in ("live", "task"):
             from omnigibson.tiptop.client import TiptopClient
 
             # the server's embodiment metadata (locked posture, home pose) shapes the scene, so fetch it first
@@ -443,6 +547,10 @@ def main(argv=None):
         log.info(f"scene ready in {time.time() - t0:.1f}s (sim dt {sim.dt:.4f}s)")
         if args.cmd == "capture":
             do_capture(sim, args, out_dir)
+        elif args.cmd == "task":
+            if not args.activity:
+                raise ValueError("task needs --activity")
+            run_task(sim, args, client, out_dir)
         elif args.cmd == "replay":
             plan = load_plan_json(args.plan)
             if args.embodiment == "r1pro" and not plan_json.get("embodiment"):
