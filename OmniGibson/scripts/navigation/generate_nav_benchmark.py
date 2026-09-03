@@ -172,6 +172,8 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
         print(f"  goal = {episode['goal_position']}")
         print(f"  shortest path = {episode['geodesic_distance']:.3f} m")
 
+    # Clear simulation state before returning so next scene can be loaded cleanly
+    og.clear()
     return episodes
 
 
