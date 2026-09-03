@@ -10,6 +10,9 @@
   - for `shenlong-gpu-02`: `172.22.224.85`
 - on server, export the corresponding IP to `export OMNIGIBSON_PUBLIC_IP=`
 
+## Debug
+- If using `campus-cluster`, and running into CUDA issues, try `source cluster_env.sh`
+
 ## Dataset info
 - robot: R1Pro
 - action_frequency: 30
