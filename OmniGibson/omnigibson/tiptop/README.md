@@ -99,7 +99,12 @@ streams to a viewer you started yourself (`rerun` in the tiptop env), e.g. when 
 During execution the client also streams the simulator's state back to the server (`sim_state` messages on the same
 websocket), so the planner's robot model in Rerun follows the simulated joints in real time and each object gets a
 green copy that follows its simulated pose next to the grey perceived one; `--no-state-stream` turns this off, and
-`replay --state-stream host:port` mirrors an offline replay into a running server's view.
+`replay --state-stream host:port` mirrors an offline replay into a running server's view. In the viewer, `log_time` is
+wall-clock and `sim_time` is simulated seconds since the capture (0 = the planner's input, robot at the capture
+posture). If the 2D views are black and the robot is a heap at the origin, the time cursor is before the data: the
+viewer keeps the time panel state (paused, loop selection, speed) across runs, so press the go-to-end button or
+choose *Following*, and check the selected recording. Start a viewer yourself only with the tiptop env's `rerun`
+(`pixi run rerun`); a stray `rerun` of another version on `PATH` that already listens on port 9876 gets reused.
 
 Options: `--objects mug,bowl,apple,banana`, `--task`, `--goal "on(mug,bowl)"` (drives the ground-truth atoms and the
 success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: use Gemini + SAM2,

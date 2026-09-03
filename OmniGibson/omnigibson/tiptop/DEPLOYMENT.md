@@ -96,7 +96,9 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    (one `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<timestamp>/`, open later with `rerun <file>`)
    or `connect` with `--rerun-url rerun+http://127.0.0.1:9876/proxy` plus a reverse tunnel to a viewer on your
    laptop (`ssh -R 9876:127.0.0.1:9876 server`, `rerun` running locally). The client's sim-state mirror works in
-   all modes.
+   all modes. Run the viewer from the tiptop env (`pixi run rerun`, 0.27.3 = the SDK): `stream` and `connect` reuse
+   whatever already listens on 9876, and a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2 on
+   the laptop) only warns that Rerun guarantees no compatibility across versions.
 9. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
    `ssh -N -L 8765:127.0.0.1:8765 server` and `--host localhost`, or `TIPTOP_HOST=0.0.0.0`. The client refuses to
    run unless the server metadata says `robot_type: panda`, `dof: 7` (the launcher's `--config` guarantees it).
