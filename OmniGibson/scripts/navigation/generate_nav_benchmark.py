@@ -32,6 +32,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Sample R1Pro point-navigation benchmark episodes.")
     parser.add_argument("--scene", choices=CHALLENGE_SCENES, default="house_single_floor")
     parser.add_argument("--num-episodes", type=int, default=5)
+    parser.add_argument("--all-scenes", action="store_true", help="Generate episodes for all challenge scenes")
+    parser.add_argument("--num-episodes-per-scene", type=int, default=None, help="Number of episodes per scene when generating multiple scenes")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--floor", type=int, default=0)
@@ -144,7 +146,7 @@ def verify_episode(env, episode):
         raise RuntimeError(f"Stored episode is unreachable on replay check: {episode['episode_id']}")
 
 
-def sample_scene(scene_model, robot_cfg, args):
+def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
     cfg = build_env_config(scene_model=scene_model, robot_cfg=copy.deepcopy(robot_cfg))
 
     print(f"Loaded scene: {scene_model}")
@@ -152,7 +154,8 @@ def sample_scene(scene_model, robot_cfg, args):
 
     env = og.Environment(configs=cfg)
     episodes = []
-    for local_idx in range(args.num_episodes):
+    count = num_episodes if num_episodes is not None else args.num_episodes
+    for local_idx in range(count):
         episode = sample_episode(
             env=env,
             scene_model=scene_model,
@@ -209,8 +212,23 @@ def main():
 
     robot_cfg = load_robot_config(args.robot_config)
     try:
-        episodes = sample_scene(scene_model=args.scene, robot_cfg=robot_cfg, args=args)
-        write_benchmark(path=args.output, args=args, robot_cfg=robot_cfg, episodes=episodes)
+        # determine which scenes to generate
+        if args.all_scenes:
+            scenes = list(CHALLENGE_SCENES)
+        else:
+            scenes = [args.scene]
+
+        per_scene = args.num_episodes_per_scene if args.num_episodes_per_scene is not None else args.num_episodes
+
+        all_episodes = []
+        for scene in scenes:
+            eps = sample_scene(scene_model=scene, robot_cfg=robot_cfg, args=args, num_episodes=per_scene)
+            # ensure unique ids across scenes
+            for i, ep in enumerate(eps):
+                ep["episode_id"] = f"{scene}_{i:03d}"
+            all_episodes.extend(eps)
+
+        write_benchmark(path=args.output, args=args, robot_cfg=robot_cfg, episodes=all_episodes)
     finally:
         og.shutdown()
 
