@@ -152,6 +152,14 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
     print(f"Loaded scene: {scene_model}")
     print(f"Robot: {robot_cfg['model']}")
 
+    # Ensure OmniGibson appdata cache directory exists and is writable to avoid texture cache write errors
+    try:
+        appdata_cache = Path(gm.APPDATA_PATH) / "global" / "cache" / "texturecache"
+        appdata_cache.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # best-effort; simulator will log errors if writes still fail
+        pass
+
     env = og.Environment(configs=cfg)
     episodes = []
     count = num_episodes if num_episodes is not None else args.num_episodes
@@ -222,15 +230,28 @@ def main():
 
         per_scene = args.num_episodes_per_scene if args.num_episodes_per_scene is not None else args.num_episodes
 
-        all_episodes = []
+        # If multiple scenes are requested, write one file per scene (atomic write)
+        out_path = Path(args.output)
+        out_parent = out_path.parent
+        out_parent.mkdir(parents=True, exist_ok=True)
+
         for scene in scenes:
             eps = sample_scene(scene_model=scene, robot_cfg=robot_cfg, args=args, num_episodes=per_scene)
-            # ensure unique ids across scenes
+            # normalize episode ids per-scene
             for i, ep in enumerate(eps):
                 ep["episode_id"] = f"{scene}_{i:03d}"
-            all_episodes.extend(eps)
 
-        write_benchmark(path=args.output, args=args, robot_cfg=robot_cfg, episodes=all_episodes)
+            # build per-scene output path: <original_stem>_<scene>.json
+            stem = out_path.stem
+            per_scene_name = f"{stem}_{scene}.json"
+            per_scene_path = out_parent / per_scene_name
+
+            # atomic write to temp file then rename
+            tmp_path = per_scene_path.with_suffix('.json.tmp')
+            write_benchmark(path=tmp_path, args=args, robot_cfg=robot_cfg, episodes=eps)
+            # move tmp to final
+            tmp_path.replace(per_scene_path)
+            print(f"Wrote per-scene benchmark: {per_scene_path}")
     finally:
         og.shutdown()
 
