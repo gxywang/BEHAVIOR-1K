@@ -87,6 +87,13 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 python -m omnigibson.tiptop.run live --host localhost --port 8765 --out-dir runs/live   # end-to-end over the websocket
 ```
 
+Demo with both visualizations on one machine: start the planner with `--rerun-mode stream`
+(`TIPTOP_RERUN_MODE=stream ~/tiptop-services/bin/start_tiptop_server.sh`), leave `OMNIGIBSON_HEADLESS` unset and run
+`live`. The Rerun viewer pops up on the first request (RGB, masks, grasps, robot, plan) and is re-spawned if you close
+it; the Isaac Sim window shows the executed trajectory. `--rerun-mode save` writes `tiptop.rrd` into each server run
+directory instead (`rerun <file>` to view later); `--rerun-mode connect --rerun-url rerun+http://host:9876/proxy`
+streams to a viewer you started yourself (`rerun` in the tiptop env), e.g. when the planner runs on another machine.
+
 Options: `--objects mug,bowl,apple,banana`, `--task`, `--goal "on(mug,bowl)"` (drives the ground-truth atoms and the
 success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: use Gemini + SAM2,
 needs `GOOGLE_API_KEY` on the server).

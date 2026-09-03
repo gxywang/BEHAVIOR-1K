@@ -14,6 +14,7 @@ import torch as th
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
+from omnigibson.macros import gm
 from omnigibson.tiptop.protocol import DROID_CAMERA_KWARGS, DROID_Q_INIT, build_request, depth_to_points
 
 log = logging.getLogger(__name__)
@@ -21,6 +22,8 @@ log = logging.getLogger(__name__)
 TABLE_HEIGHT = 0.75  # world z of the table top; the robot base sits on it, so base-frame z = 0 there
 FINGER_OPEN = 0.04
 CAMERA_NAME = "tiptop_cam"
+VIEWER_EYE = (1.9, -1.6, 1.7)  # Isaac Sim viewport pose in GUI mode, world frame
+VIEWER_TARGET = (0.45, 0.0, 0.8)
 
 # Objects with ground-truth instance segmentation; names double as the labels used in goal atoms.
 OBJECT_PRESETS = {
@@ -154,6 +157,10 @@ class TiptopSim:
     def __init__(self, config: dict):
         self.config = config
         self.env = og.Environment(configs=config)
+        if not gm.HEADLESS:  # GUI: aim the Isaac Sim viewport at the table (the TiPToP camera is a separate sensor)
+            og.sim.viewer_camera.set_position_orientation(
+                position=th.tensor(VIEWER_EYE), orientation=th.tensor(look_at_quat_xyzw(VIEWER_EYE, VIEWER_TARGET))
+            )
         self.robot = self.env.robots[0]
         self.cam = self.env.external_sensors[CAMERA_NAME]
         arm = self.robot.default_arm
