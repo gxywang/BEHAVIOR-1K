@@ -256,11 +256,11 @@ class TiptopSim:
         depth = obs["depth_linear"].cpu().numpy().astype(np.float32)
         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
         depth[depth < 0] = 0.0
-        seg = obs["seg_instance"].cpu().numpy()
-        id_to_name = {int(k): str(v) for k, v in info["seg_instance"].items()}
+        seg = obs["seg_instance"].cpu().numpy() if "seg_instance" in obs else None
+        id_to_name = {int(k): str(v) for k, v in info["seg_instance"].items()} if seg is not None else {}
         intrinsics = self.cam.intrinsic_matrix.cpu().numpy().astype(np.float32)
         robot_mask = np.zeros(depth.shape, dtype=bool)  # self-filter: the robot's own body seen by its camera
-        for label in self.mask_labels_as_invalid:
+        for label in self.mask_labels_as_invalid if seg is not None else ():
             ids = [i for i, n in id_to_name.items() if n == label]
             if ids:
                 masked = np.isin(seg, ids)
@@ -274,8 +274,16 @@ class TiptopSim:
         world_from_cam = T.pose2mat((cam_pos_b, cam_quat_b)).cpu().numpy().astype(np.float32)
 
         gt = None
+        if gt_labels and seg is None:
+            raise ValueError("ground-truth masks need instance segmentation; capture without gt_labels (--no-gt)")
         if gt_labels:
-            masks = np.stack([self.instance_mask(seg, id_to_name, label) for label in gt_labels])
+            # labels are request names; tracked objects may carry a different simulator name (task objects)
+            masks = np.stack(
+                [
+                    self.instance_mask(seg, id_to_name, self.objects[label].name if label in self.objects else label)
+                    for label in gt_labels
+                ]
+            )
             gt = {"labels": list(gt_labels), "masks": masks, "atoms": list(gt_atoms or [])}
         request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm(), gt=gt)
         if robot_mask.any():
@@ -323,6 +331,10 @@ class TiptopSim:
         pts = depth_to_points(request["depth"], request["intrinsics"], request["world_from_cam"])
         seg, id_to_name = extras["seg_instance"], extras["id_to_name"]
         report = {"camera_view_axis_base": request["world_from_cam"][:3, 2].tolist()}
+        if seg is None:  # rgb + depth only: nothing to compare masks against
+            report["note"] = "no instance segmentation rendered; mask checks skipped"
+            report["problems"] = []
+            return report
         table_ids = [i for i, n in id_to_name.items() if n == "table"]
         table_pts = pts[np.isin(seg, table_ids)] if table_ids else np.zeros((0, 3))
         table_pts = table_pts[np.isfinite(table_pts).all(axis=1)]
@@ -335,7 +347,7 @@ class TiptopSim:
         else:
             report["table_z_base_median"] = float("nan")
         for name, pose in extras["object_poses_base"].items():
-            mask = self.instance_mask(seg, id_to_name, name)
+            mask = self.instance_mask(seg, id_to_name, self.objects[name].name if name in self.objects else name)
             obj_pts = pts[mask]
             obj_pts = obj_pts[np.isfinite(obj_pts).all(axis=1)]
             centroid = obj_pts.mean(axis=0)

@@ -72,6 +72,34 @@ def add_common(p: argparse.ArgumentParser) -> None:
     r1.add_argument("--scene-objects", default="", help="comma-separated names of existing scene objects to manipulate")
     r1.add_argument("--camera", default="head", choices=["head", "wrist"])
     r1.add_argument(
+        "--activity",
+        default=None,
+        help="load a BEHAVIOR challenge task instead of spawning objects (e.g. assembling_gift_baskets); "
+        "--goal then uses BDDL names, e.g. 'inside(candle.n.01_1,wicker_basket.n.01_1)'",
+    )
+    r1.add_argument("--activity-instance", type=int, default=0, help="task instance id (0 = the template)")
+    r1.add_argument(
+        "--place",
+        action="append",
+        default=[],
+        metavar="OBJ:SUPPORT[:DX,DY]",
+        help="teleport a scene/task object onto a support before the episode (test stand-in for a carry), "
+        "e.g. wicker_basket.n.01_2:table.n.02_1:0.13,0.31",
+    )
+    r1.add_argument(
+        "--stand-for",
+        default=None,
+        metavar="ITEM,TARGET",
+        help="choose the base pose automatically so ITEM and TARGET are both in the left arm's reach "
+        "(navigation stand-in; alternative to --near / --robot-pose)",
+    )
+    p.add_argument(
+        "--no-gt",
+        action="store_true",
+        help="competition-style perception: render rgb + depth only and send just the task's object names and goal "
+        "atoms, no ground-truth masks (the server runs its detector + SAM2 on the image)",
+    )
+    r1.add_argument(
         "--no-look", action="store_true", help="capture in the ready posture instead of swinging the arm out of view"
     )
     r1.add_argument(
@@ -120,20 +148,39 @@ def build_r1pro_sim(args, embodiment: dict | None):
     from omnigibson.tiptop.r1pro import ROBOT_TYPE, R1ProSim, load_embodiment_meta, make_r1pro_env_config
 
     spawns = parse_spawns(args.spawn)
+    scene_model, room_instances = args.scene_model, None
+    if args.activity:
+        from omnigibson.tiptop.r1pro import challenge_task_info
+
+        scene_model, room_instances = challenge_task_info(args.activity)
+        log.info(f"challenge task {args.activity}: scene {scene_model}, rooms {room_instances}")
     cfg = make_r1pro_env_config(
-        scene_model=args.scene_model,
+        scene_model=scene_model,
         load_room_types=[r for r in (args.rooms or "").split(",") if r],
         spawn_presets=[sp[0] for sp in spawns],
         grasping_mode=args.grasping_mode,
         camera=args.camera,
         head_aperture_mm=args.head_aperture,
         not_load_object_categories=[c for c in args.not_load.split(",") if c],
+        activity=args.activity,
+        activity_instance_id=args.activity_instance,
+        load_room_instances=room_instances,
+        segmentation=not getattr(args, "no_gt", False),  # competition mode: rgb + depth only, like the evaluator
     )
     sim = R1ProSim(cfg, camera=args.camera)
+    if args.activity:
+        sim.track_task_objects()
+    for spec in args.place:
+        parts = spec.split(":")
+        dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) > 2 else (0.0, 0.0)
+        sim.place_on(parts[0], parts[1], dx, dy)  # settles during the posture hold below
     if args.no_look:
         sim.look_arm = None
     if args.robot_pose:
         sim.place_robot(*args.robot_pose)
+    elif args.stand_for:
+        item, target = args.stand_for.split(",")
+        sim.place_robot_for(item, target, ignore_names=[sp[0] for sp in spawns])
     elif args.near:
         sim.place_robot_near(args.near, side=args.side, standoff=args.standoff, ignore_names=[sp[0] for sp in spawns])
     else:
@@ -172,6 +219,9 @@ def build_r1pro_sim(args, embodiment: dict | None):
         joint_names=embodiment["joint_names"],
     )
     sim.hold(args.settle_steps, sim.OPEN)
+    if args.activity:
+        sim.mark_goal_initial()
+        log.info(f"task goal at start: {sim.goal_status()}")
     return sim
 
 
@@ -194,12 +244,21 @@ def build_sim(args, embodiment: dict | None = None):
     return sim
 
 
-def do_capture(sim, args, out_dir: Path) -> tuple[dict, dict]:
+def do_capture(sim, args, out_dir: Path, atoms: list[dict] | None = None) -> tuple[dict, dict]:
     from omnigibson.tiptop.protocol import save_observation_h5
 
-    atoms = parse_goal(args.goal)
-    labels = sorted({a for atom in atoms for a in atom["args"] if a in sim.objects})
-    request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
+    atoms = parse_goal(args.goal) if atoms is None else list(atoms)
+    no_gt = bool(getattr(args, "no_gt", False))
+    if getattr(args, "activity", None):
+        # BDDL names -> request labels; --no-gt asks the detector for categories (any candle will do)
+        labels, atoms = sim.tiptop_goal(atoms, category_level=no_gt)
+    else:
+        labels = sorted({a for atom in atoms for a in atom["args"] if a in sim.objects})
+    if no_gt:  # no segmentation rendered: send the names and the goal, no masks
+        request, extras = sim.capture(args.task)
+        request["gt_labels"], request["gt_atoms"] = list(labels), list(atoms)
+    else:
+        request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
@@ -242,6 +301,40 @@ def open_state_stream(hostport: str | None):
     return stream if stream.open() else None
 
 
+def live_round(sim, args, client, out_dir: Path, atoms: list[dict]) -> dict:
+    """Capture, ask the server for a plan for these atoms, save it and execute it."""
+    request, extras = do_capture(sim, args, out_dir, atoms=atoms)
+    if args.no_gt:
+        request = {k: v for k, v in request.items() if k != "gt_masks"}
+    response = client.plan(request, timeout_s=args.plan_timeout)
+    with open(out_dir / "server_response.json", "w") as f:
+        json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
+    with open(out_dir / "tiptop_plan.json", "w") as f:
+        json.dump(
+            {
+                "version": response["plan"]["version"],
+                "embodiment": response.get("embodiment") or client.metadata.get("embodiment"),
+                "q_init": response["plan"]["q_init"].tolist(),
+                "steps": [
+                    dict(
+                        s,
+                        positions=s["positions"].tolist(),
+                        velocities=None if s["velocities"] is None else s["velocities"].tolist(),
+                    )
+                    if s["type"] == "trajectory"
+                    else s
+                    for s in response["plan"]["steps"]
+                ],
+            },
+            f,
+        )
+    log.info(
+        f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
+    )
+    stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
+    return do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream)
+
+
 def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None) -> dict:
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
@@ -254,7 +347,22 @@ def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None
     finally:
         if state_stream is not None:
             state_stream.close()
-    success = check_success(sim, parse_goal(args.goal))
+    if getattr(args, "activity", None):
+        success = sim.goal_status()
+        success["all"] = success["success"]
+        # where the goal objects ended up relative to their targets (BDDL names from --goal)
+        success["poses"] = {}
+        for atom in parse_goal(args.goal):
+            for name in atom["args"]:
+                try:
+                    obj = sim.scene_object(name)
+                    lo, hi = [v.cpu().numpy().round(3).tolist() for v in obj.aabb]
+                    success["poses"][name] = {"aabb": [lo, hi]}
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    pass
+        log.info(f"goal object AABBs: {success['poses']}")
+    else:
+        success = check_success(sim, parse_goal(args.goal))
     if video is not None:
         video.close()
     result = {
@@ -284,13 +392,13 @@ def main(argv=None):
     add_common(p_live)
     p_live.add_argument("--host", default="localhost")
     p_live.add_argument("--port", type=int, default=8765)
-    p_live.add_argument(
-        "--no-gt",
-        action="store_true",
-        help="competition-style perception: send only the task's object names and goal atoms, no ground-truth masks "
-        "(the server runs its detector + SAM2 on the image)",
-    )
     p_live.add_argument("--plan-timeout", type=float, default=900.0)
+    p_live.add_argument(
+        "--sequential",
+        action="store_true",
+        help="one capture/plan/execute round per goal atom (re-standing for each with --activity), instead of one "
+        "plan for the whole goal",
+    )
     p_live.add_argument(
         "--no-state-stream", action="store_true", help="do not mirror the executed sim state into the server's Rerun"
     )
@@ -341,36 +449,31 @@ def main(argv=None):
                 log.warning("plan has no embodiment provenance; assuming it was made for the local tiptop embodiment")
             do_execute(sim, args, out_dir, plan, tag="replay", state_stream=open_state_stream(args.state_stream))
         elif args.cmd == "live":
-            request, extras = do_capture(sim, args, out_dir)
-            if args.no_gt:
-                request = {k: v for k, v in request.items() if k != "gt_masks"}
-            response = client.plan(request, timeout_s=args.plan_timeout)
-            with open(out_dir / "server_response.json", "w") as f:
-                json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
-            with open(out_dir / "tiptop_plan.json", "w") as f:
-                json.dump(
-                    {
-                        "version": response["plan"]["version"],
-                        "embodiment": response.get("embodiment") or client.metadata.get("embodiment"),
-                        "q_init": response["plan"]["q_init"].tolist(),
-                        "steps": [
-                            dict(
-                                s,
-                                positions=s["positions"].tolist(),
-                                velocities=None if s["velocities"] is None else s["velocities"].tolist(),
-                            )
-                            if s["type"] == "trajectory"
-                            else s
-                            for s in response["plan"]["steps"]
-                        ],
-                    },
-                    f,
-                )
-            log.info(
-                f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
-            )
-            stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
-            do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream)
+            atoms_all = parse_goal(args.goal)
+            rounds = [[atom] for atom in atoms_all] if args.sequential else [atoms_all]
+            outcomes = []
+            for i, atoms in enumerate(rounds):
+                round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
+                round_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    if args.sequential and args.activity and len(atoms[0]["args"]) == 2:
+                        sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
+                        sim.hold(args.settle_steps, sim.OPEN)
+                    outcomes.append(live_round(sim, args, client, round_dir, atoms))
+                except Exception as e:
+                    if not args.sequential:
+                        raise
+                    log.exception(f"round {i} {atoms} failed")
+                    outcomes.append({"error": f"{type(e).__name__}: {e}"})
+                if args.sequential:
+                    log.info(f"round {i} {atoms}: {outcomes[-1].get('success', outcomes[-1].get('error'))}")
+            if args.sequential:
+                summary = {"rounds": outcomes}
+                if args.activity:
+                    summary["task_goal"] = sim.goal_status()
+                    log.info(f"task goal after {len(rounds)} rounds: {summary['task_goal']}")
+                with open(out_dir / "sequential_summary.json", "w") as f:
+                    json.dump(summary, f, indent=2, default=str)
     except Exception:
         log.exception("run failed")
         exit_code = 1

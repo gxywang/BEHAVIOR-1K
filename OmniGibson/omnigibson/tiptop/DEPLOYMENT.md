@@ -93,28 +93,32 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    (`IDEA-Research/grounding-dino-base`, ~900 MB into `~/.cache/huggingface`) that the server fetches and loads at
    start-up when `perception.detector: grounding_dino` (both sim configs; `transformers` is in `pixi.lock`).
    `GOOGLE_API_KEY` is only needed with `perception.detector: gemini`.
-7. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
+7. **cuTAMP patch.** `tiptop/install/install-cutamp.sh` applies `tiptop/install/patches/cutamp-*.patch` on top of
+   the pinned cuTAMP release (a `get_world_cfg` list-aliasing fix that otherwise crashes every plan skeleton tried
+   after the first motion-planning attempt with `KeyError: 'table'`). A cuTAMP checkout made without the script
+   needs `git apply` of the same patch; upstreaming it to tiptop-robot/cuTAMP is the real fix.
+8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; cuRobo warms up MotionGen at server start (`/health` is 200 only afterwards).
-8. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display. Use `save`
+9. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display. Use `save`
    (one `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<timestamp>/`, open later with `rerun <file>`)
    or `connect` with `--rerun-url rerun+http://127.0.0.1:9876/proxy` plus a reverse tunnel to a viewer on your
    laptop (`ssh -R 9876:127.0.0.1:9876 server`, `rerun` running locally). The client's sim-state mirror works in
    all modes. Run the viewer from the tiptop env (`pixi run rerun`, 0.27.3 = the SDK): `stream` and `connect` reuse
    whatever already listens on 9876, and a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2 on
    the laptop) only warns that Rerun guarantees no compatibility across versions.
-9. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
+10. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
    `ssh -N -L 8765:127.0.0.1:8765 server` and `--host localhost`, or `TIPTOP_HOST=0.0.0.0`. The client refuses to
    run unless the server metadata says `robot_type: panda`, `dof: 7` (the launcher's `--config` guarantees it).
-10. **Sharing one GPU.** Laptop numbers: Isaac Sim 4-5 GB (GUI adds 1-2), planner 4 GB idle and 6.3 GB peak at
+11. **Sharing one GPU.** Laptop numbers: Isaac Sim 4-5 GB (GUI adds 1-2), planner 4 GB idle and 6.3 GB peak at
     128 particles, M2T2 1.3 GB. On a 96 GB card raise `TIPTOP_PARTICLES=256` and `TIPTOP_MAX_PLANNING_TIME=60`.
-11. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
+12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
     particle(s)" and succeed on the next request (M2T2 grasp sampling differs per call). Retry before debugging.
-12. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
-13. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the sim is forced headless; the GUI
+13. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
+14. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the sim is forced headless; the GUI
     viewport code in `scene.py` is skipped, everything else is identical.
-14. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
+15. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
     there (see USAGE_DOCS.md).
-15. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
+16. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
     to `~/tiptop-services/M2T2`; override with `TIPTOP_DIR` / `M2T2_DIR`. The laptop also has copies in
     `~/tiptop-services/bin/` that are not in git.
 

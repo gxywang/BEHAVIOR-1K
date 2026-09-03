@@ -37,8 +37,12 @@ SHADOW_CAM = "tiptop_cam"  # external sensor moved onto the robot camera's pose 
 # 0 robot pixels, no contact. Applied on top of q_home, joint name -> value.
 LOOK_ARM = {"left_arm_joint2": 2.0}
 LOOK_SETTLE_STEPS = 60
+CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
+CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
 WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so the shadow camera matches exactly
+FLOOR_COVERINGS = ("floors", "ceilings", "paver", "carpet", "rug", "mat", "doormat", "tile")  # stood on, not avoided
+ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture is ~1.4
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 
@@ -57,6 +61,31 @@ def load_embodiment_meta(robot_type: str = ROBOT_TYPE) -> dict:
         return yaml.safe_load(f)
 
 
+def challenge_task_info(activity: str) -> tuple[str, list[str]]:
+    """Scene model and room instances the challenge evaluator loads for a task (its metadata files)."""
+    import yaml
+    from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
+    from omnigibson.macros import gm
+
+    tasks = yaml.safe_load(
+        open(Path(gm.DATA_PATH) / "2026-challenge-task-instances" / "metadata" / "available_tasks.yaml")
+    )
+    if activity not in tasks:
+        raise ValueError(f"{activity!r} is not a challenge task; known: {sorted(tasks)[:5]}... ({len(tasks)})")
+    return str(tasks[activity][0]["scene_model"]), list(TASK_NAMES_TO_ROOMS[activity])
+
+
+def bddl_category(bddl_name: str) -> str:
+    """'butter_cookie.n.01_2' -> 'butter cookie', 'can__of__soda.n.01_1' -> 'can of soda' (what a detector is asked for)."""
+    return bddl_name.split(".n.")[0].replace("__", "_").replace("_", " ")
+
+
+def bddl_label(bddl_name: str) -> str:
+    """'butter_cookie.n.01_2' -> 'butter_cookie_2': the per-instance name used in requests and plans."""
+    category, _, index = bddl_name.rpartition("_")
+    return f"{bddl_category(category).replace(' ', '_')}_{index}"
+
+
 def make_r1pro_env_config(
     scene_model: str = "Rs_int",
     load_room_types=None,
@@ -67,10 +96,16 @@ def make_r1pro_env_config(
     wrist_resolution: int = 480,
     head_aperture_mm: float = HEAD_APERTURE_MM,
     not_load_object_categories=("ceilings",),
+    activity: str | None = None,
+    activity_instance_id: int = 0,
+    load_room_instances=None,
+    segmentation: bool = True,
 ) -> dict:
     """OmniGibson config: BEHAVIOR scene + R1Pro with absolute joint controllers on every group.
 
-    Spawned objects start high above the floor and are placed onto furniture by R1ProSim.place_on().
+    Spawned objects start high above the floor and are placed onto furniture by R1ProSim.place_on(). With
+    ``activity`` the scene is a challenge task instance (BehaviorTask, pre-sampled objects, the evaluator's rooms).
+    ``segmentation=False`` renders rgb + depth only (what the challenge allows; no ground-truth masks, no robot mask).
 
     Cameras: the robot camera TiPToP uses renders rgb only (video); an external "shadow" VisionSensor with the same
     intrinsics provides rgb + depth_linear + seg_instance for the capture frame after being moved onto the robot
@@ -97,7 +132,7 @@ def make_r1pro_env_config(
         "sensor_type": "VisionSensor",
         "name": SHADOW_CAM,
         "relative_prim_path": f"/{SHADOW_CAM}",
-        "modalities": ["rgb", "depth_linear", "seg_instance"],
+        "modalities": ["rgb", "depth_linear"] + (["seg_instance"] if segmentation else []),
         "sensor_kwargs": {
             "image_width": res,
             "image_height": res,
@@ -116,6 +151,22 @@ def make_r1pro_env_config(
     }
     if load_room_types:
         scene["load_room_types"] = list(load_room_types)
+    if load_room_instances:
+        scene["load_room_instances"] = list(load_room_instances)
+    task = {"type": "DummyTask"}
+    if activity:
+        task = {
+            "type": "BehaviorTask",
+            "activity_name": activity,
+            "activity_definition_id": 0,
+            "activity_instance_id": activity_instance_id,
+            "online_object_sampling": False,
+            "debug_object_sampling": False,
+            "highlight_task_relevant_objects": False,
+            "termination_config": {"max_steps": 10**8},
+            "reward_config": {"r_potential": 1.0},
+            "include_obs": False,
+        }
     objects = []
     for i, preset in enumerate(spawn_presets):
         if preset not in OBJECT_PRESETS:
@@ -171,7 +222,7 @@ def make_r1pro_env_config(
             }
         ],
         "objects": objects,
-        "task": {"type": "DummyTask"},
+        "task": task,
     }
 
 
@@ -196,6 +247,7 @@ class R1ProSim(TiptopSim):
         self.robot_cam = self.robot.sensors[self.cam_name]
         self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
         self.objects = {}
+        self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
         self.last_obs = None
@@ -216,9 +268,118 @@ class R1ProSim(TiptopSim):
         ]
         self.env.reset()
 
+    # ---------------------------------------------------------------- challenge task
+    def task_scope(self) -> dict:
+        """BDDL instance name -> simulated object for the loaded BehaviorTask (no agent, no floors, no systems)."""
+        scope = getattr(self.env.task, "object_scope", None) or {}
+        return {
+            k: v
+            for k, v in scope.items()
+            if v is not None and not k.startswith(("agent.", "floor.")) and hasattr(v, "aabb")
+        }
+
+    def track_task_objects(self, skip_categories=("table", "floor", "agent")) -> dict:
+        """Track every task object under its per-instance label ('candle_1'); furniture the items rest on is skipped."""
+        self.bddl_names = {}
+        for bddl, obj in self.task_scope().items():
+            if bddl_category(bddl) in skip_categories:
+                continue
+            label = bddl_label(bddl)
+            self.objects[label] = obj
+            self.bddl_names[label] = bddl
+        log.info(f"tracking task objects: {self.bddl_names}")
+        return dict(self.bddl_names)
+
+    def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
+        """Translate BDDL goal atoms (inside/ontop/on/nextto/holding over BDDL names) for TiPToP.
+
+        Returns the labels the request names and the atoms in TiPToP's predicates. Per instance ('candle_1', with
+        ground-truth masks) or per category ('candle': the detector finds every instance and the goal takes the
+        best-scoring one, since the task does not care which candle goes into which basket).
+        """
+        predicates = {"inside": "on", "ontop": "on", "on": "on", "nextto": "near", "holding": "holding"}
+        label_of = {bddl: label for label, bddl in self.bddl_names.items()}
+
+        def name(arg):
+            if arg not in label_of:
+                raise ValueError(f"goal names {arg!r}, which is not a tracked task object: {sorted(label_of)}")
+            return bddl_category(arg).replace(" ", "_") if category_level else label_of[arg]
+
+        out = []
+        for atom in atoms:
+            if atom["predicate"] not in predicates:
+                raise ValueError(f"unsupported goal predicate {atom['predicate']!r} ({sorted(predicates)})")
+            out.append({"predicate": predicates[atom["predicate"]], "args": [name(a) for a in atom["args"]]})
+        if category_level:
+            labels = sorted({bddl_category(b).replace(" ", "_") for b in self.bddl_names.values()})
+        else:
+            labels = sorted(self.bddl_names)
+        return labels, out
+
+    def _goal_values(self) -> list[list[bool]]:
+        """Truth of every predicate of every ground goal option, evaluating each grounded predicate once.
+
+        forpairs goals ground into every pairing (tens of thousands of options for four baskets); the simulator
+        predicates (inside, ontop) are the expensive part, so they are memoized across options.
+        """
+        task = self.env.task
+        leaf_cache, head_cache = {}, {}
+
+        def evaluate(name, *entities):
+            key = (name, entities)
+            if key not in leaf_cache:
+                leaf_cache[key] = task._evaluate_predicate(name, *entities)
+            return leaf_cache[key]
+
+        values = []
+        for option in task.ground_goal_state_options:
+            row = []
+            for head in option:
+                v = head_cache.get(id(head))
+                if v is None:
+                    v = head_cache[id(head)] = bool(head.evaluate(evaluate))
+                row.append(v)
+            values.append(row)
+        return values
+
+    @staticmethod
+    def _goal_name(head) -> str:
+        terms = list(getattr(head, "terms", []))
+        return f"{terms[0]}({', '.join(terms[1:])})" if terms else str(head)
+
+    def mark_goal_initial(self) -> None:
+        """Remember which goal predicates already hold, as the challenge metric does (no credit for those)."""
+        self.goal_initial = self._goal_values()
+
+    def goal_status(self) -> dict:
+        """Challenge-style score: 1 on full success, else the best goal option's newly satisfied fraction."""
+        task = self.env.task
+        values = self._goal_values()
+        initial = getattr(self, "goal_initial", None) or [[False] * len(v) for v in values]
+        options = task.ground_goal_state_options
+        best_i, best_new = 0, -1
+        for i, (now, was) in enumerate(zip(values, initial)):
+            new = sum(int(v and not v0) for v, v0 in zip(now, was))
+            if new > best_new:
+                best_i, best_new = i, new
+        success = any(all(row) for row in values)
+        total = len(options[best_i]) if options else 0
+        q = 1.0 if success else (best_new / total if total else 0.0)
+        return {
+            "success": success,
+            "q_score": q,
+            "options": len(options),
+            "satisfied": [self._goal_name(h) for h, v in zip(options[best_i], values[best_i]) if v] if options else [],
+            "unsatisfied": [self._goal_name(h) for h, v in zip(options[best_i], values[best_i]) if not v]
+            if options
+            else [],
+            "new": best_new,
+            "total": total,
+        }
+
     # ---------------------------------------------------------------- scene setup
     def scene_object(self, name: str):
-        obj = self.env.scene.object_registry("name", name)
+        obj = self.task_scope().get(name) or self.env.scene.object_registry("name", name)
         if obj is None:
             names = sorted(o.name for o in self.env.scene.objects)
             raise ValueError(f"no object {name!r} in scene {self.config['scene']['scene_model']}; objects: {names}")
@@ -267,11 +428,15 @@ class R1ProSim(TiptopSim):
             if room is None:
                 return False, "outside every room"
         for obj in self.env.scene.objects:
-            if obj is self.robot or obj in ignore or getattr(obj, "category", "") in ("floors", "ceilings"):
+            if obj is self.robot or obj in ignore or getattr(obj, "category", "") in FLOOR_COVERINGS:
                 continue
             lo, hi = [v.cpu().numpy() for v in obj.aabb]
-            if getattr(obj, "category", "") == "walls" and (hi[0] - lo[0]) * (hi[1] - lo[1]) > 20.0:
-                continue  # merged whole-house wall objects have a useless AABB; the floor test handles walls
+            if (hi[0] - lo[0]) * (hi[1] - lo[1]) > 20.0:
+                continue  # house-sized AABBs (merged walls, roof, ceilings) say nothing; the floor test handles walls
+            if lo[2] > ROBOT_HEIGHT:
+                continue  # entirely above the robot (roof, lamps)
+            if hi[2] - lo[2] < 0.08 and lo[2] < 0.05:
+                continue  # flat floor coverings (pavers, rugs, mats) are stood on, not avoided
             if lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r and hi[2] > 0.05:
                 return False, f"overlaps {obj.name}"
         return True, "free"
@@ -301,6 +466,54 @@ class R1ProSim(TiptopSim):
                 continue
             return self.place_robot(x, y, yaw, note=f"{s} side of {support}")
         raise RuntimeError(f"no free side around {support}; pass --side or --robot-pose")
+
+    def place_robot_for(self, item: str, target: str, ignore_names=(), reach: float = 0.9) -> dict:
+        """Stand where ITEM and TARGET are both ahead and to the left, within the left arm's reach ("navigation done").
+
+        Candidates on rings around the two objects' midpoint, facing it; scored by the farther object's distance and
+        how far left both are, rejected when an object is behind the robot, well to its right, out of reach, or the
+        footprint is not free.
+        """
+        p_item = self.scene_object(item).aabb_center.cpu().numpy()[:2]
+        p_target = self.scene_object(target).aabb_center.cpu().numpy()[:2]
+        mid = (p_item + p_target) / 2
+        best, rejected = None, {}
+        for radius in np.arange(0.35, 0.95, 0.05):
+            for angle in np.arange(0.0, 2 * np.pi, np.pi / 18):
+                x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
+                for yaw_offset in np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12):
+                    yaw = np.arctan2(mid[1] - y, mid[0] - x) + yaw_offset
+                    fwd, left = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
+                    rel = [(p - np.array([x, y])) for p in (p_item, p_target)]
+                    ahead = [float(r @ fwd) for r in rel]
+                    side = [float(r @ left) for r in rel]
+                    dist = [float(np.linalg.norm(r)) for r in rel]
+                    # the torso can turn, so a little to the right is acceptable; well to the left is preferred;
+                    # both must be inside the head camera's view (about +-45 deg of forward; the camera sees +-50)
+                    if min(ahead) < 0.15 or min(side) < -0.3 or max(dist) > reach:
+                        rejected["geometry"] = rejected.get("geometry", 0) + 1
+                        continue
+                    if max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
+                        rejected["outside camera view"] = rejected.get("outside camera view", 0) + 1
+                        continue
+                    score = max(dist) + 0.5 * max(0.0, 0.15 - min(side)) + 0.1 * abs(yaw_offset)
+                    if best is None or score < best[0]:
+                        free, why = self._footprint_free(x, y, ignore_names)
+                        if free:
+                            best = (score, x, y, yaw, dist, side)
+                        else:
+                            rejected[why] = rejected.get(why, 0) + 1
+        if best is None:
+            raise RuntimeError(
+                f"no base pose reaches both {item!r} and {target!r} within {reach} m (objects {np.round(p_item, 2)}, "
+                f"{np.round(p_target, 2)}; rejections {dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
+            )
+        score, x, y, yaw, dist, side = best
+        log.info(
+            f"standing for {item} + {target}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
+            f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m"
+        )
+        return self.place_robot(float(x), float(y), float(yaw), note=f"stand for {item} + {target}")
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
@@ -393,8 +606,19 @@ class R1ProSim(TiptopSim):
         """Move the shadow camera onto the robot camera and render one rgb + depth + segmentation frame."""
         pos, quat = self.robot_cam.get_position_orientation()
         self.cam.set_position_orientation(position=pos, orientation=quat)
-        for _ in range(4):
+        # The renderer accumulates frames over time: after the camera jumps (base teleport, look posture) the first
+        # frames are a ghost of the previous view, so render until two consecutive frames agree.
+        previous = None
+        for i in range(CAPTURE_MAX_RENDERS):
             og.sim.render()
+            og.sim.render()
+            rgb = self.cam.get_obs()[0]["rgb"][..., :3].to(th.float32)
+            if previous is not None and float((rgb - previous).abs().mean()) < CAPTURE_CONVERGED_DIFF:
+                log.info(f"capture converged after {2 * (i + 1)} renders")
+                break
+            previous = rgb
+        else:
+            log.warning(f"capture did not converge after {2 * CAPTURE_MAX_RENDERS} renders; using the last frame")
         k_robot, k_shadow = self.robot_cam.intrinsic_matrix.cpu().numpy(), self.cam.intrinsic_matrix.cpu().numpy()
         if not np.allclose(k_robot, k_shadow, atol=0.5):
             raise RuntimeError(f"shadow camera intrinsics {k_shadow.tolist()} != robot camera {k_robot.tolist()}")

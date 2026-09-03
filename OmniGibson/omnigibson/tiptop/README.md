@@ -163,6 +163,56 @@ configurations that `tiptop/scripts/check_r1pro_embodiment.py` validates the pla
 reads the embodiment provenance that `live` stores in `tiptop_plan.json`, and `--scene capture.json` reuses settled
 object poses for both embodiments.
 
+## Challenge tasks (`--activity`)
+
+`--activity <name>` loads a 2026 BEHAVIOR Challenge task instead of spawning objects: the evaluator's scene and room
+list (from `datasets/2026-challenge-task-instances/metadata/`), the pre-sampled task instance through OmniGibson's
+`BehaviorTask` (`--activity-instance`, 0 = the template), the task objects tracked under per-instance names
+(`candle_1` for `candle.n.01_1`), and the goal scored the way the challenge does (`TaskMetric`: 1 on full success,
+else the newly satisfied fraction of the best goal option; `forpairs` goals ground into thousands of options, so
+every grounded predicate is evaluated once and memoized). `--goal` uses BDDL names and predicates
+(`inside(candle.n.01_2,wicker_basket.n.01_2)`; `inside`/`ontop` become TiPToP's `on`), `--no-gt` sends only the
+categories (`candle`, `wicker basket`) so the detector finds every instance and the goal takes the largest one.
+Instance segmentation crashes Isaac after a couple of renders in these scenes, so task runs render rgb + depth only,
+which is also all the challenge allows.
+
+What replaces navigation for now: `--stand-for ITEM,TARGET` searches a base pose from which both objects are ahead,
+on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports an object (used to bring a
+basket from the floor onto the coffee table, standing in for a carry); `--sequential` runs one
+capture/plan/execute round per goal atom, re-standing before each. The rules forbid teleporting during evaluation,
+so these are test scaffolding until the base moves under its own controller.
+
+Target task: `assembling_gift_baskets` (task 26, house_double_floor_lower living room, 4 wicker baskets on the
+floor, 4 candles + 4 butter cookies + 4 Swiss cheeses + 4 bows on a 0.41 m coffee table, goal one of each inside
+every basket; the longest task at 869 s mean human time, no 2025 submission ever completed it).
+
+```bash
+python -m omnigibson.tiptop.run live --embodiment r1pro --activity assembling_gift_baskets \
+    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 --sequential \
+    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(candle.n.01_2,wicker_basket.n.01_2)" \
+    --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
+    --host localhost --port 8765 --out-dir runs/gift_5
+```
+
+Result of that command (2026-09-03, headless, detector + SAM2, no ground truth): both transfers succeeded, the
+task's partial-credit score went 0 -> 0.0625 -> 0.125 (2 of the 16 `inside` predicates; the best 2025 submission
+reached 0.31 on this task, none completed it). Per round: stand 1 s, capture 10 s (the renderer needs ~25 frames
+to settle after the base moves), detect + segment 2 s, cuTAMP 1-2 s, execute 25 s, goal scoring 7 s.
+
+| Item | Detector | M2T2 grasps | Outcome |
+|---|---|---|---|
+| butter cookie (8 cm, 2 cm thick) | 0.68 with the "round cookie" prompt | tens | grasped (fingers 4.7 / 3.1 cm), inside the basket |
+| pillar candle (10 x 11 cm) | 0.4-0.5 | hundreds | grasped, inside the basket |
+| Swiss cheese (12 x 10 x 2 cm slab) | 0.46-0.52 | none to few | plan found once, gripper closed on nothing |
+| bow (8 cm ribbon) | 0.4-0.56 with "gift bow" | few | not attempted |
+
+What stands between this and the full task: items farther than ~0.9 m from the basket need the base to move while
+holding (TiPToP plans pick and place from one base pose; the basket must be re-placed along the table or carried),
+the four baskets sit on the floor (a floor-level pick or a carry that the pipeline does not model), and the flat
+cheese and bows get almost no grasps from M2T2. Fixed on the way: a cuTAMP list-aliasing bug that appended the
+surfaces to the movables once motion planning ran (`tiptop/install/patches/`, applied by `install-cutamp.sh`),
+duplicate and nested detector boxes, the capture camera's temporal ghosting after teleports.
+
 ## Ground truth vs. detector
 
 Three perception modes, chosen by what the request carries:
