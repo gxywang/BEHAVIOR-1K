@@ -68,6 +68,9 @@ Never `pip install -e tiptop` into `behavior`.
 
 ## Running
 
+Deploying the services on a lab GPU server (Blackwell, CUDA 12.8/13 drivers) and the known issues you will hit:
+[DEPLOYMENT.md](DEPLOYMENT.md). Launchers for both services are in [scripts/](scripts/).
+
 Services (any machine with a GPU; `~/.pixi/bin` on PATH, `LD_LIBRARY_PATH` unset):
 
 ```bash

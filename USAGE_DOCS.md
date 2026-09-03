@@ -13,6 +13,7 @@
 - `tiptop/` is a git submodule: BEHAVIOR-1K only pins a tiptop commit (URL/branch in `.gitmodules`; `git submodule status` prefix `-` = not checked out, `+` = checkout differs from the pin)
   - `.gitmodules` points at the private repo `WenzhouDing/tiptop` (read access needed); upstream `tiptop-robot/tiptop` is only reachable through the `upstream` remote inside `tiptop/`
 - fresh clone: `git clone --recurse-submodules -b dev/tiptop https://github.com/gxywang/BEHAVIOR-1K.git`
+- running TiPToP against the sim (three isolated envs, launchers) and deploying it on a server incl. known issues (Blackwell, cuRobo/M2T2 rebuilds): `OmniGibson/omnigibson/tiptop/README.md` and `OmniGibson/omnigibson/tiptop/DEPLOYMENT.md`
   - existing clone / empty `tiptop/`: `git submodule update --init`
   - once the submodule points at the private repo you need read access to it for these to succeed; the rest of the clone works without it
 - after every `git pull`: `git submodule update --init` (`git pull` alone leaves `tiptop/` at the old commit; `git status` then shows `modified: tiptop (new commits)`)

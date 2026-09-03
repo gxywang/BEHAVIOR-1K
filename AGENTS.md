@@ -17,6 +17,8 @@ BEHAVIOR-1K is a monorepo for a simulation benchmark testing embodied AI agents 
 
 Supporting components: `asset_pipeline/` (3D asset conversion), `knowledgebase/` (Flask web app for browsing BDDL data), `docs/` (MkDocs site), `eval-jobqueue/` (evaluation infrastructure).
 
+On branch `dev/tiptop`, `tiptop/` is a git submodule (the TiPToP manipulation planner, its own pixi env, never installed into the sim env). The OmniGibson bridge to it and the server deployment notes with known issues live in `OmniGibson/omnigibson/tiptop/` (`README.md`, `DEPLOYMENT.md`).
+
 ## Commands
 
 ### Installation
