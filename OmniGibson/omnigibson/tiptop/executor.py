@@ -37,8 +37,10 @@ class PlanExecutor:
         converge_tol: float = 0.01,
         converge_max_steps: int = 90,
         video: VideoRecorder | None = None,
+        state_stream=None,
     ):
         self.sim = sim
+        self.state_stream = state_stream  # SimStateStream: mirrors the sim into the server's Rerun view
         self.gripper_hold_steps = gripper_hold_steps
         self.converge_tol = converge_tol
         self.converge_max_steps = converge_max_steps
@@ -51,6 +53,13 @@ class PlanExecutor:
         self.n_steps += 1
         if self.video is not None:
             self.video.add(self.sim.camera_rgb())
+        if self.state_stream is not None:
+            self.state_stream.send(
+                t=self.n_steps * self.sim.dt,
+                q_arm=self.sim.q_arm(),
+                q_gripper=float(self.sim.q_fingers()[0]),
+                objects=self.sim.object_deltas_base(),
+            )
         return self.sim.q_arm()
 
     def converge(self, q_target, tol=None, max_steps=None) -> float:

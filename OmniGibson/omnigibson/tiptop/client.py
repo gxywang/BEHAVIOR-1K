@@ -7,6 +7,7 @@ import urllib.request
 
 from websockets.sync.client import connect
 
+import numpy as np
 from omnigibson.tiptop.protocol import packb, parse_plan, unpackb
 
 log = logging.getLogger(__name__)
@@ -109,3 +110,62 @@ class TiptopClient:
             raise TiptopPlanningError(f"planning failed: {response.get('error')} (save_dir={response.get('save_dir')})")
         response["plan"] = parse_plan(response["plan"])
         return response
+
+
+class SimStateStream:
+    """Streams the simulator's robot joints and object poses to the server so its Rerun view follows the sim.
+
+    Protocol (additive, tiptop fork >= 6a790df+): after the metadata frame, the client sends msgpack dicts
+    {"type": "sim_state", "t": s, "q": (7,) arm rad, "q_gripper": finger opening m,
+     "objects": {label: (4,4) base-frame transform relative to the pose at capture}}
+    until it closes the connection. The server logs them into its current Rerun recording. Any failure only
+    disables the stream; execution never depends on it.
+    """
+
+    def __init__(self, host: str, port: int = 8765, every: int = 1):
+        self.uri = f"ws://{host}:{port}"
+        self.every = max(1, int(every))
+        self.ws = None
+        self.sent = 0
+        self.calls = 0
+
+    def open(self) -> bool:
+        try:
+            self.ws = connect(self.uri, compression=None, max_size=None, open_timeout=10.0, close_timeout=2.0)
+            metadata = unpackb(self.ws.recv(timeout=30.0))
+            if not metadata.get("sim_state_supported"):
+                log.warning("tiptop-server does not accept sim_state messages; not streaming sim state")
+                self.close()
+                return False
+            log.info(f"streaming sim state to {self.uri} every {self.every} step(s)")
+            return True
+        except Exception as e:
+            log.warning(f"sim state stream unavailable ({e})")
+            self.ws = None
+            return False
+
+    def send(self, t: float, q_arm, q_gripper: float, objects: dict) -> None:
+        self.calls += 1
+        if self.ws is None or (self.calls - 1) % self.every:
+            return
+        msg = {
+            "type": "sim_state",
+            "t": float(t),
+            "q": np.asarray(q_arm, dtype=np.float32),
+            "q_gripper": float(q_gripper),
+            "objects": {k: np.asarray(v, dtype=np.float32) for k, v in objects.items()},
+        }
+        try:
+            self.ws.send(packb(msg))
+            self.sent += 1
+        except Exception as e:
+            log.warning(f"sim state stream stopped after {self.sent} messages ({e})")
+            self.close()
+
+    def close(self) -> None:
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None

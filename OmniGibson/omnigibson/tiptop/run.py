@@ -107,14 +107,29 @@ def do_capture(sim, args, out_dir: Path) -> tuple[dict, dict]:
     return request, extras
 
 
-def do_execute(sim, args, out_dir: Path, plan: dict, tag: str) -> dict:
+def open_state_stream(hostport: str | None):
+    """Optional live mirror of the sim into the server's Rerun view; None if disabled or unavailable."""
+    if not hostport:
+        return None
+    from omnigibson.tiptop.client import SimStateStream
+
+    host, _, port = hostport.rpartition(":")
+    stream = SimStateStream(host or "localhost", int(port) if port else 8765)
+    return stream if stream.open() else None
+
+
+def do_execute(sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None) -> dict:
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
     log.info(f"executing plan: {plan_summary(plan)}")
     video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4", fps=15, every=2)
-    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video)
-    stats = executor.execute(plan)
+    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video, state_stream=state_stream)
+    try:
+        stats = executor.execute(plan)
+    finally:
+        if state_stream is not None:
+            state_stream.close()
     success = check_success(sim, parse_goal(args.goal))
     if video is not None:
         video.close()
@@ -138,6 +153,9 @@ def main(argv=None):
     p_rep = sub.add_parser("replay", help="build the scene and execute a tiptop_plan.json")
     add_common(p_rep)
     p_rep.add_argument("--plan", required=True)
+    p_rep.add_argument(
+        "--state-stream", default=None, metavar="HOST:PORT", help="mirror the sim into a tiptop-server's Rerun view"
+    )
     p_live = sub.add_parser("live", help="capture, ask a running tiptop-server for a plan, execute it")
     add_common(p_live)
     p_live.add_argument("--host", default="localhost")
@@ -146,6 +164,9 @@ def main(argv=None):
         "--no-gt", action="store_true", help="do not send ground-truth masks (server then needs Gemini + SAM2)"
     )
     p_live.add_argument("--plan-timeout", type=float, default=900.0)
+    p_live.add_argument(
+        "--no-state-stream", action="store_true", help="do not mirror the executed sim state into the server's Rerun"
+    )
     args = parser.parse_args(argv)
 
     # OmniGibson installs its own handler on the "omnigibson" logger; give this sub-logger its own INFO stream
@@ -169,7 +190,7 @@ def main(argv=None):
             do_capture(sim, args, out_dir)
         elif args.cmd == "replay":
             plan = load_plan_json(args.plan)
-            do_execute(sim, args, out_dir, plan, tag="replay")
+            do_execute(sim, args, out_dir, plan, tag="replay", state_stream=open_state_stream(args.state_stream))
         elif args.cmd == "live":
             from omnigibson.tiptop.client import TiptopClient
 
@@ -202,7 +223,8 @@ def main(argv=None):
             log.info(
                 f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
             )
-            do_execute(sim, args, out_dir, response["plan"], tag="live")
+            stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
+            do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream)
     except Exception:
         log.exception("run failed")
         exit_code = 1

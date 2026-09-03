@@ -203,6 +203,15 @@ class TiptopSim:
             th.as_tensor(pos, dtype=th.float32), th.as_tensor(quat, dtype=th.float32), base_pos, base_quat
         )
 
+    def object_deltas_base(self) -> dict:
+        """Per object: base-frame rigid transform from its pose at the last capture to its pose now (4x4)."""
+        deltas = {}
+        for name, cap in getattr(self, "capture_object_mats_base", {}).items():
+            pos_b, quat_b = self.to_base(*self.objects[name].get_position_orientation())
+            now = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
+            deltas[name] = (now @ np.linalg.inv(cap)).astype(np.float32)
+        return deltas
+
     def object_poses_world(self) -> dict:
         return {name: [p.tolist() for p in obj.get_position_orientation()] for name, obj in self.objects.items()}
 
@@ -257,8 +266,10 @@ class TiptopSim:
         request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm(), gt=gt)
 
         object_poses_base = {}
+        self.capture_object_mats_base = {}
         for name, obj in self.objects.items():
             pos_b, quat_b = self.to_base(*obj.get_position_orientation())
+            self.capture_object_mats_base[name] = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
             aabb_center_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
             object_poses_base[name] = {
                 "pos": pos_b.tolist(),
