@@ -46,6 +46,8 @@ ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
 CAMERA_MIN_DIST = 0.65  # nearer objects are cut by the head camera's bottom edge (it meets the table 0.55 m ahead)
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
+CAMERA_HALF_FOV = math.radians(49.6)  # head camera's true half-FOV: atan(360 / 306) at 720 px, fx 306
+FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 
 
@@ -594,8 +596,15 @@ class R1ProSim(TiptopSim):
             return self.place_robot(x, y, yaw, note=f"{s} side of {support}")
         raise RuntimeError(f"no free side around {support}; pass --side or --robot-pose")
 
+    def xy_radius(self, name: str) -> float:
+        """Circumscribed xy radius of a scene object, for keeping its edges inside the head camera's view."""
+        obj = self.scene_object(name)
+        lo, hi = obj.aabb
+        ex, ey = float(hi[0] - lo[0]), float(hi[1] - lo[1])
+        return 0.5 * math.hypot(ex, ey)
+
     def best_base_pose(
-        self, p_item_xy, p_target_xy, ignore=(), reach: float = 0.9, aabbs=None
+        self, p_item_xy, p_target_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=(0.0, 0.0)
     ) -> tuple[tuple | None, dict]:
         """Best base pose with two points (world xy) both ahead and to the left, within the left arm's reach.
 
@@ -603,6 +612,9 @@ class R1ProSim(TiptopSim):
         how far left both are (lower is better), rejected when a point is behind the robot, well to its right, out of
         reach, outside the head camera's view, or the footprint is not free (``ignore``: objects that do not count;
         ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken here otherwise).
+
+        ``half_widths``: each point's xy radius, so the view test can keep the object's *edges* in frame and not just
+        its centre; 0 (the default) reproduces the point test for callers that pass bare positions.
         Returns ((score, x, y, yaw, dist, side) or None, rejection counts by reason).
         """
         p_item, p_target = np.asarray(p_item_xy)[:2], np.asarray(p_target_xy)[:2]
@@ -639,7 +651,23 @@ class R1ProSim(TiptopSim):
                     if max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
                         rejected["outside camera view"] = rejected.get("outside camera view", 0) + 1
                         continue
-                    score = max(dist) + 0.5 * max(0.0, 0.15 - min(side)) + 0.1 * abs(yaw_offset)
+                    # Prefer poses that keep each object's *edges* in frame, not just its centre. A mask cut by the
+                    # image border reconstructs into a hull that runs past the real object, and the planner then
+                    # places into that phantom part: on 2026-09-04 a basket whose centre sat at 43 deg had its edge
+                    # at 61 deg, lost a third of its width off the left of the image, and the cookie was released
+                    # 3 cm outside the rim. This is a penalty rather than a rejection because for some item/container
+                    # pairs no pose frames both -- the item is then simply out of reach of a single base pose (see
+                    # README, "what stands between this and the full task").
+                    clipped = sum(
+                        max(0.0, abs(br) + math.atan2(hw, max(d, 1e-6)) - CAMERA_HALF_FOV)
+                        for br, d, hw in zip(bearing, dist, half_widths)
+                    )
+                    score = (
+                        max(dist)
+                        + 0.5 * max(0.0, 0.15 - min(side))
+                        + 0.1 * abs(yaw_offset)
+                        + FRAMING_PENALTY * clipped
+                    )
                     if best is None or score < best[0]:
                         key = (float(x), float(y))
                         if key not in footprint:
@@ -659,7 +687,10 @@ class R1ProSim(TiptopSim):
         p_item = self.scene_object(item).aabb_center.cpu().numpy()[:2]
         p_target = self.scene_object(target).aabb_center.cpu().numpy()[:2]
         ignore = [self.scene_object(n) for n in ignore_names]
-        best, rejected = self.best_base_pose(p_item, p_target, ignore=ignore, reach=reach)
+        half_widths = (self.xy_radius(item), self.xy_radius(target))
+        best, rejected = self.best_base_pose(
+            p_item, p_target, ignore=ignore, reach=reach, half_widths=half_widths
+        )
         if best is None:
             raise RuntimeError(
                 f"no base pose reaches both {item!r} and {target!r} within {reach} m (objects {np.round(p_item, 2)}, "

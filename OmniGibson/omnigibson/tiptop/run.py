@@ -386,9 +386,10 @@ def choose_stage_spot(
                 break
     ignore = [sim.scene_object(n) for n in (container, *sim.contents_of(container))]
     aabbs = sim.scene_aabbs()
+    half_widths = (sim.xy_radius(item), sim.xy_radius(container))  # keep both edges in frame, not just their centres
     best = None
     for d, x, y in tried:
-        pose, _ = sim.best_base_pose(near, (x, y), ignore=ignore, aabbs=aabbs)
+        pose, _ = sim.best_base_pose(near, (x, y), ignore=ignore, aabbs=aabbs, half_widths=half_widths)
         if pose is not None and (best is None or pose[0] < best[0]):
             best = (pose[0], d, x, y)
     if best is None:
