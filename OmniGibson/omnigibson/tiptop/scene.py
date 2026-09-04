@@ -17,7 +17,13 @@ import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
 from omnigibson.tiptop.gt_masks import masks_from_geometry
-from omnigibson.tiptop.protocol import DROID_CAMERA_KWARGS, DROID_Q_INIT, build_request, depth_to_points
+from omnigibson.tiptop.protocol import (
+    DROID_CAMERA_KWARGS,
+    DROID_Q_INIT,
+    build_request,
+    depth_to_points,
+    points_to_pixels,
+)
 from omnigibson.utils.usd_utils import mesh_prim_to_trimesh_mesh
 
 log = logging.getLogger(__name__)
@@ -187,6 +193,9 @@ class TiptopSim:
         self.dt = og.sim.get_sim_step_dt()
         self.objects = {name: self.env.scene.object_registry("name", name) for name in self.object_names()}
         self.last_obs = None
+        self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
+        self.capture_object_mats_base = {}
+        self.capture_object_aabb_min_z = {}
         joint_names = list(self.robot.joints.keys())
         log.info(
             f"robot DOF order: {joint_names}; arm idx {self.arm_idx.tolist()}, gripper idx {self.gripper_idx.tolist()}"
@@ -431,7 +440,8 @@ class TiptopSim:
                 return True
         return False
 
-    def frame_coverage(self, request: dict, extras: dict) -> dict:
+    @staticmethod
+    def frame_coverage(request: dict, extras: dict) -> dict:
         """Fraction of each object's projected AABB that falls inside the image (1.0 = fully framed).
 
         Objects cut by the image border are the silent failure mode of the whole pipeline: the server reconstructs
@@ -439,8 +449,6 @@ class TiptopSim:
         StablePlacement constraint inside that phantom volume, and the item is released beside the container. Needs
         no segmentation, so it also covers ``--no-gt`` captures, where nothing else checks the frame.
         """
-        from omnigibson.tiptop.protocol import points_to_pixels
-
         h, w = request["depth"].shape
         coverage = {}
         for name, pose in extras["object_poses_base"].items():

@@ -67,9 +67,7 @@ def load_embodiment_meta(robot_type: str = ROBOT_TYPE) -> dict:
 
 def challenge_task_info(activity: str) -> tuple[str, list[str]]:
     """Scene model and room instances the challenge evaluator loads for a task (its metadata files)."""
-    import yaml
     from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
-    from omnigibson.macros import gm
 
     tasks = yaml.safe_load(
         open(Path(gm.DATA_PATH) / "2026-challenge-task-instances" / "metadata" / "available_tasks.yaml")
@@ -256,6 +254,9 @@ class R1ProSim(TiptopSim):
         self.posture = {}
         self.q_home = None
         self.last_obs = None
+        self.last_capture_rgb = None  # R1ProSim does not call super().__init__; keep TiptopSim's defaults
+        self.capture_object_mats_base = {}
+        self.capture_object_aabb_min_z = {}
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
         self.robot.base_footprint_link.mass = BASE_MASS_KG

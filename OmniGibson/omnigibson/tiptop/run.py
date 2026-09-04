@@ -170,7 +170,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
         log.info(f"challenge task {args.activity}: scene {scene_model}, rooms {room_instances}")
     cfg = make_r1pro_env_config(
         scene_model=scene_model,
-        load_room_types=[r for r in (args.rooms or "").split(",") if r],
+        load_room_types=None if args.activity else [r for r in (args.rooms or "").split(",") if r],
         spawn_presets=[sp[0] for sp in spawns],
         grasping_mode=args.grasping_mode,
         camera=args.camera,
@@ -179,7 +179,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
         activity=args.activity,
         activity_instance_id=args.activity_instance,
         load_room_instances=room_instances,
-        segmentation=bool(getattr(args, "seg_instance", False)),  # the annotator is opt-in; masks come from geometry
+        segmentation=args.seg_instance,  # the annotator is opt-in; masks come from geometry
     )
     sim = R1ProSim(cfg, camera=args.camera)
     if args.activity:
@@ -261,11 +261,13 @@ def build_sim(args, embodiment: dict | None = None):
 def do_capture(
     sim, args, out_dir: Path, atoms: list[dict] | None = None, hints: dict | None = None
 ) -> tuple[dict, dict]:
+    import imageio
+
     from omnigibson.tiptop.protocol import save_observation_h5
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
-    no_gt = bool(getattr(args, "no_gt", False))
-    if getattr(args, "activity", None):
+    no_gt = args.no_gt
+    if args.activity:
         # BDDL names -> request labels; --no-gt asks the detector for categories (any candle will do)
         labels, atoms = sim.tiptop_goal(atoms, category_level=no_gt)
     else:
@@ -279,17 +281,13 @@ def do_capture(
         try:
             request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
         except ValueError:
-            if getattr(sim, "last_capture_rgb", None) is not None:  # what the camera saw when a goal object was missing
-                import imageio
-
+            if sim.last_capture_rgb is not None:  # what the camera saw when a goal object was missing
                 imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
             raise
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
     save_observation_h5(out_dir / "obs.h5", request, extras["cam_pos_base"], extras["cam_quat_wxyz_ros"])
-    import imageio
-
     imageio.imwrite(out_dir / "rgb.png", request["rgb"])
     depth_vis = np.clip(request["depth"] / 2.0, 0, 1)
     imageio.imwrite(out_dir / "depth.png", (depth_vis * 255).astype(np.uint8))
@@ -329,8 +327,6 @@ def open_state_stream(hostport: str | None):
 def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict | None = None) -> dict:
     """Capture, ask the server for a plan for these atoms, save it and execute it."""
     request, extras = do_capture(sim, args, out_dir, atoms=atoms, hints=hints)
-    if args.no_gt:
-        request = {k: v for k, v in request.items() if k != "gt_masks"}
     response = client.plan(request, timeout_s=args.plan_timeout)
     with open(out_dir / "server_response.json", "w") as f:
         json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
@@ -520,7 +516,7 @@ def do_execute(
     finally:
         if state_stream is not None:
             state_stream.close()
-    if getattr(args, "activity", None):
+    if args.activity:
         success = sim.goal_status()
         success["all"] = success["success"]
         # where the goal objects ended up relative to their targets (BDDL names)

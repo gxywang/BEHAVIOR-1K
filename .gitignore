@@ -9,3 +9,6 @@ outputs/
 
 __pycache__/
 .codex
+
+# tiptop / eval run outputs (obs.h5, videos, plans) -- see OmniGibson/omnigibson/tiptop/README.md
+runs/

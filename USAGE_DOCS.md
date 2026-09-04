@@ -58,8 +58,15 @@ export OMNIGIBSON_REMOTE_STREAMING=webrtc      # and do NOT set OMNIGIBSON_HEADL
   `NVST_CCE_CONNECTED` / `All Streams connected`, and the picture arrives. 49100 is hardcoded in the client and binds
   `0.0.0.0`. `ufw` is disabled on the host. This also means an SSH tunnel works as a fallback:
   `ssh -N -L 49100:127.0.0.1:49100 shenlong-gpu-01`, then point the client at `127.0.0.1`.
-- The `http://<ip>:8211/?server=<ip>` URL `simulator.py:300` prints is **stale** — Isaac Sim 5.1 no longer ships
-  the browser client (`omni.services.streamclient.webrtc`), and nothing binds 8211. Ignore it.
+- The stream shows **only the main viewport**. Until 2026-09-04 every robot/external camera also docked its own
+  ViewportWindow into the streamed frame (`gm.HEADLESS` is false while streaming), which cluttered the picture and
+  cost an extra render per camera per frame; `vision_sensor.py` now suppresses those under `REMOTE_STREAMING`.
+  Check with `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` — only `_0` should appear, while
+  `Replicator`, `Replicator_01`, `Replicator_02` must all still be created (the sensors still render for capture).
+- Streaming problems now leave a trail: `/app/livestream/logLevel=debug` and `webrtc/logQosStatus` are set, so the
+  Kit log carries signalling, peer state and reason codes instead of just CONNECTED/DISCONNECTED.
+- `gm.HTTP_PORT` / the `:8211` browser client is **dead** on Isaac Sim 5.1 — `omni.services.streamclient.webrtc`
+  is not shipped and nothing binds the port. The startup line now prints the address for the desktop client.
 - `gm.PUBLIC_IP` is hardcoded to gpu-01's `172.22.224.37`; on gpu-02 or campus-cluster export `OMNIGIBSON_PUBLIC_IP`.
 
 ### Running the stack

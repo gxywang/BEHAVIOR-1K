@@ -22,9 +22,6 @@ DROID_CAMERA_KWARGS = {"image_width": 1280, "image_height": 720, "focal_length":
 # Franka joint configuration the DROID reference observations start from (radians, panda_joint1..7).
 DROID_Q_INIT = np.array([0.0, -0.628, 0.0, -2.513, 0.0, 1.885, 0.0], dtype=np.float32)
 
-REQUEST_KEYS = ("rgb", "depth", "intrinsics", "world_from_cam", "task", "q_init")
-GT_KEYS = ("gt_labels", "gt_masks", "gt_atoms")
-
 
 # --------------------------------------------------------------------------------------------------------------------
 # msgpack-numpy wire format (what tiptop's msgpack_numpy.unpackb expects), hand-rolled so the sim side only needs msgpack
