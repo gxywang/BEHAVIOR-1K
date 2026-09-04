@@ -267,6 +267,15 @@ def depth_to_points(depth, intrinsics, world_from_cam=None) -> np.ndarray:
     return pts
 
 
+def points_to_pixels(points, intrinsics, world_from_cam) -> tuple:
+    """Project (N, 3) points given in ``world_from_cam``'s reference frame to (N, 2) pixels; also returns camera z."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    cam = (pts - world_from_cam[:3, 3]) @ world_from_cam[:3, :3]  # inverse rigid transform
+    fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
+    z = np.where(np.abs(cam[:, 2]) < 1e-9, 1e-9, cam[:, 2])
+    return np.stack([fx * cam[:, 0] / z + cx, fy * cam[:, 1] / z + cy], axis=-1), cam[:, 2]
+
+
 def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:
     """Linearly resample an (N, dof) trajectory sampled every ``dt`` seconds onto ``target_dt``, keeping the end point."""
     positions = np.asarray(positions, dtype=np.float32)

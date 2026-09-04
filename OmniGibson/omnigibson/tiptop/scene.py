@@ -152,12 +152,24 @@ def make_env_config(
     }
 
 
+def canonical_object_name(name: str) -> tuple:
+    """('candle.n.01_2' | 'candle_2') -> ('candle', '2'); a bare category -> ('candle', '')."""
+    name = name.split(".n.")[0] + ("_" + name.rsplit("_", 1)[1] if ".n." in name else "")
+    name = name.replace("__", "_")
+    category, _, index = name.rpartition("_")
+    return (category, index) if category and index.isdigit() else (name, "")
+
+
 class TiptopSim:
     """Owns the OmniGibson environment and produces TiPToP observations / executes joint targets."""
 
     OPEN, CLOSE = 1.0, -1.0  # MultiFingerGripperController binary: command >= 0 opens, < 0 closes
     expect_table_z = 0.0  # validate_capture: expected table top height in the base frame (None = no table check)
     mask_labels_as_invalid = ()  # instance labels whose pixels get depth 0 (e.g. the robot seen by its own camera)
+    # validate_capture: warn below this fraction of an object's projected AABB being inside the image. Measured on
+    # the gift-basket task: 0.21 for the clipped basket that made the planner drop the cookie outside it, 0.72 for
+    # the same basket framed in the round that succeeded. The AABB over-estimates the silhouette, so keep it low.
+    FRAME_COVERAGE_MIN = 0.5
     gt_mask_tol = 0.008  # geometry masks: surface distance (m) within which a depth pixel belongs to an object
 
     def __init__(self, config: dict):
@@ -325,10 +337,19 @@ class TiptopSim:
             pos_b, quat_b = self.to_base(*obj.get_position_orientation())
             self.capture_object_mats_base[name] = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
             aabb_center_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
+            lo, hi = obj.aabb
+            identity = th.tensor([0.0, 0.0, 0.0, 1.0])
+            corners_b = [
+                self.to_base(th.tensor([x, y, z]), identity)[0].tolist()
+                for x in (float(lo[0]), float(hi[0]))
+                for y in (float(lo[1]), float(hi[1]))
+                for z in (float(lo[2]), float(hi[2]))
+            ]
             object_poses_base[name] = {
                 "pos": pos_b.tolist(),
                 "quat_xyzw": quat_b.tolist(),
                 "aabb_center": aabb_center_b.tolist(),
+                "aabb_corners": corners_b,  # for the frame-coverage check in validate_capture
             }
         extras = {
             "cam_pos_base": cam_pos_b.cpu().numpy().tolist(),
@@ -396,14 +417,77 @@ class TiptopSim:
             )
         return np.isin(seg, ids)
 
+    @staticmethod
+    def _names_goal_object(name: str, goal_args) -> bool:
+        """Does tracked object ``name`` correspond to one of the goal atoms' arguments?
+
+        Atoms carry request labels: BDDL instance names for a task (``candle.n.01_2``), the per-instance label for
+        spawned objects (``candle_2``), or a bare category with ``--no-gt`` (``candle``), which matches any instance.
+        """
+        nc, ni = canonical_object_name(name)
+        for arg in goal_args:
+            ac, ai = canonical_object_name(arg)
+            if ac == nc and (not ai or not ni or ai == ni):
+                return True
+        return False
+
+    def frame_coverage(self, request: dict, extras: dict) -> dict:
+        """Fraction of each object's projected AABB that falls inside the image (1.0 = fully framed).
+
+        Objects cut by the image border are the silent failure mode of the whole pipeline: the server reconstructs
+        the visible sliver into a convex hull that runs *past* the real object, cuTAMP happily satisfies its
+        StablePlacement constraint inside that phantom volume, and the item is released beside the container. Needs
+        no segmentation, so it also covers ``--no-gt`` captures, where nothing else checks the frame.
+        """
+        from omnigibson.tiptop.protocol import points_to_pixels
+
+        h, w = request["depth"].shape
+        coverage = {}
+        for name, pose in extras["object_poses_base"].items():
+            corners = pose.get("aabb_corners")
+            if not corners:
+                continue
+            px, z = points_to_pixels(corners, request["intrinsics"], request["world_from_cam"])
+            if (z <= 0).any():  # straddles the image plane: the projection is meaningless
+                continue
+            u0, v0 = px.min(axis=0)
+            u1, v1 = px.max(axis=0)
+            box = max(u1 - u0, 1e-6) * max(v1 - v0, 1e-6)
+            inside = max(min(u1, w) - max(u0, 0.0), 0.0) * max(min(v1, h) - max(v0, 0.0), 0.0)
+            coverage[name] = float(inside / box)
+        return coverage
+
     def validate_capture(self, request: dict, extras: dict) -> dict:
         """Numerically check the frame conventions: table at base z=0, object mask centroids near their true poses."""
         pts = depth_to_points(request["depth"], request["intrinsics"], request["world_from_cam"])
         seg, id_to_name = extras["seg_instance"], extras["id_to_name"]
         report = {"camera_view_axis_base": request["world_from_cam"][:3, 2].tolist()}
+        # Objects at least partly in view but cut by the image border (measured 2026-09-04: a basket at 0.21
+        # coverage reconstructed 8 cm too long and the cookie was released 3 cm outside its rim; the same basket
+        # fully framed in the next round, 0.72, worked). Runs with or without segmentation.
+        coverage = self.frame_coverage(request, extras)
+        report["frame_coverage"] = coverage
+        # Only the goal's own objects matter: every capture of a crowded table clips something at the edge, and a
+        # warning per clipped bystander would drown the one that actually breaks the plan.
+        goal_args = {a for atom in request.get("gt_atoms") or [] for a in atom.get("args", [])}
+        clipped, seen = [], set()
+        for name, c in sorted(coverage.items(), key=lambda kv: kv[1]):
+            # with no atoms to filter by, report every clipped object rather than staying silent
+            if not (self.FRAME_COVERAGE_MIN > c > 0.0):
+                continue
+            if goal_args and not self._names_goal_object(name, goal_args):
+                continue
+            key = canonical_object_name(name)  # 'candle.n.01_2' and 'candle_2' are the same object
+            if key in seen:
+                continue
+            seen.add(key)
+            clipped.append(
+                f"{name} is cut by the image border ({100 * c:.0f}% of its projected extent is in frame); its "
+                f"reconstructed hull will run past the real object"
+            )
         if seg is None:  # rgb + depth only: nothing to compare masks against
             report["note"] = "no instance segmentation rendered; mask checks skipped"
-            report["problems"] = []
+            report["problems"] = clipped
             return report
         table_ids = [i for i, n in id_to_name.items() if n == "table"]
         table_pts = pts[np.isin(seg, table_ids)] if table_ids else np.zeros((0, 3))
@@ -441,5 +525,5 @@ class TiptopSim:
                 )
         if report["camera_view_axis_base"][2] > -0.2:
             problems.append("camera optical axis is not pointing downward in the base frame")
-        report["problems"] = problems
+        report["problems"] = problems + clipped
         return report

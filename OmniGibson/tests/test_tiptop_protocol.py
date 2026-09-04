@@ -14,6 +14,7 @@ from omnigibson.tiptop.protocol import (
     resample_trajectory,
     save_observation_h5,
     unpackb,
+    points_to_pixels,
 )
 
 
@@ -116,3 +117,29 @@ def test_depth_to_points_pinhole():
     assert np.allclose(pts[2, 5], [0.4, 0, 2.0])
     depth[0, 0] = 0
     assert np.isnan(depth_to_points(depth, K)[0, 0]).all()
+
+
+def test_points_to_pixels_inverts_depth_to_points():
+    """points_to_pixels is the inverse of depth_to_points, including the world_from_cam transform."""
+    K = np.array([[10.0, 0, 3], [0, 10.0, 2], [0, 0, 1]])
+    depth = np.array([[2.0, 3.0], [4.0, 5.0]], dtype=np.float32)
+    # a non-trivial rigid transform: 90 deg about z, then a translation
+    world_from_cam = np.array(
+        [[0.0, -1.0, 0.0, 0.5], [1.0, 0.0, 0.0, -0.2], [0.0, 0.0, 1.0, 1.3], [0.0, 0.0, 0.0, 1.0]]
+    )
+    pts = depth_to_points(depth, K, world_from_cam).reshape(-1, 3)
+    px, z = points_to_pixels(pts, K, world_from_cam)
+    v, u = np.meshgrid(np.arange(2), np.arange(2), indexing="ij")
+    assert np.allclose(px[:, 0], u.ravel(), atol=1e-9)
+    assert np.allclose(px[:, 1], v.ravel(), atol=1e-9)
+    assert np.allclose(z, depth.ravel(), atol=1e-9)
+
+
+def test_points_to_pixels_flags_points_outside_the_frame():
+    """A point beyond the image edge projects outside [0, w) - what the capture clipping check relies on."""
+    K = np.array([[306.0, 0, 360.0], [0, 306.0, 360.0], [0, 0, 1]])
+    eye = np.eye(4)
+    px, z = points_to_pixels([[0.0, 0.0, 1.0], [-2.0, 0.0, 1.0], [0.0, 2.0, 1.0]], K, eye)
+    assert np.allclose(px[0], [360.0, 360.0]) and z[0] == 1.0
+    assert px[1][0] < 0  # off the left edge
+    assert px[2][1] > 720  # off the bottom edge
