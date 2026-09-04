@@ -50,7 +50,13 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
     r1 = p.add_argument_group("r1pro", "BEHAVIOR-1K R1Pro in a BEHAVIOR scene (navigation assumed done)")
     r1.add_argument("--scene-model", default="Rs_int")
-    r1.add_argument("--rooms", default=None, help="comma-separated load_room_types (default: whole scene)")
+    r1.add_argument(
+        "--rooms",
+        default=None,
+        help="comma-separated rooms to load: load_room_types without --activity (default: the whole scene), room "
+        "instances with it (default: the evaluator's list for the task; the house scene with all of them costs the "
+        "client ~16 GB of RAM)",
+    )
     r1.add_argument("--near", default=None, help="furniture name to stand next to, e.g. breakfast_table_skczfi_0")
     r1.add_argument(
         "--side",
@@ -98,12 +104,6 @@ def add_common(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="competition-style perception: send just the task's object names and goal atoms, no ground-truth masks "
         "(the server runs its detector + SAM2 on the image)",
-    )
-    r1.add_argument(
-        "--rooms",
-        default=None,
-        help="comma-separated room instances to load with --activity (default: the evaluator's list for the task; "
-        "the house scene with all of them costs the client ~16 GB of RAM)",
     )
     r1.add_argument(
         "--seg-instance",
