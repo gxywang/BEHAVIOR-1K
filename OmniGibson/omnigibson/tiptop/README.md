@@ -106,6 +106,29 @@ viewer keeps the time panel state (paused, loop selection, speed) across runs, s
 choose *Following*, and check the selected recording. Start a viewer yourself only with the tiptop env's `rerun`
 (`pixi run rerun`); a stray `rerun` of another version on `PATH` that already listens on port 9876 gets reused.
 
+### Rerun from the laptop
+
+On a headless server `--rerun-mode stream` cannot work (it spawns a native viewer and needs a display). Serve the
+viewer from the server instead and open it in a browser -- the laptop needs nothing installed, and the version
+matches the SDK by construction (Rerun requires viewer and SDK to be the same version; the env pins 0.27.3):
+
+```bash
+OmniGibson/omnigibson/tiptop/scripts/start_rerun_viewer.sh          # gRPC :9876, web viewer :9090
+TIPTOP_GPU=2 TIPTOP_RERUN_MODE=connect TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml \
+  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh       # planner logs into that viewer
+# laptop:
+ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
+#   then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy
+```
+
+Both ports must be forwarded: the browser loads the viewer from 9090 and then connects to 9876 itself. The same
+launcher replays a finished recording -- pass the file: `start_rerun_viewer.sh tiptop_server_outputs/<ts>/tiptop.rrd`.
+
+The R1Pro renders as a mesh-less set of frames unless the visual meshes have been generated next to the URDF
+(they are gitignored, ~50 MB): `cd tiptop && pixi run python scripts/make_r1pro_embodiment.py --copy-meshes`.
+That also rewrites the tracked embodiment files with a machine-local provenance path -- `git -C tiptop checkout --
+tiptop/embodiments/assets/r1pro/r1pro_left_meta.yml` afterwards to keep the submodule clean.
+
 Options: `--objects mug,bowl,apple,banana`, `--task`, `--goal "on(mug,bowl)"` (drives the ground-truth atoms and the
 success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: send just the object
 names and goal atoms, the server runs its detector + SAM2 on the image; see "Ground truth vs. detector").
