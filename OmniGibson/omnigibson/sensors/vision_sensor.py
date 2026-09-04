@@ -206,9 +206,12 @@ class VisionSensor(BaseSensor):
         with og.sim.editing_usd():
             self._render_product = lazy.omni.replicator.core.create.render_product(self.prim_path, resolution)
 
-        # Create a new viewport to link to this camera or link to a pre-existing one
+        # Create a new viewport to link to this camera or link to a pre-existing one.
+        # Under REMOTE_STREAMING the Kit app is already launched windowless (simulator.py) and the streamed frame
+        # should show only the main Viewport, so auxiliary sensors must not dock extra ViewportWindows into it --
+        # gm.HEADLESS is False in that mode, which would otherwise give every robot/external camera its own window.
         viewport_name = self._load_config["viewport_name"]
-        should_create_viewport = viewport_name is not None or not gm.HEADLESS
+        should_create_viewport = viewport_name is not None or not (gm.HEADLESS or gm.REMOTE_STREAMING)
         viewport = None
         if should_create_viewport and viewport_name is not None:
             vp_names_to_handles = {vp.name: vp for vp in lazy.omni.kit.viewport.window.get_viewport_window_instances()}

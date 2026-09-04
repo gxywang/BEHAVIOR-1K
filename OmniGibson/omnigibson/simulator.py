@@ -277,6 +277,12 @@ def _launch_app():
         app.set_setting("/app/livestream/proto", "websocket")
         app.set_setting("/app/livestream/websocket/framerate_limit", 120)
         app.set_setting("/ngx/enabled", False)
+        # Streaming diagnostics: the livestream core defaults logLevel to "silence" and the webrtc extension
+        # defaults logQosStatus to False, so a failed or degraded session logs only CONNECTED/DISCONNECTED with
+        # no reason code, negotiated resolution or encoder stats. Extension [settings] are applied as defaults,
+        # so setting them here -- before enable_extension below -- survives.
+        app.set_setting("/app/livestream/logLevel", "debug")
+        app.set_setting("/app/livestream/webrtc/logQosStatus", True)
 
         # Find our IP address
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -297,7 +303,9 @@ def _launch_app():
             app.set_setting("/app/livestream/publicEndpointAddress", gm.PUBLIC_IP)
             app.set_setting("/app/livestream/port", gm.WEBRTC_PORT)
             lazy.isaacsim.core.utils.extensions.enable_extension("omni.kit.livestream.webrtc")
-            print(f"Now streaming on: http://{ip}:{gm.HTTP_PORT}/?server={ip}")
+            # The browser client that served gm.HTTP_PORT (omni.services.streamclient.webrtc) is not shipped
+            # with Isaac Sim 5.x, so print what actually works: the desktop client takes a bare address.
+            print(f"Now streaming on {gm.PUBLIC_IP or ip} -- connect the Isaac Sim WebRTC Streaming Client")
         else:
             raise ValueError(
                 f"Invalid REMOTE_STREAMING option {gm.REMOTE_STREAMING}. Must be one of None, native, webrtc."

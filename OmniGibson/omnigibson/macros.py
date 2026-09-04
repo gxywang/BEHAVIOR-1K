@@ -143,7 +143,9 @@ gm.HEADLESS = os.getenv("OMNIGIBSON_HEADLESS", "False").lower() in ("true", "1",
 # Whether to enable remote streaming. None disables it, other valid options are "native", "webrtc".
 gm.REMOTE_STREAMING = os.getenv("OMNIGIBSON_REMOTE_STREAMING", None)
 
-# What port the webrtc and http servers should run on. This is only used if REMOTE_STREAMING is set to "webrtc"
+# What port the webrtc and http servers should run on. This is only used if REMOTE_STREAMING is set to "webrtc".
+# HTTP_PORT is UNUSED on Isaac Sim 5.x: the browser client extension that served it
+# (omni.services.streamclient.webrtc) is no longer shipped, and nothing binds the port. Kept for compatibility.
 gm.HTTP_PORT = os.getenv("OMNIGIBSON_HTTP_PORT", 8211)
 gm.WEBRTC_PORT = os.getenv("OMNIGIBSON_WEBRTC_PORT", 49100)
 gm.PUBLIC_IP = os.getenv("OMNIGIBSON_PUBLIC_IP", "172.22.224.37") # for webrtc streaming remote server
