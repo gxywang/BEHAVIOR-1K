@@ -36,7 +36,7 @@ pixi install && pixi run setup && pixi run download-weights
 
 # 4. services (launchers in this directory; TIPTOP_HOST=0.0.0.0 to serve other machines)
 <repo>/OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
-TIPTOP_RERUN_MODE=save <repo>/OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh
+<repo>/OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh      # hosts the Rerun viewer too (item 9)
 
 # 5. smoke test from the sim env (headless). Expect: scene ready ~30 s, plan 5-8 s, success check on(mug, bowl) true.
 cd <repo>/OmniGibson && OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.run live --host localhost --port 8765 \
@@ -99,14 +99,16 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    needs `git apply` of the same patch; upstreaming it to tiptop-robot/cuTAMP is the real fix.
 8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; cuRobo warms up MotionGen at server start (`/health` is 200 only afterwards).
-9. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display, so it is
-   laptop-only. On a server run `scripts/start_rerun_viewer.sh` (serves the env's own 0.27.3 viewer over gRPC 9876
-   + web 9090) and start the planner with `TIPTOP_RERUN_MODE=connect`; the laptop then needs only a browser and
-   `ssh -L`. See README.md "Rerun from the laptop". `--rerun-mode save` remains the archival mode — one
-   `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<timestamp>/`, replayable by passing the file to
-   the same launcher. The client's sim-state mirror works in all modes. Viewer and SDK must be the *same* version
-   (0.27.3 here); a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2 on the laptop) is why
-   serving from the server is preferred — it matches by construction.
+9. **Rerun.** The planner hosts the viewer itself (`--rerun-mode serve`, the launcher's default): gRPC 9876 and the
+   web viewer 9090, both on 127.0.0.1, one recording for the planner's lifetime, viewer killed with the planner.
+   The laptop needs only a browser and `ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 <server>`; see
+   README.md "Rerun" for the URL and what the view holds. A taken 9876/9090 is a startup error, not a fallback
+   (`pkill -u $USER -f 'rerun --serve-web'`, or `--rerun-grpc-port` / `--rerun-web-port`). `--rerun-mode stream`
+   spawns a native window and is laptop-only; `save` writes one `tiptop.rrd` per request under
+   `tiptop/tiptop_server_outputs/<timestamp>/`, replayable with `pixi run rerun --serve-web --bind 127.0.0.1 <file>`.
+   The simulator's mirror (joints, its own object meshes, camera images) works in every mode. Viewer and SDK must
+   be the *same* version (0.27.3 here); a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2
+   on the laptop) is why the planner runs the SDK's own binary and never a `rerun` from `PATH`.
 10. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
    `ssh -N -L 8765:127.0.0.1:8765 server` and `--host localhost`, or `TIPTOP_HOST=0.0.0.0`. The client refuses to
    run unless the server metadata says `robot_type: panda`, `dof: 7` (the launcher's `--config` guarantees it).
@@ -122,9 +124,13 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
     from the environment, appeared to fix it on one short connection and does NOT hold up: a longer session with
     it set still threw 115 errors. Two dead ends: the `GPU ... is not white-listed` warning gates nothing
     (disassembly shows that branch falling through to the same success path), and NVENC is healthy on the card
-    (h264/hevc/av1 encode at 200+ fps outside Isaac Sim). The real fix is a newer StreamSDK -- the official 5.1.0
-    *container* carries 7.7.2, and NVIDIA fixed NVENC init on this exact GPU in Kit 110.1.1 (Isaac Sim 6.0).
-    Until then use Rerun (item 9) plus the per-round `live.mp4`; neither needs an encoder.
+    (h264/hevc/av1 encode at 200+ fps outside Isaac Sim). No drop-in fix exists for Isaac Sim 5.1 (checked
+    2026-09-05): the Kit 107 registry's newer `omni.kit.streamsdk.plugins` 7.7.2 ships a byte-identical
+    `libNvStreamServer.so` (StreamSDK 04.72, sm_52 kernels only), the official 5.1.0 container carries the same
+    7.6.3, and the StreamSDK generations that work on this card (04.84/04.86) come only with
+    `omni.kit.livestream.webrtc` 10.x for Kit 110 / Isaac Sim 6.0 (python 3.12). Use Rerun (item 9), which carries
+    the robot's head camera and a third-person view of the workspace from the simulator, plus the per-round
+    `live.mp4`; none of them needs an encoder.
 15. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
     `gm.HEADLESS` stays false, so the viewport-camera code in `scene.py` still runs — that is what aims the streamed
     view, and it is why you must NOT also set `OMNIGIBSON_HEADLESS=1`. Auxiliary sensor cameras are kept out of the
@@ -137,8 +143,9 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 18. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
     (2 GB swap) after 16 transfers: Isaac client 14 GB RSS, planner 4.4 GB, Rerun viewer 2.8 GB, M2T2 1.1 GB, plus
     the desktop. The kernel killed the client, which shared VSCode's cgroup, and took the editor session with it.
-    Mitigations: the server now spawns the viewer with `--rerun-memory-limit 2GB` (Rerun's own default is 75% of
-    RAM, and `--no-state-stream` on the client keeps per-step state out of it entirely); run long clients in their own
+    Mitigations: the planner caps its viewer at `--rerun-memory-limit 2GB` (Rerun's own default is 75% of RAM; the
+    oldest non-static data is dropped past it, and `--no-state-stream` on the client keeps per-step state and camera
+    images out of it entirely); run long clients in their own
     cgroup with a cap and a high OOM score, e.g. `systemd-run --user --scope -p MemoryMax=18G choom -n 800 -- python
     -m omnigibson.tiptop.run task ...`; give the box real swap (16 GB) before a long run; watch `rss_gb` in the
     per-transfer log lines for growth.
@@ -159,8 +166,9 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 
 ## Files
 
-- Bridge (this directory): `protocol.py`, `client.py`, `scene.py`, `executor.py`, `run.py`, `r1pro.py`, `scripts/`,
-  tests in `OmniGibson/tests/test_tiptop_protocol.py`.
+- Bridge (this directory): `protocol.py`, `client.py` (planning client + the Rerun mirror), `scene.py`, `executor.py`,
+  `run.py`, `r1pro.py`, `scripts/` (service launchers, `stream_scene.py`, `probe_r1pro.py`), tests in
+  `OmniGibson/tests/test_tiptop_protocol.py`.
 - Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/config/tiptop_sim_{panda,r1pro}.yml`,
   `tiptop/embodiments/` (R1Pro), `scripts/make_r1pro_embodiment.py`, `install/install-curobo.sh`,
   `install/install-cutamp.sh`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.

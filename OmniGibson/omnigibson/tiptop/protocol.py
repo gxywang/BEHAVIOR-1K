@@ -273,6 +273,31 @@ def points_to_pixels(points, intrinsics, world_from_cam) -> tuple:
     return np.stack([fx * cam[:, 0] / z + cx, fy * cam[:, 1] / z + cy], axis=-1), cam[:, 2]
 
 
+def match_objects(perceived: dict, simulated: dict, max_dist: float = 0.08) -> dict:
+    """Pair perceived objects with simulated ones by position ({name: [x, y, z]}, both in the same frame).
+
+    Perception numbers instances in detection order ("candle_2" is whichever candle the detector found second) and
+    the simulator by task instance, so a name never identifies an object across the two; a position does. Greedy by
+    distance, each simulated object used once. Returns {perceived name: {"sim": simulated name or None, "dist":
+    metres to it, or to the nearest simulated object when none is within ``max_dist``}}; a perceived object without
+    a partner is a false detection or a hull that landed somewhere else.
+    """
+    pairs = sorted(
+        (float(np.linalg.norm(np.asarray(p, dtype=np.float64) - np.asarray(s, dtype=np.float64))), p_name, s_name)
+        for p_name, p in perceived.items()
+        for s_name, s in simulated.items()
+    )
+    out = {name: {"sim": None, "dist": None} for name in perceived}
+    used = set()
+    for dist, p_name, s_name in pairs:
+        if out[p_name]["dist"] is None:
+            out[p_name]["dist"] = dist  # the nearest overall, for the report when nothing is close enough
+        if out[p_name]["sim"] is None and s_name not in used and dist <= max_dist:
+            out[p_name] = {"sim": s_name, "dist": dist}
+            used.add(s_name)
+    return out
+
+
 def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:
     """Linearly resample an (N, dof) trajectory sampled every ``dt`` seconds onto ``target_dt``, keeping the end point."""
     positions = np.asarray(positions, dtype=np.float32)

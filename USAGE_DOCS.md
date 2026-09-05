@@ -1,7 +1,7 @@
 # Usage docs for lab
 ## Basics
 - `module load cuda-toolkit/13.0`
-- on server: set `OMNIGIBSON_REMOTE_STREAMING=webrtc` to watch, or `OMNIGIBSON_HEADLESS=1` to run batch — never both (see [Bring-up](#bring-up))
+- on server: run `OMNIGIBSON_HEADLESS=1` and watch in Rerun (see [Bring-up](#bring-up)); `OMNIGIBSON_REMOTE_STREAMING=webrtc` is the unreliable alternative — never set both
 - always `export CUDA_DEVICE_ORDER=PCI_BUS_ID` alongside `CUDA_VISIBLE_DEVICES=`, so indices match `nvidia-smi`
 - to run `uv` install script: `bash setup_uv.sh   --new-env b1k   --omnigibson   --bddl   --dataset  --joylo  --eval --accept-nvidia-eula   --accept-dataset-tos`
 - download [Isaac Sim WebRTC Streaming Client](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/download.html)
@@ -51,52 +51,59 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2
 ```
 
 **1. Services** (needed for `live` / `task`; not for `capture` or `stream_scene`). The planner answers `/health`
-only after cuRobo warms up, ~40 s.
+only after cuRobo warms up, ~40 s, and it hosts the Rerun viewer itself (web 9090, gRPC 9876, on 127.0.0.1): one
+recording per planner process, gone when the planner exits. One terminal or tmux window each, in the foreground,
+so Ctrl-C stops them.
 
 ```bash
-M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh &
-TIPTOP_GPU=2 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 \
-  TIPTOP_MAX_PLANNING_TIME=40 TIPTOP_RERUN_MODE=save \
-  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh &
+M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
+TIPTOP_GPU=2 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
+  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh
 
 curl -s localhost:8123/health; curl -s localhost:8765/health    # {"status":"healthy"...} and OK
 ```
 
-**2. Rerun** (optional; see `OmniGibson/omnigibson/tiptop/README.md` "Rerun from the laptop"). Start it *before*
-the planner and swap the planner's `TIPTOP_RERUN_MODE=save` for `connect`:
+**2. Rerun** (the view of a run: planner's perception + plan, the simulator's robot, objects and cameras; see
+`OmniGibson/omnigibson/tiptop/README.md` "Rerun" for what each entity is). On the laptop:
 
 ```bash
-OmniGibson/omnigibson/tiptop/scripts/start_rerun_viewer.sh &     # gRPC 9876, web viewer 9090
-# laptop: ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
-#         then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy
+ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
+# then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy  and keep the time panel on Following
 ```
 
-**3. Run one of these.** Streaming and headless are mutually exclusive — pick per command, do not export both.
+Reload the tab after restarting the planner. If `ssh -L` says a port is in use, a `rerun` on the laptop holds it:
+close it, or map other local ports (`-L 9091:127.0.0.1:9090 -L 9877:127.0.0.1:9876` and the URL with 9091/9877).
+
+**3. Run one of these.** (a) and (b) are headless and the picture is in Rerun (the robot's head camera and a
+third-person overview are streamed there by the simulator, so no WebRTC client is needed); (c) is the WebRTC
+path and must run without `OMNIGIBSON_HEADLESS`.
 
 ```bash
-# a) full episode, watched live from the laptop
-OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python -m omnigibson.tiptop.run live \
+# a) the demo: load the scene, one basket onto the coffee table, stand once, fill the basket round by round
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live \
     --embodiment r1pro --activity assembling_gift_baskets \
-    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 --sequential \
-    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(candle.n.01_2,wicker_basket.n.01_2)" \
+    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
+    --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2 --sequential \
+    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2)" \
     --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
     --host localhost --port 8765 --out-dir runs/demo
+    # more items from the same spot: list them all in --stand-for and --goal (README "Challenge tasks")
 
-# b) same episode, batch (no viewer, faster)
-OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live ...   # same flags as (a)
+# b) capture one frame only, no planner
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
+    --embodiment r1pro --activity assembling_gift_baskets --out-dir runs/cap
 
-# c) just look at a scene — no services needed
+# c) look at a scene over WebRTC (unreliable on this GPU, see below) -- no services needed
 OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python \
     OmniGibson/omnigibson/tiptop/scripts/stream_scene.py --activity assembling_gift_baskets \
     --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
     --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2
-
-# d) capture one frame only, no planner
-OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
-    --embodiment r1pro --activity assembling_gift_baskets --out-dir runs/cap
 ```
 
-Connect the client while the scene loads (~160 s). Shut down with `pkill -u $USER -f "tiptop-server|m2t2_server"`.
+The scene takes ~160 s to load; the robot appears in Rerun as soon as it is placed. Per round the client logs how
+each perceived object pairs with a simulated one (`perceived 'candle' (goal, 85 grasps) = simulated candle_4 (2.9 cm
+off)`); a goal object with no partner within 8 cm is a false detection. Stop everything with Ctrl-C in each
+window, or `pkill -u $USER -f "tiptop-server|m2t2_server|omnigibson.tiptop.run"` for anything detached.
 
 ### Streaming the viewport to a laptop
 
@@ -116,12 +123,15 @@ Connect the client while the scene loads (~160 s). Shut down with `pkill -u $USE
   fix on one short connection and is not one -- a longer session with it set still threw 115 errors. Do not rely on
   it. Two dead ends recorded so nobody repeats them: the `GPU ... is not white-listed` warning gates nothing
   (that branch falls through to the same success path), and NVENC on the card is healthy (h264/hevc/av1 all encode
-  at 200+ fps outside Isaac Sim). The real fix is a newer StreamSDK: the official 5.1.0 *container* carries 7.7.2,
-  and NVIDIA fixed NVENC init on this exact GPU in Kit 110.1.1 (Isaac Sim 6.0).
-- **What to use instead.** [Rerun](#bring-up) for everything the planner does -- it needs no encoder and is the
-  better view of TiPToP anyway -- and the per-round `live.mp4` the bridge already writes for what the robot did.
-  `stream_scene.py` and `OMNIGIBSON_REMOTE_STREAMING` still work when the stream happens to hold, but treat a
-  working picture as luck rather than a guarantee.
+  at 200+ fps outside Isaac Sim). There is no drop-in fix for 5.1 (checked 2026-09-05): the newer
+  `omni.kit.streamsdk.plugins` 7.7.2 in the Kit 107 registry ships a byte-identical streaming server library, the
+  official 5.1.0 container carries the same 7.6.3, and the StreamSDK builds that work on this card only come with
+  Isaac Sim 6.0 (Kit 110, python 3.12).
+- **What to use instead.** [Rerun](#bring-up): the planner's perception and plan, the simulator's robot and
+  objects, and the robot's head camera plus a third-person overview streamed from the simulator at 5 Hz -- none
+  of it needs an encoder -- and the per-round `live.mp4` the bridge writes. `stream_scene.py` and
+  `OMNIGIBSON_REMOTE_STREAMING` still work when the stream happens to hold, but treat a working picture as luck
+  rather than a guarantee.
 - The stream shows only the main viewport: `vision_sensor.py` suppresses auxiliary camera windows under
   `REMOTE_STREAMING`. To confirm, `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` should print only `_0`,
   while `Replicator`, `Replicator_01` and `Replicator_02` are all still created (the sensors still render).

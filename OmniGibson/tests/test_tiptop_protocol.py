@@ -9,6 +9,7 @@ from omnigibson.tiptop.protocol import (
     build_request,
     depth_to_points,
     load_observation_h5,
+    match_objects,
     packb,
     parse_plan,
     resample_trajectory,
@@ -143,3 +144,34 @@ def test_points_to_pixels_flags_points_outside_the_frame():
     assert np.allclose(px[0], [360.0, 360.0]) and z[0] == 1.0
     assert px[1][0] < 0  # off the left edge
     assert px[2][1] > 720  # off the bottom edge
+
+
+def test_match_objects_pairs_by_position_not_name():
+    # perception's "candle_2" is the simulator's candle_1, one candle over (2026-09-04, round_01 of runs/demo)
+    perceived = {"candle": [0.594, 0.572, 0.471], "candle_2": [0.714, 0.572, 0.472]}
+    simulated = {"candle_1": [0.732, 0.596, 0.472], "candle_2": [0.612, 0.595, 0.472]}
+    match = match_objects(perceived, simulated)
+    assert match["candle"]["sim"] == "candle_2" and match["candle_2"]["sim"] == "candle_1"
+    assert all(m["dist"] < 0.04 for m in match.values())
+
+
+def test_match_objects_flags_false_detections_and_uses_each_simulated_object_once():
+    perceived = {"candle": [0.607, 0.169, 0.41], "cookie": [0.653, -0.149, 0.436], "cookie_2": [0.66, -0.14, 0.44]}
+    simulated = {"cookie_1": [0.668, -0.153, 0.428]}
+    match = match_objects(perceived, simulated)
+    assert match["candle"]["sim"] is None and match["candle"]["dist"] > 0.3  # nothing near: a phantom
+    assert match["cookie"]["sim"] == "cookie_1"
+    assert match["cookie_2"]["sim"] is None and match["cookie_2"]["dist"] < 0.02  # the partner was taken
+
+
+def test_sim_state_message_roundtrips_matrices_and_jpeg_bytes():
+    msg = {
+        "type": "sim_state",
+        "t": 1.5,
+        "q": np.zeros(11, np.float32),
+        "objects": {"candle_2": np.eye(4, dtype=np.float32)},
+        "images": {"head_cam": b"\xff\xd8jpeg"},
+    }
+    back = unpackb(packb(msg))
+    assert back["images"]["head_cam"] == b"\xff\xd8jpeg"
+    assert back["objects"]["candle_2"].shape == (4, 4) and back["q"].dtype == np.float32

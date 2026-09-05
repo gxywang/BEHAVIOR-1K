@@ -1,12 +1,13 @@
 """CLI for the TiPToP <-> OmniGibson bridge.
 
-Run inside the `behavior` conda env with OMNIGIBSON_HEADLESS=1 (or unset it for the GUI):
+Run inside the sim env with OMNIGIBSON_HEADLESS=1 (or unset it for the GUI):
 
   python -m omnigibson.tiptop.run capture --out-dir runs/scene1
   python -m omnigibson.tiptop.run replay  --plan <tiptop_plan.json> --scene runs/scene1/capture.json --out-dir runs/replay
   python -m omnigibson.tiptop.run live    --host localhost --port 8765 --out-dir runs/live
 
-`capture` writes obs.h5 (droid-sim-evals layout + ground-truth masks) for `tiptop-h5`; `live` talks to `tiptop-server`.
+`capture` writes obs.h5 (droid-sim-evals layout + ground-truth masks) for `tiptop-h5`; `live` talks to `tiptop-server`
+and, unless --no-state-stream, mirrors the simulator into the server's Rerun view for the whole session.
 """
 
 import argparse
@@ -22,6 +23,7 @@ log = logging.getLogger("omnigibson.tiptop")
 
 DEFAULT_TASK = "put the mug in the bowl"
 DEFAULT_GOAL = "on(mug,bowl)"
+MATCH_MAX_DIST = 0.08  # perceived hull to simulated object: farther than this is a different object
 
 
 def parse_goal(goal: str) -> list[dict]:
@@ -95,8 +97,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
     r1.add_argument(
         "--stand-for",
         default=None,
-        metavar="ITEM,TARGET",
-        help="choose the base pose automatically so ITEM and TARGET are both in the left arm's reach "
+        metavar="ITEM[,ITEM...],TARGET",
+        help="choose the base pose once so every ITEM and the TARGET are in the left arm's reach "
         "(navigation stand-in; alternative to --near / --robot-pose)",
     )
     p.add_argument(
@@ -184,6 +186,10 @@ def build_r1pro_sim(args, embodiment: dict | None):
     sim = R1ProSim(cfg, camera=args.camera)
     if args.activity:
         sim.track_task_objects()
+    # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
+    sim.track_context(
+        *{spec.split(":")[1] for spec in args.place + args.spawn}, args.near, getattr(args, "stage_support", None)
+    )
     for spec in args.place:
         parts = spec.split(":")
         dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) > 2 else (0.0, 0.0)
@@ -193,8 +199,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
     if args.robot_pose:
         sim.place_robot(*args.robot_pose)
     elif args.stand_for:
-        item, target = args.stand_for.split(",")
-        sim.place_robot_for(item, target, ignore_names=[sp[0] for sp in spawns])
+        sim.place_robot_for(*[n for n in args.stand_for.split(",") if n], ignore_names=[sp[0] for sp in spawns])
     elif args.near:
         sim.place_robot_near(args.near, side=args.side, standoff=args.standoff, ignore_names=[sp[0] for sp in spawns])
     else:
@@ -313,21 +318,69 @@ def do_capture(
     return request, extras
 
 
-def open_state_stream(hostport: str | None):
-    """Optional live mirror of the sim into the server's Rerun view; None if disabled or unavailable."""
+def goal_hints(sim, args, atoms: list[dict]) -> dict | None:
+    """Where each goal object is (base frame), so a category-level goal ('candle') acts on the instance meant."""
+    if not (args.activity and args.no_gt):
+        return None
+    _, tiptop_atoms = sim.tiptop_goal(atoms, category_level=True)
+    return {
+        label: sim.base_hint(bddl)
+        for atom, tiptop_atom in zip(atoms, tiptop_atoms)
+        for bddl, label in zip(atom["args"], tiptop_atom["args"])
+    }
+
+
+def open_state_stream(hostport: str | None, sim):
+    """Mirror the simulator into the server's Rerun view for the rest of the session; None if disabled."""
     if not hostport:
         return None
     from omnigibson.tiptop.client import SimStateStream
 
     host, _, port = hostport.rpartition(":")
     stream = SimStateStream(host or "localhost", int(port) if port else 8765)
-    return stream if stream.open() else None
+    stream.attach(sim)  # keeps retrying on its own when the server is not there yet
+    return stream
+
+
+def perception_report(request: dict, extras: dict, response: dict) -> dict:
+    """Pair what the server perceived with the simulator's objects by position, and say what the goal acts on.
+
+    Perception numbers instances in detection order, the simulator by task instance, so the names agree only by
+    chance (2026-09-04: the server's "candle_2" was the simulator's candle_1, one candle over). Logged per round and
+    saved with the result; a goal object without a simulated partner is the first thing to look at.
+    """
+    from omnigibson.tiptop.protocol import match_objects
+
+    perceived = response.get("objects") or {}
+    simulated = {name: pose["aabb_center"] for name, pose in extras["object_poses_base"].items()}
+    match = match_objects({label: info["position"] for label, info in perceived.items()}, simulated, MATCH_MAX_DIST)
+    goal_args = {a for atom in request.get("gt_atoms") or [] for a in atom["args"]}
+    for label in sorted(perceived, key=lambda name: (name not in goal_args, name)):
+        info, m = perceived[label], match[label]
+        role = "goal" if label in goal_args else ("movable" if info["movable"] else "surface")
+        head = f"perceived {label!r} ({role}, {info['grasps']} grasps)"
+        if m["sim"] is None:
+            nearest = f"{100 * m['dist']:.0f} cm" if m["dist"] is not None else "nothing tracked"
+            (log.warning if role == "goal" else log.info)(
+                f"{head}: no simulated object within {100 * MATCH_MAX_DIST:.0f} cm (nearest {nearest}): "
+                "false detection or misplaced hull"
+            )
+        else:
+            log.info(f"{head} = simulated {m['sim']} ({100 * m['dist']:.1f} cm off)")
+    return {label: dict(perceived[label], **match[label]) for label in perceived}
 
 
 def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict | None = None) -> dict:
     """Capture, ask the server for a plan for these atoms, save it and execute it."""
+    from omnigibson.tiptop.client import TiptopPlanningError
+
     request, extras = do_capture(sim, args, out_dir, atoms=atoms, hints=hints)
-    response = client.plan(request, timeout_s=args.plan_timeout)
+    try:
+        response = client.plan(request, timeout_s=args.plan_timeout)
+    except TiptopPlanningError:
+        if client.last_response and client.last_response.get("objects"):  # what perception made of the frame
+            perception_report(request, extras, client.last_response)
+        raise
     with open(out_dir / "server_response.json", "w") as f:
         json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
     with open(out_dir / "tiptop_plan.json", "w") as f:
@@ -352,8 +405,8 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict 
     log.info(
         f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
     )
-    stream = None if args.no_state_stream else open_state_stream(f"{args.host}:{args.port}")
-    return do_execute(sim, args, out_dir, response["plan"], tag="live", state_stream=stream, atoms=atoms)
+    match = perception_report(request, extras, response)
+    return do_execute(sim, args, out_dir, response["plan"], tag="live", atoms=atoms, extra={"perception": match})
 
 
 def choose_stage_spot(
@@ -385,7 +438,7 @@ def choose_stage_spot(
     half_widths = (sim.xy_radius(item), sim.xy_radius(container))  # keep both edges in frame, not just their centres
     best = None
     for d, x, y in tried:
-        pose, _ = sim.best_base_pose(near, (x, y), ignore=ignore, aabbs=aabbs, half_widths=half_widths)
+        pose, _ = sim.best_base_pose([near, (x, y)], ignore=ignore, aabbs=aabbs, half_widths=half_widths)
         if pose is not None and (best is None or pose[0] < best[0]):
             best = (pose[0], d, x, y)
     if best is None:
@@ -465,9 +518,7 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
                     sim.place_robot_for(item, basket)
                     sim.hold(args.settle_steps, sim.OPEN)
                     atoms = [{"predicate": "inside", "args": [item, basket]}]
-                    _, tiptop_atoms = sim.tiptop_goal(atoms, category_level=bool(args.no_gt))
-                    hints = {lab: sim.base_hint(b) for lab, b in zip(tiptop_atoms[0]["args"], (item, basket))}
-                    live_round(sim, args, client, round_dir, atoms=atoms, hints=hints)
+                    live_round(sim, args, client, round_dir, atoms=atoms, hints=goal_hints(sim, args, atoms))
                     # the goal names the category, so any item of this type that ended up inside counts
                     now_inside = [i for i in items if i not in placed and sim.predicate_holds("inside", i, basket)]
                     record["inside"], record["placed"] = bool(now_inside), now_inside
@@ -500,22 +551,18 @@ def run_task(sim, args, client, out_dir: Path) -> dict:
 
 
 def do_execute(
-    sim, args, out_dir: Path, plan: dict, tag: str, state_stream=None, atoms: list[dict] | None = None
+    sim, args, out_dir: Path, plan: dict, tag: str, atoms: list[dict] | None = None, extra: dict | None = None
 ) -> dict:
     """Execute a plan and check the goal: the task's own with --activity (``atoms``, default --goal, then names the
-    objects whose AABBs are logged), else every --goal atom."""
+    objects whose AABBs are logged), else every --goal atom. ``extra`` is saved with the result."""
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
     video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4", fps=15, every=2)
-    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video, state_stream=state_stream)
-    try:
-        stats = executor.execute(plan)
-    finally:
-        if state_stream is not None:
-            state_stream.close()
+    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video)
+    stats = executor.execute(plan)
     if args.activity:
         success = sim.goal_status()
         success["all"] = success["success"]
@@ -539,6 +586,7 @@ def do_execute(
         "execution": stats,
         "success": success,
         "final_object_poses_world": sim.object_poses_world(),
+        **(extra or {}),
     }
     with open(out_dir / f"{tag}_result.json", "w") as f:
         json.dump(result, f, indent=2)
@@ -565,11 +613,16 @@ def main(argv=None):
     p_live.add_argument(
         "--sequential",
         action="store_true",
-        help="one capture/plan/execute round per goal atom (re-standing for each with --activity), instead of one "
-        "plan for the whole goal",
+        help="one capture/plan/execute round per goal atom from where the robot stands, instead of one plan for the "
+        "whole goal",
     )
     p_live.add_argument(
-        "--no-state-stream", action="store_true", help="do not mirror the executed sim state into the server's Rerun"
+        "--restand",
+        action="store_true",
+        help="with --sequential and --activity: teleport the base to a reachable pose before every round",
+    )
+    p_live.add_argument(
+        "--no-state-stream", action="store_true", help="do not mirror the simulator into the server's Rerun view"
     )
     p_task = sub.add_parser("task", help="work through a challenge task's whole inside(item, container) goal")
     add_common(p_task)
@@ -598,6 +651,7 @@ def main(argv=None):
     from omnigibson.tiptop.protocol import load_plan_json
 
     exit_code = 0
+    stream = None
     try:
         t0 = time.time()
         client = None
@@ -615,10 +669,13 @@ def main(argv=None):
             metadata = client.fetch_metadata()
             client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
             sim = build_sim(args, embodiment=metadata.get("embodiment"))
+            if not args.no_state_stream:
+                stream = open_state_stream(f"{args.host}:{args.port}", sim)
         elif args.cmd == "replay":
             with open(args.plan) as f:
                 plan_json = json.load(f)
             sim = build_sim(args, embodiment=plan_json.get("embodiment"))  # provenance saved by `live`
+            stream = open_state_stream(args.state_stream, sim)
         else:
             sim = build_sim(args)
         log.info(f"scene ready in {time.time() - t0:.1f}s (sim dt {sim.dt:.4f}s)")
@@ -632,7 +689,7 @@ def main(argv=None):
             plan = load_plan_json(args.plan)
             if args.embodiment == "r1pro" and not plan_json.get("embodiment"):
                 log.warning("plan has no embodiment provenance; assuming it was made for the local tiptop embodiment")
-            do_execute(sim, args, out_dir, plan, tag="replay", state_stream=open_state_stream(args.state_stream))
+            do_execute(sim, args, out_dir, plan, tag="replay")
         elif args.cmd == "live":
             atoms_all = parse_goal(args.goal)
             rounds = [[atom] for atom in atoms_all] if args.sequential else [atoms_all]
@@ -641,10 +698,10 @@ def main(argv=None):
                 round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
                 round_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    if args.sequential and args.activity and len(atoms[0]["args"]) == 2:
+                    if args.sequential and args.restand and args.activity and len(atoms[0]["args"]) == 2:
                         sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
                         sim.hold(args.settle_steps, sim.OPEN)
-                    outcomes.append(live_round(sim, args, client, round_dir, atoms))
+                    outcomes.append(live_round(sim, args, client, round_dir, atoms, hints=goal_hints(sim, args, atoms)))
                 except Exception as e:
                     if not args.sequential:
                         raise
@@ -663,6 +720,8 @@ def main(argv=None):
         log.exception("run failed")
         exit_code = 1
     finally:
+        if stream is not None:
+            stream.close()
         if og.app is not None:  # og.shutdown() exits with status 0 when Isaac Sim was never launched
             og.shutdown()
     sys.exit(exit_code)

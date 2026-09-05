@@ -32,7 +32,7 @@ def main() -> None:
     ap.add_argument("--activity-instance", type=int, default=0)
     ap.add_argument("--not-load", default="ceilings", help="comma-separated categories to leave out")
     ap.add_argument("--place", action="append", default=[], metavar="OBJ:SUPPORT[:DX,DY]")
-    ap.add_argument("--stand-for", default=None, metavar="ITEM,TARGET", help="base pose reaching both")
+    ap.add_argument("--stand-for", default=None, metavar="ITEM[,ITEM...],TARGET", help="base pose reaching all")
     ap.add_argument("--steps", type=int, default=300, help="steps between liveness lines")
     args = ap.parse_args()
 
@@ -60,8 +60,7 @@ def main() -> None:
         dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) > 2 else (0.0, 0.0)
         sim.place_on(parts[0], parts[1], dx, dy)
     if args.stand_for:
-        item, target = args.stand_for.split(",")
-        sim.place_robot_for(item, target)
+        sim.place_robot_for(*[n for n in args.stand_for.split(",") if n])
 
     embodiment = load_embodiment_meta()
     sim.apply_posture(embodiment["locked_joints"], embodiment["q_home"], joint_names=embodiment["joint_names"])
@@ -71,9 +70,7 @@ def main() -> None:
     pos, _ = sim.robot.get_position_orientation()
     x, y = float(pos[0]), float(pos[1])
     eye = (x - 1.6, y - 1.6, 2.0)
-    og.sim.viewer_camera.set_position_orientation(
-        position=eye, orientation=look_at_quat_xyzw(eye, (x, y, 1.0))
-    )
+    og.sim.viewer_camera.set_position_orientation(position=eye, orientation=look_at_quat_xyzw(eye, (x, y, 1.0)))
     print("[stream] ready -- connect the Isaac Sim WebRTC Streaming Client", flush=True)
 
     n = 0

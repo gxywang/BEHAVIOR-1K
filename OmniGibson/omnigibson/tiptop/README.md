@@ -74,13 +74,13 @@ Deploying the services on a lab GPU server (Blackwell, CUDA 12.8/13 drivers) and
 Services (any machine with a GPU; `~/.pixi/bin` on PATH, `LD_LIBRARY_PATH` unset):
 
 ```bash
-cd ~/tiptop-services/M2T2 && pixi run server --host 127.0.0.1 --port 8123          # grasp server
-cd ~/Desktop/BEHAVIOR-1K/tiptop && pixi run tiptop-server --config tiptop/config/tiptop_sim_panda.yml \
-    --num-particles 128 --max-planning-time 30 --rerun-mode disabled                 # planner, ws://…:8765
-# remote server: ssh -N -L 8765:127.0.0.1:8765 user@shenlong-gpu-01, then --host localhost below
+OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh                     # grasp server, http://127.0.0.1:8123
+TIPTOP_CONFIG=tiptop/config/tiptop_sim_panda.yml \
+    OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh          # planner ws://127.0.0.1:8765 + Rerun viewer
+# planner on a remote server: ssh -N -L 8765:127.0.0.1:8765 -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 <server>
 ```
 
-Simulator (conda env `behavior`; set `OMNIGIBSON_HEADLESS=1` or unset it for the GUI):
+Simulator (the sim env; set `OMNIGIBSON_HEADLESS=1` or unset it for the GUI):
 
 ```bash
 python -m omnigibson.tiptop.run capture --out-dir runs/scene1                       # obs.h5, capture.json, rgb/depth/masks png
@@ -90,64 +90,57 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 python -m omnigibson.tiptop.run live --host localhost --port 8765 --out-dir runs/live   # end-to-end over the websocket
 ```
 
-Demo with both visualizations on one machine (**laptop only** -- `stream` needs a display; for a server see
-"Rerun from the laptop" below): start the planner with `--rerun-mode stream`
-(`TIPTOP_RERUN_MODE=stream ~/tiptop-services/bin/start_tiptop_server.sh`), leave `OMNIGIBSON_HEADLESS` unset and run
-`live`. The Rerun viewer pops up on the first request (RGB, masks, grasps, robot, plan) and is re-spawned if you close
-it; the Isaac Sim window shows the executed trajectory. `--rerun-mode save` writes `tiptop.rrd` into each server run
-directory instead (`rerun <file>` to view later); `--rerun-mode connect --rerun-url rerun+http://host:9876/proxy`
-streams to a viewer you started yourself (`rerun` in the tiptop env), e.g. when the planner runs on another machine.
-During execution the client also streams the simulator's state back to the server (`sim_state` messages over a second
-connection to the same port), so the planner's robot model in Rerun follows the simulated joints in real time and each object gets a
-green copy that follows its simulated pose next to the grey perceived one; `--no-state-stream` turns this off, and
-`replay --state-stream host:port` mirrors an offline replay into a running server's view. In the viewer, `log_time` is
-wall-clock and `sim_time` is simulated seconds since the capture (0 = the planner's input, robot at the capture
-posture). If the 2D views are black and the robot is a heap at the origin, the time cursor is before the data: the
-viewer keeps the time panel state (paused, loop selection, speed) across runs, so press the go-to-end button or
-choose *Following*, and check the selected recording. Start a viewer yourself only with the tiptop env's `rerun`
-(`pixi run rerun`); a stray `rerun` of another version on `PATH` that already listens on port 9876 gets reused.
-
-### Rerun from the laptop
-
-On a headless server `--rerun-mode stream` cannot work (it spawns a native viewer and needs a display). Serve the
-viewer from the server instead and open it in a browser -- the laptop needs nothing installed, and the version
-matches the SDK by construction (Rerun requires viewer and SDK to be the same version; the env pins 0.27.3):
-
-```bash
-OmniGibson/omnigibson/tiptop/scripts/start_rerun_viewer.sh          # gRPC :9876, web viewer :9090
-TIPTOP_GPU=2 TIPTOP_RERUN_MODE=connect TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml \
-  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh       # planner logs into that viewer
-# laptop:
-ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
-#   then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy
-```
-
-Both ports must be forwarded: the browser loads the viewer from 9090 and then connects to 9876 itself. The same
-launcher replays a finished recording -- pass the file: `start_rerun_viewer.sh tiptop_server_outputs/<ts>/tiptop.rrd`.
-
-**"Address already in use"** comes from one of two places, and they are separate problems:
-
-- *On the server*: a viewer is already running. Re-running the launcher now says so and exits 0 -- one viewer
-  serves every planner run, so this is harmless. `ss -tlnp | grep -E '9876|9090'` shows who holds them.
-- *On the laptop*: `ssh -L` cannot bind because something local already listens on 9876 or 9090 -- usually your own
-  `rerun` (a stray `~/.local/bin/rerun` grabs 9876 by default) or an earlier tunnel still open. Close it, or map to
-  different local ports: `ssh -N -L 9091:127.0.0.1:9090 -L 9877:127.0.0.1:9876 shenlong-gpu-01`, then open
-  `http://127.0.0.1:9091/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9877%2Fproxy`.
-
-Do not start a local viewer on the laptop for this flow -- the browser is the viewer, and a local `rerun` is both
-the usual cause of the port clash and the wrong version (0.30.2 against the SDK's 0.27.3).
-
-The R1Pro renders as a mesh-less set of frames unless the visual meshes have been generated next to the URDF
-(they are gitignored, ~50 MB): `cd tiptop && pixi run python scripts/make_r1pro_embodiment.py --copy-meshes`.
-That also rewrites the tracked embodiment files with a machine-local provenance path -- `git -C tiptop checkout --
-tiptop/embodiments/assets/r1pro/r1pro_left_meta.yml` afterwards to keep the submodule clean.
-
 Options: `--objects mug,bowl,apple,banana`, `--task`, `--goal "on(mug,bowl)"` (drives the ground-truth atoms and the
 success check), `--grasping-mode physical|assisted|sticky`, `--no-video`, `--no-gt` (live only: send just the object
 names and goal atoms, the server runs its detector + SAM2 on the image; see "Ground truth vs. detector").
 
 Outputs per run: `obs.h5`, `capture.json` (poses, intrinsics, validation), `*_result.json` (tracking errors, gripper
-events, success), `*.mp4` from the external camera.
+events, success, the perception-to-simulator pairing), `*.mp4` from the capture camera.
+
+### Rerun
+
+The planner hosts the viewer (`--rerun-mode serve`, the launcher's default). Open
+`http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy` in a browser (both ports tunnelled when
+the planner runs elsewhere). Nothing is installed on the laptop, the viewer is the SDK's own (0.27.3, so the versions
+match by construction), there is exactly one recording per planner process, and the viewer dies with the planner, so
+a fresh tab never shows an earlier session. The planner refuses to start while 9876 or 9090 is taken (a viewer
+nobody owns would keep old data): `pkill -u $USER -f 'rerun --serve-web'`, or pass `--rerun-grpc-port` /
+`--rerun-web-port`. On the laptop, `ssh -L` fails the same way when a local `rerun` holds 9876; close it or map other
+local ports.
+
+What the recording holds:
+
+| entity | what | from |
+|---|---|---|
+| `r1pro_left/...`, `panda/...` | the planner's robot model at the simulator's current joints | planner (URDF); joints from the simulator |
+| `world/sim/<task name>` | green: the simulator's own meshes of the task objects at their simulated poses; grey-blue: furniture named on the command line | simulator |
+| `world/objects/<label>`, `obj_pcd/<label>`, `grasps/<label>/...`, `world/table`, `pcd`, `cam` | grey: what perception reconstructed for the *last* request (hulls, clouds, top 30 grasps, table plane, camera), cleared when the next request arrives | planner |
+| `rgb`, `bboxes`, `masks` | the last request's image, detections and masks | planner |
+| `sim/head_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | what the capture camera sees, and a third-person view over the robot's left shoulder | simulator, every 6 env steps |
+| `sim/gripper_opening_m` | the finger opening | simulator, every 2 env steps |
+
+Names: `world/sim/*` uses the simulator's task names (`candle_2` is `candle.n.01_2`); `world/objects/*` uses
+perception's, which number instances in detection order, so `candle_2` is usually a *different* candle in the two
+trees. Nothing is matched by name. After every plan the client pairs the two by position and logs one line per
+perceived object -- `perceived 'candle' (goal, 85 grasps) = simulated candle_2 (2.9 cm off)` -- saved as
+`perception` in `live_result.json`; a perceived object with no simulated partner within 8 cm is a false detection
+or a hull that landed somewhere else, and the goal object is the first line to read.
+
+Everything sits on the `log_time` timeline (wall clock). Keep the viewer on *Following* (time panel, bottom); the
+simulator runs slower than real time, so the view is live but not real-time-scaled. When the planner restarts,
+reload the tab.
+
+The simulator side is `client.SimStateStream`, a second websocket connection to the planner's port, open for the
+whole session: its meshes once, then joints and object poses every 2 env steps and JPEGs in every third message
+(`--no-state-stream` turns it off; `replay --state-stream host:port` mirrors an offline replay). Other planner modes:
+`TIPTOP_RERUN_MODE=save` writes one `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<ts>/`
+(`cd tiptop && pixi run rerun --serve-web --bind 127.0.0.1 <file>` replays it in the browser the same way),
+`connect` streams to a viewer you started, `stream` spawns the native viewer (needs a display).
+
+The R1Pro renders as a mesh-less set of frames unless the visual meshes have been generated next to the URDF
+(they are gitignored, ~50 MB): `cd tiptop && pixi run python scripts/make_r1pro_embodiment.py --copy-meshes`.
+That also rewrites the tracked embodiment files with a machine-local provenance path -- `git -C tiptop checkout --
+tiptop/embodiments/assets/r1pro/r1pro_left_meta.yml` afterwards to keep the submodule clean.
 
 ## R1Pro in a BEHAVIOR scene
 
@@ -226,28 +219,39 @@ python -m omnigibson.tiptop.run task --embodiment r1pro --activity assembling_gi
     --attempts-per-item 2 --host localhost --port 8765 --out-dir runs/gift_task
 ```
 
-What replaces navigation for now: `--stand-for ITEM,TARGET` searches a base pose from which both objects are ahead,
-on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports an object (used to bring a
-basket from the floor onto the coffee table, standing in for a carry); `--sequential` runs one
-capture/plan/execute round per goal atom, re-standing before each. The rules forbid teleporting during evaluation,
-so these are test scaffolding until the base moves under its own controller.
+What replaces navigation for now: `--stand-for ITEM[,ITEM...],TARGET` searches one base pose from which every
+item and the target are ahead, on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports
+an object before the episode (used to bring a basket from the floor onto the coffee table, standing in for a
+carry); `--sequential` runs one capture/plan/execute round per goal atom from where the robot stands (`--restand`
+teleports the base to a fresh pose before each round instead). The rules forbid teleporting during evaluation, so
+these are test scaffolding until the base moves under its own controller.
 
 Target task: `assembling_gift_baskets` (task 26, house_double_floor_lower living room, 4 wicker baskets on the
 floor, 4 candles + 4 butter cookies + 4 Swiss cheeses + 4 bows on a 0.41 m coffee table, goal one of each inside
 every basket; the longest task at 869 s mean human time, no 2025 submission ever completed it).
 
+The demo: the scene loads, one basket is put on the coffee table, the robot is placed once next to it and stays
+there, and the planner fills the basket from that spot, one item per round:
+
 ```bash
 python -m omnigibson.tiptop.run live --embodiment r1pro --activity assembling_gift_baskets \
-    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 --sequential \
-    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(candle.n.01_2,wicker_basket.n.01_2)" \
+    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
+    --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2 --sequential \
+    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2)" \
     --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
-    --host localhost --port 8765 --out-dir runs/gift_5
+    --host localhost --port 8765 --out-dir runs/demo
 ```
 
-Result of that command (2026-09-03, headless, detector + SAM2, no ground truth): both transfers succeeded, the
-task's partial-credit score went 0 -> 0.0625 -> 0.125 (2 of the 16 `inside` predicates; the best 2025 submission
-reached 0.31 on this task, none completed it). Per round: stand 1 s, capture 10 s (the renderer needs ~25 frames
-to settle after the base moves), detect + segment 2 s, cuTAMP 1-2 s, execute 25 s, goal scoring 7 s.
+More items from the same spot: name them all in `--stand-for` and `--goal`; the pose search fails loudly, with
+its rejection counts, when no single base pose reaches every one of them (the coffee table is 1.6 m long and the
+arm reaches 0.9 m). With `--stand-for candle.n.01_4,swiss_cheese.n.01_1,wicker_basket.n.01_2` (2026-09-05, both
+0.8 m away) the candle was set down on the basket's rim, the arm tipped the basket on the way back and the cheese
+went where the basket had been: the planner places on the hull's top face, and its 1 cm surface shrink is less
+than a wicker rim. With a fresh base pose per round (`--restand`, 2026-09-03: cookie then candle, each 0.7 m away)
+both items went in and the task's partial-credit score moved 0 -> 0.0625 -> 0.125 (2 of the 16 `inside`
+predicates; the best 2025 submission reached 0.31 on this task, none completed it). Per round: capture 10 s (the
+renderer needs ~25 frames to settle after the base moves), detect + segment 2 s, cuTAMP 1-2 s, execute 25 s, goal
+scoring 7 s.
 
 | Item | Detector | M2T2 grasps | Outcome |
 |---|---|---|---|

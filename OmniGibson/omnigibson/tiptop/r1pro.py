@@ -23,7 +23,7 @@ import yaml
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
-from omnigibson.tiptop.scene import OBJECT_PRESETS, TiptopSim, look_at_quat_xyzw
+from omnigibson.tiptop.scene import OBJECT_PRESETS, TiptopSim, look_at_quat_xyzw, overview_cam_config
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ ROBOT_NAME = "robot_r1"
 ROBOT_TYPE = "r1pro_left"
 CAMERA_LINKS = {"head": "zed_link", "wrist": "left_realsense_link"}
 SHADOW_CAM = "tiptop_cam"  # external sensor moved onto the robot camera's pose for each capture (see _capture_obs)
+OVERVIEW_CAM = "overview_cam"  # third-person camera for the Rerun mirror, placed behind-left of the robot
 # Capture posture: the ready posture with the left shoulder abducted so the arm swings out to the robot's left, out of
 # the head camera's view. In the ready posture the gripper sits in front of the table objects and hides most of them
 # (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
@@ -180,7 +181,7 @@ def make_r1pro_env_config(
             "action_frequency": 30,
             "rendering_frequency": 30,
             "physics_frequency": 120,
-            "external_sensors": [shadow_cam],
+            "external_sensors": [shadow_cam, overview_cam_config()],  # the overview is aimed by place_robot
         },
         "scene": scene,
         "robots": [
@@ -234,6 +235,7 @@ class R1ProSim(TiptopSim):
 
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)
+    STREAM_CAMERA = "head_cam"
     look_arm = LOOK_ARM  # joint overrides on top of q_home for the capture; None: capture in the ready posture
 
     def __init__(self, config: dict, camera: str = "head"):
@@ -249,14 +251,18 @@ class R1ProSim(TiptopSim):
         self.cam_name = f"{self.robot.name}:{CAMERA_LINKS[camera]}:Camera:0"
         self.robot_cam = self.robot.sensors[self.cam_name]
         self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
+        self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
+        self.context = {}  # furniture shown in the Rerun mirror (track_context)
         self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
+        self.state_stream = None  # R1ProSim does not call super().__init__; keep TiptopSim's defaults
+        self.n_steps = 0
         self.last_obs = None
-        self.last_capture_rgb = None  # R1ProSim does not call super().__init__; keep TiptopSim's defaults
-        self.capture_object_mats_base = {}
+        self.last_capture_rgb = None
         self.capture_object_aabb_min_z = {}
+        self._stream_meshes = {}
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
         self.robot.base_footprint_link.mass = BASE_MASS_KG
@@ -516,6 +522,12 @@ class R1ProSim(TiptopSim):
         for name in names:
             self.objects[name] = self.scene_object(name)
 
+    def track_context(self, *names: str) -> None:
+        """Furniture drawn in the Rerun mirror for orientation (never sent to the planner)."""
+        for name in names:
+            if name:
+                self.context[name] = self.scene_object(name)
+
     def place_on(self, name: str, support: str, dx: float = 0.0, dy: float = 0.0, lift: float = 0.01) -> None:
         """Drop a tracked object onto the top of a piece of furniture (AABB top + offsets)."""
         obj, sup = self.scene_object(name), self.scene_object(support)
@@ -525,7 +537,8 @@ class R1ProSim(TiptopSim):
         pos = th.tensor([center[0] + dx, center[1] + dy, hi[2] + (ohi[2] - olo[2]) / 2 + lift], dtype=th.float32)
         obj.set_position_orientation(position=pos, orientation=th.tensor([0.0, 0.0, 0.0, 1.0]))
         obj.keep_still()
-        self.objects[name] = obj
+        if obj not in self.objects.values():  # task objects are already tracked under their label
+            self.objects[name] = obj
         log.info(f"placed {name} on {support} at {np.round(pos.numpy(), 3).tolist()} (support top z={hi[2]:.3f})")
 
     def scene_aabbs(self) -> list[tuple]:
@@ -605,21 +618,27 @@ class R1ProSim(TiptopSim):
         return 0.5 * math.hypot(ex, ey)
 
     def best_base_pose(
-        self, p_item_xy, p_target_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=(0.0, 0.0)
+        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None
     ) -> tuple[tuple | None, dict]:
-        """Best base pose with two points (world xy) both ahead and to the left, within the left arm's reach.
+        """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
+        the left arm's reach.
 
-        Candidates on rings around the two points' midpoint, facing it; scored by the farther point's distance and
-        how far left both are (lower is better), rejected when a point is behind the robot, well to its right, out of
-        reach, outside the head camera's view, or the footprint is not free (``ignore``: objects that do not count;
-        ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken here otherwise).
+        Candidates on rings around the points' centroid, facing it; scored by the farthest point's distance and
+        how far left the points are (lower is better), rejected when a point is behind the robot, well to its right,
+        out of reach, outside the head camera's view, hidden behind the container, or the footprint is not free
+        (``ignore``: objects that do not count; ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken
+        here otherwise).
 
         ``half_widths``: each point's xy radius, so the view test can keep the object's *edges* in frame and not just
-        its centre; 0 (the default) reproduces the point test for callers that pass bare positions.
-        Returns ((score, x, y, yaw, dist, side) or None, rejection counts by reason).
+        its centre; None reproduces the point test for callers that pass bare positions.
+        Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
         """
-        p_item, p_target = np.asarray(p_item_xy)[:2], np.asarray(p_target_xy)[:2]
-        mid = (p_item + p_target) / 2
+        pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
+        if len(pts) < 2:
+            raise ValueError("best_base_pose needs at least one item and the target")
+        half_widths = [0.0] * len(pts) if half_widths is None else list(half_widths)
+        t = len(pts) - 1  # the target (container) is last
+        mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         best, rejected, footprint = None, {}, {}  # footprint: (x, y) -> _footprint_free result (yaw-independent)
         for radius in np.arange(0.35, 0.95, 0.05):
@@ -628,24 +647,26 @@ class R1ProSim(TiptopSim):
                 for yaw_offset in np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12):
                     yaw = np.arctan2(mid[1] - y, mid[0] - x) + yaw_offset
                     fwd, left = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
-                    rel = [(p - np.array([x, y])) for p in (p_item, p_target)]
+                    rel = [p - np.array([x, y]) for p in pts]
                     ahead = [float(r @ fwd) for r in rel]
                     side = [float(r @ left) for r in rel]
                     dist = [float(np.linalg.norm(r)) for r in rel]
                     # the torso can turn, so a little to the right is acceptable; well to the left is preferred;
-                    # both must be inside the head camera's view (about +-45 deg of forward; the camera sees +-50)
+                    # all must be inside the head camera's view (about +-45 deg of forward; the camera sees +-50)
                     if min(ahead) < 0.15 or min(side) < -0.3 or max(dist) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
                     if min(dist) < CAMERA_MIN_DIST:  # below the head camera's frame (a cookie at 0.42 m: empty mask)
                         rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
                         continue
-                    # a container nearer than the item and in line with it hides the item (empty mask): keep their
+                    # a container nearer than an item and in line with it hides the item (empty mask): keep their
                     # bearings apart by the container's angular half-width plus a margin for the item
                     bearing = [math.atan2(sd, ah) for ah, sd in zip(ahead, side)]
-                    apart = abs(bearing[0] - bearing[1])
-                    if dist[1] < dist[0] + 0.05 and apart < math.atan(TARGET_HALF_WIDTH / dist[1]) + math.atan(
-                        0.06 / dist[0]
+                    if any(
+                        dist[t] < dist[i] + 0.05
+                        and abs(bearing[i] - bearing[t])
+                        < math.atan(TARGET_HALF_WIDTH / dist[t]) + math.atan(0.06 / dist[i])
+                        for i in range(t)
                     ):
                         rejected["container hides the item"] = rejected.get("container hides the item", 0) + 1
                         continue
@@ -664,10 +685,7 @@ class R1ProSim(TiptopSim):
                         for br, d, hw in zip(bearing, dist, half_widths)
                     )
                     score = (
-                        max(dist)
-                        + 0.5 * max(0.0, 0.15 - min(side))
-                        + 0.1 * abs(yaw_offset)
-                        + FRAMING_PENALTY * clipped
+                        max(dist) + 0.5 * max(0.0, 0.15 - min(side)) + 0.1 * abs(yaw_offset) + FRAMING_PENALTY * clipped
                     )
                     if best is None or score < best[0]:
                         key = (float(x), float(y))
@@ -680,37 +698,41 @@ class R1ProSim(TiptopSim):
                             rejected[why] = rejected.get(why, 0) + 1
         return best, rejected
 
-    def place_robot_for(self, item: str, target: str, ignore_names=(), reach: float = 0.9) -> dict:
-        """Stand where ITEM and TARGET are both in the left arm's reach ("navigation done"): best pose + place_robot.
+    def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9) -> dict:
+        """Stand where every item and the target (the last name) are in the left arm's reach ("navigation done").
 
         ignore_names: objects that do not count as obstacles, resolved like place_robot_near's (unknown names raise).
         """
-        p_item = self.scene_object(item).aabb_center.cpu().numpy()[:2]
-        p_target = self.scene_object(target).aabb_center.cpu().numpy()[:2]
+        if len(names) < 2:
+            raise ValueError("place_robot_for needs ITEM[,ITEM...],TARGET")
+        points = [self.scene_object(n).aabb_center.cpu().numpy()[:2] for n in names]
         ignore = [self.scene_object(n) for n in ignore_names]
-        half_widths = (self.xy_radius(item), self.xy_radius(target))
         best, rejected = self.best_base_pose(
-            p_item, p_target, ignore=ignore, reach=reach, half_widths=half_widths
+            points, ignore=ignore, reach=reach, half_widths=[self.xy_radius(n) for n in names]
         )
         if best is None:
             raise RuntimeError(
-                f"no base pose reaches both {item!r} and {target!r} within {reach} m (objects {np.round(p_item, 2)}, "
-                f"{np.round(p_target, 2)}; rejections {dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
+                f"no base pose reaches {list(names)} within {reach} m (objects "
+                f"{[np.round(p, 2).tolist() for p in points]}; rejections "
+                f"{dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
             )
         score, x, y, yaw, dist, side = best
         log.info(
-            f"standing for {item} + {target}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
+            f"standing for {' + '.join(names)}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
             f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m"
         )
-        return self.place_robot(float(x), float(y), float(yaw), note=f"stand for {item} + {target}")
+        return self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
+        # third-person view of the workspace over the robot's left shoulder: the overview camera in the Rerun
+        # mirror, and the Isaac Sim viewport when there is one
+        eye = (x - 1.5 * math.cos(yaw) - 1.1 * math.sin(yaw), y - 1.5 * math.sin(yaw) + 1.1 * math.cos(yaw), 1.7)
+        target = (x + 0.7 * math.cos(yaw), y + 0.7 * math.sin(yaw), 0.55)
+        self.aim_overview(eye, target)
         if not gm.HEADLESS:
-            eye = (x - 2.2 * math.cos(yaw) - 1.0 * math.sin(yaw), y - 2.2 * math.sin(yaw) + 1.0 * math.cos(yaw), 2.0)
-            target = (x + 0.8 * math.cos(yaw), y + 0.8 * math.sin(yaw), 0.8)
             og.sim.viewer_camera.set_position_orientation(
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
@@ -812,9 +834,9 @@ class R1ProSim(TiptopSim):
         if not np.allclose(k_robot, k_shadow, atol=0.5):
             raise RuntimeError(f"shadow camera intrinsics {k_shadow.tolist()} != robot camera {k_robot.tolist()}")
         p2, q2 = self.cam.get_position_orientation()
-        assert th.allclose(p2, pos, atol=1e-4) and th.allclose(
-            q2.abs(), quat.abs(), atol=1e-4
-        ), "shadow camera did not move"
+        assert th.allclose(p2, pos, atol=1e-4) and th.allclose(q2.abs(), quat.abs(), atol=1e-4), (
+            "shadow camera did not move"
+        )
         return self.cam.get_obs()
 
     def camera_rgb(self) -> np.ndarray | None:

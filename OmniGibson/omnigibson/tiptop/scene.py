@@ -5,9 +5,15 @@ Conventions handled here (the parts that silently break a TiPToP integration):
 - TiPToP expects an OpenCV camera (+x right, +y down, +z forward) while OmniGibson/USD cameras look down -z with +y up.
 - TiPToP expects z-depth (distance to the image plane) = OmniGibson ``depth_linear``, not ``depth`` (ray length).
 - OmniGibson quaternions are (x, y, z, w); the droid H5 layout stores (w, x, y, z).
+
+The simulator also mirrors itself into the planner's Rerun view (``state_stream``, see client.SimStateStream): its
+own object meshes under their task names, the planned joints, the finger opening and two camera images, a few times
+per simulated second, from ``step``.
 """
 
+import io
 import logging
+import time
 
 import numpy as np
 import torch as th
@@ -31,8 +37,13 @@ log = logging.getLogger(__name__)
 TABLE_HEIGHT = 0.75  # world z of the table top; the robot base sits on it, so base-frame z = 0 there
 FINGER_OPEN = 0.04
 CAMERA_NAME = "tiptop_cam"
-VIEWER_EYE = (1.9, -1.6, 1.7)  # Isaac Sim viewport pose in GUI mode, world frame
+OVERVIEW_CAM = "overview_cam"  # third-person rgb camera for the Rerun mirror, aimed at the workspace
+OVERVIEW_SIZE = (640, 360)
+VIEWER_EYE = (1.9, -1.6, 1.7)  # Isaac Sim viewport / overview camera pose in the Panda scene, world frame
 VIEWER_TARGET = (0.45, 0.0, 0.8)
+STREAM_MAX_FACES = 4000  # meshes sent to the Rerun mirror are decimated to this many triangles
+STREAM_IMAGE_MAX_PX = 480  # longest side of the JPEGs in the mirror
+STREAM_JPEG_QUALITY = 75
 
 # Objects with ground-truth instance segmentation; names double as the labels used in goal atoms.
 OBJECT_PRESETS = {
@@ -77,6 +88,38 @@ def look_at_quat_xyzw(eye, target, up=(0.0, 0.0, 1.0)) -> list[float]:
     return T.mat2quat(th.tensor(rot, dtype=th.float32)).tolist()
 
 
+def overview_cam_config(eye=(0.0, 0.0, 3.0), target=(1.0, 0.0, 0.0)) -> dict:
+    """External rgb sensor for the Rerun mirror; not in the observation, read on demand by ``stream_images``."""
+    return {
+        "sensor_type": "VisionSensor",
+        "name": OVERVIEW_CAM,
+        "relative_prim_path": f"/{OVERVIEW_CAM}",
+        "modalities": ["rgb"],
+        "sensor_kwargs": {
+            "image_width": OVERVIEW_SIZE[0],
+            "image_height": OVERVIEW_SIZE[1],
+            "focal_length": 17.0,
+            "horizontal_aperture": 40.0,
+        },
+        "position": list(eye),
+        "orientation": look_at_quat_xyzw(eye, target),
+        "include_in_obs": False,
+    }
+
+
+def jpeg_bytes(rgb: np.ndarray, max_px: int = STREAM_IMAGE_MAX_PX, quality: int = STREAM_JPEG_QUALITY) -> bytes:
+    """(H, W, 3) uint8 -> JPEG, downscaled so the longer side is at most ``max_px``."""
+    from PIL import Image
+
+    img = Image.fromarray(np.ascontiguousarray(rgb[..., :3]))
+    if max(img.size) > max_px:
+        scale = max_px / max(img.size)
+        img = img.resize((max(1, round(img.size[0] * scale)), max(1, round(img.size[1] * scale))), Image.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def make_env_config(
     objects=("mug", "bowl"),
     q_init=DROID_Q_INIT,
@@ -107,7 +150,8 @@ def make_env_config(
                     "position": list(camera_pos),
                     "orientation": look_at_quat_xyzw(camera_pos, camera_target),
                     "include_in_obs": True,
-                }
+                },
+                overview_cam_config(VIEWER_EYE, VIEWER_TARGET),
             ],
         },
         "scene": {"type": "Scene", "use_floor_plane": True, "floor_plane_visible": True},
@@ -166,6 +210,11 @@ def canonical_object_name(name: str) -> tuple:
     return (category, index) if category and index.isdigit() else (name, "")
 
 
+def rerun_name(name: str) -> str:
+    """Entity-path-safe object name for the Rerun mirror ('table.n.02_1' -> 'table_n_02_1')."""
+    return name.replace(".", "_").replace(" ", "_").replace("/", "_")
+
+
 class TiptopSim:
     """Owns the OmniGibson environment and produces TiPToP observations / executes joint targets."""
 
@@ -177,6 +226,7 @@ class TiptopSim:
     # the same basket framed in the round that succeeded. The AABB over-estimates the silhouette, so keep it low.
     FRAME_COVERAGE_MIN = 0.5
     gt_mask_tol = 0.008  # geometry masks: surface distance (m) within which a depth pixel belongs to an object
+    STREAM_CAMERA = "cam"  # name of the capture camera's image in the Rerun mirror
 
     def __init__(self, config: dict):
         self.config = config
@@ -187,15 +237,19 @@ class TiptopSim:
             )
         self.robot = self.env.robots[0]
         self.cam = self.env.external_sensors[CAMERA_NAME]
+        self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         arm = self.robot.default_arm
         self.arm_idx = self.robot.arm_control_idx[arm]
         self.gripper_idx = self.robot.gripper_control_idx[arm]
         self.dt = og.sim.get_sim_step_dt()
         self.objects = {name: self.env.scene.object_registry("name", name) for name in self.object_names()}
+        self.context = {"table": self.env.scene.object_registry("name", "table")}  # furniture shown in the mirror
+        self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self.n_steps = 0
         self.last_obs = None
         self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
-        self.capture_object_mats_base = {}
         self.capture_object_aabb_min_z = {}
+        self._stream_meshes = {}
         joint_names = list(self.robot.joints.keys())
         log.info(
             f"robot DOF order: {joint_names}; arm idx {self.arm_idx.tolist()}, gripper idx {self.gripper_idx.tolist()}"
@@ -230,17 +284,20 @@ class TiptopSim:
             th.as_tensor(pos, dtype=th.float32), th.as_tensor(quat, dtype=th.float32), base_pos, base_quat
         )
 
-    def object_deltas_base(self) -> dict:
-        """Per object: base-frame rigid transform from its pose at the last capture to its pose now (4x4)."""
-        deltas = {}
-        for name, cap in getattr(self, "capture_object_mats_base", {}).items():
-            pos_b, quat_b = self.to_base(*self.objects[name].get_position_orientation())
-            now = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
-            deltas[name] = (now @ np.linalg.inv(cap)).astype(np.float32)
-        return deltas
+    @property
+    def sim_time(self) -> float:
+        return self.n_steps * self.dt
 
     def object_poses_world(self) -> dict:
         return {name: [p.tolist() for p in obj.get_position_orientation()] for name, obj in self.objects.items()}
+
+    def object_poses_base_mats(self) -> dict:
+        """Base-frame 4x4 pose of every mirrored object (tracked objects and context furniture), by Rerun name."""
+        mats = {}
+        for name, obj in (*self.objects.items(), *self.context.items()):
+            pos_b, quat_b = self.to_base(*obj.get_position_orientation())
+            mats[rerun_name(name)] = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float32)
+        return mats
 
     def apply_object_poses(self, poses: dict) -> None:
         for name, (pos, quat) in poses.items():
@@ -255,6 +312,9 @@ class TiptopSim:
 
     def step(self, q_arm, gripper: float):
         self.last_obs = self.env.step(self.action(q_arm, gripper))[0]
+        self.n_steps += 1
+        if self.state_stream is not None:
+            self.state_stream.on_step(self)
         return self.last_obs
 
     def hold(self, n_steps: int, gripper: float = OPEN, q_arm=None):
@@ -266,6 +326,65 @@ class TiptopSim:
         if self.last_obs is None or "external" not in self.last_obs:
             return None
         return self.last_obs["external"][CAMERA_NAME]["rgb"][..., :3].cpu().numpy().astype(np.uint8)
+
+    # ---------------------------------------------------------------- Rerun mirror
+    def aim_overview(self, eye, target) -> None:
+        if self.overview is not None:
+            self.overview.set_position_orientation(
+                position=th.tensor(eye, dtype=th.float32), orientation=th.tensor(look_at_quat_xyzw(eye, target))
+            )
+
+    def stream_images(self) -> dict:
+        """JPEGs for the mirror: the capture camera as the robot sees it, and the overview camera."""
+        images = {}
+        rgb = self.camera_rgb()
+        if rgb is not None:
+            images[self.STREAM_CAMERA] = jpeg_bytes(rgb)
+        if self.overview is not None:
+            over = self.overview.get_obs()[0].get("rgb")
+            if over is not None and over.numel():
+                images["overview"] = jpeg_bytes(over.cpu().numpy().astype(np.uint8))
+        return images
+
+    def stream_scene(self) -> dict:
+        """Every mirrored object's mesh in its own frame plus its current base-frame pose (see SimStateStream)."""
+        t0 = time.time()
+        poses = self.object_poses_base_mats()
+        scene = {}
+        for kind, group in (("object", self.objects), ("context", self.context)):
+            for name, obj in group.items():
+                key = rerun_name(name)
+                if key not in self._stream_meshes:
+                    try:
+                        self._stream_meshes[key] = self.mesh_local(obj)
+                    except Exception as e:  # noqa: BLE001 - a missing mesh only costs its picture in the viewer
+                        log.warning(f"no mesh for {name!r} in the Rerun mirror ({e})")
+                        self._stream_meshes[key] = None
+                if self._stream_meshes[key] is None:
+                    continue
+                vertices, faces = self._stream_meshes[key]
+                scene[key] = {"vertices": vertices, "faces": faces, "pose": poses[key], "kind": kind}
+        log.info(
+            f"Rerun mirror: {len(scene)} meshes, {sum(len(m['faces']) for m in scene.values())} triangles "
+            f"({time.time() - t0:.1f}s)"
+        )
+        return scene
+
+    def mesh_local(self, obj) -> tuple[np.ndarray, np.ndarray]:
+        """(vertices (N, 3) f32, faces (M, 3) i32) of an object in its own frame, decimated to STREAM_MAX_FACES."""
+        tm = self.trimesh_world(obj)
+        pos, quat = obj.get_position_orientation()
+        rot = T.quat2mat(quat).cpu().numpy().astype(np.float64)
+        vertices = (np.asarray(tm.vertices, dtype=np.float64) - pos.cpu().numpy()) @ rot
+        faces = np.asarray(tm.faces, dtype=np.int64)
+        if len(faces) > STREAM_MAX_FACES:
+            import open3d as o3d
+
+            mesh = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(faces)
+            ).simplify_quadric_decimation(target_number_of_triangles=STREAM_MAX_FACES)
+            vertices, faces = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+        return vertices.astype(np.float32), faces.astype(np.int32)
 
     # ---------------------------------------------------------------- observation
     def _capture_obs(self) -> tuple[dict, dict]:
@@ -340,11 +459,9 @@ class TiptopSim:
             request["robot_mask"] = robot_mask  # the server keeps SAM2 off these pixels (occluding gripper)
 
         object_poses_base = {}
-        self.capture_object_mats_base = {}
         self.capture_object_aabb_min_z = {name: float(obj.aabb[0][2]) for name, obj in self.objects.items()}
         for name, obj in self.objects.items():
             pos_b, quat_b = self.to_base(*obj.get_position_orientation())
-            self.capture_object_mats_base[name] = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
             aabb_center_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
             lo, hi = obj.aabb
             identity = th.tensor([0.0, 0.0, 0.0, 1.0])
@@ -376,14 +493,15 @@ class TiptopSim:
         }
         return request, extras
 
-    def object_trimesh_world(self, name: str) -> trimesh.Trimesh:
-        """Every visual mesh of every link of ``self.objects[name]`` as one trimesh in the WORLD frame (current pose).
+    @staticmethod
+    def trimesh_world(obj) -> trimesh.Trimesh:
+        """Every visual mesh of every link of ``obj`` as one trimesh in the WORLD frame (current pose).
 
         Links without visual meshes contribute their collision meshes. Poses come from the Fabric hierarchy, so the
         result is current after teleports / set_position_orientation without a physics step.
         """
         parts = []
-        for link in self.objects[name].links.values():
+        for link in obj.links.values():
             # meta-link volumes (particleapplier, slicer, fluidsource, ...) sit in visual_meshes with purpose "guide":
             # never rendered, so they must not claim depth pixels; collision meshes are all "guide" and stay unfiltered
             geoms = {k: g for k, g in link.visual_meshes.items() if g.purpose != "guide"} or link.collision_meshes
@@ -394,8 +512,11 @@ class TiptopSim:
                     )
                 )
         if not parts:
-            raise ValueError(f"object {name!r} has no visual or collision meshes")
+            raise ValueError(f"object {obj.name!r} has no visual or collision meshes")
         return trimesh.util.concatenate(parts)
+
+    def object_trimesh_world(self, name: str) -> trimesh.Trimesh:
+        return self.trimesh_world(self.objects[name])
 
     def geometry_masks(
         self, depth, intrinsics, cam_pos_world, cam_quat_cv_world, labels, tol: float | None = None

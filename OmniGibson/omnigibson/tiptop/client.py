@@ -130,54 +130,107 @@ class TiptopClient:
 
 
 class SimStateStream:
-    """Streams the simulator's robot joints and object poses to the server so its Rerun view follows the sim.
+    """Mirrors the simulator into the planner's Rerun view over a second websocket connection to the same port.
 
-    Protocol (additive, tiptop fork >= 6a790df+): after the metadata frame, the client sends msgpack dicts
-    {"type": "sim_state", "t": s, "q": (dof,) planned joints in the server's joint order, "q_gripper": finger opening m,
-     "objects": {label: (4,4) base-frame transform relative to the pose at capture}}
-    until it closes the connection. The server logs them into its current Rerun recording. Any failure only
-    disables the stream; execution never depends on it.
+    The server's ``_sim_state_stream`` is the other end. Messages are msgpack with numpy arrays:
+      sim_scene  {"type": "sim_scene", "objects": {name: {"vertices": (N, 3) f32 in the object's own frame,
+                  "faces": (M, 3) i32, "pose": (4, 4) f32 base-frame pose, "kind": "object" | "context"}}}
+                 once per connection: the simulator's own meshes (task objects, and furniture named as context)
+      sim_state  {"type": "sim_state", "t": simulated seconds, "q": (dof,) f32 planned joints in the server's joint
+                  order, "q_gripper": finger opening (m), "objects": {name: (4, 4) f32 base-frame pose},
+                  "images": {name: JPEG bytes}}   every ``every`` env steps; images in every ``image_every``-th one
+    Names are the simulator's own (task instance names, ``candle_2``); the server keeps perception's names for its
+    hulls and matches nothing by name. ``attach`` once per session; ``TiptopSim.step`` calls ``on_step``. A failure
+    never reaches the episode: a dropped connection is retried every ``reconnect_s`` (``max_failures`` times in a
+    row, then the mirror is off), an error while reading the simulator turns the mirror off at once.
     """
 
-    def __init__(self, host: str, port: int = 8765, every: int = 1):
+    def __init__(
+        self,
+        host: str,
+        port: int = 8765,
+        every: int = 2,
+        image_every: int = 3,
+        reconnect_s: float = 5.0,
+        max_failures: int = 3,
+    ):
         self.uri = f"ws://{host}:{port}"
         self.every = max(1, int(every))
+        self.image_every = max(1, int(image_every))
+        self.reconnect_s = reconnect_s
+        self.max_failures = max_failures
         self.ws = None
+        self.sim = None
         self.sent = 0
         self.calls = 0
+        self.failures = 0  # connection attempts failed in a row
+        self.disabled = False  # no mirror on the server, too many failed connections, or the simulator side failed
+        self._last_attempt = 0.0
 
-    def open(self) -> bool:
+    def attach(self, sim) -> bool:
+        """Connect, send the simulator's meshes and hook into ``sim.step``; False if not connected (yet)."""
+        self.sim = sim
+        ok = self._connect()
+        sim.state_stream = None if self.disabled else self
+        return ok
+
+    def _connect(self) -> bool:
+        self._last_attempt = time.time()
         try:
-            self.ws = connect(self.uri, compression=None, max_size=None, open_timeout=10.0, close_timeout=2.0)
-            metadata = unpackb(self.ws.recv(timeout=30.0))
+            self.ws = connect(self.uri, compression=None, max_size=None, open_timeout=3.0, close_timeout=2.0)
+            metadata = unpackb(self.ws.recv(timeout=10.0))
             if not metadata.get("sim_state_supported"):
                 log.warning("tiptop-server does not accept sim_state messages; not streaming sim state")
                 self.close()
+                self.disabled = True
                 return False
-            log.info(f"streaming sim state to {self.uri} every {self.every} step(s)")
+            scene = self.sim.stream_scene()
+            self.ws.send(packb({"type": "sim_scene", "objects": scene}))
+            self.failures = 0
+            log.info(
+                f"streaming sim state to {self.uri}: {len(scene)} meshes, state every {self.every} step(s), "
+                f"images in every {self.image_every}. message"
+            )
             return True
         except Exception as e:
-            log.warning(f"sim state stream unavailable ({e})")
-            self.ws = None
+            self.close()
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                self.disabled = True
+                log.warning(f"sim state stream unavailable ({e}); giving up after {self.failures} attempts")
+            else:
+                log.warning(f"sim state stream unavailable ({e}); retrying in {self.reconnect_s:.0f} s")
             return False
 
-    def send(self, t: float, q_arm, q_gripper: float, objects: dict) -> None:
+    def on_step(self, sim) -> None:
         self.calls += 1
-        if self.ws is None or (self.calls - 1) % self.every:
+        if self.disabled or (self.calls - 1) % self.every:
             return
-        msg = {
-            "type": "sim_state",
-            "t": float(t),
-            "q": np.asarray(q_arm, dtype=np.float32),
-            "q_gripper": float(q_gripper),
-            "objects": {k: np.asarray(v, dtype=np.float32) for k, v in objects.items()},
-        }
+        if self.ws is None and (time.time() - self._last_attempt < self.reconnect_s or not self._connect()):
+            return
         try:
-            self.ws.send(packb(msg))
-            self.sent += 1
-        except Exception as e:
-            log.warning(f"sim state stream stopped after {self.sent} messages ({e})")
+            msg = {
+                "type": "sim_state",
+                "t": float(sim.sim_time),
+                "q": np.asarray(sim.q_arm(), dtype=np.float32),
+                "q_gripper": float(sim.q_fingers()[0]),
+                "objects": sim.object_poses_base_mats(),
+            }
+            if self.sent % self.image_every == 0:
+                msg["images"] = sim.stream_images()
+            payload = packb(msg)
+        except Exception as e:  # noqa: BLE001 - the mirror must never end an episode
+            log.warning(f"sim state mirror off: reading the simulator failed ({e})")
             self.close()
+            self.disabled = True
+            return
+        try:
+            self.ws.send(payload)
+            self.sent += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"sim state stream dropped after {self.sent} messages ({e}); reconnecting")
+            self.close()
+            self._last_attempt = time.time()
 
     def close(self) -> None:
         if self.ws is not None:
