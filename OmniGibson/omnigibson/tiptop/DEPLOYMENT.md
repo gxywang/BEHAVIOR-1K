@@ -115,15 +115,16 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
     particle(s)" and succeed on the next request (M2T2 grasp sampling differs per call). Retry before debugging.
 13. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
-14. **Blackwell WebRTC needs `UseRefactoredVideoEncoder=1`.** On an RTX PRO 6000 Blackwell (device `0x2BB5`) the
-    client connects and then shows black: the bundled StreamSDK 7.6.3 predates the card and logs
-    `VideoEncoder: Could not get encoded frame` per frame. Export `UseRefactoredVideoEncoder=1` (a StreamSDK regkey,
-    read from the environment by its bare name, or from `~/.config/regkeys.txt`) in the shell that launches the sim.
-    Verified A/B: unset -> 34 encoder errors, no picture; `=1` -> 0 errors, video flows. Ignore the
-    `GPU ... is not white-listed` warning; disassembly shows that branch falls through to the same success path.
-    NVENC is healthy on the card independently (h264/hevc/av1 all encode fine outside Isaac Sim). The wider fix is
-    a newer StreamSDK -- the official 5.1.0 *container* carries 7.7.2, and NVIDIA fixed an NVENC init failure on
-    this exact GPU in Kit 110.1.1 (Isaac Sim 6.0).
+14. **WebRTC streaming is unreliable on RTX PRO 6000 Blackwell; use Rerun.** The client connects, a few frames
+    arrive, the encoder stops producing and the client drops, repeatedly -- one session: 4 `FIRST_FRAME_SENT`
+    against 115 `VideoEncoder: Could not get encoded frame` and 24 `CLIENT_DISCONNECT_UNINTENDED`. The bundled
+    StreamSDK 7.6.3 predates the card (device `0x2BB5`). `UseRefactoredVideoEncoder=1`, a StreamSDK regkey read
+    from the environment, appeared to fix it on one short connection and does NOT hold up: a longer session with
+    it set still threw 115 errors. Two dead ends: the `GPU ... is not white-listed` warning gates nothing
+    (disassembly shows that branch falling through to the same success path), and NVENC is healthy on the card
+    (h264/hevc/av1 encode at 200+ fps outside Isaac Sim). The real fix is a newer StreamSDK -- the official 5.1.0
+    *container* carries 7.7.2, and NVIDIA fixed NVENC init on this exact GPU in Kit 110.1.1 (Isaac Sim 6.0).
+    Until then use Rerun (item 9) plus the per-round `live.mp4`; neither needs an encoder.
 15. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
     `gm.HEADLESS` stays false, so the viewport-camera code in `scene.py` still runs — that is what aims the streamed
     view, and it is why you must NOT also set `OMNIGIBSON_HEADLESS=1`. Auxiliary sensor cameras are kept out of the

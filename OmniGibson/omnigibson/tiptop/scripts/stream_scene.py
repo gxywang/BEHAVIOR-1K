@@ -9,8 +9,8 @@ M2T2. Steps forever until interrupted.
 Do NOT also set OMNIGIBSON_HEADLESS: streaming already runs the app windowless, and scene.py only aims the
 viewport camera while gm.HEADLESS is false.
 
-On an RTX PRO 6000 Blackwell the stream connects but stays black unless UseRefactoredVideoEncoder=1 is also
-exported; see DEPLOYMENT.md item 14.
+On an RTX PRO 6000 Blackwell the WebRTC stream is unreliable -- it connects, sends a few frames, drops, repeats.
+Rerun is the dependable view of a run; see DEPLOYMENT.md item 14.
 """
 
 import argparse
