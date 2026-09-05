@@ -27,8 +27,10 @@ from omnigibson.tiptop.protocol import (
     DROID_CAMERA_KWARGS,
     DROID_Q_INIT,
     build_request,
+    canonical_object_name,
     depth_to_points,
     points_to_pixels,
+    rerun_name,
 )
 from omnigibson.utils.usd_utils import mesh_prim_to_trimesh_mesh
 
@@ -120,15 +122,11 @@ def jpeg_bytes(rgb: np.ndarray, max_px: int = STREAM_IMAGE_MAX_PX, quality: int 
     return buf.getvalue()
 
 
-def make_env_config(
-    objects=("mug", "bowl"),
-    q_init=DROID_Q_INIT,
-    grasping_mode: str = "physical",
-    camera_pos=(0.95, -0.65, TABLE_HEIGHT + 0.70),
-    camera_target=(0.50, 0.0, TABLE_HEIGHT),
-    camera_kwargs: dict | None = None,
-    table_height: float = TABLE_HEIGHT,
-) -> dict:
+CAPTURE_CAMERA_EYE = (0.95, -0.65, TABLE_HEIGHT + 0.70)  # the DROID-style external capture camera, world frame
+CAPTURE_CAMERA_TARGET = (0.50, 0.0, TABLE_HEIGHT)
+
+
+def make_env_config(objects=("mug", "bowl"), grasping_mode: str = "physical") -> dict:
     """OmniGibson config: empty scene, table, Franka Panda (base at the table height), external RGB-D camera."""
     object_cfgs = []
     for name in objects:
@@ -146,9 +144,9 @@ def make_env_config(
                     "name": CAMERA_NAME,
                     "relative_prim_path": f"/{CAMERA_NAME}",
                     "modalities": ["rgb", "depth_linear", "seg_instance"],
-                    "sensor_kwargs": dict(DROID_CAMERA_KWARGS, **(camera_kwargs or {})),
-                    "position": list(camera_pos),
-                    "orientation": look_at_quat_xyzw(camera_pos, camera_target),
+                    "sensor_kwargs": dict(DROID_CAMERA_KWARGS),
+                    "position": list(CAPTURE_CAMERA_EYE),
+                    "orientation": look_at_quat_xyzw(CAPTURE_CAMERA_EYE, CAPTURE_CAMERA_TARGET),
                     "include_in_obs": True,
                 },
                 overview_cam_config(VIEWER_EYE, VIEWER_TARGET),
@@ -160,13 +158,13 @@ def make_env_config(
                 "model": "franka",
                 "name": "robot0",
                 "end_effector": "gripper",
-                "position": [0.0, 0.0, table_height],
+                "position": [0.0, 0.0, TABLE_HEIGHT],
                 "orientation": [0.0, 0.0, 0.0, 1.0],
                 "obs_modalities": ["proprio"],
                 "action_normalize": False,
                 "grasping_mode": grasping_mode,
                 "self_collisions": True,
-                "reset_joint_pos": [float(q) for q in q_init] + [FINGER_OPEN, FINGER_OPEN],
+                "reset_joint_pos": [float(q) for q in DROID_Q_INIT] + [FINGER_OPEN, FINGER_OPEN],
                 "controller_config": {
                     "arm_0": {
                         "name": "JointController",
@@ -194,25 +192,12 @@ def make_env_config(
                 "size": 1.0,
                 "scale": [1.4, 1.4, 0.05],
                 "rgba": [0.62, 0.52, 0.40, 1.0],
-                "position": [0.30, 0.0, table_height - 0.025],
+                "position": [0.30, 0.0, TABLE_HEIGHT - 0.025],
             },
             *object_cfgs,
         ],
         "task": {"type": "DummyTask"},
     }
-
-
-def canonical_object_name(name: str) -> tuple:
-    """('candle.n.01_2' | 'candle_2') -> ('candle', '2'); a bare category -> ('candle', '')."""
-    name = name.split(".n.")[0] + ("_" + name.rsplit("_", 1)[1] if ".n." in name else "")
-    name = name.replace("__", "_")
-    category, _, index = name.rpartition("_")
-    return (category, index) if category and index.isdigit() else (name, "")
-
-
-def rerun_name(name: str) -> str:
-    """Entity-path-safe object name for the Rerun mirror ('table.n.02_1' -> 'table_n_02_1')."""
-    return name.replace(".", "_").replace(" ", "_").replace("/", "_")
 
 
 class TiptopSim:
@@ -244,12 +229,7 @@ class TiptopSim:
         self.dt = og.sim.get_sim_step_dt()
         self.objects = {name: self.env.scene.object_registry("name", name) for name in self.object_names()}
         self.context = {"table": self.env.scene.object_registry("name", "table")}  # furniture shown in the mirror
-        self.state_stream = None  # client.SimStateStream once attached; fed from step()
-        self.n_steps = 0
-        self.last_obs = None
-        self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
-        self.capture_object_aabb_min_z = {}
-        self._stream_meshes = {}
+        self._init_state()
         joint_names = list(self.robot.joints.keys())
         log.info(
             f"robot DOF order: {joint_names}; arm idx {self.arm_idx.tolist()}, gripper idx {self.gripper_idx.tolist()}"
@@ -257,6 +237,14 @@ class TiptopSim:
         assert list(self.robot.controller_order) == ["arm_0", "gripper_0"], self.robot.controller_order
         assert self.robot.action_dim == len(self.arm_idx) + 1, self.robot.action_dim
         self.env.reset()
+
+    def _init_state(self) -> None:
+        """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
+        self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self.last_obs = None
+        self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
+        self.capture_object_aabb_min_z = {}  # where each tracked object rested at the last capture
+        self._stream_meshes = {}
 
     def set_finger_max_effort(self, effort_n: float) -> None:
         """Raise the finger drive force (the Franka USD ships 20 N; the real hand delivers 70 N continuous)."""
@@ -284,10 +272,6 @@ class TiptopSim:
             th.as_tensor(pos, dtype=th.float32), th.as_tensor(quat, dtype=th.float32), base_pos, base_quat
         )
 
-    @property
-    def sim_time(self) -> float:
-        return self.n_steps * self.dt
-
     def object_poses_world(self) -> dict:
         return {name: [p.tolist() for p in obj.get_position_orientation()] for name, obj in self.objects.items()}
 
@@ -312,7 +296,6 @@ class TiptopSim:
 
     def step(self, q_arm, gripper: float):
         self.last_obs = self.env.step(self.action(q_arm, gripper))[0]
-        self.n_steps += 1
         if self.state_stream is not None:
             self.state_stream.on_step(self)
         return self.last_obs

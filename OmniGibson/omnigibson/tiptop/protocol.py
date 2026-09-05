@@ -1,8 +1,10 @@
 """Wire and file formats shared with a TiPToP planning server.
 
 No OmniGibson imports: this module is usable (and unit-tested) without Isaac Sim. Formats mirror
-``tiptop/tiptop_websocket_server.py``, ``tiptop/planning.py`` and ``tiptop/tiptop_offline.py`` (v0.3.0) and the
-reference IsaacLab client in tiptop-robot/droid-sim-evals.
+``tiptop/tiptop_websocket_server.py``, ``tiptop/planning.py`` and ``tiptop/tiptop_offline.py`` at the submodule
+commit BEHAVIOR-1K pins (the simulator-side additions since tiptop v0.3.0 -- gt_* keys, robot_mask, goal_hints,
+the ``objects`` response, the mirror messages -- are described in tiptop/docs/simulation.md and listed in
+tiptop/CHANGELOG.md) and the reference IsaacLab client in tiptop-robot/droid-sim-evals.
 """
 
 import json
@@ -14,6 +16,7 @@ import numpy as np
 
 # Plan JSON schema produced by tiptop.planning.serialize_plan; the client accepts any 1.x version.
 SUPPORTED_PLAN_MAJOR = 1
+MATCH_MAX_DIST = 0.08  # perceived hull to simulated object (m): farther apart is a different object
 
 # Camera used by the DROID IsaacLab reference simulation: 1280x720, 2.8 mm focal length, 5.376 mm aperture,
 # i.e. fx = fy = 1280 * 2.8 / 5.376 = 666.67 px, principal point at the image center.
@@ -273,10 +276,10 @@ def points_to_pixels(points, intrinsics, world_from_cam) -> tuple:
     return np.stack([fx * cam[:, 0] / z + cx, fy * cam[:, 1] / z + cy], axis=-1), cam[:, 2]
 
 
-def match_objects(perceived: dict, simulated: dict, max_dist: float = 0.08) -> dict:
+def match_objects(perceived: dict, simulated: dict, max_dist: float = MATCH_MAX_DIST) -> dict:
     """Pair perceived objects with simulated ones by position ({name: [x, y, z]}, both in the same frame).
 
-    Perception numbers instances in detection order ("candle_2" is whichever candle the detector found second) and
+    Perception numbers instances by box size ("candle_2" is the second-largest candle the detector found) and
     the simulator by task instance, so a name never identifies an object across the two; a position does. Greedy by
     distance, each simulated object used once. Returns {perceived name: {"sim": simulated name or None, "dist":
     metres to it, or to the nearest simulated object when none is within ``max_dist``}}; a perceived object without
@@ -296,6 +299,21 @@ def match_objects(perceived: dict, simulated: dict, max_dist: float = 0.08) -> d
             out[p_name] = {"sim": s_name, "dist": dist}
             used.add(s_name)
     return out
+
+
+def canonical_object_name(name: str) -> tuple:
+    """('candle.n.01_2' | 'candle_2') -> ('candle', '2'); a bare category or a BDDL name without an instance -> (.., '')."""
+    if ".n." in name:
+        category, _, rest = name.partition(".n.")  # 'candle', '01_2'
+        index = rest.rpartition("_")[2] if "_" in rest else ""  # '2', or '' for 'candle.n.01'
+        name = category.replace("__", "_") + (f"_{index}" if index else "")
+    category, _, index = name.rpartition("_")
+    return (category, index) if category and index.isdigit() else (name, "")
+
+
+def rerun_name(name: str) -> str:
+    """Entity-path-safe object name for the Rerun mirror ('table.n.02_1' -> 'table_n_02_1')."""
+    return name.replace(".", "_").replace(" ", "_").replace("/", "_")
 
 
 def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:

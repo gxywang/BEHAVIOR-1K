@@ -85,6 +85,8 @@ jobs:
           - test_transform_utils
           - test_snapshots
           - test_transition_rules
+          - test_tiptop_protocol
+          - test_tiptop_gt_masks
         include:
         # --- BEGIN AUTO-GENERATED EXAMPLE INCLUDES ---
           - {test_file: test_examples, example: "environments.navigation_env_demo"}

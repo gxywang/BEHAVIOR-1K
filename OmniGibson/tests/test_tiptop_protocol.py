@@ -7,10 +7,12 @@ import pytest
 
 from omnigibson.tiptop.protocol import (
     build_request,
+    canonical_object_name,
     depth_to_points,
     load_observation_h5,
     match_objects,
     packb,
+    rerun_name,
     parse_plan,
     resample_trajectory,
     save_observation_h5,
@@ -167,7 +169,6 @@ def test_match_objects_flags_false_detections_and_uses_each_simulated_object_onc
 def test_sim_state_message_roundtrips_matrices_and_jpeg_bytes():
     msg = {
         "type": "sim_state",
-        "t": 1.5,
         "q": np.zeros(11, np.float32),
         "objects": {"candle_2": np.eye(4, dtype=np.float32)},
         "images": {"head_cam": b"\xff\xd8jpeg"},
@@ -175,3 +176,61 @@ def test_sim_state_message_roundtrips_matrices_and_jpeg_bytes():
     back = unpackb(packb(msg))
     assert back["images"]["head_cam"] == b"\xff\xd8jpeg"
     assert back["objects"]["candle_2"].shape == (4, 4) and back["q"].dtype == np.float32
+
+
+def test_match_objects_edge_cases():
+    assert match_objects({}, {"a": [0, 0, 0]}) == {}
+    assert match_objects({"p": [0, 0, 0]}, {}) == {"p": {"sim": None, "dist": None}}
+    assert match_objects({"p": [0, 0, 0]}, {"a": [0.08, 0, 0]})["p"]["sim"] == "a"  # max_dist is inclusive
+    assert match_objects({"p": [0, 0, 0]}, {"a": [0.08 + 1e-6, 0, 0]})["p"]["sim"] is None
+    tie = match_objects({"p": [0, 0, 0]}, {"b": [0.01, 0, 0], "a": [-0.01, 0, 0]})
+    assert tie["p"]["sim"] == "a"  # equal distance: name order, deterministic
+    m = match_objects({"z": [0, 0, 0], "a": [0.05, 0, 0]}, {"s": [0.02, 0, 0]})
+    assert m["z"]["sim"] == "s" and m["a"]["sim"] is None and abs(m["a"]["dist"] - 0.03) < 1e-9  # nearest pair first
+
+
+def test_resample_trajectory_edges():
+    one = np.full((1, 7), 0.3, np.float32)
+    out = resample_trajectory(one, 0.02, 1 / 30)
+    assert out.shape == (1, 7) and out is not one
+    two = np.array([[0.0] * 7, [1.0] * 7])
+    assert np.array_equal(resample_trajectory(two, 0.01, 1 / 30), two)  # coarser than the trajectory: start + end
+    p = np.linspace(0, 1, 11)[:, None].repeat(7, 1)
+    assert np.allclose(resample_trajectory(p, 0.02, 0.02), p)  # identity
+    for n in (4, 8, 14, 31):
+        r = resample_trajectory(np.linspace(0, 1, n)[:, None], 0.1, 0.1)
+        assert len(r) == n and not np.allclose(r[-1], r[-2])  # no duplicated end point
+
+
+def test_parse_plan_skips_metadata_and_rejects_empty_trajectory():
+    steps = parse_plan({"steps": [{"type": "metadata", "x": 1}, {"type": "gripper", "action": "open"}]})["steps"]
+    assert [s["type"] for s in steps] == ["gripper"]
+    with pytest.raises(ValueError):
+        parse_plan({"steps": [{"type": "trajectory", "positions": []}]})
+
+
+def test_load_observation_h5_droid_layout(tmp_path):
+    import h5py
+
+    req = _request(gt=False)
+    with h5py.File(tmp_path / "droid.h5", "w") as f:
+        f.create_dataset("rgb", data=req["rgb"])
+        f.create_dataset("depth", data=req["depth"])
+        f.create_dataset("intrinsic_matrix", data=req["intrinsics"])
+        f.create_dataset("q_init", data=req["q_init"])
+        f.create_dataset("pos_w", data=[0.3, 0.0, 0.5])
+        f.create_dataset("quat_w_ros", data=[1.0, 0.0, 0.0, 0.0])
+    back = load_observation_h5(tmp_path / "droid.h5")
+    # the stock loader's 1.5 cm DROID calibration offset applies when the file does not say otherwise
+    assert np.allclose(back["world_from_cam"][:3, 3], [0.3, 0.0, 0.515])
+    assert np.allclose(back["world_from_cam"][:3, :3], np.eye(3))
+
+
+def test_canonical_object_name_and_rerun_name():
+    for raw in ("candle.n.01_2", "candle_2"):
+        assert canonical_object_name(raw) == ("candle", "2")
+    assert canonical_object_name("can__of__soda.n.01_1") == ("can_of_soda", "1")
+    assert canonical_object_name("candle") == ("candle", "")
+    assert canonical_object_name("wicker_basket.n.01") == ("wicker_basket", "")
+    assert canonical_object_name("breakfast_table_skczfi_0") == ("breakfast_table_skczfi", "0")
+    assert rerun_name("table.n.02_1") == "table_n_02_1" and rerun_name("can of soda/1") == "can_of_soda_1"

@@ -59,5 +59,6 @@ connect/disconnect. Look for `carb.livestream-rtc.plugin` lines in
 **A connected session that shows a picture, goes black, and comes back** is the encoder failing rather than the
 network. Look for `VideoEncoder: Could not get encoded frame` paired with `CLIENT_DISCONNECT_UNINTENDED`. This has
 been seen on RTX PRO 6000 Blackwell with the StreamSDK bundled in Isaac Sim 5.1, which predates that GPU; NVENC
-itself is fine on the card. A newer StreamSDK (the official 5.1.0 container, or Isaac Sim 6.0) is the fix. The
-`GPU ... is not white-listed` warning is unrelated and can be ignored.
+itself is fine on the card, and no newer StreamSDK exists for Isaac Sim 5.1 (the 5.1.0 container ships the same
+one; the builds that work on that card come with Isaac Sim 6.0). The `GPU ... is not white-listed` warning is
+unrelated and can be ignored.

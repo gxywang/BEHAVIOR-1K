@@ -1,10 +1,10 @@
 # Deploying the TiPToP bridge on a lab GPU server
 
-Written 2026-09-02 from a working laptop install (RTX 4090 Laptop, sm_89, driver 580 = CUDA 13.0). **Nothing here has
-been exercised on a Blackwell server yet**; the "Known issues" list is what an audit of the laptop install predicts
-will bite on an RTX PRO 6000 (Blackwell, sm_120) or similar, with a CUDA 12.8 or 13 driver. Read this before the
-first `pixi install` on a new machine. Companion docs: [README.md](README.md) (architecture, conventions, runbook),
-[USAGE_DOCS.md](../../../USAGE_DOCS.md) (lab servers, sim install with uv, submodule workflow).
+Written 2026-09-02 from a laptop install (RTX 4090 Laptop, sm_89, driver 580 = CUDA 13.0) and exercised on
+shenlong-gpu-01 (8x RTX PRO 6000 Blackwell, sm_120) on 2026-09-04; the "Known issues" say which of the predictions
+held (USAGE_DOCS.md has the server's own notes). Read this before the first `pixi install` on a new machine.
+Companion docs: [README.md](README.md) (the pipeline, the demo, Rerun, conventions), [USAGE_DOCS.md](../../../USAGE_DOCS.md)
+(lab servers, sim install with uv, submodule workflow).
 
 ## Layout: three isolated environments, nothing shared
 
@@ -12,7 +12,7 @@ first `pixi install` on a new machine. Companion docs: [README.md](README.md) (a
 |---|---|---|---|
 | OmniGibson sim + this bridge | uv venv `b1k` from `setup_uv.sh` (python 3.11, torch 2.7.0+cu128, Isaac Sim 5.1) | repo root | planner `ws://host:8765` |
 | TiPToP planner | pixi env `tiptop/.pixi` (python 3.12, conda-forge torch 2.7.1 cu129, cuda-toolkit 12.9, nvcc 12.9.86) | `tiptop/` submodule | M2T2 `http://host:8123` |
-| M2T2 grasp server | pixi env `~/tiptop-services/M2T2/.pixi` (python 3.11, torch 2.4.1 cu120 as locked today) | separate clone | nothing |
+| M2T2 grasp server | pixi env `~/tiptop-services/M2T2/.pixi` (python 3.11; torch 2.4.1 cu120 as committed, 2.8.0 cu129 after the Blackwell fix in issue 2) | separate clone | nothing |
 
 Only websocket/HTTP crosses the boundaries. Never `pip install` tiptop into the sim env: numpy 2 vs 1.26, two
 different cuRobo forks with the same import name, python 3.12 vs 3.11. `rerun-sdk` cannot go into the sim env either
@@ -53,7 +53,7 @@ pixi run cuobjdump --list-elf curobo/src/curobo/curobolib/geom_cu.cpython-312-x8
 #   must list the server's own sm_XX (sm_120 for RTX PRO 6000); sm_89-only means the laptop build was copied
 cd ~/tiptop-services/M2T2
 pixi run python -c "import torch, pointnet2_ops._ext as e; print(torch.__version__, torch.cuda.get_arch_list(), e.__file__)"
-curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers only after cuRobo warm-up (~10 s)
+curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers after warm-up + viewer start (~40 s)
 ```
 
 ## Known issues, in the order you will hit them
@@ -68,10 +68,11 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    `git checkout b5fad1d`). Optional: `TORCH_CUDA_ARCH_LIST="12.0" pixi run install-curobo` to force the arch.
 2. **M2T2's committed lock cannot target Blackwell.** It resolves torch 2.4.1 (conda-forge cuda120 build, arch list
    ends at sm_90) and nvcc 12.1 (`--list-gpu-arch` ends at compute_90); its PointNet++ op `pointnet2_ops._ext`
-   is compiled by `pixi run setup` for the local GPU only. Fix (untested): in `~/tiptop-services/M2T2/pixi.toml` set
-   `[system-requirements] cuda = "12.8"`, `cuda-toolkit = "12.8.*"` (or `12.9.*`), `pytorch-gpu = ">=2.7"`,
-   keep `python = "3.11.*"` and `numpy = "<2"`; then `pixi install` (re-locks), `pixi run setup`,
-   `pixi run download-weights`, and check the arch list. `m2t2_server.py` calls `torch.load` without
+   is compiled by `pixi run setup` for the local GPU only. Fix (applied on shenlong-gpu-01, not in git -- redo it
+   on every fresh clone): in `~/tiptop-services/M2T2/pixi.toml` set `[system-requirements] cuda = "12.8"`,
+   `cuda-toolkit = "12.9.*"`, `pytorch-gpu = ">=2.7,<2.9"` (pointnet2_ops is old CUDA-extension code; the solver
+   would otherwise pick a much newer torch), keep `python = "3.11.*"` and `numpy = "<2"`; then `pixi install`
+   (re-locks), `pixi run setup`, `pixi run download-weights`, and check the arch list. `m2t2_server.py` calls `torch.load` without
    `weights_only`; the checkpoint loads fine with the torch>=2.6 default. Weights: git-lfs clone of
    `huggingface.co/wentao-yuan/m2t2`, md5 checked by the task.
 3. **Driver, toolkit, glibc.** Blackwell needs driver >= 570 (CUDA 12.8). The tiptop env's CUDA 12.9 runtime runs on
@@ -88,21 +89,22 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 6. **Network and credentials.** github.com: the private submodule `WenzhouDing/tiptop` (deploy key or token; the
    laptop uses an ssh `insteadOf` rewrite), `williamshen-nz/curobo`, `tiptop-robot/cuTAMP` (tag v0.0.6),
    `facebookresearch/segment-anything-2` at the locked commit; conda-forge and PyPI; huggingface.co via git-lfs
-   (M2T2 weights, ~230 MB); dl.fbaipublicfiles.com (SAM-2 checkpoint, 900 MB, fetched into `tiptop/tiptop/.cache/`
-   on first use, only needed without ground-truth masks); huggingface.co for the Grounding DINO weights
-   (`IDEA-Research/grounding-dino-base`, ~900 MB into `~/.cache/huggingface`) that the server fetches and loads at
-   start-up when `perception.detector: grounding_dino` (both sim configs; `transformers` is in `pixi.lock`).
+   (M2T2 weights, ~230 MB); dl.fbaipublicfiles.com (SAM-2 checkpoint, 900 MB, into `tiptop/tiptop/.cache/`) and
+   huggingface.co (Grounding DINO, `IDEA-Research/grounding-dino-base`, ~900 MB into `~/.cache/huggingface`): with
+   `perception.detector: grounding_dino` (both sim configs; `transformers` is in `pixi.lock`) the server fetches
+   and loads both at start-up, before `/health` answers, whether or not requests then carry ground-truth masks.
    `GOOGLE_API_KEY` is only needed with `perception.detector: gemini`.
 7. **cuTAMP patch.** `tiptop/install/install-cutamp.sh` applies `tiptop/install/patches/cutamp-*.patch` on top of
    the pinned cuTAMP release (a `get_world_cfg` list-aliasing fix that otherwise crashes every plan skeleton tried
    after the first motion-planning attempt with `KeyError: 'table'`). A cuTAMP checkout made without the script
    needs `git apply` of the same patch; upstreaming it to tiptop-robot/cuTAMP is the real fix.
 8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
-   first plan; cuRobo warms up MotionGen at server start (`/health` is 200 only afterwards).
+   first plan; at server start cuRobo warms up MotionGen, the detector and SAM2 load and the Rerun viewer starts
+   (`/health` is 200 only afterwards, ~40 s on the server).
 9. **Rerun.** The planner hosts the viewer itself (`--rerun-mode serve`, the launcher's default): gRPC 9876 and the
    web viewer 9090, both on 127.0.0.1, one recording for the planner's lifetime, viewer killed with the planner.
    The laptop needs only a browser and `ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 <server>`; see
-   README.md "Rerun" for the URL and what the view holds. A taken 9876/9090 is a startup error, not a fallback
+   README.md "What Rerun shows" for the URL and what the view holds. A taken 9876/9090 is a startup error, not a fallback
    (`pkill -u $USER -f 'rerun --serve-web'`, or `--rerun-grpc-port` / `--rerun-web-port`). `--rerun-mode stream`
    spawns a native window and is laptop-only; `save` writes one `tiptop.rrd` per request under
    `tiptop/tiptop_server_outputs/<timestamp>/`, replayable with `pixi run rerun --serve-web --bind 127.0.0.1 <file>`.
@@ -111,7 +113,9 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    on the laptop) is why the planner runs the SDK's own binary and never a `rerun` from `PATH`.
 10. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
    `ssh -N -L 8765:127.0.0.1:8765 server` and `--host localhost`, or `TIPTOP_HOST=0.0.0.0`. The client refuses to
-   run unless the server metadata says `robot_type: panda`, `dof: 7` (the launcher's `--config` guarantees it).
+   run unless the server metadata matches its embodiment: `robot_type: panda`, `dof: 7` for `--embodiment franka`
+   (the launcher's default config), `robot_type: r1pro_left` with the dof from the embodiment metadata for
+   `--embodiment r1pro` (`TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml`).
 11. **Sharing one GPU.** Laptop numbers: Isaac Sim 4-5 GB (GUI adds 1-2), planner 4 GB idle and 6.3 GB peak at
     128 particles, M2T2 1.3 GB. On a 96 GB card raise `TIPTOP_PARTICLES=256` and `TIPTOP_MAX_PLANNING_TIME=60`.
 12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
@@ -158,8 +162,11 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
   run `pixi run python scripts/make_r1pro_embodiment.py --copy-meshes` in `tiptop/` on a machine that has the
   OmniGibson robot assets (any machine with the sim datasets), or accept a mesh-less robot in Rerun.
 - Regenerating the embodiment needs the OmniGibson robot assets; re-validate with `scripts/check_r1pro_embodiment.py`
-  against a fresh simulator probe (scratch script `probe_r1pro.py` in the session notes; prints joint order, eef and
-  camera poses at sampled configurations).
+  against a fresh simulator probe (`OmniGibson/omnigibson/tiptop/scripts/probe_r1pro.py`, run in the sim env: joint
+  order, eef and camera poses at sampled configurations).
+- The torso start posture is the simulator's choice (`--torso`); cuRobo's sphere model is in self-collision for
+  hips beyond torso joint1 1.2 / joint2 -1.7 (README "The demo"), and a start state in self-collision fails every
+  plan with `INVALID_START_STATE_SELF_COLLISION` before any motion is tried.
 - VRAM on the laptop during an Rs_int episode: about 9.5 GB total with both services idle (Isaac + scene ~5 GB).
 - Never attach `seg_instance` to a robot-mounted camera in this Isaac build (segfault after ~35 steps); the bridge
   captures through an external shadow camera. Keep the robot camera rgb-only.
@@ -168,7 +175,7 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 
 - Bridge (this directory): `protocol.py`, `client.py` (planning client + the Rerun mirror), `scene.py`, `executor.py`,
   `run.py`, `r1pro.py`, `scripts/` (service launchers, `stream_scene.py`, `probe_r1pro.py`), tests in
-  `OmniGibson/tests/test_tiptop_protocol.py`.
+  `OmniGibson/tests/test_tiptop_protocol.py` and `test_tiptop_gt_masks.py` (neither needs Isaac Sim).
 - Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/config/tiptop_sim_{panda,r1pro}.yml`,
   `tiptop/embodiments/` (R1Pro), `scripts/make_r1pro_embodiment.py`, `install/install-curobo.sh`,
   `install/install-cutamp.sh`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.

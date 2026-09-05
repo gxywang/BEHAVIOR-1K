@@ -7,9 +7,11 @@ metadata (``embodiment.locked_joints`` / ``joint_names`` / ``q_home``) or, offli
 in the tiptop submodule.
 
 World frame for TiPToP = the robot's ``base_link`` (floor level), which is both ``robot.get_position_orientation()``
-here and the URDF root of the planner model. Capture uses the head camera (``zed_link``) or the left wrist camera;
-pixels belonging to the robot itself are removed from the depth so M2T2 never proposes grasps on the robot.
-Navigation is out of scope: the robot is placed next to the target furniture (``--near``) or at an explicit pose.
+here and the URDF root of the planner model. Capture uses the head camera (``zed_link``) or the left wrist camera,
+in a look posture that swings the arm out of the camera's view; with ``--seg-instance`` the robot's own pixels are
+also removed from the depth. Navigation is out of scope: the base is teleported once, to a pose from which the
+named objects are in reach and in view (``--stand-for``), next to a piece of furniture (``--near``) or to an
+explicit pose.
 """
 
 import logging
@@ -23,15 +25,22 @@ import yaml
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
-from omnigibson.tiptop.scene import OBJECT_PRESETS, TiptopSim, jpeg_bytes, look_at_quat_xyzw, overview_cam_config
+from omnigibson.tiptop.scene import (
+    CAMERA_NAME,
+    OBJECT_PRESETS,
+    OVERVIEW_CAM,
+    TiptopSim,
+    jpeg_bytes,
+    look_at_quat_xyzw,
+    overview_cam_config,
+)
 
 log = logging.getLogger(__name__)
 
 ROBOT_NAME = "robot_r1"
 ROBOT_TYPE = "r1pro_left"
 CAMERA_LINKS = {"head": "zed_link", "wrist": "left_realsense_link"}
-SHADOW_CAM = "tiptop_cam"  # external sensor moved onto the robot camera's pose for each capture (see _capture_obs)
-OVERVIEW_CAM = "overview_cam"  # third-person camera for the Rerun mirror, placed behind-left of the robot
+SHADOW_CAM = CAMERA_NAME  # the external capture sensor, moved onto the robot camera's pose per capture (_capture_obs)
 # Capture posture: the ready posture with the left shoulder abducted so the arm swings out to the robot's left, out of
 # the head camera's view. In the ready posture the gripper sits in front of the table objects and hides most of them
 # (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
@@ -45,13 +54,8 @@ WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so
 FLOOR_COVERINGS = ("floors", "ceilings", "paver", "carpet", "rug", "mat", "doormat", "tile")  # stood on, not avoided
 ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture is ~1.4
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
-CAMERA_MIN_DIST = (
-    0.65  # nearer objects are cut by the head camera's bottom edge; measured per posture by camera_min_dist
-)
-CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets the table: an object needs room to be whole
+CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
-TABLE_TOP_Z = 0.42  # the gift-basket coffee table; camera_min_dist is measured against this height
-CAMERA_HALF_FOV = math.radians(49.6)  # head camera's true half-FOV: atan(360 / 306) at 720 px, fx 306
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 
@@ -242,7 +246,6 @@ class R1ProSim(TiptopSim):
 
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)
-    STREAM_CAMERA = "head_cam"
     look_arm = LOOK_ARM  # joint overrides on top of q_home for the capture; None: capture in the ready posture
 
     def __init__(self, config: dict, camera: str = "head"):
@@ -258,7 +261,7 @@ class R1ProSim(TiptopSim):
         self.cam_name = f"{self.robot.name}:{CAMERA_LINKS[camera]}:Camera:0"
         self.robot_cam = self.robot.sensors[self.cam_name]
         self.wrist_cam_name = f"{self.robot.name}:{CAMERA_LINKS['wrist']}:Camera:0"
-        self.camera_min_dist = CAMERA_MIN_DIST  # measured by apply_posture
+        self.STREAM_CAMERA = f"{camera}_cam"  # the capture camera's image in the Rerun mirror
         self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
@@ -266,12 +269,7 @@ class R1ProSim(TiptopSim):
         self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
-        self.state_stream = None  # R1ProSim does not call super().__init__; keep TiptopSim's defaults
-        self.n_steps = 0
-        self.last_obs = None
-        self.last_capture_rgb = None
-        self.capture_object_aabb_min_z = {}
-        self._stream_meshes = {}
+        self._init_state()
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
         self.robot.base_footprint_link.mass = BASE_MASS_KG
@@ -340,7 +338,7 @@ class R1ProSim(TiptopSim):
     def _goal_values(self) -> list[list[bool]]:
         """Truth of every predicate of every ground goal option, evaluating each grounded predicate once.
 
-        forpairs goals ground into every pairing (tens of thousands of options for four baskets); the simulator
+        forpairs goals ground into every pairing (331,776 options for four baskets); the simulator
         predicates (inside, ontop) are the expensive part, so they are memoized across options.
         """
         task = self.env.task
@@ -627,7 +625,7 @@ class R1ProSim(TiptopSim):
         return 0.5 * math.hypot(ex, ey)
 
     def best_base_pose(
-        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, min_dist: float | None = None
+        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, support_z=None
     ) -> tuple[tuple | None, dict]:
         """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
         the left arm's reach.
@@ -639,15 +637,21 @@ class R1ProSim(TiptopSim):
         here otherwise).
 
         ``half_widths``: each point's xy radius, so the view test can keep the object's *edges* in frame and not just
-        its centre; None reproduces the point test for callers that pass bare positions. ``min_dist``: how close
-        the head camera can see (``camera_min_dist``, measured by apply_posture, by default).
+        its centre; None reproduces the point test for callers that pass bare positions. ``support_z``: the world
+        height each object stands at (one value, or one per point), so the head camera's reach for it can be
+        measured (``camera_floor_distance``); None skips that test.
         Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
         """
-        min_dist = self.camera_min_dist if min_dist is None else min_dist
         pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
         if len(pts) < 2:
             raise ValueError("best_base_pose needs at least one item and the target")
         half_widths = [0.0] * len(pts) if half_widths is None else list(half_widths)
+        if support_z is None:
+            min_dists = [0.0] * len(pts)
+        else:
+            heights = [support_z] * len(pts) if np.isscalar(support_z) else list(support_z)
+            min_dists = [self.camera_floor_distance(float(z)) + CAMERA_MIN_MARGIN for z in heights]
+        half_fov = math.atan2(self.robot_cam.image_width / 2, float(self.robot_cam.intrinsic_matrix[0, 0]))
         t = len(pts) - 1  # the target (container) is last
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
@@ -667,7 +671,7 @@ class R1ProSim(TiptopSim):
                     if min(ahead) < 0.15 or min(side) < -0.3 or max(dist) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
-                    if min(dist) < min_dist:  # below the head camera's frame (a cookie at 0.42 m: empty mask)
+                    if any(d < m for d, m in zip(dist, min_dists)):  # cut by the bottom of the head camera's frame
                         rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
                         continue
                     # a container nearer than an item and in line with it hides the item (empty mask): keep their
@@ -692,7 +696,7 @@ class R1ProSim(TiptopSim):
                     # pairs no pose frames both -- the item is then simply out of reach of a single base pose (see
                     # README, "what stands between this and the full task").
                     clipped = sum(
-                        max(0.0, abs(br) + math.atan2(hw, max(d, 1e-6)) - CAMERA_HALF_FOV)
+                        max(0.0, abs(br) + math.atan2(hw, max(d, 1e-6)) - half_fov)
                         for br, d, hw in zip(bearing, dist, half_widths)
                     )
                     score = (
@@ -716,10 +720,16 @@ class R1ProSim(TiptopSim):
         """
         if len(names) < 2:
             raise ValueError("place_robot_for needs ITEM[,ITEM...],TARGET")
-        points = [self.scene_object(n).aabb_center.cpu().numpy()[:2] for n in names]
+        objects = [self.scene_object(n) for n in names]
+        points = [o.aabb_center.cpu().numpy()[:2] for o in objects]
+        support_z = [float(o.aabb[0][2]) for o in objects]  # each object's bottom: the top of what it stands on
         ignore = [self.scene_object(n) for n in ignore_names]
+        log.info(
+            f"head camera at z {float(self.robot_cam.get_position_orientation()[0][2]):.2f} m sees a surface at "
+            f"z {min(support_z):.2f} from {self.camera_floor_distance(min(support_z)):.2f} m ahead"
+        )
         best, rejected = self.best_base_pose(
-            points, ignore=ignore, reach=reach, half_widths=[self.xy_radius(n) for n in names]
+            points, ignore=ignore, reach=reach, half_widths=[self.xy_radius(n) for n in names], support_z=support_z
         )
         if best is None:
             raise RuntimeError(
@@ -787,17 +797,12 @@ class R1ProSim(TiptopSim):
             raise RuntimeError(
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
-        self.camera_min_dist = self.camera_floor_distance(TABLE_TOP_Z) + CAMERA_MIN_MARGIN
-        log.info(
-            f"head camera at z {cam_z:.2f} m sees the table top from {self.camera_min_dist - CAMERA_MIN_MARGIN:.2f} m "
-            f"ahead; base poses keep objects beyond {self.camera_min_dist:.2f} m"
-        )
 
     def camera_floor_distance(self, surface_z: float) -> float:
         """How far ahead of the base (m) the head camera's bottom image edge meets a horizontal surface at ``surface_z``.
 
         Objects nearer than this are cut off at the bottom of the capture. Depends on the torso posture (camera
-        height and pitch), so it is measured after apply_posture instead of assumed.
+        height and pitch) and nothing else, so it holds for any base pose once the posture is applied.
         """
         pos, quat = self.robot_cam.get_position_orientation()
         k = self.robot_cam.intrinsic_matrix.cpu().numpy()
@@ -848,7 +853,7 @@ class R1ProSim(TiptopSim):
         return {self.robot.name: a}
 
     def _capture_obs(self) -> tuple[dict, dict]:
-        """Move the shadow camera onto the robot camera and render one rgb + depth + segmentation frame."""
+        """Move the shadow camera onto the robot camera and render one rgb + depth (+ segmentation) frame."""
         pos, quat = self.robot_cam.get_position_orientation()
         self.cam.set_position_orientation(position=pos, orientation=quat)
         # The renderer accumulates frames over time: after the camera jumps (base teleport, look posture) the first
@@ -882,9 +887,9 @@ class R1ProSim(TiptopSim):
         return self.last_obs[self.robot.name][sensor_name]["rgb"][..., :3].cpu().numpy().astype(np.uint8)
 
     def stream_images(self) -> dict:
-        """Head camera, left wrist camera and the overview, as JPEGs for the Rerun mirror."""
+        """The capture camera, the left wrist camera and the overview, as JPEGs for the Rerun mirror."""
         images = super().stream_images()
         wrist = self._robot_rgb(self.wrist_cam_name)
-        if wrist is not None:
+        if wrist is not None and self.wrist_cam_name != self.cam_name:
             images["wrist_cam"] = jpeg_bytes(wrist)
         return images

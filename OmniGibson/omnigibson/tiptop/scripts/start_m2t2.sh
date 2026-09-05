@@ -1,6 +1,7 @@
 #!/bin/bash
-# M2T2 grasp server for TiPToP (http://host:8123). Env: M2T2_DIR (default ~/tiptop-services/M2T2), M2T2_HOST, M2T2_PORT.
-# M2T2_GPU (index or UUID; pins CUDA_VISIBLE_DEVICES on shared multi-GPU boxes).
+# M2T2 grasp server for TiPToP. Env: M2T2_DIR (default ~/tiptop-services/M2T2), M2T2_HOST / M2T2_PORT (default
+# 127.0.0.1:8123 -- must match perception.m2t2.url in the planner's config, tiptop/config/*.yml, which has no flag
+# for it), M2T2_GPU (index or UUID; pins CUDA_VISIBLE_DEVICES on shared multi-GPU boxes).
 # See ../DEPLOYMENT.md for how the M2T2 clone is set up.
 set -e
 export PATH="$HOME/.pixi/bin:$PATH"

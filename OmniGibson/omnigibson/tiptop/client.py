@@ -136,9 +136,9 @@ class SimStateStream:
       sim_scene  {"type": "sim_scene", "objects": {name: {"vertices": (N, 3) f32 in the object's own frame,
                   "faces": (M, 3) i32, "pose": (4, 4) f32 base-frame pose, "kind": "object" | "context"}}}
                  once per connection: the simulator's own meshes (task objects, and furniture named as context)
-      sim_state  {"type": "sim_state", "t": simulated seconds, "q": (dof,) f32 planned joints in the server's joint
-                  order, "q_gripper": finger opening (m), "objects": {name: (4, 4) f32 base-frame pose},
-                  "images": {name: JPEG bytes}}   every ``every`` env steps; images in every ``image_every``-th one
+      sim_state  {"type": "sim_state", "q": (dof,) f32 planned joints in the server's joint order, "q_gripper":
+                  finger opening (m), "objects": {name: (4, 4) f32 base-frame pose}, "images": {name: JPEG bytes}}
+                 every ``every`` env steps; images in every ``image_every``-th one
     Names are the simulator's own (task instance names, ``candle_2``); the server keeps perception's names for its
     hulls and matches nothing by name. ``attach`` once per session; ``TiptopSim.step`` calls ``on_step``. A failure
     never reaches the episode: a dropped connection is retried every ``reconnect_s`` (``max_failures`` times in a
@@ -211,7 +211,6 @@ class SimStateStream:
         try:
             msg = {
                 "type": "sim_state",
-                "t": float(sim.sim_time),
                 "q": np.asarray(sim.q_arm(), dtype=np.float32),
                 "q_gripper": float(sim.q_fingers()[0]),
                 "objects": sim.object_poses_base_mats(),

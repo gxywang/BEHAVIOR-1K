@@ -170,7 +170,7 @@ def check_success(sim, atoms: list[dict]) -> dict:
             a = sim.objects.get(args[0])
             grasping = str(sim.robot.is_grasping())
             # lifted relative to where the object rested at capture time (the base may be on the floor, not the table)
-            z0 = getattr(sim, "capture_object_aabb_min_z", {}).get(args[0])
+            z0 = sim.capture_object_aabb_min_z.get(args[0])
             if z0 is None and a is not None:
                 z0 = sim.base_pose()[0][2].item()
             lifted = bool(a is not None and a.aabb[0][2].item() > z0 + 0.05)

@@ -4,7 +4,7 @@
 - on server: run `OMNIGIBSON_HEADLESS=1` and watch in Rerun (see [Bring-up](#bring-up)); `OMNIGIBSON_REMOTE_STREAMING=webrtc` is the unreliable alternative — never set both
 - always `export CUDA_DEVICE_ORDER=PCI_BUS_ID` alongside `CUDA_VISIBLE_DEVICES=`, so indices match `nvidia-smi`
 - to run `uv` install script: `bash setup_uv.sh   --new-env b1k   --omnigibson   --bddl   --dataset  --joylo  --eval --accept-nvidia-eula   --accept-dataset-tos`
-- download [Isaac Sim WebRTC Streaming Client](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/download.html)
+- WebRTC (unreliable on the Blackwell boxes, see [Streaming](#streaming-the-viewport-to-a-laptop)): [Isaac Sim WebRTC Streaming Client](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/download.html)
 - on streaming client, connect to server `172.22.224.37` for `shenlong-gpu-01`
   - for `campus-cluster`'s `shenlong` partition: `172.29.128.5`
   - for `shenlong-gpu-02`: `172.22.224.85`
@@ -53,7 +53,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2
 **1. Services** (needed for `live` / `task`; not for `capture` or `stream_scene`). The planner answers `/health`
 only after cuRobo warms up, ~40 s, and it hosts the Rerun viewer itself (web 9090, gRPC 9876, on 127.0.0.1): one
 recording per planner process, gone when the planner exits. One terminal or tmux window each, in the foreground,
-so Ctrl-C stops them.
+so Ctrl-C stops them. What the pipeline does and what every flag means: `OmniGibson/omnigibson/tiptop/README.md`.
 
 ```bash
 M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
@@ -64,7 +64,7 @@ curl -s localhost:8123/health; curl -s localhost:8765/health    # {"status":"hea
 ```
 
 **2. Rerun** (the view of a run: planner's perception + plan, the simulator's robot, objects and cameras; see
-`OmniGibson/omnigibson/tiptop/README.md` "Rerun" for what each entity is). On the laptop:
+`OmniGibson/omnigibson/tiptop/README.md` "What Rerun shows" for what each entity is). On the laptop:
 
 ```bash
 ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
@@ -74,13 +74,15 @@ ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
 Reload the tab after restarting the planner. If `ssh -L` says a port is in use, a `rerun` on the laptop holds it:
 close it, or map other local ports (`-L 9091:127.0.0.1:9090 -L 9877:127.0.0.1:9876` and the URL with 9091/9877).
 
-**3. Run one of these.** (a) and (b) are headless and the picture is in Rerun (the robot's head camera and a
-third-person overview are streamed there by the simulator, so no WebRTC client is needed); (c) is the WebRTC
-path and must run without `OMNIGIBSON_HEADLESS`.
+**3. Run one of these.** (a) is headless and its picture is in Rerun (the robot's head and wrist cameras and a
+third-person overview are streamed there by the simulator, so no WebRTC client is needed); (b) writes its frame
+to files under `--out-dir` (`rgb.png`, `depth.png`, `gt_masks.png`, `capture.json`) and opens no mirror; (c) holds
+the scene for a look at the set-up, mirrored into Rerun with `--state-stream localhost:8765` (headless, planner
+running) or, without `OMNIGIBSON_HEADLESS`, over WebRTC.
 
 ```bash
 # a) the demo: load the scene, stage one basket with one item of each kind next to it, stand once, fill it
-#    round by round with oracle masks (README "Challenge tasks" explains every flag)
+#    round by round with oracle masks (README "The demo": same command, what to expect, why it is set up so)
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live \
     --embodiment r1pro --activity assembling_gift_baskets \
     --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 --place candle.n.01_4:table.n.02_1:0.05,0.12 \
@@ -96,48 +98,45 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live \
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
     --embodiment r1pro --activity assembling_gift_baskets --out-dir runs/cap
 
-# c) look at a scene over WebRTC (unreliable on this GPU, see below) -- no services needed
-OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python \
-    OmniGibson/omnigibson/tiptop/scripts/stream_scene.py --activity assembling_gift_baskets \
-    --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 \
-    --stand-for swiss_cheese.n.01_1,wicker_basket.n.01_2
+# c) hold the demo's set-up and look at it in the planner's Rerun (no plan is requested); drop --state-stream and
+#    set OMNIGIBSON_REMOTE_STREAMING=webrtc instead of OMNIGIBSON_HEADLESS for the WebRTC viewport
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python OmniGibson/omnigibson/tiptop/scripts/stream_scene.py \
+    --activity assembling_gift_baskets --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 \
+    --torso 1.2 -1.7 -0.9 0.0 --stand-for swiss_cheese.n.01_1,wicker_basket.n.01_2 --state-stream localhost:8765
 ```
 
 The scene takes 3-5 min to load; the robot appears in Rerun as soon as it is placed. The Rerun layout: the 3D
 world on the left (planner's robot model, grey perception hulls with the goal object's grasps, green simulator
 objects), on the right the head camera, the left wrist camera, the overview and the last request's masks. Per
-round the client logs how each perceived object pairs with a simulated one (`perceived 'candle_4' (goal, 85
-grasps) = simulated candle_4 (2.9 cm off)`); a goal object with no partner within 8 cm is a false detection. Stop
+round the client logs how each perceived object pairs with a simulated one (`perceived 'candle_4' (goal, 173
+grasps) = simulated candle_4 (2.4 cm off)`); a goal object with no partner within 8 cm is a false detection. Stop
 everything with Ctrl-C in each window, or `pkill -u $USER -f "tiptop-server|m2t2_server|omnigibson.tiptop.run"`
-for anything detached.
+for anything detached (write the pattern so it cannot match your own shell, e.g. `"[t]iptop-server"`, when the
+command itself contains it).
+
+Timings measured here (2026-09-05, the demo): scene + task load 3-5 min, capture 8 s, plan 3-4 s, execute 25-30 s,
+goal scoring 20 s. VRAM with all three services up: ~21 GB of 96 GB (sim 14 GB, planner 5.6 GB, M2T2 1.2 GB).
+Run outputs accumulate under `runs/` (gitignored) and `tiptop/tiptop_server_outputs/` (one directory per planning
+request, ~30 MB each); delete old ones by hand.
 
 ### Streaming the viewport to a laptop
 
 - **Set `OMNIGIBSON_REMOTE_STREAMING=webrtc` and leave `OMNIGIBSON_HEADLESS` unset.** Streaming already runs the
-  app windowless (`simulator.py:173`), but `tiptop/scene.py:184` only aims the viewport camera while `gm.HEADLESS`
-  is false — set both and you stream a default pose.
+  app windowless (`simulator.py:173`), but the bridge only aims the viewport camera while `gm.HEADLESS` is false
+  (`TiptopSim.__init__` in `tiptop/scene.py`, `R1ProSim.place_robot` in `tiptop/r1pro.py`) — set both and you
+  stream a default pose.
 - Client: the standalone **Isaac Sim WebRTC Streaming Client** (5.1). Type the bare IP, no port.
 - **TCP 49100 is the only port that must reach the server.** OmniGibson selects
   `/app/livestream/proto = "websocket"` (`simulator.py:277`), so video rides the signalling socket and no UDP media
   port is bound; `ufw` is disabled on the host. An SSH tunnel therefore works as a fallback:
   `ssh -N -L 49100:127.0.0.1:49100 shenlong-gpu-01`, then point the client at `127.0.0.1`.
-- **WebRTC streaming is unreliable on this GPU -- use Rerun instead.** The client connects and gets a few frames,
-  then the encoder stops producing and the client drops, over and over: one session logged 4 `FIRST_FRAME_SENT`
-  against 115 `Could not get encoded frame` and 24 `CLIENT_DISCONNECT_UNINTENDED`, which is the
-  scene / black / scene cycle you see. The bundled StreamSDK (`omni.kit.streamsdk.plugins-7.6.3`) was built before
-  this card shipped. `UseRefactoredVideoEncoder=1` (a StreamSDK regkey, read from the environment) looked like a
-  fix on one short connection and is not one -- a longer session with it set still threw 115 errors. Do not rely on
-  it. Two dead ends recorded so nobody repeats them: the `GPU ... is not white-listed` warning gates nothing
-  (that branch falls through to the same success path), and NVENC on the card is healthy (h264/hevc/av1 all encode
-  at 200+ fps outside Isaac Sim). There is no drop-in fix for 5.1 (checked 2026-09-05): the newer
-  `omni.kit.streamsdk.plugins` 7.7.2 in the Kit 107 registry ships a byte-identical streaming server library, the
-  official 5.1.0 container carries the same 7.6.3, and the StreamSDK builds that work on this card only come with
-  Isaac Sim 6.0 (Kit 110, python 3.12).
-- **What to use instead.** [Rerun](#bring-up): the planner's perception and plan, the simulator's robot and
-  objects, and the robot's head camera plus a third-person overview streamed from the simulator at 5 Hz -- none
-  of it needs an encoder -- and the per-round `live.mp4` the bridge writes. `stream_scene.py` and
-  `OMNIGIBSON_REMOTE_STREAMING` still work when the stream happens to hold, but treat a working picture as luck
-  rather than a guarantee.
+- **WebRTC streaming is unreliable on this GPU; Rerun is the view.** The client connects, gets a few frames, the
+  encoder stops producing (`VideoEncoder: Could not get encoded frame`) and the client drops, over and over: the
+  scene / black / scene cycle. The bundled StreamSDK 7.6.3 predates the card and no drop-in replacement exists for
+  Isaac Sim 5.1 (checked 2026-09-05; details and the dead ends in DEPLOYMENT.md item 14). What replaces it:
+  [Rerun](#bring-up) carries the robot's head and wrist cameras and a third-person overview from the simulator, and
+  the bridge writes `live.mp4` per round. `stream_scene.py` and `OMNIGIBSON_REMOTE_STREAMING` still work when the
+  stream happens to hold; treat a working picture as luck.
 - The stream shows only the main viewport: `vision_sensor.py` suppresses auxiliary camera windows under
   `REMOTE_STREAMING`. To confirm, `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` should print only `_0`,
   while `Replicator`, `Replicator_01` and `Replicator_02` are all still created (the sensors still render).
@@ -146,13 +145,10 @@ for anything detached.
 - `gm.PUBLIC_IP` defaults to gpu-01's `172.22.224.37`; on gpu-02 or campus-cluster export `OMNIGIBSON_PUBLIC_IP`.
 - `OMNIGIBSON_HTTP_PORT` / port 8211 does nothing on Isaac Sim 5.x — no browser client is shipped.
 
-Timings measured here: scene + task load 160 s, capture 10 s, plan 4-8 s, execute 25 s, goal scoring 10 s.
-VRAM with all three services up: ~21 GB of 96 GB (sim 14 GB, planner 5.6 GB, M2T2 1.2 GB).
-
 Notes that differ from DEPLOYMENT.md's predictions:
 - pixi is 0.79; `pixi install --locked` did **not** rewrite `pixi.lock` (issue 4 was about 0.78).
 - cuRobo's unpinned `origin/main` happened to be the known-good `b5fad1d`; a later `setup-planners` may move it.
-- Issue 17 (RAM) is moot at 1.5 TB. `data.pyg.org` resolves again; irrelevant to the pixi envs either way.
+- Issue 18 (RAM) is moot at 1.5 TB. `data.pyg.org` resolves again; irrelevant to the pixi envs either way.
 - The private submodule uses a repo-scoped deploy key at `~/.ssh/id_ed25519` plus a global
   `url."git@github.com:WenzhouDing/".insteadOf` rewrite. Other GitHub SSH clones from this account will fail
   ("Repository not found") because `~/.ssh/config` sets `IdentitiesOnly yes` — use HTTPS for those.
@@ -166,7 +162,7 @@ Notes that differ from DEPLOYMENT.md's predictions:
   - once the submodule points at the private repo you need read access to it for these to succeed; the rest of the clone works without it
 - after every `git pull`: `git submodule update --init` (`git pull` alone leaves `tiptop/` at the old commit; `git status` then shows `modified: tiptop (new commits)`)
   - consumers only, once: `git config submodule.recurse true` makes `git pull`/`git checkout` update `tiptop/` automatically (skip if you develop in `tiptop/`: every checkout or pull that moves the pin detaches your `tiptop/` branch)
-- install: `pip install -e tiptop` after `git submodule update --init` (version comes from tiptop's git tags; `setup.sh` does not install it)
+- install: the planner is never pip-installed into the sim env (three isolated envs, `OmniGibson/omnigibson/tiptop/DEPLOYMENT.md`); after `git submodule update --init` run `cd tiptop && pixi install --locked && pixi run setup-planners`
 - develop in `tiptop/` (fresh clones and `git submodule update` leave it on a detached HEAD; commits made there are hidden by the next `git submodule update`):
   - `git -C tiptop checkout main && git -C tiptop pull --ff-only`
   - edit, `git -C tiptop commit`, `git -C tiptop push` (push tiptop FIRST)

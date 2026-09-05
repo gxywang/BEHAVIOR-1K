@@ -1,7 +1,7 @@
 """Probe the live R1Pro in an empty scene: joint order, limits, eef/camera poses at sampled configs, intrinsics.
 
-Writes probe.json for tiptop/scripts/check_r1pro_embodiment.py (validates the planner model against the simulator).
-Run from OmniGibson/ in the behavior env: OMNIGIBSON_HEADLESS=1 python omnigibson/tiptop/scripts/probe_r1pro.py probe.json
+Writes probe.json for tiptop/scripts/check_r1pro_embodiment.py (validates the planner model against the simulator):
+    cd <repo> && OMNIGIBSON_HEADLESS=1 ./b1k/bin/python OmniGibson/omnigibson/tiptop/scripts/probe_r1pro.py probe.json
 """
 
 import json
@@ -12,8 +12,10 @@ import torch as th
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
+from omnigibson.tiptop.r1pro import load_embodiment_meta
 
 OUT = sys.argv[1]
+POSTURE_TORSO = [float(v) for v in load_embodiment_meta()["posture_torso"]]  # the embodiment's torso posture
 rng = np.random.default_rng(0)
 jc = lambda: {
     "name": "JointController",
@@ -32,7 +34,7 @@ cfg = {
             "name": "robot_r1",
             "position": [0, 0, 0],
             "orientation": [0, 0, 0, 1],
-            "obs_modalities": ["rgb", "depth_linear", "seg_instance"],
+            "obs_modalities": ["rgb"],  # only intrinsics and poses are read; seg_instance on a robot camera segfaults
             "action_normalize": False,
             "self_collisions": True,
             "grasping_mode": "sticky",
@@ -137,8 +139,8 @@ for k in range(25):
     qd = {}
     if k == 0:  # all zeros, fingers open
         qd = {n: 0.0 for n in arm_l + arm_r + trunk} | {n: 0.05 for n in fing}
-    elif k == 1:  # challenge torso posture, arms at zero
-        qd = {n: 0.0 for n in arm_l + arm_r} | dict(zip(trunk, [1.025, -1.45, -0.47, 0.0])) | {n: 0.05 for n in fing}
+    elif k == 1:  # the embodiment's torso posture (planned joints, not locked), arms at zero
+        qd = {n: 0.0 for n in arm_l + arm_r} | dict(zip(trunk, POSTURE_TORSO)) | {n: 0.05 for n in fing}
     else:  # random configuration inside 80% of the joint ranges
         for n in arm_l + arm_r + trunk:
             lo_, hi_ = info["limits"][n]

@@ -4,7 +4,8 @@ Isaac's ``seg_instance`` annotator segfaults on the first render in large BEHAVI
 so task runs render rgb + depth only. Ground-truth masks are then computed geometrically: a pixel belongs to an object
 when its unprojected depth point lies on (within ``tol`` of) that object's surface mesh at its current pose.
 
-No OmniGibson / torch imports: numpy + scipy (a trimesh dependency) + trimesh only, so this is unit-testable.
+No torch / Isaac Sim imports: numpy + scipy (a trimesh dependency) + trimesh, plus ``protocol.depth_to_points``
+(pure numpy), so this is unit-testable.
 """
 
 import numpy as np

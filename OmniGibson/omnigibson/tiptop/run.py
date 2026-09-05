@@ -5,9 +5,11 @@ Run inside the sim env with OMNIGIBSON_HEADLESS=1 (or unset it for the GUI):
   python -m omnigibson.tiptop.run capture --out-dir runs/scene1
   python -m omnigibson.tiptop.run replay  --plan <tiptop_plan.json> --scene runs/scene1/capture.json --out-dir runs/replay
   python -m omnigibson.tiptop.run live    --host localhost --port 8765 --out-dir runs/live
+  python -m omnigibson.tiptop.run task    --embodiment r1pro --activity <task> --stage-support <furniture> --out-dir runs/task
 
 `capture` writes obs.h5 (droid-sim-evals layout + ground-truth masks) for `tiptop-h5`; `live` talks to `tiptop-server`
-and, unless --no-state-stream, mirrors the simulator into the server's Rerun view for the whole session.
+and, unless --no-state-stream, mirrors the simulator into the server's Rerun view for the whole session; `task` works
+through a challenge task's whole inside(item, container) goal with a fresh base pose per transfer.
 """
 
 import argparse
@@ -23,7 +25,6 @@ log = logging.getLogger("omnigibson.tiptop")
 
 DEFAULT_TASK = "put the mug in the bowl"
 DEFAULT_GOAL = "on(mug,bowl)"
-MATCH_MAX_DIST = 0.08  # perceived hull to simulated object: farther than this is a different object
 
 
 def parse_goal(goal: str) -> list[dict]:
@@ -122,7 +123,10 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="comma-separated object categories left out of the scene (e.g. straight_chair)",
     )
     r1.add_argument(
-        "--head-aperture", type=float, default=40.0, help="head camera horizontal aperture (mm); eval uses 40"
+        "--head-aperture",
+        type=float,
+        default=None,
+        help="head camera horizontal aperture (mm); default: the challenge evaluator's setting (40)",
     )
     r1.add_argument(
         "--torso",
@@ -150,8 +154,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
 
 
-def parse_spawns(specs) -> list[tuple[str, str, float, float]]:
-    """'PRESET:SUPPORT[:DX,DY]' -> (preset, support, dx, dy); validated before Isaac Sim starts."""
+def parse_spawns(specs, flag: str = "--spawn") -> list[tuple[str, str, float, float]]:
+    """'NAME:SUPPORT[:DX,DY]' -> (name, support, dx, dy) for --spawn and --place; validated before Isaac Sim starts."""
     spawns = []
     for spec in specs:
         parts = spec.split(":")
@@ -161,16 +165,22 @@ def parse_spawns(specs) -> list[tuple[str, str, float, float]]:
             dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) == 3 else (0.0, 0.0)
         except ValueError:
             raise SystemExit(
-                f"--spawn {spec!r}: expected PRESET:SUPPORT or PRESET:SUPPORT:DX,DY (e.g. mug:table_x_0:-0.2,0.15)"
+                f"{flag} {spec!r}: expected NAME:SUPPORT or NAME:SUPPORT:DX,DY (e.g. mug:table_x_0:-0.2,0.15)"
             )
         spawns.append((parts[0], parts[1], dx, dy))
     return spawns
 
 
 def build_r1pro_sim(args, embodiment: dict | None):
-    from omnigibson.tiptop.r1pro import ROBOT_TYPE, R1ProSim, load_embodiment_meta, make_r1pro_env_config
+    from omnigibson.tiptop.r1pro import (
+        HEAD_APERTURE_MM,
+        ROBOT_TYPE,
+        R1ProSim,
+        load_embodiment_meta,
+        make_r1pro_env_config,
+    )
 
-    spawns = parse_spawns(args.spawn)
+    spawns, places = parse_spawns(args.spawn), parse_spawns(args.place, flag="--place")
     scene_model, room_instances = args.scene_model, None
     if args.activity:
         from omnigibson.tiptop.r1pro import challenge_task_info
@@ -185,7 +195,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
         spawn_presets=[sp[0] for sp in spawns],
         grasping_mode=args.grasping_mode,
         camera=args.camera,
-        head_aperture_mm=args.head_aperture,
+        head_aperture_mm=HEAD_APERTURE_MM if args.head_aperture is None else args.head_aperture,
         not_load_object_categories=[c for c in args.not_load.split(",") if c],
         activity=args.activity,
         activity_instance_id=args.activity_instance,
@@ -197,12 +207,10 @@ def build_r1pro_sim(args, embodiment: dict | None):
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
     sim.track_context(
-        *{spec.split(":")[1] for spec in args.place + args.spawn}, args.near, getattr(args, "stage_support", None)
+        *{support for _, support, _, _ in places + spawns}, args.near, getattr(args, "stage_support", None)
     )
-    for spec in args.place:
-        parts = spec.split(":")
-        dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) > 2 else (0.0, 0.0)
-        sim.place_on(parts[0], parts[1], dx, dy)  # settles during the holds below
+    for name, support, dx, dy in places:
+        sim.place_on(name, support, dx, dy)  # settles during the holds below
     if args.no_look:
         sim.look_arm = None
     if embodiment is None:
@@ -341,6 +349,16 @@ def goal_hints(sim, args, atoms: list[dict]) -> dict | None:
     }
 
 
+def setup_logging() -> None:
+    """Give the bridge's logger its own INFO stream: OmniGibson's handler on the "omnigibson" logger hides INFO."""
+    tiptop_log = logging.getLogger("omnigibson.tiptop")
+    tiptop_log.setLevel(logging.INFO)
+    tiptop_log.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    tiptop_log.addHandler(handler)
+
+
 def open_state_stream(hostport: str | None, sim):
     """Mirror the simulator into the server's Rerun view for the rest of the session; None if disabled."""
     if not hostport:
@@ -356,11 +374,11 @@ def open_state_stream(hostport: str | None, sim):
 def perception_report(request: dict, extras: dict, response: dict) -> dict:
     """Pair what the server perceived with the simulator's objects by position, and say what the goal acts on.
 
-    Perception numbers instances in detection order, the simulator by task instance, so the names agree only by
+    Perception numbers instances by box size, the simulator by task instance, so the names agree only by
     chance (2026-09-04: the server's "candle_2" was the simulator's candle_1, one candle over). Logged per round and
     saved with the result; a goal object without a simulated partner is the first thing to look at.
     """
-    from omnigibson.tiptop.protocol import match_objects
+    from omnigibson.tiptop.protocol import MATCH_MAX_DIST, match_objects
 
     perceived = response.get("objects") or {}
     simulated = {name: pose["aabb_center"] for name, pose in extras["object_poses_base"].items()}
@@ -447,9 +465,13 @@ def choose_stage_spot(
     ignore = [sim.scene_object(n) for n in (container, *sim.contents_of(container))]
     aabbs = sim.scene_aabbs()
     half_widths = (sim.xy_radius(item), sim.xy_radius(container))  # keep both edges in frame, not just their centres
+    lo, hi = [v.cpu().numpy() for v in sim.scene_object(support).aabb]
+    support_z = (float(sim.scene_object(item).aabb[0][2]), float(hi[2]))  # the item where it is, the container on top
     best = None
     for d, x, y in tried:
-        pose, _ = sim.best_base_pose([near, (x, y)], ignore=ignore, aabbs=aabbs, half_widths=half_widths)
+        pose, _ = sim.best_base_pose(
+            [near, (x, y)], ignore=ignore, aabbs=aabbs, half_widths=half_widths, support_z=support_z
+        )
         if pose is not None and (best is None or pose[0] < best[0]):
             best = (pose[0], d, x, y)
     if best is None:
@@ -459,7 +481,6 @@ def choose_stage_spot(
         )
         return sim.free_spot_on(container, support, near=near)
     score, d, x, y = best
-    lo, hi = [v.cpu().numpy() for v in sim.scene_object(support).aabb]
     cx, cy = ((lo + hi) / 2)[:2].tolist()
     log.info(
         f"staging {container} for {item}: spot ({x:.2f}, {y:.2f}), {d:.2f} m from the item, base-pose score "
@@ -648,14 +669,7 @@ def main(argv=None):
     )
     p_task.add_argument("--attempts-per-item", type=int, default=2, help="candidate items tried per type per container")
     args = parser.parse_args(argv)
-
-    # OmniGibson installs its own handler on the "omnigibson" logger; give this sub-logger its own INFO stream
-    tiptop_log = logging.getLogger("omnigibson.tiptop")
-    tiptop_log.setLevel(logging.INFO)
-    tiptop_log.propagate = False
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
-    tiptop_log.addHandler(handler)
+    setup_logging()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     import omnigibson as og
