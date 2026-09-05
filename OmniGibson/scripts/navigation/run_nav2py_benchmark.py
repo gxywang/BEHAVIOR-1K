@@ -69,6 +69,8 @@ def parse_args():
     parser.add_argument("--max-lookahead-distance", type=float, default=None)
     parser.add_argument("--lookahead-time", type=float, default=None)
     parser.add_argument("--collision-horizon", type=float, default=None)
+    parser.add_argument("--profile-max-linear-velocity", type=float, default=None)
+    parser.add_argument("--profile-max-angular-velocity", type=float, default=None)
     return parser.parse_args()
 
 
@@ -173,20 +175,22 @@ def select_costmap(costmap_bundle, costmap_source):
     return costmap_bundle["og_eroded"], True
 
 
-def make_robot_profile(robot, nav2py_api, clearance_is_in_costmap=False):
+def make_robot_profile(robot, nav2py_api, args, clearance_is_in_costmap=False):
     robot_radius = float(th.norm(robot.reset_joint_pos_aabb_extent[:2]).item() / 2.0)
     radius = 0.01 if clearance_is_in_costmap else robot_radius
     footprint_padding = 0.0 if clearance_is_in_costmap else 0.2
     inflation_radius = 0.0 if clearance_is_in_costmap else robot_radius + 0.2
+    max_linear_velocity = 0.75 if args.profile_max_linear_velocity is None else args.profile_max_linear_velocity
+    max_angular_velocity = 1.0 if args.profile_max_angular_velocity is None else args.profile_max_angular_velocity
     recovery_maneuvers = nav2py_api["RecoveryManeuver"]
     return nav2py_api["RobotProfile"](
         name=robot.model,
         kinematic_type=nav2py_api["KinematicType"].HOLONOMIC,
         footprint=nav2py_api["CircleFootprint"](radius),
-        max_forward_velocity=0.75,
-        max_reverse_velocity=0.75,
-        max_lateral_velocity=0.75,
-        max_angular_velocity=1.0,
+        max_forward_velocity=max_linear_velocity,
+        max_reverse_velocity=max_linear_velocity,
+        max_lateral_velocity=max_linear_velocity,
+        max_angular_velocity=max_angular_velocity,
         max_linear_acceleration=1.0,
         max_linear_deceleration=1.0,
         max_linear_jerk=20.0,
@@ -216,6 +220,10 @@ def robot_profile_diagnostics(profile):
         "footprint_padding": float(profile.footprint_padding),
         "inflation_radius": float(profile.inflation_radius),
         "padded_footprint_radius": float(profile.padded_footprint.bounding_radius),
+        "max_forward_velocity": float(profile.max_forward_velocity),
+        "max_reverse_velocity": float(profile.max_reverse_velocity),
+        "max_lateral_velocity": float(profile.max_lateral_velocity),
+        "max_angular_velocity": float(profile.max_angular_velocity),
     }
 
 
@@ -667,6 +675,8 @@ def main():
         "max_lookahead_distance",
         "lookahead_time",
         "collision_horizon",
+        "profile_max_linear_velocity",
+        "profile_max_angular_velocity",
     ):
         value = getattr(args, arg_name)
         if value is not None and value <= 0.0:
@@ -695,6 +705,7 @@ def main():
             profile = make_robot_profile(
                 robot,
                 nav2py_api,
+                args,
                 clearance_is_in_costmap=args.costmap_source == "og-eroded",
             )
 
