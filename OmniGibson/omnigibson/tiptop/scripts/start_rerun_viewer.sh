@@ -18,6 +18,21 @@ RERUN="$PWD/.pixi/envs/default/lib/python3.12/site-packages/rerun_sdk/rerun_cli/
 
 GRPC="${RERUN_GRPC_PORT:-9876}"
 WEB="${RERUN_WEB_PORT:-9090}"
+
+# One viewer serves every planner run, so re-running this is a no-op rather than an "address already in use"
+# crash. Both ports must be free together: a half-bound leftover means a stale process to kill.
+busy() { ss -tln 2>/dev/null | grep -q "127.0.0.1:$1 "; }
+if busy "$GRPC" || busy "$WEB"; then
+  if busy "$GRPC" && busy "$WEB"; then
+    echo "Rerun viewer is already running on ${GRPC}/${WEB} -- reusing it, nothing to do." >&2
+    echo "  browser: http://127.0.0.1:${WEB}/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A${GRPC}%2Fproxy" >&2
+    exit 0
+  fi
+  echo "Port $(busy "$GRPC" && echo "$GRPC" || echo "$WEB") is taken but its pair is free -- a stale viewer?" >&2
+  echo "  ss -tlnp | grep -E '${GRPC}|${WEB}'   then kill the pid, or set RERUN_GRPC_PORT / RERUN_WEB_PORT" >&2
+  exit 1
+fi
+
 cat >&2 <<MSG
 Rerun $("$RERUN" --version | head -1 | cut -d' ' -f2) serving:
   gRPC (planner connects here) : rerun+http://127.0.0.1:${GRPC}/proxy

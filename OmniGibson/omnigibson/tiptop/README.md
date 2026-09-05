@@ -125,6 +125,18 @@ ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
 Both ports must be forwarded: the browser loads the viewer from 9090 and then connects to 9876 itself. The same
 launcher replays a finished recording -- pass the file: `start_rerun_viewer.sh tiptop_server_outputs/<ts>/tiptop.rrd`.
 
+**"Address already in use"** comes from one of two places, and they are separate problems:
+
+- *On the server*: a viewer is already running. Re-running the launcher now says so and exits 0 -- one viewer
+  serves every planner run, so this is harmless. `ss -tlnp | grep -E '9876|9090'` shows who holds them.
+- *On the laptop*: `ssh -L` cannot bind because something local already listens on 9876 or 9090 -- usually your own
+  `rerun` (a stray `~/.local/bin/rerun` grabs 9876 by default) or an earlier tunnel still open. Close it, or map to
+  different local ports: `ssh -N -L 9091:127.0.0.1:9090 -L 9877:127.0.0.1:9876 shenlong-gpu-01`, then open
+  `http://127.0.0.1:9091/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9877%2Fproxy`.
+
+Do not start a local viewer on the laptop for this flow -- the browser is the viewer, and a local `rerun` is both
+the usual cause of the port clash and the wrong version (0.30.2 against the SDK's 0.27.3).
+
 The R1Pro renders as a mesh-less set of frames unless the visual meshes have been generated next to the URDF
 (they are gitignored, ~50 MB): `cd tiptop && pixi run python scripts/make_r1pro_embodiment.py --copy-meshes`.
 That also rewrites the tracked embodiment files with a machine-local provenance path -- `git -C tiptop checkout --
