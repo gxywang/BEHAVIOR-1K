@@ -39,11 +39,12 @@ def parse_args():
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
         "--costmap-source",
-        choices=("nav2py-inflated", "og-eroded"),
+        choices=("nav2py-inflated", "og-eroded", "og-eroded-soft"),
         default="nav2py-inflated",
         help=(
             "nav2py-inflated uses the raw OmniGibson traversability map and lets nav2py inflate it. "
-            "og-eroded uses OmniGibson's robot-eroded traversability map and treats that map as already inflated."
+            "og-eroded uses OmniGibson's robot-eroded traversability map and treats that map as already inflated. "
+            "og-eroded-soft adds non-lethal costs near OG-eroded obstacles to prefer higher-clearance paths."
         ),
     )
     parser.add_argument(
@@ -71,6 +72,8 @@ def parse_args():
     parser.add_argument("--collision-horizon", type=float, default=None)
     parser.add_argument("--profile-max-linear-velocity", type=float, default=None)
     parser.add_argument("--profile-max-angular-velocity", type=float, default=None)
+    parser.add_argument("--soft-cost-radius", type=float, default=0.75)
+    parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -162,16 +165,33 @@ def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False):
     )
 
 
-def make_costmap_bundle(scene, floor, robot, nav2py_api):
-    return {
+def make_soft_costmap(costmap, radius, cost_scaling_factor):
+    soft_costmap = costmap.copy()
+    hard_obstacles = costmap.data >= 254
+    soft_costmap.inflate(radius, cost_scaling_factor, inscribed_radius=0.0)
+    soft_costmap.data[hard_obstacles] = costmap.data[hard_obstacles]
+    return soft_costmap
+
+
+def make_costmap_bundle(scene, floor, robot, nav2py_api, args):
+    bundle = {
         "raw": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False),
         "og_eroded": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=True),
     }
+    if args.costmap_source == "og-eroded-soft":
+        bundle["og_eroded_soft"] = make_soft_costmap(
+            bundle["og_eroded"],
+            args.soft_cost_radius,
+            args.soft_cost_scaling_factor,
+        )
+    return bundle
 
 
 def select_costmap(costmap_bundle, costmap_source):
     if costmap_source == "nav2py-inflated":
         return costmap_bundle["raw"], False
+    if costmap_source == "og-eroded-soft":
+        return costmap_bundle["og_eroded_soft"], True
     return costmap_bundle["og_eroded"], True
 
 
@@ -653,6 +673,8 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, args, re
         "costmap_source": args.costmap_source,
         "dynamic_safety_disabled": args.disable_dynamic_safety,
         "trace_failures": args.trace_failures,
+        "soft_cost_radius": args.soft_cost_radius,
+        "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
         "navigation_config": navigation_config_diagnostics(navigation_config),
         "summary": summarize_results(results),
         "episodes": results,
@@ -677,6 +699,8 @@ def main():
         "collision_horizon",
         "profile_max_linear_velocity",
         "profile_max_angular_velocity",
+        "soft_cost_radius",
+        "soft_cost_scaling_factor",
     ):
         value = getattr(args, arg_name)
         if value is not None and value <= 0.0:
@@ -706,13 +730,13 @@ def main():
                 robot,
                 nav2py_api,
                 args,
-                clearance_is_in_costmap=args.costmap_source == "og-eroded",
+                clearance_is_in_costmap=args.costmap_source in {"og-eroded", "og-eroded-soft"},
             )
 
             costmap_bundles = {}
             for episode in scene_episodes:
                 floor = int(episode.get("floor", 0))
-                costmap_bundles.setdefault(floor, make_costmap_bundle(env.scene, floor, robot, nav2py_api))
+                costmap_bundles.setdefault(floor, make_costmap_bundle(env.scene, floor, robot, nav2py_api, args))
                 result = run_episode(
                     env,
                     robot,
