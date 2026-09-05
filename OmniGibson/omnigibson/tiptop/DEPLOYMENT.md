@@ -115,16 +115,25 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
     particle(s)" and succeed on the next request (M2T2 grasp sampling differs per call). Retry before debugging.
 13. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
-14. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
+14. **Blackwell WebRTC needs `UseRefactoredVideoEncoder=1`.** On an RTX PRO 6000 Blackwell (device `0x2BB5`) the
+    client connects and then shows black: the bundled StreamSDK 7.6.3 predates the card and logs
+    `VideoEncoder: Could not get encoded frame` per frame. Export `UseRefactoredVideoEncoder=1` (a StreamSDK regkey,
+    read from the environment by its bare name, or from `~/.config/regkeys.txt`) in the shell that launches the sim.
+    Verified A/B: unset -> 34 encoder errors, no picture; `=1` -> 0 errors, video flows. Ignore the
+    `GPU ... is not white-listed` warning; disassembly shows that branch falls through to the same success path.
+    NVENC is healthy on the card independently (h264/hevc/av1 all encode fine outside Isaac Sim). The wider fix is
+    a newer StreamSDK -- the official 5.1.0 *container* carries 7.7.2, and NVIDIA fixed an NVENC init failure on
+    this exact GPU in Kit 110.1.1 (Isaac Sim 6.0).
+15. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
     `gm.HEADLESS` stays false, so the viewport-camera code in `scene.py` still runs — that is what aims the streamed
     view, and it is why you must NOT also set `OMNIGIBSON_HEADLESS=1`. Auxiliary sensor cameras are kept out of the
     streamed frame (`vision_sensor.py` checks `REMOTE_STREAMING`); everything else is identical.
-15. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
+16. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
     there (see USAGE_DOCS.md).
-16. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
+17. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
     to `~/tiptop-services/M2T2`; override with `TIPTOP_DIR` / `M2T2_DIR`. The laptop also has copies in
     `~/tiptop-services/bin/` that are not in git.
-17. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
+18. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
     (2 GB swap) after 16 transfers: Isaac client 14 GB RSS, planner 4.4 GB, Rerun viewer 2.8 GB, M2T2 1.1 GB, plus
     the desktop. The kernel killed the client, which shared VSCode's cgroup, and took the editor session with it.
     Mitigations: the server now spawns the viewer with `--rerun-memory-limit 2GB` (Rerun's own default is 75% of

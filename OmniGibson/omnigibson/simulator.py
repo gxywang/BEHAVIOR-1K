@@ -281,7 +281,7 @@ def _launch_app():
         # defaults logQosStatus to False, so a failed or degraded session logs only CONNECTED/DISCONNECTED with
         # no reason code, negotiated resolution or encoder stats. Extension [settings] are applied as defaults,
         # so setting them here -- before enable_extension below -- survives.
-        app.set_setting("/app/livestream/logLevel", "debug")
+        app.set_setting("/app/livestream/logLevel", gm.LIVESTREAM_LOG_LEVEL)
         app.set_setting("/app/livestream/webrtc/logQosStatus", True)
 
         # Find our IP address

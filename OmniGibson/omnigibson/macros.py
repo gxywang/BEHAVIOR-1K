@@ -150,6 +150,10 @@ gm.HTTP_PORT = os.getenv("OMNIGIBSON_HTTP_PORT", 8211)
 gm.WEBRTC_PORT = os.getenv("OMNIGIBSON_WEBRTC_PORT", 49100)
 gm.PUBLIC_IP = os.getenv("OMNIGIBSON_PUBLIC_IP", "172.22.224.37") # for webrtc streaming remote server
 
+# Livestream log verbosity: silence | warning | debug | verbose. "debug" names the peer and reason codes; "verbose"
+# additionally dumps the negotiated SDP and the NvEnc error codes behind "Could not get encoded frame".
+gm.LIVESTREAM_LOG_LEVEL = os.getenv("OMNIGIBSON_LIVESTREAM_LOG_LEVEL", "debug")
+
 # Whether to use numpy or torch controller backend. Numpy is significantly faster and should be used
 # for single-threaded (i.e.: non-large scale parallelized env) purposes
 gm.USE_NUMPY_CONTROLLER_BACKEND = True

@@ -48,6 +48,7 @@ Every shell that launches anything needs the GPU pin. Check `nvidia-smi` first â
 ```bash
 cd ~/projects/BEHAVIOR-1K
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2
+export UseRefactoredVideoEncoder=1      # required for WebRTC on this GPU -- see Streaming below
 ```
 
 **1. Services** (needed for `live` / `task`; not for `capture` or `stream_scene`). The planner answers `/health`
@@ -108,6 +109,13 @@ Connect the client while the scene loads (~160 s). Shut down with `pkill -u $USE
   `/app/livestream/proto = "websocket"` (`simulator.py:277`), so video rides the signalling socket and no UDP media
   port is bound; `ufw` is disabled on the host. An SSH tunnel therefore works as a fallback:
   `ssh -N -L 49100:127.0.0.1:49100 shenlong-gpu-01`, then point the client at `127.0.0.1`.
+- **`UseRefactoredVideoEncoder=1` is required here.** Without it the client connects, negotiates, and then gets a
+  black picture: the bundled StreamSDK (`omni.kit.streamsdk.plugins-7.6.3`, built before this GPU shipped) logs
+  `VideoEncoder: Could not get encoded frame` once per frame. It is an NVIDIA StreamSDK regkey, read straight from
+  the environment by the bare key name (it also works from `~/.config/regkeys.txt`, one `Key=Value` per line).
+  Measured A/B on the same scene: unset -> 34 encoder errors and no picture; `=1` -> 0 errors, ~9 Mbit/s of video.
+  The `GPU with device ID 11189 is not white-listed` warning is unrelated noise -- that branch gates nothing.
+  NVENC itself is fine on this card (h264/hevc/av1 all encode at 200+ fps outside Isaac Sim).
 - The stream shows only the main viewport: `vision_sensor.py` suppresses auxiliary camera windows under
   `REMOTE_STREAMING`. To confirm, `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` should print only `_0`,
   while `Replicator`, `Replicator_01` and `Replicator_02` are all still created (the sensors still render).
