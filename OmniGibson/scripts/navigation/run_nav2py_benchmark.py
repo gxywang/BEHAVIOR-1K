@@ -59,6 +59,11 @@ def parse_args():
         action="store_true",
         help="Store compact per-step trace data for failed episodes.",
     )
+    parser.add_argument(
+        "--disable-path-smoothing",
+        action="store_true",
+        help="Disable A* line-of-sight path smoothing.",
+    )
     parser.add_argument("--desired-linear-velocity", type=float, default=None)
     parser.add_argument("--min-lookahead-distance", type=float, default=None)
     parser.add_argument("--max-lookahead-distance", type=float, default=None)
@@ -261,11 +266,20 @@ def make_navigation_config(nav2py_api, args):
 
     if controller_updates:
         config = replace(config, controller=replace(config.controller, **controller_updates))
+    if args.disable_path_smoothing:
+        config = replace(config, planner=replace(config.planner, smooth_path=False))
     return config
 
 
 def navigation_config_diagnostics(config):
     return {
+        "planner": {
+            "allow_diagonal": bool(config.planner.allow_diagonal),
+            "cost_penalty": float(config.planner.cost_penalty),
+            "lethal_cost": int(config.planner.lethal_cost),
+            "max_planning_time": float(config.planner.max_planning_time),
+            "smooth_path": bool(config.planner.smooth_path),
+        },
         "controller": {
             "desired_linear_velocity": float(config.controller.desired_linear_velocity),
             "min_lookahead_distance": float(config.controller.min_lookahead_distance),
