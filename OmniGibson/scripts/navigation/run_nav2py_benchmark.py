@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,16 @@ def parse_args():
             "This is for diagnosis only."
         ),
     )
+    parser.add_argument(
+        "--trace-failures",
+        action="store_true",
+        help="Store compact per-step trace data for failed episodes.",
+    )
+    parser.add_argument("--desired-linear-velocity", type=float, default=None)
+    parser.add_argument("--min-lookahead-distance", type=float, default=None)
+    parser.add_argument("--max-lookahead-distance", type=float, default=None)
+    parser.add_argument("--lookahead-time", type=float, default=None)
+    parser.add_argument("--collision-horizon", type=float, default=None)
     return parser.parse_args()
 
 
@@ -234,7 +245,45 @@ class DiagnosticCollisionModel:
         )
 
 
-def make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api, disable_dynamic_safety=False):
+def make_navigation_config(nav2py_api, args):
+    config = nav2py_api["NavigationConfig"]()
+    controller_updates = {}
+    for arg_name, field_name in (
+        ("desired_linear_velocity", "desired_linear_velocity"),
+        ("min_lookahead_distance", "min_lookahead_distance"),
+        ("max_lookahead_distance", "max_lookahead_distance"),
+        ("lookahead_time", "lookahead_time"),
+        ("collision_horizon", "collision_horizon"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            controller_updates[field_name] = value
+
+    if controller_updates:
+        config = replace(config, controller=replace(config.controller, **controller_updates))
+    return config
+
+
+def navigation_config_diagnostics(config):
+    return {
+        "controller": {
+            "desired_linear_velocity": float(config.controller.desired_linear_velocity),
+            "min_lookahead_distance": float(config.controller.min_lookahead_distance),
+            "max_lookahead_distance": float(config.controller.max_lookahead_distance),
+            "lookahead_time": float(config.controller.lookahead_time),
+            "collision_horizon": float(config.controller.collision_horizon),
+        },
+    }
+
+
+def make_navigator(
+    profile,
+    costmap,
+    costmap_is_profile_inflated,
+    nav2py_api,
+    navigation_config,
+    disable_dynamic_safety=False,
+):
     collision_model = DiagnosticCollisionModel(
         nav2py_api["FootprintCollisionModel"](),
         nav2py_api,
@@ -243,7 +292,7 @@ def make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api, di
     navigator = nav2py_api["Navigator"](
         profile,
         costmap,
-        nav2py_api["NavigationConfig"](),
+        navigation_config,
         collision_model=collision_model,
     )
     if costmap_is_profile_inflated:
@@ -316,6 +365,40 @@ def state_estimate_diagnostic(state, costmap):
         "angular_velocity_body": float(state.angular_velocity),
         "linear_speed_body": math.hypot(float(state.linear_velocity[0]), float(state.linear_velocity[1])),
         "map": point_cost_diagnostic(costmap, [state.pose.x, state.pose.y]),
+    }
+
+
+def step_trace_entry(
+    step,
+    now,
+    state,
+    costmap,
+    final_position,
+    final_distance,
+    nav_status,
+    command,
+    requested_command,
+    safety_decision,
+    safety_decision_without_override,
+):
+    return {
+        "step": int(step),
+        "time": float(now),
+        "pose": {
+            "x": float(state.pose.x),
+            "y": float(state.pose.y),
+            "yaw": float(state.pose.yaw),
+        },
+        "linear_velocity_body": [float(state.linear_velocity[0]), float(state.linear_velocity[1])],
+        "angular_velocity_body": float(state.angular_velocity),
+        "map": point_cost_diagnostic(costmap, final_position[:2]),
+        "final_distance": float(final_distance),
+        "nav2py_state": nav_status.state.value,
+        "nav2py_reason": nav_status.reason,
+        "requested_command": command_diagnostic(requested_command),
+        "command": command_diagnostic(command),
+        "safety_decision": safety_decision_diagnostic(safety_decision),
+        "safety_decision_without_override": safety_decision_diagnostic(safety_decision_without_override),
     }
 
 
@@ -407,7 +490,7 @@ def xy_distance(position, goal):
     return math.hypot(float(position[0]) - float(goal[0]), float(position[1]) - float(goal[1]))
 
 
-def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
+def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, nav2py_api, args):
     place_robot(robot, episode)
 
     for _ in range(args.settle_steps):
@@ -419,6 +502,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         costmap,
         costmap_is_profile_inflated,
         nav2py_api,
+        navigation_config,
         disable_dynamic_safety=args.disable_dynamic_safety,
     )
     costmap_diagnostics = episode_costmap_diagnostics(costmap_bundle, navigator.costmap, episode)
@@ -439,6 +523,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
     last_requested_command = None
     last_safety_decision = None
     last_safety_decision_without_override = None
+    step_trace = []
+    first_lethal_cell_event = None
     for step in range(args.max_steps):
         now = step * dt
         state = robot_state_estimate(robot, now, nav2py_api)
@@ -456,13 +542,38 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         final_distance = xy_distance(position[:2], goal[:2])
         success = final_distance <= args.success_distance
         nav_status = navigator.status()
+        map_diagnostic = point_cost_diagnostic(navigator.costmap, position[:2])
+        if first_lethal_cell_event is None and map_diagnostic["cost"] is not None and map_diagnostic["cost"] >= 253:
+            first_lethal_cell_event = {
+                "step": int(step),
+                "time": float(now),
+                "position": to_float_list(position),
+                "map": map_diagnostic,
+                "final_distance": float(final_distance),
+            }
+        if args.trace_failures:
+            step_trace.append(
+                step_trace_entry(
+                    step,
+                    now,
+                    state,
+                    navigator.costmap,
+                    position,
+                    final_distance,
+                    nav_status,
+                    command,
+                    last_requested_command,
+                    last_safety_decision,
+                    last_safety_decision_without_override,
+                )
+            )
         if success or nav_status.state.value in {"succeeded", "failed", "blocked", "canceled"}:
             break
 
     status = navigator.status()
     position, orientation = robot.get_position_orientation()
     final_yaw = float(T.quat2euler(orientation)[2].item())
-    return {
+    result = {
         "episode_id": episode["episode_id"],
         "scene_model": episode["scene_model"],
         "floor": int(episode.get("floor", 0)),
@@ -489,7 +600,11 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         "last_requested_command": command_diagnostic(last_requested_command),
         "last_safety_decision": safety_decision_diagnostic(last_safety_decision),
         "last_safety_decision_without_override": safety_decision_diagnostic(last_safety_decision_without_override),
+        "first_lethal_cell_event": first_lethal_cell_event,
     }
+    if args.trace_failures and not success:
+        result["step_trace"] = step_trace
+    return result
 
 
 def summarize_results(results):
@@ -504,7 +619,7 @@ def summarize_results(results):
     }
 
 
-def write_results(path, benchmark_path, nav2py_root, args, results):
+def write_results(path, benchmark_path, nav2py_root, navigation_config, args, results):
     output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -515,6 +630,8 @@ def write_results(path, benchmark_path, nav2py_root, args, results):
         "success_distance": args.success_distance,
         "costmap_source": args.costmap_source,
         "dynamic_safety_disabled": args.disable_dynamic_safety,
+        "trace_failures": args.trace_failures,
+        "navigation_config": navigation_config_diagnostics(navigation_config),
         "summary": summarize_results(results),
         "episodes": results,
     }
@@ -530,10 +647,23 @@ def main():
         raise ValueError("--max-steps must be at least 1")
     if args.success_distance <= 0.0:
         raise ValueError("--success-distance must be positive")
+    for arg_name in (
+        "desired_linear_velocity",
+        "min_lookahead_distance",
+        "max_lookahead_distance",
+        "lookahead_time",
+        "collision_horizon",
+    ):
+        value = getattr(args, arg_name)
+        if value is not None and value <= 0.0:
+            raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
 
     seed_everything(args.seed)
     add_nav2py_to_path(args.nav2py_root)
     nav2py_api = load_nav2py()
+    navigation_config = make_navigation_config(nav2py_api, args)
+    if navigation_config.controller.min_lookahead_distance > navigation_config.controller.max_lookahead_distance:
+        raise ValueError("--min-lookahead-distance must be less than or equal to --max-lookahead-distance")
     _, episodes = load_benchmark(args.benchmark)
 
     with gm.unlocked():
@@ -558,7 +688,16 @@ def main():
             for episode in scene_episodes:
                 floor = int(episode.get("floor", 0))
                 costmap_bundles.setdefault(floor, make_costmap_bundle(env.scene, floor, robot, nav2py_api))
-                result = run_episode(env, robot, episode, costmap_bundles[floor], profile, nav2py_api, args)
+                result = run_episode(
+                    env,
+                    robot,
+                    episode,
+                    costmap_bundles[floor],
+                    profile,
+                    navigation_config,
+                    nav2py_api,
+                    args,
+                )
                 results.append(result)
                 active = result["costmap_diagnostics"]["active"]
                 print(
@@ -576,7 +715,7 @@ def main():
 
             og.clear()
 
-        output = write_results(args.output, args.benchmark, args.nav2py_root, args, results)
+        output = write_results(args.output, args.benchmark, args.nav2py_root, navigation_config, args, results)
         summary = summarize_results(results)
         print(f"\nSaved results to: {output}")
         print(f"Success rate: {summary['successes']}/{summary['total']} ({summary['success_rate']:.1%})")
