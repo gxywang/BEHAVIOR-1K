@@ -225,6 +225,68 @@ def point_cost_diagnostic(costmap, point):
     }
 
 
+def command_diagnostic(command):
+    if command is None:
+        return None
+    return {
+        "timestamp": float(command.timestamp),
+        "valid_until": float(command.valid_until),
+        "is_stop": bool(command.is_stop),
+        "velocity": {
+            "vx": float(command.velocity.vx),
+            "vy": float(command.velocity.vy),
+            "wz": float(command.velocity.wz),
+        },
+    }
+
+
+def safety_decision_diagnostic(decision):
+    if decision is None:
+        return None
+    return {
+        "action": decision.action.value,
+        "reason": decision.reason,
+        "command": command_diagnostic(decision.command),
+    }
+
+
+def state_estimate_diagnostic(state, costmap):
+    return {
+        "timestamp": float(state.timestamp),
+        "pose": {
+            "x": float(state.pose.x),
+            "y": float(state.pose.y),
+            "yaw": float(state.pose.yaw),
+        },
+        "linear_velocity_body": [float(state.linear_velocity[0]), float(state.linear_velocity[1])],
+        "angular_velocity_body": float(state.angular_velocity),
+        "linear_speed_body": math.hypot(float(state.linear_velocity[0]), float(state.linear_velocity[1])),
+        "map": point_cost_diagnostic(costmap, [state.pose.x, state.pose.y]),
+    }
+
+
+def robot_state_diagnostic(robot, timestamp, costmap):
+    position, orientation = robot.get_position_orientation()
+    yaw = float(T.quat2euler(orientation)[2].item())
+    linear_velocity_world = robot.get_linear_velocity()
+    angular_velocity_world = robot.get_angular_velocity()
+    rotation_world_to_body = T.quat2mat(orientation).T
+    linear_velocity_body = rotation_world_to_body @ linear_velocity_world
+    angular_velocity_body = rotation_world_to_body @ angular_velocity_world
+
+    return {
+        "timestamp": float(timestamp),
+        "position": to_float_list(position),
+        "yaw": yaw,
+        "linear_velocity_world": to_float_list(linear_velocity_world),
+        "angular_velocity_world": to_float_list(angular_velocity_world),
+        "linear_velocity_body": to_float_list(linear_velocity_body),
+        "angular_velocity_body": to_float_list(angular_velocity_body),
+        "linear_speed_body": math.hypot(float(linear_velocity_body[0]), float(linear_velocity_body[1])),
+        "map": point_cost_diagnostic(costmap, position[:2]),
+    }
+
+
 def episode_costmap_diagnostics(costmap_bundle, active_costmap, episode):
     diagnostics = {}
     for name, costmap in {
@@ -312,10 +374,16 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
     dt = profile.control_period
     commanded_steps = 0
     success = False
+    last_state = None
+    last_command = None
+    last_safety_decision = None
     for step in range(args.max_steps):
         now = step * dt
         state = robot_state_estimate(robot, now, nav2py_api)
         command = navigator.tick(state, now)
+        last_state = state
+        last_command = command
+        last_safety_decision = navigator.last_safety_decision
         if command is not None and not command.is_stop:
             commanded_steps += 1
 
@@ -323,7 +391,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         position, _ = robot.get_position_orientation()
         final_distance = xy_distance(position[:2], goal[:2])
         success = final_distance <= args.success_distance
-        if success or navigator.status().state.value in {"succeeded", "failed", "blocked", "canceled"}:
+        nav_status = navigator.status()
+        if success or nav_status.state.value in {"succeeded", "failed", "blocked", "canceled"}:
             break
 
     status = navigator.status()
@@ -350,6 +419,10 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         "geodesic_distance": float(episode["geodesic_distance"]),
         "remaining_distance": status.remaining_distance,
         "progress": status.progress,
+        "last_tick_state": state_estimate_diagnostic(last_state, navigator.costmap),
+        "final_robot_state": robot_state_diagnostic(robot, (step + 1) * dt, navigator.costmap),
+        "last_command": command_diagnostic(last_command),
+        "last_safety_decision": safety_decision_diagnostic(last_safety_decision),
     }
 
 
