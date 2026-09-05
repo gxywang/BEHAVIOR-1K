@@ -79,15 +79,18 @@ third-person overview are streamed there by the simulator, so no WebRTC client i
 path and must run without `OMNIGIBSON_HEADLESS`.
 
 ```bash
-# a) the demo: load the scene, one basket onto the coffee table, stand once, fill the basket round by round
+# a) the demo: load the scene, stage one basket with one item of each kind next to it, stand once, fill it
+#    round by round with oracle masks (README "Challenge tasks" explains every flag)
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live \
     --embodiment r1pro --activity assembling_gift_baskets \
-    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
-    --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2 --sequential \
-    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2)" \
-    --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
-    --host localhost --port 8765 --out-dir runs/demo
-    # more items from the same spot: list them all in --stand-for and --goal (README "Challenge tasks")
+    --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 --place candle.n.01_4:table.n.02_1:0.05,0.12 \
+    --place butter_cookie.n.01_1:table.n.02_1:0.25,0.12 --place bow.n.08_3:table.n.02_1:0.32,-0.30 \
+    --torso 1.2 -1.7 -0.9 0.0 \
+    --stand-for candle.n.01_4,swiss_cheese.n.01_1,butter_cookie.n.01_1,bow.n.08_3,wicker_basket.n.01_2 --sequential \
+    --goal "inside(candle.n.01_4,wicker_basket.n.01_2);inside(swiss_cheese.n.01_1,wicker_basket.n.01_2);inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(bow.n.08_3,wicker_basket.n.01_2)" \
+    --task "prepare a gift basket: put the candle, the cheese, the cookie and the bow in the wicker basket" \
+    --grasping-mode sticky --host localhost --port 8765 --out-dir runs/demo
+    # add --no-gt for detector + SAM2 instead of oracle masks
 
 # b) capture one frame only, no planner
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
@@ -96,14 +99,17 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
 # c) look at a scene over WebRTC (unreliable on this GPU, see below) -- no services needed
 OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python \
     OmniGibson/omnigibson/tiptop/scripts/stream_scene.py --activity assembling_gift_baskets \
-    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
-    --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2
+    --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 \
+    --stand-for swiss_cheese.n.01_1,wicker_basket.n.01_2
 ```
 
-The scene takes ~160 s to load; the robot appears in Rerun as soon as it is placed. Per round the client logs how
-each perceived object pairs with a simulated one (`perceived 'candle' (goal, 85 grasps) = simulated candle_4 (2.9 cm
-off)`); a goal object with no partner within 8 cm is a false detection. Stop everything with Ctrl-C in each
-window, or `pkill -u $USER -f "tiptop-server|m2t2_server|omnigibson.tiptop.run"` for anything detached.
+The scene takes 3-5 min to load; the robot appears in Rerun as soon as it is placed. The Rerun layout: the 3D
+world on the left (planner's robot model, grey perception hulls with the goal object's grasps, green simulator
+objects), on the right the head camera, the left wrist camera, the overview and the last request's masks. Per
+round the client logs how each perceived object pairs with a simulated one (`perceived 'candle_4' (goal, 85
+grasps) = simulated candle_4 (2.9 cm off)`); a goal object with no partner within 8 cm is a false detection. Stop
+everything with Ctrl-C in each window, or `pkill -u $USER -f "tiptop-server|m2t2_server|omnigibson.tiptop.run"`
+for anything detached.
 
 ### Streaming the viewport to a laptop
 

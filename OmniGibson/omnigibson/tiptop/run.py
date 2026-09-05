@@ -124,6 +124,15 @@ def add_common(p: argparse.ArgumentParser) -> None:
     r1.add_argument(
         "--head-aperture", type=float, default=40.0, help="head camera horizontal aperture (mm); eval uses 40"
     )
+    r1.add_argument(
+        "--torso",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("J1", "J2", "J3", "J4"),
+        help="start the torso here instead of the embodiment's q_home (rad; lower and more forward puts the head "
+        "camera closer to the table, so the robot can stand nearer)",
+    )
     p.add_argument("--task", default=DEFAULT_TASK)
     p.add_argument(
         "--goal", default=DEFAULT_GOAL, help="goal atoms, e.g. 'on(mug,bowl)'; used for gt_atoms and success checks"
@@ -193,9 +202,34 @@ def build_r1pro_sim(args, embodiment: dict | None):
     for spec in args.place:
         parts = spec.split(":")
         dx, dy = (float(v) for v in parts[2].split(",")) if len(parts) > 2 else (0.0, 0.0)
-        sim.place_on(parts[0], parts[1], dx, dy)  # settles during the posture hold below
+        sim.place_on(parts[0], parts[1], dx, dy)  # settles during the holds below
     if args.no_look:
         sim.look_arm = None
+    if embodiment is None:
+        embodiment = load_embodiment_meta()
+        log.info(f"posture from {embodiment['robot_type']} meta file (no server metadata / plan provenance)")
+    else:
+        if embodiment.get("robot_type") != ROBOT_TYPE:
+            raise ValueError(f"embodiment {embodiment.get('robot_type')!r} is not {ROBOT_TYPE!r}")
+        try:  # best effort: warn when the submodule's generated meta drifted from what the server/plan carries
+            local = load_embodiment_meta(ROBOT_TYPE)
+            if (
+                local["locked_joints"] != embodiment["locked_joints"]
+                or local["joint_names"] != embodiment["joint_names"]
+            ):
+                log.warning(
+                    "server/plan embodiment differs from the local tiptop submodule's meta file; using the former"
+                )
+        except FileNotFoundError:
+            pass
+    q_home = [float(v) for v in embodiment["q_home"]]
+    if args.torso:  # the planner moves the torso anyway; this only changes where the episode (and the capture) starts
+        for joint, value in zip(embodiment["torso_joints"], args.torso):
+            q_home[embodiment["joint_names"].index(joint)] = value
+    # the posture decides how close the head camera can see, so it comes before the base pose is chosen
+    sim.apply_posture(
+        embodiment["locked_joints"], q_home, settle_steps=args.settle_steps, joint_names=embodiment["joint_names"]
+    )
     if args.robot_pose:
         sim.place_robot(*args.robot_pose)
     elif args.stand_for:
@@ -214,29 +248,6 @@ def build_r1pro_sim(args, embodiment: dict | None):
         log.info(f"applied object poses from {args.scene}")
     if args.finger_max_effort is not None:
         sim.set_finger_max_effort(args.finger_max_effort)
-    if embodiment is None:
-        embodiment = load_embodiment_meta()
-        log.info(f"posture from {embodiment['robot_type']} meta file (no server metadata / plan provenance)")
-    else:
-        if embodiment.get("robot_type") != ROBOT_TYPE:
-            raise ValueError(f"embodiment {embodiment.get('robot_type')!r} is not {ROBOT_TYPE!r}")
-        try:  # best effort: warn when the submodule's generated meta drifted from what the server/plan carries
-            local = load_embodiment_meta(ROBOT_TYPE)
-            if (
-                local["locked_joints"] != embodiment["locked_joints"]
-                or local["joint_names"] != embodiment["joint_names"]
-            ):
-                log.warning(
-                    "server/plan embodiment differs from the local tiptop submodule's meta file; using the former"
-                )
-        except FileNotFoundError:
-            pass
-    sim.apply_posture(
-        embodiment["locked_joints"],
-        embodiment["q_home"],
-        settle_steps=args.settle_steps,
-        joint_names=embodiment["joint_names"],
-    )
     sim.hold(args.settle_steps, sim.OPEN)
     if args.activity:
         sim.mark_goal_initial()

@@ -108,23 +108,24 @@ nobody owns would keep old data): `pkill -u $USER -f 'rerun --serve-web'`, or pa
 `--rerun-web-port`. On the laptop, `ssh -L` fails the same way when a local `rerun` holds 9876; close it or map other
 local ports.
 
-What the recording holds:
+The layout is sent by the planner: one 3D view (left) and, on the right, the simulator's cameras and the last
+request's masks. Everything else the recording holds stays out of the layout so the view stays readable.
 
 | entity | what | from |
 |---|---|---|
 | `r1pro_left/...`, `panda/...` | the planner's robot model at the simulator's current joints | planner (URDF); joints from the simulator |
 | `world/sim/<task name>` | green: the simulator's own meshes of the task objects at their simulated poses; grey-blue: furniture named on the command line | simulator |
-| `world/objects/<label>`, `obj_pcd/<label>`, `grasps/<label>/...`, `world/table`, `pcd`, `cam` | grey: what perception reconstructed for the *last* request (hulls, clouds, top 30 grasps, table plane, camera), cleared when the next request arrives | planner |
-| `rgb`, `bboxes`, `masks` | the last request's image, detections and masks | planner |
-| `sim/head_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | what the capture camera sees, and a third-person view over the robot's left shoulder | simulator, every 6 env steps |
-| `sim/gripper_opening_m` | the finger opening | simulator, every 2 env steps |
+| `world/objects/<label>`, `grasps/<label>/...`, `world/table`, `pcd`, `cam` | grey: what perception reconstructed for the *last* request (hulls, the top 30 grasps of the goal's objects, table plane, cloud, camera), cleared when the next request arrives | planner |
+| `sim/head_cam`, `sim/wrist_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | the head camera, the left wrist camera, and a third-person view over the robot's left shoulder | simulator, every 6 env steps |
+| `masks` | the last request's image with its masks and boxes (`rgb`, `bboxes`, `obj_pcd/*` are logged too but hidden: the same content) | planner |
 
 Names: `world/sim/*` uses the simulator's task names (`candle_2` is `candle.n.01_2`); `world/objects/*` uses
-perception's, which number instances in detection order, so `candle_2` is usually a *different* candle in the two
-trees. Nothing is matched by name. After every plan the client pairs the two by position and logs one line per
-perceived object -- `perceived 'candle' (goal, 85 grasps) = simulated candle_2 (2.9 cm off)` -- saved as
-`perception` in `live_result.json`; a perceived object with no simulated partner within 8 cm is a false detection
-or a hull that landed somewhere else, and the goal object is the first line to read.
+perception's, which with ground-truth masks are the same names and with the detector number instances in
+detection order, so `candle_2` is usually a *different* candle in the two trees. Nothing is matched by name. After
+every plan the client pairs the two by position and logs one line per perceived object --
+`perceived 'candle' (goal, 85 grasps) = simulated candle_2 (2.9 cm off)` -- saved as `perception` in
+`live_result.json`; a perceived object with no simulated partner within 8 cm is a false detection or a hull that
+landed somewhere else, and the goal object is the first line to read.
 
 Everything sits on the `log_time` timeline (wall clock). Keep the viewer on *Following* (time panel, bottom); the
 simulator runs slower than real time, so the view is live but not real-time-scaled. When the planner restarts,
@@ -218,6 +219,50 @@ python -m omnigibson.tiptop.run task --embodiment r1pro --activity assembling_gi
     --stage-support table.n.02_1 --task "put the item in the wicker basket" --grasping-mode sticky \
     --attempts-per-item 2 --host localhost --port 8765 --out-dir runs/gift_task
 ```
+
+What replaces navigation for now: `--stand-for ITEM[,ITEM...],TARGET` searches one base pose from which every
+item and the target are ahead, on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports
+an object before the episode (used to bring a basket from the floor onto the coffee table, standing in for a
+carry); `--sequential` runs one capture/plan/execute round per goal atom from where the robot stands (`--restand`
+teleports the base to a fresh pose before each round instead). The rules forbid teleporting during evaluation, so
+these are test scaffolding until the base moves under its own controller.
+
+Target task: `assembling_gift_baskets` (task 26, house_double_floor_lower living room, 4 wicker baskets on the
+floor, 4 candles + 4 butter cookies + 4 Swiss cheeses + 4 bows on a 0.41 m coffee table, goal one of each inside
+every basket; the longest task at 869 s mean human time, no 2025 submission ever completed it).
+
+The demo: the scene loads, one basket is put on the coffee table with one candle, one cheese, one cookie and one
+bow next to it, the robot is placed once, flush with the table's long side, and fills the basket from that spot,
+one item per round, with oracle masks:
+
+```bash
+python -m omnigibson.tiptop.run live --embodiment r1pro --activity assembling_gift_baskets \
+    --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 --place candle.n.01_4:table.n.02_1:0.05,0.12 \
+    --place butter_cookie.n.01_1:table.n.02_1:0.25,0.12 --place bow.n.08_3:table.n.02_1:0.32,-0.30 \
+    --torso 1.2 -1.7 -0.9 0.0 \
+    --stand-for candle.n.01_4,swiss_cheese.n.01_1,butter_cookie.n.01_1,bow.n.08_3,wicker_basket.n.01_2 --sequential \
+    --goal "inside(candle.n.01_4,wicker_basket.n.01_2);inside(swiss_cheese.n.01_1,wicker_basket.n.01_2);inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(bow.n.08_3,wicker_basket.n.01_2)" \
+    --task "prepare a gift basket: put the candle, the cheese, the cookie and the bow in the wicker basket" \
+    --grasping-mode sticky --host localhost --port 8765 --out-dir runs/demo
+```
+
+Why it is set up this way (measured 2026-09-05 in the scene): no single base pose reaches four items where the
+task leaves them (the coffee table is 0.82 x 1.67 m and the arm reaches ~0.9 m), so the candle, cookie and bow are
+teleported next to the basket at the +x edge, where the cheese already is. `--torso 1.2 -1.7 -0.9 0` starts the
+torso a little lower than the challenge posture (head camera at ~1.28 m instead of 1.40) and pitched forward;
+the height alone changes nothing, the pitch is what lets the robot stand close: `apply_posture` measures where
+the camera's bottom image edge meets the table top (0.55 m ahead in the challenge posture, ~0.4 m tilted) and
+the base-pose search keeps objects beyond that. Two limits found on the way: crouching the hips further
+(joint1 1.3, joint2 -1.9) puts cuRobo's sphere model of the robot in self-collision at every tilt, so every plan
+fails with `INVALID_START_STATE_SELF_COLLISION` (joint1 <= 1.2 is clear), and deeper still (1.5, -2.2) the
+simulator cannot even hold the locked right arm. From the chosen pose the five objects are 0.55-0.8 m away.
+`--stand-for` fails loudly, with its rejection counts, when no single pose works; `--restand` brings back a
+fresh pose per round.
+
+Result of that command (2026-09-05, headless, oracle masks): all four items ended up inside the basket, the
+task's partial-credit score 0 -> 0.25 (4 of the 16 `inside` predicates); per round capture 8 s, plan 3-4 s,
+execute 25-30 s, goal scoring 20 s. The same set-up with the detector instead of oracle masks (`--no-gt`) is
+the competition-style variant.
 
 What replaces navigation for now: `--stand-for ITEM[,ITEM...],TARGET` searches one base pose from which every
 item and the target are ahead, on the left and within reach of the left arm; `--place OBJ:SUPPORT:DX,DY` teleports
