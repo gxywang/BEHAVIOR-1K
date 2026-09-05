@@ -45,6 +45,14 @@ def parse_args():
             "og-eroded uses OmniGibson's robot-eroded traversability map and treats that map as already inflated."
         ),
     )
+    parser.add_argument(
+        "--disable-dynamic-safety",
+        action="store_true",
+        help=(
+            "Bypass nav2py's dynamic collision safety veto while still logging the delegated safety decision. "
+            "This is for diagnosis only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -70,8 +78,10 @@ def load_nav2py():
             Pose2D,
             RecoveryManeuver,
             RobotProfile,
+            SafetyAction,
             StateEstimate,
         )
+        from nav2py.components import FootprintCollisionModel, SafetyDecision
         from nav2py.maps import Costmap2D
     except ImportError as exc:
         raise RuntimeError(
@@ -81,6 +91,7 @@ def load_nav2py():
     return {
         "CircleFootprint": CircleFootprint,
         "Costmap2D": Costmap2D,
+        "FootprintCollisionModel": FootprintCollisionModel,
         "GoalSemantics": GoalSemantics,
         "KinematicType": KinematicType,
         "NavigationConfig": NavigationConfig,
@@ -89,6 +100,8 @@ def load_nav2py():
         "Pose2D": Pose2D,
         "RecoveryManeuver": RecoveryManeuver,
         "RobotProfile": RobotProfile,
+        "SafetyAction": SafetyAction,
+        "SafetyDecision": SafetyDecision,
         "StateEstimate": StateEstimate,
     }
 
@@ -190,8 +203,49 @@ def robot_profile_diagnostics(profile):
     }
 
 
-def make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api):
-    navigator = nav2py_api["Navigator"](profile, costmap, nav2py_api["NavigationConfig"]())
+class DiagnosticCollisionModel:
+    def __init__(self, delegate, nav2py_api, disabled=False):
+        self.delegate = delegate
+        self.disabled = disabled
+        self.compatibility = delegate.compatibility
+        self._safety_decision_cls = nav2py_api["SafetyDecision"]
+        self._continue_action = nav2py_api["SafetyAction"].CONTINUE
+        self.last_requested_command = None
+        self.last_delegate_decision = None
+
+    def evaluate(self, context):
+        self.last_requested_command = context.command
+        self.last_delegate_decision = self.delegate.evaluate(context)
+        if self.disabled:
+            return self._safety_decision_cls(context.command, self._continue_action)
+        return self.last_delegate_decision
+
+    def filter(self, command, pose, profile, costmap, *, lethal_cost, horizon):
+        self.last_requested_command = command
+        if self.disabled:
+            return command
+        return self.delegate.filter(
+            command,
+            pose,
+            profile,
+            costmap,
+            lethal_cost=lethal_cost,
+            horizon=horizon,
+        )
+
+
+def make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api, disable_dynamic_safety=False):
+    collision_model = DiagnosticCollisionModel(
+        nav2py_api["FootprintCollisionModel"](),
+        nav2py_api,
+        disabled=disable_dynamic_safety,
+    )
+    navigator = nav2py_api["Navigator"](
+        profile,
+        costmap,
+        nav2py_api["NavigationConfig"](),
+        collision_model=collision_model,
+    )
     if costmap_is_profile_inflated:
         navigator.update_costmap(costmap, profile_inflated=True, base_costmap=costmap)
     return navigator
@@ -360,7 +414,13 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         env.step({robot.name: controller_no_op_action(robot)})
 
     costmap, costmap_is_profile_inflated = select_costmap(costmap_bundle, args.costmap_source)
-    navigator = make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api)
+    navigator = make_navigator(
+        profile,
+        costmap,
+        costmap_is_profile_inflated,
+        nav2py_api,
+        disable_dynamic_safety=args.disable_dynamic_safety,
+    )
     costmap_diagnostics = episode_costmap_diagnostics(costmap_bundle, navigator.costmap, episode)
     goal = episode["goal_position"]
     navigator.submit(
@@ -376,14 +436,18 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
     success = False
     last_state = None
     last_command = None
+    last_requested_command = None
     last_safety_decision = None
+    last_safety_decision_without_override = None
     for step in range(args.max_steps):
         now = step * dt
         state = robot_state_estimate(robot, now, nav2py_api)
         command = navigator.tick(state, now)
         last_state = state
         last_command = command
+        last_requested_command = navigator.collision_model.last_requested_command
         last_safety_decision = navigator.last_safety_decision
+        last_safety_decision_without_override = navigator.collision_model.last_delegate_decision
         if command is not None and not command.is_stop:
             commanded_steps += 1
 
@@ -422,7 +486,9 @@ def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
         "last_tick_state": state_estimate_diagnostic(last_state, navigator.costmap),
         "final_robot_state": robot_state_diagnostic(robot, (step + 1) * dt, navigator.costmap),
         "last_command": command_diagnostic(last_command),
+        "last_requested_command": command_diagnostic(last_requested_command),
         "last_safety_decision": safety_decision_diagnostic(last_safety_decision),
+        "last_safety_decision_without_override": safety_decision_diagnostic(last_safety_decision_without_override),
     }
 
 
@@ -448,6 +514,7 @@ def write_results(path, benchmark_path, nav2py_root, args, results):
         "max_steps": args.max_steps,
         "success_distance": args.success_distance,
         "costmap_source": args.costmap_source,
+        "dynamic_safety_disabled": args.disable_dynamic_safety,
         "summary": summarize_results(results),
         "episodes": results,
     }
