@@ -36,6 +36,15 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=1800)
     parser.add_argument("--success-distance", type=float, default=0.5)
     parser.add_argument("--settle-steps", type=int, default=10)
+    parser.add_argument(
+        "--costmap-source",
+        choices=("nav2py-inflated", "og-eroded"),
+        default="nav2py-inflated",
+        help=(
+            "nav2py-inflated uses the raw OmniGibson traversability map and lets nav2py inflate it. "
+            "og-eroded uses OmniGibson's robot-eroded traversability map and treats that map as already inflated."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,8 +111,11 @@ def group_episodes_by_scene(episodes):
     return groups
 
 
-def make_costmap(scene, floor, nav2py_api):
-    trav_map = scene.trav_map.floor_map[floor].detach().cpu().numpy()
+def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False):
+    trav_map = th.clone(scene.trav_map.floor_map[floor])
+    if erode_for_robot:
+        trav_map = scene.trav_map._erode_trav_map(trav_map, robot=robot)
+    trav_map = trav_map.detach().cpu().numpy()
     occupancy = np.full(trav_map.shape, 100, dtype=np.int16)
     occupancy[trav_map == 255] = 0
 
@@ -119,8 +131,24 @@ def make_costmap(scene, floor, nav2py_api):
     )
 
 
-def make_robot_profile(robot, nav2py_api):
-    radius = float(th.norm(robot.reset_joint_pos_aabb_extent[:2]).item() / 2.0)
+def make_costmap_bundle(scene, floor, robot, nav2py_api):
+    return {
+        "raw": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False),
+        "og_eroded": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=True),
+    }
+
+
+def select_costmap(costmap_bundle, costmap_source):
+    if costmap_source == "nav2py-inflated":
+        return costmap_bundle["raw"], False
+    return costmap_bundle["og_eroded"], True
+
+
+def make_robot_profile(robot, nav2py_api, clearance_is_in_costmap=False):
+    robot_radius = float(th.norm(robot.reset_joint_pos_aabb_extent[:2]).item() / 2.0)
+    radius = 0.01 if clearance_is_in_costmap else robot_radius
+    footprint_padding = 0.0 if clearance_is_in_costmap else 0.2
+    inflation_radius = 0.0 if clearance_is_in_costmap else robot_radius + 0.2
     recovery_maneuvers = nav2py_api["RecoveryManeuver"]
     return nav2py_api["RobotProfile"](
         name=robot.model,
@@ -140,8 +168,8 @@ def make_robot_profile(robot, nav2py_api):
         can_rotate_in_place=True,
         control_period=1.0 / 30.0,
         command_latency=0.0,
-        footprint_padding=0.2,
-        inflation_radius=radius + 0.2,
+        footprint_padding=footprint_padding,
+        inflation_radius=inflation_radius,
         allowed_recovery_maneuvers=frozenset(
             {
                 recovery_maneuvers.STOP,
@@ -151,6 +179,64 @@ def make_robot_profile(robot, nav2py_api):
             }
         ),
     )
+
+
+def robot_profile_diagnostics(profile):
+    return {
+        "footprint_radius": float(profile.footprint.bounding_radius),
+        "footprint_padding": float(profile.footprint_padding),
+        "inflation_radius": float(profile.inflation_radius),
+        "padded_footprint_radius": float(profile.padded_footprint.bounding_radius),
+    }
+
+
+def make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api):
+    navigator = nav2py_api["Navigator"](profile, costmap, nav2py_api["NavigationConfig"]())
+    if costmap_is_profile_inflated:
+        navigator.update_costmap(costmap, profile_inflated=True, base_costmap=costmap)
+    return navigator
+
+
+def point_cost_diagnostic(costmap, point):
+    cell = costmap.world_to_map(float(point[0]), float(point[1]))
+    if cell is None:
+        return {
+            "cell": None,
+            "cost": None,
+            "start_rejected": True,
+            "goal_rejected": True,
+            "free_neighbor_cells_r1": 0,
+        }
+
+    row, col = cell
+    cost = int(costmap.data[row, col])
+    free_neighbors = 0
+    for r in range(row - 1, row + 2):
+        for c in range(col - 1, col + 2):
+            if 0 <= r < costmap.data.shape[0] and 0 <= c < costmap.data.shape[1]:
+                free_neighbors += int(not costmap.is_lethal(r, c, lethal_cost=253))
+
+    return {
+        "cell": [int(row), int(col)],
+        "cost": cost,
+        "start_rejected": cost >= 254,
+        "goal_rejected": cost >= 253,
+        "free_neighbor_cells_r1": free_neighbors,
+    }
+
+
+def episode_costmap_diagnostics(costmap_bundle, active_costmap, episode):
+    diagnostics = {}
+    for name, costmap in {
+        "raw": costmap_bundle["raw"],
+        "og_eroded": costmap_bundle["og_eroded"],
+        "active": active_costmap,
+    }.items():
+        diagnostics[name] = {
+            "start": point_cost_diagnostic(costmap, episode["start_position"]),
+            "goal": point_cost_diagnostic(costmap, episode["goal_position"]),
+        }
+    return diagnostics
 
 
 def controller_no_op_action(robot):
@@ -205,13 +291,15 @@ def xy_distance(position, goal):
     return math.hypot(float(position[0]) - float(goal[0]), float(position[1]) - float(goal[1]))
 
 
-def run_episode(env, robot, episode, costmap, profile, nav2py_api, args):
+def run_episode(env, robot, episode, costmap_bundle, profile, nav2py_api, args):
     place_robot(robot, episode)
 
     for _ in range(args.settle_steps):
         env.step({robot.name: controller_no_op_action(robot)})
 
-    navigator = nav2py_api["Navigator"](profile, costmap, nav2py_api["NavigationConfig"]())
+    costmap, costmap_is_profile_inflated = select_costmap(costmap_bundle, args.costmap_source)
+    navigator = make_navigator(profile, costmap, costmap_is_profile_inflated, nav2py_api)
+    costmap_diagnostics = episode_costmap_diagnostics(costmap_bundle, navigator.costmap, episode)
     goal = episode["goal_position"]
     navigator.submit(
         nav2py_api["NavigationTask"](
@@ -246,6 +334,9 @@ def run_episode(env, robot, episode, costmap, profile, nav2py_api, args):
         "scene_model": episode["scene_model"],
         "floor": int(episode.get("floor", 0)),
         "success": success,
+        "costmap_source": args.costmap_source,
+        "robot_profile": robot_profile_diagnostics(profile),
+        "costmap_diagnostics": costmap_diagnostics,
         "nav2py_state": status.state.value,
         "nav2py_reason": status.reason,
         "steps": step + 1,
@@ -283,6 +374,7 @@ def write_results(path, benchmark_path, nav2py_root, args, results):
         "seed": args.seed,
         "max_steps": args.max_steps,
         "success_distance": args.success_distance,
+        "costmap_source": args.costmap_source,
         "summary": summarize_results(results),
         "episodes": results,
     }
@@ -316,20 +408,31 @@ def main():
             cfg = build_env_config(scene_model=scene_model, robot_cfg=robot_cfg)
             env = og.Environment(configs=cfg)
             robot = env.robots[0]
-            profile = make_robot_profile(robot, nav2py_api)
+            profile = make_robot_profile(
+                robot,
+                nav2py_api,
+                clearance_is_in_costmap=args.costmap_source == "og-eroded",
+            )
 
-            costmaps = {}
+            costmap_bundles = {}
             for episode in scene_episodes:
                 floor = int(episode.get("floor", 0))
-                costmaps.setdefault(floor, make_costmap(env.scene, floor, nav2py_api))
-                result = run_episode(env, robot, episode, costmaps[floor], profile, nav2py_api, args)
+                costmap_bundles.setdefault(floor, make_costmap_bundle(env.scene, floor, robot, nav2py_api))
+                result = run_episode(env, robot, episode, costmap_bundles[floor], profile, nav2py_api, args)
                 results.append(result)
+                active = result["costmap_diagnostics"]["active"]
                 print(
                     f"  {result['episode_id']}: "
                     f"{'SUCCESS' if result['success'] else 'FAIL'} "
                     f"final_distance={result['final_distance']:.3f}m "
                     f"state={result['nav2py_state']}"
                 )
+                if not result["success"]:
+                    print(
+                        f"    active_costs: start={active['start']['cost']} "
+                        f"goal={active['goal']['cost']} "
+                        f"reason={result['nav2py_reason']}"
+                    )
 
             og.clear()
 
