@@ -99,13 +99,14 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    needs `git apply` of the same patch; upstreaming it to tiptop-robot/cuTAMP is the real fix.
 8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; cuRobo warms up MotionGen at server start (`/health` is 200 only afterwards).
-9. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display. Use `save`
-   (one `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<timestamp>/`, open later with `rerun <file>`)
-   or `connect` with `--rerun-url rerun+http://127.0.0.1:9876/proxy` plus a reverse tunnel to a viewer on your
-   laptop (`ssh -R 9876:127.0.0.1:9876 server`, `rerun` running locally). The client's sim-state mirror works in
-   all modes. Run the viewer from the tiptop env (`pixi run rerun`, 0.27.3 = the SDK): `stream` and `connect` reuse
-   whatever already listens on 9876, and a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2 on
-   the laptop) only warns that Rerun guarantees no compatibility across versions.
+9. **Rerun on a headless box.** `--rerun-mode stream` spawns a viewer window and needs a display, so it is
+   laptop-only. On a server run `scripts/start_rerun_viewer.sh` (serves the env's own 0.27.3 viewer over gRPC 9876
+   + web 9090) and start the planner with `TIPTOP_RERUN_MODE=connect`; the laptop then needs only a browser and
+   `ssh -L`. See README.md "Rerun from the laptop". `--rerun-mode save` remains the archival mode — one
+   `tiptop.rrd` per request under `tiptop/tiptop_server_outputs/<timestamp>/`, replayable by passing the file to
+   the same launcher. The client's sim-state mirror works in all modes. Viewer and SDK must be the *same* version
+   (0.27.3 here); a `rerun` of another version on `PATH` (`~/.local/bin/rerun` was 0.30.2 on the laptop) is why
+   serving from the server is preferred — it matches by construction.
 10. **Ports.** Launchers bind 127.0.0.1. Same machine: nothing to do. Sim on the laptop, planner on the server:
    `ssh -N -L 8765:127.0.0.1:8765 server` and `--host localhost`, or `TIPTOP_HOST=0.0.0.0`. The client refuses to
    run unless the server metadata says `robot_type: panda`, `dof: 7` (the launcher's `--config` guarantees it).
@@ -114,8 +115,10 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
     particle(s)" and succeed on the next request (M2T2 grasp sampling differs per call). Retry before debugging.
 13. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
-14. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the sim is forced headless; the GUI
-    viewport code in `scene.py` is skipped, everything else is identical.
+14. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
+    `gm.HEADLESS` stays false, so the viewport-camera code in `scene.py` still runs — that is what aims the streamed
+    view, and it is why you must NOT also set `OMNIGIBSON_HEADLESS=1`. Auxiliary sensor cameras are kept out of the
+    streamed frame (`vision_sensor.py` checks `REMOTE_STREAMING`); everything else is identical.
 15. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
     there (see USAGE_DOCS.md).
 16. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`

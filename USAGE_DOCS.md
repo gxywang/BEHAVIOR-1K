@@ -1,9 +1,8 @@
 # Usage docs for lab
 ## Basics
 - `module load cuda-toolkit/13.0`
-- on server: `export OMNIGIBSON_REMOTE_STREAMING=webrtc` to stream, `export OMNIGIBSON_HEADLESS=1` to run without a viewport
-  - set only one: streaming already forces the app headless, and `OMNIGIBSON_HEADLESS=1` additionally skips aiming the viewport camera, so you stream a default pose (see the runbook below)
-  - if using `CUDA_VISIBLE_DEVICES=`, make sure to add this to `.bashrc` to make GPU ordering consistent with `nvidia_smi`: `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+- on server: set `OMNIGIBSON_REMOTE_STREAMING=webrtc` to watch, or `OMNIGIBSON_HEADLESS=1` to run batch — never both (see [Bring-up](#bring-up))
+- always `export CUDA_DEVICE_ORDER=PCI_BUS_ID` alongside `CUDA_VISIBLE_DEVICES=`, so indices match `nvidia-smi`
 - to run `uv` install script: `bash setup_uv.sh   --new-env b1k   --omnigibson   --bddl   --dataset  --joylo  --eval --accept-nvidia-eula   --accept-dataset-tos`
 - download [Isaac Sim WebRTC Streaming Client](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/download.html)
 - on streaming client, connect to server `172.22.224.37` for `shenlong-gpu-01`
@@ -42,53 +41,80 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   # check nvidia-smi 
   cards and are expected.
 - The service launchers now take `TIPTOP_GPU` / `M2T2_GPU` (index or UUID); unset = unchanged laptop behaviour.
 
-### Streaming the viewport to a laptop
+### Bring-up
 
-```bash
-export OMNIGIBSON_REMOTE_STREAMING=webrtc      # and do NOT set OMNIGIBSON_HEADLESS
-```
-
-- **Unset `OMNIGIBSON_HEADLESS`.** Streaming already forces the app headless (`simulator.py:173`), but
-  `tiptop/scene.py:166` only aims the viewport camera when `gm.HEADLESS` is false — with it set you stream a
-  default camera pose.
-- Client: the standalone **Isaac Sim WebRTC Streaming Client** (5.1). Type the bare IP `172.22.224.37`, no port.
-- Ports: **TCP 49100 only** — and nothing else. OmniGibson sets `/app/livestream/proto = "websocket"`
-  (`simulator.py:277`), so the video rides the same WebSocket as the signalling; no UDP media port is ever bound.
-  Verified 2026-09-04 with a client on the campus network: `ss -uanp` shows no UDP media socket, the Kit log reports
-  `NVST_CCE_CONNECTED` / `All Streams connected`, and the picture arrives. 49100 is hardcoded in the client and binds
-  `0.0.0.0`. `ufw` is disabled on the host. This also means an SSH tunnel works as a fallback:
-  `ssh -N -L 49100:127.0.0.1:49100 shenlong-gpu-01`, then point the client at `127.0.0.1`.
-- The stream shows **only the main viewport**. Until 2026-09-04 every robot/external camera also docked its own
-  ViewportWindow into the streamed frame (`gm.HEADLESS` is false while streaming), which cluttered the picture and
-  cost an extra render per camera per frame; `vision_sensor.py` now suppresses those under `REMOTE_STREAMING`.
-  Check with `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` — only `_0` should appear, while
-  `Replicator`, `Replicator_01`, `Replicator_02` must all still be created (the sensors still render for capture).
-- Streaming problems now leave a trail: `/app/livestream/logLevel=debug` and `webrtc/logQosStatus` are set, so the
-  Kit log carries signalling, peer state and reason codes instead of just CONNECTED/DISCONNECTED.
-- `gm.HTTP_PORT` / the `:8211` browser client is **dead** on Isaac Sim 5.1 — `omni.services.streamclient.webrtc`
-  is not shipped and nothing binds the port. The startup line now prints the address for the desktop client.
-- `gm.PUBLIC_IP` is hardcoded to gpu-01's `172.22.224.37`; on gpu-02 or campus-cluster export `OMNIGIBSON_PUBLIC_IP`.
-
-### Running the stack
+Every shell that launches anything needs the GPU pin. Check `nvidia-smi` first — the box is shared.
 
 ```bash
 cd ~/projects/BEHAVIOR-1K
-M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh &                  # http://127.0.0.1:8123
-TIPTOP_GPU=2 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 \
-  TIPTOP_MAX_PLANNING_TIME=40 TIPTOP_RERUN_MODE=save \
-  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh &                  # ws://127.0.0.1:8765
-curl -s localhost:8123/health; curl -s localhost:8765/health                     # planner answers after cuRobo warm-up
-
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 OMNIGIBSON_HEADLESS=1 \
-  b1k/bin/python -m omnigibson.tiptop.run live --embodiment r1pro \
-    --activity assembling_gift_baskets --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 --sequential \
-    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(candle.n.01_2,wicker_basket.n.01_2)" \
-    --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
-    --host localhost --port 8765 --out-dir runs/server_live
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2
 ```
 
-Use `--rerun-mode save` (DEPLOYMENT issue 9): `stream` needs a display. `runs/stream_scene.py` loads the same
-scene and idles, for streaming without running an episode.
+**1. Services** (needed for `live` / `task`; not for `capture` or `stream_scene`). The planner answers `/health`
+only after cuRobo warms up, ~40 s.
+
+```bash
+M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh &
+TIPTOP_GPU=2 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 \
+  TIPTOP_MAX_PLANNING_TIME=40 TIPTOP_RERUN_MODE=save \
+  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh &
+
+curl -s localhost:8123/health; curl -s localhost:8765/health    # {"status":"healthy"...} and OK
+```
+
+**2. Rerun** (optional; see `OmniGibson/omnigibson/tiptop/README.md` "Rerun from the laptop"). Start it *before*
+the planner and swap the planner's `TIPTOP_RERUN_MODE=save` for `connect`:
+
+```bash
+OmniGibson/omnigibson/tiptop/scripts/start_rerun_viewer.sh &     # gRPC 9876, web viewer 9090
+# laptop: ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
+#         then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy
+```
+
+**3. Run one of these.** Streaming and headless are mutually exclusive — pick per command, do not export both.
+
+```bash
+# a) full episode, watched live from the laptop
+OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python -m omnigibson.tiptop.run live \
+    --embodiment r1pro --activity assembling_gift_baskets \
+    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 --sequential \
+    --goal "inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(candle.n.01_2,wicker_basket.n.01_2)" \
+    --task "put the item in the wicker basket" --grasping-mode sticky --no-gt \
+    --host localhost --port 8765 --out-dir runs/demo
+
+# b) same episode, batch (no viewer, faster)
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live ...   # same flags as (a)
+
+# c) just look at a scene — no services needed
+OMNIGIBSON_REMOTE_STREAMING=webrtc ./b1k/bin/python \
+    OmniGibson/omnigibson/tiptop/scripts/stream_scene.py --activity assembling_gift_baskets \
+    --place wicker_basket.n.01_2:table.n.02_1:0.28,0.16 \
+    --stand-for butter_cookie.n.01_1,wicker_basket.n.01_2
+
+# d) capture one frame only, no planner
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
+    --embodiment r1pro --activity assembling_gift_baskets --out-dir runs/cap
+```
+
+Connect the client while the scene loads (~160 s). Shut down with `pkill -u $USER -f "tiptop-server|m2t2_server"`.
+
+### Streaming the viewport to a laptop
+
+- **Set `OMNIGIBSON_REMOTE_STREAMING=webrtc` and leave `OMNIGIBSON_HEADLESS` unset.** Streaming already runs the
+  app windowless (`simulator.py:173`), but `tiptop/scene.py:184` only aims the viewport camera while `gm.HEADLESS`
+  is false — set both and you stream a default pose.
+- Client: the standalone **Isaac Sim WebRTC Streaming Client** (5.1). Type the bare IP, no port.
+- **TCP 49100 is the only port that must reach the server.** OmniGibson selects
+  `/app/livestream/proto = "websocket"` (`simulator.py:277`), so video rides the signalling socket and no UDP media
+  port is bound; `ufw` is disabled on the host. An SSH tunnel therefore works as a fallback:
+  `ssh -N -L 49100:127.0.0.1:49100 shenlong-gpu-01`, then point the client at `127.0.0.1`.
+- The stream shows only the main viewport: `vision_sensor.py` suppresses auxiliary camera windows under
+  `REMOTE_STREAMING`. To confirm, `grep -oE "ViewportTexture_[0-9]+" <kit log> | sort -u` should print only `_0`,
+  while `Replicator`, `Replicator_01` and `Replicator_02` are all still created (the sensors still render).
+- When a session misbehaves, read the Kit log: `/app/livestream/logLevel=debug` and the WebRTC QoS callback are on,
+  so `carb.livestream-rtc.plugin` lines carry signalling, peer state and disconnect reasons.
+- `gm.PUBLIC_IP` defaults to gpu-01's `172.22.224.37`; on gpu-02 or campus-cluster export `OMNIGIBSON_PUBLIC_IP`.
+- `OMNIGIBSON_HTTP_PORT` / port 8211 does nothing on Isaac Sim 5.x — no browser client is shipped.
 
 Timings measured here: scene + task load 160 s, capture 10 s, plan 4-8 s, execute 25 s, goal scoring 10 s.
 VRAM with all three services up: ~21 GB of 96 GB (sim 14 GB, planner 5.6 GB, M2T2 1.2 GB).

@@ -90,14 +90,15 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 python -m omnigibson.tiptop.run live --host localhost --port 8765 --out-dir runs/live   # end-to-end over the websocket
 ```
 
-Demo with both visualizations on one machine: start the planner with `--rerun-mode stream`
+Demo with both visualizations on one machine (**laptop only** -- `stream` needs a display; for a server see
+"Rerun from the laptop" below): start the planner with `--rerun-mode stream`
 (`TIPTOP_RERUN_MODE=stream ~/tiptop-services/bin/start_tiptop_server.sh`), leave `OMNIGIBSON_HEADLESS` unset and run
 `live`. The Rerun viewer pops up on the first request (RGB, masks, grasps, robot, plan) and is re-spawned if you close
 it; the Isaac Sim window shows the executed trajectory. `--rerun-mode save` writes `tiptop.rrd` into each server run
 directory instead (`rerun <file>` to view later); `--rerun-mode connect --rerun-url rerun+http://host:9876/proxy`
 streams to a viewer you started yourself (`rerun` in the tiptop env), e.g. when the planner runs on another machine.
-During execution the client also streams the simulator's state back to the server (`sim_state` messages on the same
-websocket), so the planner's robot model in Rerun follows the simulated joints in real time and each object gets a
+During execution the client also streams the simulator's state back to the server (`sim_state` messages over a second
+connection to the same port), so the planner's robot model in Rerun follows the simulated joints in real time and each object gets a
 green copy that follows its simulated pose next to the grey perceived one; `--no-state-stream` turns this off, and
 `replay --state-stream host:port` mirrors an offline replay into a running server's view. In the viewer, `log_time` is
 wall-clock and `sim_time` is simulated seconds since the capture (0 = the planner's input, robot at the capture
