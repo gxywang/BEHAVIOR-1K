@@ -12,6 +12,7 @@ import yaml
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
+from omnigibson.controllers import ControllerView
 from omnigibson.macros import gm
 
 
@@ -33,13 +34,19 @@ def parse_args():
     parser.add_argument("--scene", choices=CHALLENGE_SCENES, default="house_single_floor")
     parser.add_argument("--num-episodes", type=int, default=5)
     parser.add_argument("--all-scenes", action="store_true", help="Generate episodes for all challenge scenes")
-    parser.add_argument("--num-episodes-per-scene", type=int, default=None, help="Number of episodes per scene when generating multiple scenes")
+    parser.add_argument(
+        "--num-episodes-per-scene",
+        type=int,
+        default=None,
+        help="Number of episodes per scene when generating multiple scenes",
+    )
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--floor", type=int, default=0)
     parser.add_argument("--min-distance", type=float, default=1.0)
     parser.add_argument("--max-distance", type=float, default=10.0)
     parser.add_argument("--max-trials", type=int, default=500)
+    parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
         "--robot-config",
         default=str(Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"),
@@ -102,7 +109,68 @@ def build_env_config(scene_model, robot_cfg):
     }
 
 
-def sample_episode(env, scene_model, episode_idx, floor, min_distance, max_distance, max_trials):
+def controller_no_op_action(robot):
+    action = []
+    for group_key, controller_idx in robot.controllers.values():
+        action.append(ControllerView.compute_no_op_action(group_key, controller_idx).float())
+    return th.cat(action) if action else th.empty(0, dtype=th.float32)
+
+
+def place_robot(robot, position, orientation):
+    robot.set_joint_positions(robot.reset_joint_pos, drive=False)
+    robot.set_position_orientation(position=position, orientation=orientation)
+    robot.set_linear_velocity(th.zeros(3))
+    robot.set_angular_velocity(th.zeros(3))
+    robot.set_joint_velocities(th.zeros(robot.n_dof), drive=False)
+
+
+def eroded_floor_map(scene, floor, robot):
+    trav_map = th.clone(scene.trav_map.floor_map[floor])
+    return scene.trav_map._erode_trav_map(trav_map, robot=robot)
+
+
+def point_to_map_cell(scene, point):
+    map_size = scene.trav_map.map_size
+    resolution = float(scene.trav_map.map_resolution)
+    origin = -0.5 * map_size * resolution
+    col = math.floor((float(point[0]) - origin) / resolution)
+    row = math.floor((float(point[1]) - origin) / resolution)
+    return int(row), int(col)
+
+
+def point_is_free(scene, trav_map, point):
+    row, col = point_to_map_cell(scene, point)
+    if row < 0 or col < 0 or row >= trav_map.shape[0] or col >= trav_map.shape[1]:
+        return False
+    return int(trav_map[row, col]) == 255
+
+
+def episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
+    robot = env.robots[0]
+    if not point_is_free(env.scene, floor_trav_map, start):
+        return False
+    if not point_is_free(env.scene, floor_trav_map, goal):
+        return False
+
+    place_robot(robot, start, start_quat)
+    for _ in range(settle_steps):
+        env.step({robot.name: controller_no_op_action(robot)})
+
+    settled_position, _ = robot.get_position_orientation()
+    return point_is_free(env.scene, floor_trav_map, settled_position[:2])
+
+
+def sample_episode(
+    env,
+    scene_model,
+    episode_idx,
+    floor,
+    floor_trav_map,
+    min_distance,
+    max_distance,
+    max_trials,
+    settle_steps,
+):
     robot = env.robots[0]
 
     for trial in range(1, max_trials + 1):
@@ -119,6 +187,9 @@ def sample_episode(env, scene_model, episode_idx, floor, min_distance, max_dista
 
         start_yaw = float(th.rand(1).item() * 2.0 * math.pi)
         start_quat = T.euler2quat(th.tensor([0.0, 0.0, start_yaw]))
+        if not episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
+            continue
+
         return {
             "episode_id": f"{scene_model}_{episode_idx:03d}",
             "scene_model": scene_model,
@@ -159,15 +230,18 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
     env = og.Environment(configs=cfg)
     episodes = []
     count = num_episodes if num_episodes is not None else args.num_episodes
+    floor_trav_map = eroded_floor_map(env.scene, args.floor, env.robots[0])
     for local_idx in range(count):
         episode = sample_episode(
             env=env,
             scene_model=scene_model,
             episode_idx=local_idx,
             floor=args.floor,
+            floor_trav_map=floor_trav_map,
             min_distance=args.min_distance,
             max_distance=args.max_distance,
             max_trials=args.max_trials,
+            settle_steps=args.settle_steps,
         )
         verify_episode(env, episode)
         episodes.append(episode)
@@ -192,6 +266,7 @@ def write_benchmark(path, args, robot_cfg, episodes):
                 "floor": args.floor,
                 "min_distance": args.min_distance,
                 "max_distance": args.max_distance,
+                "settle_steps": args.settle_steps,
                 "episodes": episodes,
             },
             f,
@@ -209,6 +284,8 @@ def main():
         raise ValueError("--num-episodes must be at least 1")
     if args.min_distance > args.max_distance:
         raise ValueError("--min-distance must be <= --max-distance")
+    if args.settle_steps < 0:
+        raise ValueError("--settle-steps must be non-negative")
 
     seed_everything(args.seed)
 

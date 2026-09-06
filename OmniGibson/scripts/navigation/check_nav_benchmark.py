@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 
@@ -7,19 +8,33 @@ import numpy as np
 import torch as th
 
 import omnigibson as og
+from omnigibson.controllers import ControllerView
 from omnigibson.macros import gm
 
 
 DEFAULT_INPUT = "outputs/navigation/nav_benchmark_test.json"
+DEFAULT_ROBOT_CONFIG = str(
+    Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Check saved nav benchmark episodes for validity.")
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Path to benchmark JSON file.")
-    parser.add_argument("--robot-config", default=None, help="Optional robot yaml used when generating episodes.")
+    parser.add_argument(
+        "--robot-config",
+        default=DEFAULT_ROBOT_CONFIG,
+        help="Robot yaml used when generating episodes.",
+    )
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--distance-tol", type=float, default=0.25, help="Absolute tolerance (m) for geodesic distance match.")
+    parser.add_argument(
+        "--distance-tol",
+        type=float,
+        default=0.25,
+        help="Absolute tolerance (m) for geodesic distance match.",
+    )
     parser.add_argument("--max-trials", type=int, default=500)
+    parser.add_argument("--settle-steps", type=int, default=10)
     return parser.parse_args()
 
 
@@ -87,6 +102,69 @@ def build_env_config(scene_model, robot_cfg):
     return cfg
 
 
+def controller_no_op_action(robot):
+    action = []
+    for group_key, controller_idx in robot.controllers.values():
+        action.append(ControllerView.compute_no_op_action(group_key, controller_idx).float())
+    return th.cat(action) if action else th.empty(0, dtype=th.float32)
+
+
+def place_robot(robot, position, orientation):
+    robot.set_joint_positions(robot.reset_joint_pos, drive=False)
+    robot.set_position_orientation(position=position, orientation=orientation)
+    robot.set_linear_velocity(th.zeros(3))
+    robot.set_angular_velocity(th.zeros(3))
+    robot.set_joint_velocities(th.zeros(robot.n_dof), drive=False)
+
+
+def eroded_floor_map(scene, floor, robot):
+    trav_map = th.clone(scene.trav_map.floor_map[floor])
+    return scene.trav_map._erode_trav_map(trav_map, robot=robot)
+
+
+def point_to_map_cell(scene, point):
+    map_size = scene.trav_map.map_size
+    resolution = float(scene.trav_map.map_resolution)
+    origin = -0.5 * map_size * resolution
+    col = math.floor((float(point[0]) - origin) / resolution)
+    row = math.floor((float(point[1]) - origin) / resolution)
+    return int(row), int(col)
+
+
+def point_is_free(scene, trav_map, point):
+    row, col = point_to_map_cell(scene, point)
+    if row < 0 or col < 0 or row >= trav_map.shape[0] or col >= trav_map.shape[1]:
+        return False, (row, col), None
+    cost = int(trav_map[row, col])
+    return cost == 255, (row, col), cost
+
+
+def validate_episode_points(env, floor_trav_map, episode, settle_steps):
+    robot = env.robots[0]
+    start = th.tensor(episode["start_position"], dtype=th.float32)
+    goal = th.tensor(episode["goal_position"], dtype=th.float32)
+    start_quat = th.tensor(episode["start_quat"], dtype=th.float32)
+
+    start_free, start_cell, start_cost = point_is_free(env.scene, floor_trav_map, start)
+    if not start_free:
+        return f"start occupied cell={start_cell} value={start_cost}"
+
+    goal_free, goal_cell, goal_cost = point_is_free(env.scene, floor_trav_map, goal)
+    if not goal_free:
+        return f"goal occupied cell={goal_cell} value={goal_cost}"
+
+    place_robot(robot, start, start_quat)
+    for _ in range(settle_steps):
+        env.step({robot.name: controller_no_op_action(robot)})
+
+    settled_position, _ = robot.get_position_orientation()
+    settled_free, settled_cell, settled_cost = point_is_free(env.scene, floor_trav_map, settled_position[:2])
+    if not settled_free:
+        return f"settled start occupied cell={settled_cell} value={settled_cost}"
+
+    return None
+
+
 def check_episodes(data, args):
     episodes = data.get("episodes")
     if not episodes:
@@ -101,27 +179,50 @@ def check_episodes(data, args):
     failures = []
     for scene_model, eps in groups.items():
         print(f"\nChecking scene: {scene_model} ({len(eps)} episodes)")
-        cfg = build_env_config(scene_model=scene_model, robot_cfg=data.get("robot_cfg") if data.get("robot_cfg") else None)
+        cfg = build_env_config(
+            scene_model=scene_model,
+            robot_cfg=data.get("robot_cfg") if data.get("robot_cfg") else None,
+        )
         env = og.Environment(configs=cfg)
+        floor_trav_maps = {}
 
         for ep in eps:
             floor = int(ep.get("floor", 0))
             start = ep["start_position"]
             goal = ep["goal_position"]
             stored_dist = float(ep.get("geodesic_distance", -1.0))
+            episode_failures = []
 
-            _, distance = env.scene.get_shortest_path(floor, start[:2], goal[:2], entire_path=False, robot=env.robots[0] if env.robots else None)
+            if env.robots:
+                if floor not in floor_trav_maps:
+                    floor_trav_maps[floor] = eroded_floor_map(env.scene, floor, env.robots[0])
+                invalid_reason = validate_episode_points(env, floor_trav_maps[floor], ep, args.settle_steps)
+                if invalid_reason is not None:
+                    episode_failures.append(invalid_reason)
+
+            _, distance = env.scene.get_shortest_path(
+                floor,
+                start[:2],
+                goal[:2],
+                entire_path=False,
+                robot=env.robots[0] if env.robots else None,
+            )
             if distance is None:
-                failures.append((ep["episode_id"], "unreachable"))
-                print(f"  [FAIL] {ep['episode_id']}: unreachable")
-                continue
-            distance = float(distance.item() if hasattr(distance, "item") else distance)
-            diff = abs(distance - stored_dist)
-            if diff > args.distance_tol:
-                failures.append((ep["episode_id"], f"distance_mismatch stored={stored_dist:.3f} now={distance:.3f} diff={diff:.3f}"))
-                print(f"  [FAIL] {ep['episode_id']}: stored {stored_dist:.3f} m vs now {distance:.3f} m (diff {diff:.3f} m)")
+                episode_failures.append("unreachable")
             else:
-                print(f"  [OK]   {ep['episode_id']}: {distance:.3f} m (matches stored)")
+                distance = float(distance.item() if hasattr(distance, "item") else distance)
+                diff = abs(distance - stored_dist)
+                if diff > args.distance_tol:
+                    episode_failures.append(
+                        f"distance_mismatch stored={stored_dist:.3f} now={distance:.3f} diff={diff:.3f}"
+                    )
+
+            if episode_failures:
+                failures.extend((ep["episode_id"], failure) for failure in episode_failures)
+                print(f"  [FAIL] {ep['episode_id']}: {'; '.join(episode_failures)}")
+                continue
+
+            print(f"  [OK]   {ep['episode_id']}: {distance:.3f} m (matches stored)")
 
         og.shutdown()
 
@@ -135,6 +236,8 @@ def check_episodes(data, args):
 
 def main():
     args = parse_args()
+    if args.settle_steps < 0:
+        raise ValueError("--settle-steps must be non-negative")
     if args.seed is not None:
         seed_everything(args.seed)
 
