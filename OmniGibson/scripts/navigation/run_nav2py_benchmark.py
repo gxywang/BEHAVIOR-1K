@@ -74,6 +74,7 @@ def parse_args():
     parser.add_argument("--profile-max-angular-velocity", type=float, default=None)
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
+    parser.add_argument("--planner-cost-penalty", type=float, default=None)
     return parser.parse_args()
 
 
@@ -294,6 +295,8 @@ def make_navigation_config(nav2py_api, args):
 
     if controller_updates:
         config = replace(config, controller=replace(config.controller, **controller_updates))
+    if args.planner_cost_penalty is not None:
+        config = replace(config, planner=replace(config.planner, cost_penalty=args.planner_cost_penalty))
     if args.disable_path_smoothing:
         config = replace(config, planner=replace(config.planner, smooth_path=False))
     return config
@@ -701,6 +704,7 @@ def main():
         "profile_max_angular_velocity",
         "soft_cost_radius",
         "soft_cost_scaling_factor",
+        "planner_cost_penalty",
     ):
         value = getattr(args, arg_name)
         if value is not None and value <= 0.0:
