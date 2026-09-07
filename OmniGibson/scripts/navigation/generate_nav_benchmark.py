@@ -42,7 +42,6 @@ def parse_args():
     )
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--floor", type=int, default=0)
     parser.add_argument("--min-distance", type=float, default=1.0)
     parser.add_argument("--max-distance", type=float, default=10.0)
     parser.add_argument("--max-trials", type=int, default=500)
@@ -228,15 +227,19 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
     appdata_cache.mkdir(parents=True, exist_ok=True)
 
     env = og.Environment(configs=cfg)
+    if env.robots[0].model in ("r1", "r1pro"):
+        og.sim.stop()
+        env.robots[0].base_footprint_link.mass = 250.0
+        og.sim.play()
     episodes = []
     count = num_episodes if num_episodes is not None else args.num_episodes
-    floor_trav_map = eroded_floor_map(env.scene, args.floor, env.robots[0])
+    floor_trav_map = eroded_floor_map(env.scene, 0, env.robots[0])
     for local_idx in range(count):
         episode = sample_episode(
             env=env,
             scene_model=scene_model,
             episode_idx=local_idx,
-            floor=args.floor,
+            floor=0,
             floor_trav_map=floor_trav_map,
             min_distance=args.min_distance,
             max_distance=args.max_distance,
@@ -263,7 +266,7 @@ def write_benchmark(path, args, robot_cfg, episodes):
             {
                 "seed": args.seed,
                 "robot": robot_cfg["model"],
-                "floor": args.floor,
+                "floor": 0,
                 "min_distance": args.min_distance,
                 "max_distance": args.max_distance,
                 "settle_steps": args.settle_steps,

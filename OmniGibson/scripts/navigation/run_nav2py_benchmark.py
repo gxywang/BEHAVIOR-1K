@@ -730,6 +730,10 @@ def main():
             cfg = build_env_config(scene_model=scene_model, robot_cfg=robot_cfg)
             env = og.Environment(configs=cfg)
             robot = env.robots[0]
+            if robot.model in ("r1", "r1pro"):
+                og.sim.stop()
+                robot.base_footprint_link.mass = 250.0
+                og.sim.play()
             profile = make_robot_profile(
                 robot,
                 nav2py_api,
