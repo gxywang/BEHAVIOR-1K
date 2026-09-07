@@ -24,7 +24,7 @@ DEFAULT_BENCHMARK = "outputs/navigation/nav_benchmark_test.json"
 DEFAULT_OUTPUT = "outputs/navigation/nav2py_results.json"
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run nav2py on saved BEHAVIOR navigation benchmark episodes.")
     parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK, help="Path to benchmark JSON.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Path to write result JSON.")
@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def add_nav2py_to_path(nav2py_root):
@@ -698,8 +698,8 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, args, re
     return output
 
 
-def main():
-    args = parse_args()
+def main(args=None, shutdown=True):
+    args = parse_args() if args is None else args
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
     if args.success_distance <= 0.0:
@@ -759,7 +759,8 @@ def main():
             costmap_bundles = {}
             for episode in scene_episodes:
                 floor = int(episode.get("floor", 0))
-                costmap_bundles.setdefault(floor, make_costmap_bundle(env.scene, floor, robot, nav2py_api, args))
+                if floor not in costmap_bundles:
+                    costmap_bundles[floor] = make_costmap_bundle(env.scene, floor, robot, nav2py_api, args)
                 result = run_episode(
                     env,
                     robot,
@@ -791,8 +792,13 @@ def main():
         summary = summarize_results(results)
         print(f"\nSaved results to: {output}")
         print(f"Success rate: {summary['successes']}/{summary['total']} ({summary['success_rate']:.1%})")
+    except Exception:
+        if not shutdown:
+            og.clear()
+        raise
     finally:
-        og.shutdown()
+        if shutdown:
+            og.shutdown()
 
 
 if __name__ == "__main__":

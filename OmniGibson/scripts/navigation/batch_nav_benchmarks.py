@@ -1,4 +1,4 @@
-"""Check or run every task benchmark JSON in a directory, one process per file."""
+"""Check every task benchmark in a directory, or run them in one simulator session."""
 
 import argparse
 import os
@@ -28,23 +28,48 @@ def main():
     if not benchmarks:
         parser.error(f"No benchmark JSON files found in {benchmark_dir}")
 
-    script_name = "check_nav_benchmark.py" if args.mode == "check" else "run_nav2py_benchmark.py"
-    script = Path(__file__).resolve().with_name(script_name)
     output_dir = Path(args.output_dir).expanduser()
     if args.mode == "run":
         output_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.setdefault("OMNIGIBSON_HEADLESS", "1")
 
+    if args.mode == "run":
+        os.environ.setdefault("OMNIGIBSON_HEADLESS", "1")
+        from run_nav2py_benchmark import main as run_benchmark
+        from run_nav2py_benchmark import parse_args as parse_run_args
+        import omnigibson as og
+
+        run_args = parse_run_args(extra_args)
+        failures = []
+        try:
+            for index, benchmark in enumerate(benchmarks, 1):
+                print(f"\n[{index}/{len(benchmarks)}] run: {benchmark.name}", flush=True)
+                run_args.benchmark = str(benchmark)
+                run_args.output = str(output_dir / f"{benchmark.stem}_results.json")
+                try:
+                    run_benchmark(run_args, shutdown=False)
+                except Exception as exc:
+                    failures.append((benchmark.name, str(exc)))
+                    print(f"  FAILED: {benchmark.name}: {exc}", flush=True)
+            print(
+                f"\nCompleted {len(benchmarks)} files: "
+                f"{len(benchmarks) - len(failures)} passed, {len(failures)} failed.",
+                flush=True,
+            )
+            for name, reason in failures:
+                print(f"  FAILED: {name}: {reason}", flush=True)
+            return 1 if failures else 0
+        finally:
+            if og.app is not None:
+                og.shutdown()
+
+    script = Path(__file__).resolve().with_name("check_nav_benchmark.py")
     failures = []
     for index, benchmark in enumerate(benchmarks, 1):
         print(f"\n[{index}/{len(benchmarks)}] {args.mode}: {benchmark.name}", flush=True)
         command = [sys.executable, str(script)]
-        if args.mode == "check":
-            command.extend(["--input", str(benchmark)])
-        else:
-            output = output_dir / f"{benchmark.stem}_results.json"
-            command.extend(["--benchmark", str(benchmark), "--output", str(output)])
+        command.extend(["--input", str(benchmark)])
         result = subprocess.run(command + extra_args, env=env, check=False)
         if result.returncode != 0:
             failures.append((benchmark.name, result.returncode))
