@@ -72,6 +72,24 @@ def parse_args(argv=None):
     parser.add_argument("--collision-horizon", type=float, default=None)
     parser.add_argument("--profile-max-linear-velocity", type=float, default=None)
     parser.add_argument("--profile-max-angular-velocity", type=float, default=None)
+    parser.add_argument(
+        "--command-max-linear-velocity",
+        type=float,
+        default=None,
+        help=(
+            "Maximum absolute vx/vy command sent to OmniGibson. Defaults to the base controller "
+            "command_output_limits from --robot-config."
+        ),
+    )
+    parser.add_argument(
+        "--command-max-angular-velocity",
+        type=float,
+        default=None,
+        help=(
+            "Maximum absolute wz command sent to OmniGibson. Defaults to the base controller "
+            "command_output_limits from --robot-config."
+        ),
+    )
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
@@ -254,6 +272,34 @@ def robot_profile_diagnostics(profile):
     }
 
 
+def _symmetric_limit(lower, upper, index):
+    return min(abs(float(lower[index])), abs(float(upper[index])))
+
+
+def resolve_command_limits(robot_cfg, args):
+    linear = args.command_max_linear_velocity
+    angular = args.command_max_angular_velocity
+    output_limits = robot_cfg.get("controller_config", {}).get("base", {}).get("command_output_limits")
+    if output_limits is not None:
+        lower, upper = output_limits
+        if linear is None:
+            linear = min(_symmetric_limit(lower, upper, 0), _symmetric_limit(lower, upper, 1))
+        if angular is None:
+            angular = _symmetric_limit(lower, upper, 2)
+
+    return {
+        "max_linear_velocity": None if linear is None else float(linear),
+        "max_angular_velocity": None if angular is None else float(angular),
+    }
+
+
+def command_limits_diagnostics(command_limits):
+    return {
+        "max_linear_velocity": command_limits["max_linear_velocity"],
+        "max_angular_velocity": command_limits["max_angular_velocity"],
+    }
+
+
 class DiagnosticCollisionModel:
     def __init__(self, delegate, nav2py_api, disabled=False):
         self.delegate = delegate
@@ -428,6 +474,8 @@ def step_trace_entry(
     final_distance,
     nav_status,
     command,
+    executed_command,
+    command_was_capped,
     requested_command,
     safety_decision,
     safety_decision_without_override,
@@ -448,6 +496,8 @@ def step_trace_entry(
         "nav2py_reason": nav_status.reason,
         "requested_command": command_diagnostic(requested_command),
         "command": command_diagnostic(command),
+        "executed_command": command_diagnostic(executed_command),
+        "command_was_capped": bool(command_was_capped),
         "safety_decision": safety_decision_diagnostic(safety_decision),
         "safety_decision_without_override": safety_decision_diagnostic(safety_decision_without_override),
     }
@@ -496,6 +546,27 @@ def controller_no_op_action(robot):
     return th.cat(action) if action else th.empty(0, dtype=th.float32)
 
 
+def clamp_abs(value, limit):
+    if limit is None:
+        return value
+    return max(-limit, min(limit, value))
+
+
+def cap_command_to_controller_limits(command, command_limits):
+    if command is None or command.is_stop:
+        return command
+
+    velocity = command.velocity
+    capped_velocity = type(velocity)(
+        vx=clamp_abs(velocity.vx, command_limits["max_linear_velocity"]),
+        vy=clamp_abs(velocity.vy, command_limits["max_linear_velocity"]),
+        wz=clamp_abs(velocity.wz, command_limits["max_angular_velocity"]),
+    )
+    if capped_velocity == velocity:
+        return command
+    return replace(command, velocity=capped_velocity)
+
+
 def action_from_nav2py_command(robot, command):
     action = controller_no_op_action(robot)
     if command is None:
@@ -541,7 +612,7 @@ def xy_distance(position, goal):
     return math.hypot(float(position[0]) - float(goal[0]), float(position[1]) - float(goal[1]))
 
 
-def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, nav2py_api, args):
+def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, command_limits, nav2py_api, args):
     env.reset(get_obs=False)
     place_robot(robot, episode)
 
@@ -572,24 +643,31 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
     success = False
     last_state = None
     last_command = None
+    last_executed_command = None
     last_requested_command = None
     last_safety_decision = None
     last_safety_decision_without_override = None
     step_trace = []
     first_lethal_cell_event = None
+    capped_command_steps = 0
     for step in range(args.max_steps):
         now = step * dt
         state = robot_state_estimate(robot, now, nav2py_api)
         command = navigator.tick(state, now)
+        executed_command = cap_command_to_controller_limits(command, command_limits)
+        command_was_capped = executed_command != command
+        if command_was_capped:
+            capped_command_steps += 1
         last_state = state
         last_command = command
+        last_executed_command = executed_command
         last_requested_command = navigator.collision_model.last_requested_command
         last_safety_decision = navigator.last_safety_decision
         last_safety_decision_without_override = navigator.collision_model.last_delegate_decision
-        if command is not None and not command.is_stop:
+        if executed_command is not None and not executed_command.is_stop:
             commanded_steps += 1
 
-        env.step({robot.name: action_from_nav2py_command(robot, command)})
+        env.step({robot.name: action_from_nav2py_command(robot, executed_command)})
         position, _ = robot.get_position_orientation()
         final_distance = xy_distance(position[:2], goal[:2])
         success = final_distance <= args.success_distance
@@ -614,6 +692,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
                     final_distance,
                     nav_status,
                     command,
+                    executed_command,
+                    command_was_capped,
                     last_requested_command,
                     last_safety_decision,
                     last_safety_decision_without_override,
@@ -635,11 +715,13 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "success": success,
         "costmap_source": args.costmap_source,
         "robot_profile": robot_profile_diagnostics(profile),
+        "controller_command_limits": command_limits_diagnostics(command_limits),
         "costmap_diagnostics": costmap_diagnostics,
         "nav2py_state": status.state.value,
         "nav2py_reason": status.reason,
         "steps": step + 1,
         "commanded_steps": commanded_steps,
+        "capped_command_steps": capped_command_steps,
         "sim_time": (step + 1) * dt,
         "start_position": episode["start_position"],
         "goal_position": episode["goal_position"],
@@ -652,6 +734,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "last_tick_state": state_estimate_diagnostic(last_state, navigator.costmap),
         "final_robot_state": robot_state_diagnostic(robot, (step + 1) * dt, navigator.costmap),
         "last_command": command_diagnostic(last_command),
+        "last_executed_command": command_diagnostic(last_executed_command),
         "last_requested_command": command_diagnostic(last_requested_command),
         "last_safety_decision": safety_decision_diagnostic(last_safety_decision),
         "last_safety_decision_without_override": safety_decision_diagnostic(last_safety_decision_without_override),
@@ -674,7 +757,7 @@ def summarize_results(results):
     }
 
 
-def write_results(path, benchmark_path, nav2py_root, navigation_config, args, results):
+def write_results(path, benchmark_path, nav2py_root, navigation_config, command_limits, args, results):
     output = Path(path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -689,6 +772,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, args, re
         "soft_cost_radius": args.soft_cost_radius,
         "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
         "navigation_config": navigation_config_diagnostics(navigation_config),
+        "controller_command_limits": command_limits_diagnostics(command_limits),
         "summary": summarize_results(results),
         "episodes": results,
     }
@@ -712,6 +796,8 @@ def main(args=None, shutdown=True):
         "collision_horizon",
         "profile_max_linear_velocity",
         "profile_max_angular_velocity",
+        "command_max_linear_velocity",
+        "command_max_angular_velocity",
         "soft_cost_radius",
         "soft_cost_scaling_factor",
         "planner_cost_penalty",
@@ -733,6 +819,7 @@ def main(args=None, shutdown=True):
         gm.ENABLE_TRANSITION_RULES = False
 
     robot_cfg = load_robot_config(args.robot_config)
+    command_limits = resolve_command_limits(robot_cfg, args)
     results = []
     try:
         for (scene_model, scene_instance, _), scene_episodes in group_episodes_by_scene(episodes).items():
@@ -768,6 +855,7 @@ def main(args=None, shutdown=True):
                     costmap_bundles[floor],
                     profile,
                     navigation_config,
+                    command_limits,
                     nav2py_api,
                     args,
                 )
@@ -788,7 +876,15 @@ def main(args=None, shutdown=True):
 
             og.clear()
 
-        output = write_results(args.output, args.benchmark, args.nav2py_root, navigation_config, args, results)
+        output = write_results(
+            args.output,
+            args.benchmark,
+            args.nav2py_root,
+            navigation_config,
+            command_limits,
+            args,
+            results,
+        )
         summary = summarize_results(results)
         print(f"\nSaved results to: {output}")
         print(f"Success rate: {summary['successes']}/{summary['total']} ({summary['success_rate']:.1%})")
