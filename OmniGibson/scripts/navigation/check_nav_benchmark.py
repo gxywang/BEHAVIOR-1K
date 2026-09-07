@@ -171,18 +171,21 @@ def check_episodes(data, args):
         print("No episodes to check.")
         return 0
 
-    # group episodes by scene for efficient env reuse
+    # Group episodes by template and room selection for efficient env reuse.
     groups = {}
     for ep in episodes:
-        groups.setdefault(ep["scene_model"], []).append(ep)
+        key = (ep["scene_model"], ep.get("scene_instance"), tuple(ep.get("load_room_instances") or ()))
+        groups.setdefault(key, []).append(ep)
 
     failures = []
-    for scene_model, eps in groups.items():
+    for (scene_model, scene_instance, _), eps in groups.items():
         print(f"\nChecking scene: {scene_model} ({len(eps)} episodes)")
         cfg = build_env_config(
             scene_model=scene_model,
             robot_cfg=data.get("robot_cfg") if data.get("robot_cfg") else None,
         )
+        cfg["scene"]["scene_instance"] = scene_instance
+        cfg["scene"]["load_room_instances"] = eps[0].get("load_room_instances")
         env = og.Environment(configs=cfg)
         floor_trav_maps = {}
 
@@ -224,7 +227,7 @@ def check_episodes(data, args):
 
             print(f"  [OK]   {ep['episode_id']}: {distance:.3f} m (matches stored)")
 
-        og.shutdown()
+        og.clear()
 
     print(f"\nChecked {len(episodes)} episodes: {len(failures)} failures")
     if failures:

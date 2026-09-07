@@ -136,13 +136,19 @@ def load_benchmark(path):
     episodes = data.get("episodes") if isinstance(data, dict) else data
     if not episodes:
         raise RuntimeError(f"No benchmark episodes found in {p}")
+    if any(
+        not episode.get("task_name") or not episode.get("scene_instance") or "load_room_instances" not in episode
+        for episode in episodes
+    ):
+        raise ValueError("Benchmark lacks task-template metadata. Regenerate it with generate_nav_benchmark.py.")
     return data, episodes
 
 
 def group_episodes_by_scene(episodes):
     groups = {}
     for episode in episodes:
-        groups.setdefault(episode["scene_model"], []).append(episode)
+        key = (episode["scene_model"], episode["scene_instance"], tuple(episode["load_room_instances"] or ()))
+        groups.setdefault(key, []).append(episode)
     return groups
 
 
@@ -536,6 +542,7 @@ def xy_distance(position, goal):
 
 
 def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, nav2py_api, args):
+    env.reset(get_obs=False)
     place_robot(robot, episode)
 
     for _ in range(args.settle_steps):
@@ -621,6 +628,9 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
     result = {
         "episode_id": episode["episode_id"],
         "scene_model": episode["scene_model"],
+        "task_name": episode["task_name"],
+        "scene_instance": episode["scene_instance"],
+        "load_room_instances": episode["load_room_instances"],
         "floor": int(episode.get("floor", 0)),
         "success": success,
         "costmap_source": args.costmap_source,
@@ -725,9 +735,14 @@ def main():
     robot_cfg = load_robot_config(args.robot_config)
     results = []
     try:
-        for scene_model, scene_episodes in group_episodes_by_scene(episodes).items():
-            print(f"\nRunning scene: {scene_model} ({len(scene_episodes)} episodes)")
-            cfg = build_env_config(scene_model=scene_model, robot_cfg=robot_cfg)
+        for (scene_model, scene_instance, _), scene_episodes in group_episodes_by_scene(episodes).items():
+            print(f"\nRunning template: {scene_instance} ({len(scene_episodes)} episodes)")
+            cfg = build_env_config(
+                scene_model=scene_model,
+                robot_cfg=robot_cfg,
+                scene_instance=scene_instance,
+                load_room_instances=scene_episodes[0]["load_room_instances"],
+            )
             env = og.Environment(configs=cfg)
             robot = env.robots[0]
             if robot.model in ("r1", "r1pro"):

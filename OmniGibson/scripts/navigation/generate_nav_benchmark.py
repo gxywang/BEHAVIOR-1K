@@ -32,13 +32,13 @@ DEFAULT_OUTPUT = "outputs/navigation/nav_benchmark_test.json"
 def parse_args():
     parser = argparse.ArgumentParser(description="Sample R1Pro point-navigation benchmark episodes.")
     parser.add_argument("--scene", choices=CHALLENGE_SCENES, default="house_single_floor")
-    parser.add_argument("--num-episodes", type=int, default=5)
+    parser.add_argument("--num-episodes", type=int, default=5, help="Number of episodes per task template")
     parser.add_argument("--all-scenes", action="store_true", help="Generate episodes for all challenge scenes")
     parser.add_argument(
         "--num-episodes-per-scene",
         type=int,
         default=None,
-        help="Number of episodes per scene when generating multiple scenes",
+        help="Override episode count per task template in each selected scene",
     )
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=0)
@@ -79,7 +79,7 @@ def load_robot_config(path):
     return robot_cfg
 
 
-def build_env_config(scene_model, robot_cfg):
+def build_env_config(scene_model, robot_cfg, scene_instance, load_room_instances):
     return {
         "env": {
             "action_frequency": 30,
@@ -90,13 +90,14 @@ def build_env_config(scene_model, robot_cfg):
         "scene": {
             "type": "InteractiveTraversableScene",
             "scene_model": scene_model,
+            "scene_instance": scene_instance,
             "trav_map_resolution": 0.1,
             "default_erosion_radius": 0.0,
             "trav_map_with_objects": True,
             "num_waypoints": 1,
             "waypoint_resolution": 0.2,
             "load_room_types": None,
-            "load_room_instances": None,
+            "load_room_instances": load_room_instances,
             "include_robots": False,
         },
         "robots": [robot_cfg],
@@ -173,8 +174,14 @@ def sample_episode(
     robot = env.robots[0]
 
     for trial in range(1, max_trials + 1):
+        env.reset(get_obs=False)
         _, start = env.scene.get_random_point(floor=floor, robot=robot)
         _, goal = env.scene.get_random_point(floor=floor, reference_point=start, robot=robot)
+        rooms = env.scene.load_room_instances
+        if rooms is not None and any(
+            env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms for point in (start, goal)
+        ):
+            continue
         _, distance = env.scene.get_shortest_path(floor, start[:2], goal[:2], entire_path=False, robot=robot)
 
         if distance is None:
@@ -216,10 +223,16 @@ def verify_episode(env, episode):
         raise RuntimeError(f"Stored episode is unreachable on replay check: {episode['episode_id']}")
 
 
-def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
-    cfg = build_env_config(scene_model=scene_model, robot_cfg=copy.deepcopy(robot_cfg))
+def sample_scene(scene_model, task_name, scene_instance, load_room_instances, robot_cfg, args, num_episodes=None):
+    cfg = build_env_config(
+        scene_model=scene_model,
+        robot_cfg=copy.deepcopy(robot_cfg),
+        scene_instance=scene_instance,
+        load_room_instances=load_room_instances,
+    )
 
     print(f"Loaded scene: {scene_model}")
+    print(f"Task template: {scene_instance}")
     print(f"Robot: {robot_cfg['model']}")
 
     # Ensure OmniGibson appdata cache directory exists and is writable to avoid texture cache write errors
@@ -247,6 +260,10 @@ def sample_scene(scene_model, robot_cfg, args, num_episodes=None):
             settle_steps=args.settle_steps,
         )
         verify_episode(env, episode)
+        episode["episode_id"] = f"{scene_model}_{task_name}_{local_idx:03d}"
+        episode["task_name"] = task_name
+        episode["scene_instance"] = scene_instance
+        episode["load_room_instances"] = load_room_instances
         episodes.append(episode)
         print(f"\nSampled episode {episode['episode_id']}:")
         print(f"  start = {episode['start_position']}")
@@ -285,6 +302,8 @@ def main():
     args = parse_args()
     if args.num_episodes < 1:
         raise ValueError("--num-episodes must be at least 1")
+    if args.num_episodes_per_scene is not None and args.num_episodes_per_scene < 1:
+        raise ValueError("--num-episodes-per-scene must be at least 1")
     if args.min_distance > args.max_distance:
         raise ValueError("--min-distance must be <= --max-distance")
     if args.settle_steps < 0:
@@ -297,6 +316,12 @@ def main():
         gm.ENABLE_TRANSITION_RULES = False
 
     robot_cfg = load_robot_config(args.robot_config)
+    from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
+    from omnigibson.tasks.behavior_task import BehaviorTask
+
+    task_metadata = Path(gm.DATA_PATH) / "2026-challenge-task-instances" / "metadata" / "available_tasks.yaml"
+    with open(task_metadata, "r", encoding="utf-8") as f:
+        available_tasks = yaml.safe_load(f)
     try:
         # determine which scenes to generate
         if args.all_scenes:
@@ -306,28 +331,31 @@ def main():
 
         per_scene = args.num_episodes_per_scene if args.num_episodes_per_scene is not None else args.num_episodes
 
-        # If multiple scenes are requested, write one file per scene (atomic write)
+        # Write one file per task template (atomic write).
         out_path = Path(args.output)
         out_parent = out_path.parent
         out_parent.mkdir(parents=True, exist_ok=True)
 
         for scene in scenes:
-            eps = sample_scene(scene_model=scene, robot_cfg=robot_cfg, args=args, num_episodes=per_scene)
-            # normalize episode ids per-scene
-            for i, ep in enumerate(eps):
-                ep["episode_id"] = f"{scene}_{i:03d}"
-
-            # build per-scene output path: <original_stem>_<scene>.json
-            stem = out_path.stem
-            per_scene_name = f"{stem}_{scene}.json"
-            per_scene_path = out_parent / per_scene_name
-
-            # atomic write to temp file then rename
-            tmp_path = per_scene_path.with_suffix('.json.tmp')
-            write_benchmark(path=tmp_path, args=args, robot_cfg=robot_cfg, episodes=eps)
-            # move tmp to final
-            tmp_path.replace(per_scene_path)
-            print(f"Wrote per-scene benchmark: {per_scene_path}")
+            task_names = [name for name, configs in available_tasks.items() if configs[0]["scene_model"] == scene]
+            if not task_names:
+                raise ValueError(f"No competition tasks found for scene {scene}")
+            for task_name in task_names:
+                scene_instance = BehaviorTask.get_cached_activity_scene_filename(scene, task_name, 0, 0)
+                eps = sample_scene(
+                    scene_model=scene,
+                    task_name=task_name,
+                    scene_instance=scene_instance,
+                    load_room_instances=TASK_NAMES_TO_ROOMS[task_name],
+                    robot_cfg=robot_cfg,
+                    args=args,
+                    num_episodes=per_scene,
+                )
+                task_path = out_parent / f"{out_path.stem}_{scene}_{task_name}.json"
+                tmp_path = task_path.with_suffix(".json.tmp")
+                write_benchmark(path=tmp_path, args=args, robot_cfg=robot_cfg, episodes=eps)
+                tmp_path.replace(task_path)
+                print(f"Wrote task benchmark: {task_path}")
     finally:
         og.shutdown()
 
