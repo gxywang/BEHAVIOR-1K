@@ -340,7 +340,7 @@ def do_capture(
         if tracked:
             request["gt_buttons"] = tracked
             log.info(f"button poses carried from earlier rounds: {tracked}")
-    if getattr(sim, "held_objects", None):  # what the other hand holds: an obstacle the planner must not pick up
+    if sim.held_objects:  # what a hand already holds: an obstacle the planner must not pick up
         request["held_labels"] = sorted(sim.held_objects)
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
@@ -477,7 +477,7 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict 
     )
     match = perception_report(request, extras, response)
     if response.get("buttons"):  # detected buttons: kept for later rounds (an object in hand moves with its gripper)
-        held = {label: (arm, sim.eef_pose_base(arm)) for label, arm in getattr(sim, "held_objects", {}).items()}
+        held = {label: (arm, sim.eef_pose_base(arm)) for label, arm in sim.held_objects.items()}
         sim.buttons.update(response["buttons"], held)
     return do_execute(sim, args, out_dir, response["plan"], tag="live", atoms=atoms, extra={"perception": match})
 
@@ -652,7 +652,7 @@ def do_execute(
             if atom["predicate"] == "holding" and executor.close_eef is not None and args.activity:
                 label = sim.tiptop_goal([atom], category_level=args.no_gt)[1][0]["args"][0]
                 arm = getattr(sim, "arm", None)
-                sim.held_objects = {**getattr(sim, "held_objects", {}), label: arm}
+                sim.held_objects[label] = arm
                 sim.buttons.grasped(label, arm, executor.close_eef)
     finally:
         if press_targets and args.grasping_mode != "physical":
@@ -819,13 +819,7 @@ def main(argv=None):
                         sim.hold(args.settle_steps, sim.OPEN)
                     round_client = client
                     if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
-                        holding_arm = sim.arm
-                        for atom in atoms:  # a held object is turned so its button faces the free hand
-                            label = sim.tiptop_goal([atom], category_level=args.no_gt)[1][0]["args"][0]
-                            if sim.buttons.specs.get(label, {}).get("arm"):
-                                sim.present_button(label)
-                        # the other arm presses; this one keeps holding (its wrist roll may have turned)
-                        sim.adopt_embodiment(press_meta["embodiment"], free_joints=(f"{holding_arm}_arm_joint7",))
+                        sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
                         round_client = press_client
                         sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
                     outcomes.append(

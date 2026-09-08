@@ -363,19 +363,3 @@ def test_button_tracker_carries_a_detected_button_through_a_grasp():
     assert np.allclose(
         tracker.current(lambda arm: now)["radio_button"]["position"], [0.3, 0.4, 0.9]
     )  # a prior echoed back changes nothing
-
-
-def test_turn_about_axis():
-    import numpy as np
-
-    from omnigibson.tiptop.protocol import turn_about_axis
-
-    assert abs(turn_about_axis([0, 0, 1], [1, 0, 0], [0, 1, 0]) - np.pi / 2) < 1e-9  # x to y: +90 deg about z
-    assert abs(turn_about_axis([0, 0, 1], [0, 1, 0], [1, 0, 0]) + np.pi / 2) < 1e-9
-    assert abs(turn_about_axis([0, 0, -1], [1, 0, 0], [0, 1, 0]) + np.pi / 2) < 1e-9  # the axis sign flips the turn
-    away = turn_about_axis([0, 0, 1], [0.78, 0.62, 0.05], [-0.5, -0.86, 0.0])  # facing away: 159 deg apart in the plane
-    assert (
-        abs(abs(away) - np.arccos(np.dot([0.78, 0.62], [-0.5, -0.86]) / np.hypot(0.78, 0.62) / np.hypot(0.5, 0.86)))
-        < 1e-6
-    )
-    assert turn_about_axis([0, 0, 1], [0, 0, 1], [1, 0, 0]) == 0.0  # nothing to turn in the plane

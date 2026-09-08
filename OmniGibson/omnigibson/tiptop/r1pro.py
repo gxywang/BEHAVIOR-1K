@@ -894,60 +894,12 @@ class R1ProSim(TiptopSim):
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
 
-    def present_button(self, label: str, target=(-0.5, -0.86, 0.0), settle_steps: int = 120) -> float:
-        """Turn the holding arm's wrist roll so the tracked button's face points along ``target`` (base frame; the
-        default faces the right arm), as far as the joint's range allows. The joint's axis is measured with a small
-        probe turn (the eef's rotation from it), so no convention is assumed. Returns the cosine between the face
-        normal and the target afterwards."""
-        from scipy.spatial.transform import Rotation
-
-        from omnigibson.tiptop.protocol import turn_about_axis
-
-        entry = self.buttons.specs.get(label)
-        if entry is None or entry["arm"] is None:
-            raise ValueError(f"{label}: no tracked button in a hand to present")
-        arm, joint = entry["arm"], f"{entry['arm']}_arm_joint7"
-        if joint not in self.planned_joints:
-            raise RuntimeError(f"{joint} is not a planned joint ({self.planned_joints}); present before switching arms")
-        k = self.planned_joints.index(joint)
-        lo, hi = float(self.robot.joints[joint].lower_limit), float(self.robot.joints[joint].upper_limit)
-        q = np.asarray(self.q_arm(), dtype=np.float64)
-        before = self.eef_pose_base(arm)
-        step = 0.05 if q[k] + 0.05 <= hi else -0.05
-        probe = q.copy()
-        probe[k] += step
-        self.hold(20, self.last_gripper, q_arm=probe.astype(np.float32))
-        q = np.asarray(self.q_arm(), dtype=np.float64)
-        rotvec = Rotation.from_matrix(self.eef_pose_base(arm)[:3, :3] @ before[:3, :3].T).as_rotvec()
-        if np.linalg.norm(rotvec) < 1e-3:
-            raise RuntimeError(f"{joint} did not move for the probe turn")
-        axis = rotvec / np.linalg.norm(rotvec) * np.sign(step)  # the axis a positive joint increment turns about
-        normal = np.asarray(self.buttons.current(self.eef_pose_base)[label]["normal"])
-        target = np.asarray(target, dtype=np.float64) / np.linalg.norm(target)
-        ideal = turn_about_axis(axis, normal, target)
-        options = [c for c in (ideal, ideal - 2 * np.pi, ideal + 2 * np.pi) if lo <= q[k] + c <= hi]
-        if not options:  # out of range: the limit that faces the target best
-            options = [b - q[k] for b in (lo, hi)]
-        turn = max(options, key=lambda c: float(np.dot(Rotation.from_rotvec(axis * c).apply(normal), target)))
-        q[k] += turn
-        self.hold(settle_steps, self.last_gripper, q_arm=q.astype(np.float32))
-        err = abs(float(self.q_arm()[k]) - q[k])
-        cos = float(np.dot(self.buttons.current(self.eef_pose_base)[label]["normal"], target))
-        log.info(
-            f"presented {label}: {joint} turned {np.degrees(turn):.0f} deg (ideal {np.degrees(ideal):.0f}, range "
-            f"[{np.degrees(lo):.0f}, {np.degrees(hi):.0f}] deg, {err:.3f} rad short); the face now points "
-            f"{np.degrees(np.arccos(np.clip(cos, -1, 1))):.0f} deg from the target"
-        )
-        return cos
-
-    def adopt_embodiment(self, embodiment: dict, tol: float = 0.05, free_joints: tuple = ()) -> None:
+    def adopt_embodiment(self, embodiment: dict, tol: float = 0.05) -> None:
         """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
         something up. The joints the new embodiment locks (torso, the other arm) must already be where it expects
         them within ``tol`` (a loaded wrist settles up to ~0.035 rad short of its target under a held object; the
         new planner only uses these values for the other arm's own collision spheres); fingers are the gripper
-        state and are not checked, nor are ``free_joints`` (a wrist roll turned to present a held object: it spins
-        a near-symmetric gripper about its own axis, so the new planner's model of that arm stays close enough).
-        The arm that planned so far keeps
+        state and are not checked. The arm that planned so far keeps
         its last gripper command (a held object stays held) and its joints are held at their current values.
         The capture no longer swings an arm out of the camera's view (the held object should be seen), and the
         Rerun mirror keeps reporting the first embodiment's joints."""
@@ -959,11 +911,7 @@ class R1ProSim(TiptopSim):
         if unknown:
             raise ValueError(f"joints unknown to the simulator: {unknown}")
         q = self.robot.get_joint_positions()
-        errs = {
-            j: abs(float(q[self.joint_index[j]]) - v)
-            for j, v in locked.items()
-            if "finger" not in j and j not in free_joints
-        }
+        errs = {j: abs(float(q[self.joint_index[j]]) - v) for j, v in locked.items() if "finger" not in j}
         worst = max(errs, key=errs.get)
         if errs[worst] > tol:
             raise RuntimeError(

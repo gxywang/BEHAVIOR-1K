@@ -286,6 +286,7 @@ class TiptopSim:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
         self.buttons = ButtonTracker()  # detected buttons carried across rounds (and through a grasp)
+        self.held_objects = {}  # request label -> arm, for objects a plan picked up (they move with that gripper)
         self.recorders = []  # executor.VideoRecorder instances, fed from step(); the caption is stamped on each frame
         self.video_caption = None
         self.last_obs = None

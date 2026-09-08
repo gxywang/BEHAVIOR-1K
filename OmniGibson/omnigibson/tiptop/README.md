@@ -207,11 +207,12 @@ pick (in the hand it often sits at the image border); the planner reports what i
 response) and `ButtonTracker` keeps it: once the object is grasped, the pose moves with the gripper that closed
 on it (p_now = T_eef_now inv(T_eef_at_close) p_then, the arm's own kinematics; 1.6 cm off after a 43 cm lift with
 a 137 deg turn) and is sent as `gt_buttons`, a prior that a fresh detection in the press round overrides when it
-lands within 5 cm. Before the arms switch, `present_button` turns the holding wrist (roll joint, range +-90 deg,
-its axis measured with a small probe turn) so the tracked face normal points at the right arm as far as the range
-allows; `adopt_embodiment` leaves that joint out of its check. The request also names what the other hand holds
-(`held_labels`), which the planner keeps as an obstacle rather than something to pick up. Either way the planner's
-`Push` plans hover, press and back-off along the normal with the gripper closed. The executor stops the press segment as soon as the simulator's `ToggledOn` flips (a finger on the object
+lands within 5 cm. So that the press round can see the button, the planner chooses the grasp with it: a grasp
+fixes where the object ends up after the lift, so the pick round keeps only the M2T2 grasps that leave the button
+facing the head camera (`tiptop/presenting.py`; the best few when none do), and the left arm's home pose holds
+the object in the camera's view. The request also names what the other hand holds (`held_labels`), which the
+planner keeps as an obstacle rather than something to pick up. Either way the planner's `Push` plans hover,
+press and back-off along the normal with the gripper closed. The executor stops the press segment as soon as the simulator's `ToggledOn` flips (a finger on the object
 inside that radius for 5 steps) and lets the back-off run; meanwhile the bridge keeps OmniGibson's sticky or
 assisted grasp off the pressing arm (`block_grasping`), since a closed gripper touching an object for 0.3 s would
 otherwise attach it. The round is scored by the task's own `toggled_on`.

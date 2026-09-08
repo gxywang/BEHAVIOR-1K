@@ -345,17 +345,3 @@ def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:
     if len(tq) == 0 or tq[-1] < t[-1] - 1e-9:
         tq = np.append(tq, t[-1])
     return np.stack([np.interp(tq, t, positions[:, j]) for j in range(positions.shape[1])], axis=1).astype(np.float32)
-
-
-def turn_about_axis(axis, vector, target) -> float:
-    """The angle (rad, right-handed about ``axis``) that turns ``vector`` to face ``target`` as well as a rotation
-    about that axis can: both are projected onto the plane normal to the axis first. 0 when either has no
-    component in that plane."""
-    a = np.asarray(axis, dtype=np.float64)
-    a = a / np.linalg.norm(a)
-    v = np.asarray(vector, dtype=np.float64)
-    t = np.asarray(target, dtype=np.float64)
-    vp, tp = v - np.dot(v, a) * a, t - np.dot(t, a) * a
-    if np.linalg.norm(vp) < 1e-9 or np.linalg.norm(tp) < 1e-9:
-        return 0.0
-    return float(np.arctan2(np.dot(a, np.cross(vp, tp)), np.dot(vp, tp)))
