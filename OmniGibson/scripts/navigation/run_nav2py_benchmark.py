@@ -90,6 +90,14 @@ def parse_args(argv=None):
             "command_output_limits from --robot-config."
         ),
     )
+    parser.add_argument(
+        "--safety-slowdown-scales",
+        default="0.75,0.5,0.25,0.125,0.0625",
+        help=(
+            "Comma-separated uniform slowdown scales for nav2py dynamic collision safety. "
+            "Use 'nav2py-default' to keep nav2py's built-in ladder."
+        ),
+    )
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
@@ -300,9 +308,23 @@ def command_limits_diagnostics(command_limits):
     }
 
 
+def parse_safety_slowdown_scales(value):
+    if value == "nav2py-default":
+        return None
+
+    scales = tuple(float(part.strip()) for part in value.split(",") if part.strip())
+    if not scales:
+        raise ValueError("--safety-slowdown-scales must contain at least one value")
+    if any(scale <= 0.0 or scale >= 1.0 for scale in scales):
+        raise ValueError("--safety-slowdown-scales values must be in (0, 1)")
+    return scales
+
+
 class DiagnosticCollisionModel:
-    def __init__(self, delegate, nav2py_api, disabled=False):
+    def __init__(self, delegate, nav2py_api, disabled=False, slowdown_scales=None):
         self.delegate = delegate
+        if slowdown_scales is not None:
+            self.delegate._slowdown_scales = slowdown_scales
         self.disabled = disabled
         self.compatibility = delegate.compatibility
         self._safety_decision_cls = nav2py_api["SafetyDecision"]
@@ -380,11 +402,13 @@ def make_navigator(
     nav2py_api,
     navigation_config,
     disable_dynamic_safety=False,
+    safety_slowdown_scales=None,
 ):
     collision_model = DiagnosticCollisionModel(
         nav2py_api["FootprintCollisionModel"](),
         nav2py_api,
         disabled=disable_dynamic_safety,
+        slowdown_scales=safety_slowdown_scales,
     )
     navigator = nav2py_api["Navigator"](
         profile,
@@ -627,6 +651,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         nav2py_api,
         navigation_config,
         disable_dynamic_safety=args.disable_dynamic_safety,
+        safety_slowdown_scales=args.safety_slowdown_scales,
     )
     costmap_diagnostics = episode_costmap_diagnostics(costmap_bundle, navigator.costmap, episode)
     goal = episode["goal_position"]
@@ -771,6 +796,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "trace_failures": args.trace_failures,
         "soft_cost_radius": args.soft_cost_radius,
         "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
+        "safety_slowdown_scales": args.safety_slowdown_scales,
         "navigation_config": navigation_config_diagnostics(navigation_config),
         "controller_command_limits": command_limits_diagnostics(command_limits),
         "summary": summarize_results(results),
@@ -805,6 +831,8 @@ def main(args=None, shutdown=True):
         value = getattr(args, arg_name)
         if value is not None and value <= 0.0:
             raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
+
+    args.safety_slowdown_scales = parse_safety_slowdown_scales(args.safety_slowdown_scales)
 
     seed_everything(args.seed)
     add_nav2py_to_path(args.nav2py_root)
