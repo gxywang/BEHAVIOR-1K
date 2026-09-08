@@ -31,6 +31,12 @@ def parse_args(argv=None):
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Path to write result JSON.")
     parser.add_argument("--nav2py-root", default=None, help="Path to a local nav2py checkout if it is not installed.")
     parser.add_argument(
+        "--episode-ids",
+        nargs="+",
+        default=None,
+        help="Run only these full benchmark episode IDs.",
+    )
+    parser.add_argument(
         "--robot-config",
         default=str(Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"),
     )
@@ -73,6 +79,24 @@ def parse_args(argv=None):
     parser.add_argument("--collision-horizon", type=float, default=None)
     parser.add_argument("--profile-max-linear-velocity", type=float, default=None)
     parser.add_argument("--profile-max-angular-velocity", type=float, default=None)
+    parser.add_argument(
+        "--state-linear-velocity-deadband",
+        type=float,
+        default=0.01,
+        help=(
+            "Treat smaller measured base linear velocities as simulator settling noise before "
+            "passing state to nav2py."
+        ),
+    )
+    parser.add_argument(
+        "--state-angular-velocity-deadband",
+        type=float,
+        default=0.01,
+        help=(
+            "Treat smaller measured base angular velocities as simulator settling noise before "
+            "passing state to nav2py."
+        ),
+    )
     parser.add_argument(
         "--command-max-linear-velocity",
         type=float,
@@ -169,6 +193,20 @@ def load_benchmark(path):
     ):
         raise ValueError("Benchmark lacks task-template metadata. Regenerate it with generate_nav_benchmark.py.")
     return data, episodes
+
+
+def filter_episodes(episodes, episode_ids):
+    if episode_ids is None:
+        return episodes
+
+    selected = set(episode_ids)
+    filtered = [episode for episode in episodes if episode["episode_id"] in selected]
+    missing = sorted(selected - {episode["episode_id"] for episode in episodes})
+    if missing:
+        raise ValueError(f"Requested episode IDs not found in benchmark: {missing}")
+    if not filtered:
+        raise ValueError("No episodes remain after applying --episode-ids")
+    return filtered
 
 
 def group_episodes_by_scene(episodes):
@@ -621,19 +659,27 @@ def place_robot(robot, episode):
     robot.set_joint_velocities(th.zeros(robot.n_dof), drive=False)
 
 
-def robot_state_estimate(robot, timestamp, nav2py_api):
+def apply_deadband(value, deadband):
+    value = float(value)
+    return 0.0 if abs(value) < deadband else value
+
+
+def robot_state_estimate(robot, timestamp, nav2py_api, args):
     position, orientation = robot.get_position_orientation()
     yaw = float(T.quat2euler(orientation)[2].item())
     rotation_world_to_body = T.quat2mat(orientation).T
     linear_velocity = rotation_world_to_body @ robot.get_linear_velocity()
     angular_velocity = rotation_world_to_body @ robot.get_angular_velocity()
+    vx = apply_deadband(linear_velocity[0].item(), args.state_linear_velocity_deadband)
+    vy = apply_deadband(linear_velocity[1].item(), args.state_linear_velocity_deadband)
+    wz = apply_deadband(angular_velocity[2].item(), args.state_angular_velocity_deadband)
 
     return nav2py_api["StateEstimate"](
         timestamp=timestamp,
         frame_id="map",
         pose=nav2py_api["Pose2D"](float(position[0].item()), float(position[1].item()), yaw),
-        linear_velocity=(float(linear_velocity[0].item()), float(linear_velocity[1].item())),
-        angular_velocity=float(angular_velocity[2].item()),
+        linear_velocity=(vx, vy),
+        angular_velocity=wz,
         velocity_available=True,
     )
 
@@ -683,7 +729,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
     capped_command_steps = 0
     for step in range(args.max_steps):
         now = step * dt
-        state = robot_state_estimate(robot, now, nav2py_api)
+        state = robot_state_estimate(robot, now, nav2py_api, args)
         command = navigator.tick(state, now)
         executed_command = cap_command_to_controller_limits(command, command_limits)
         command_was_capped = executed_command != command
@@ -803,6 +849,8 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "soft_cost_radius": args.soft_cost_radius,
         "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
         "safety_slowdown_scales": args.safety_slowdown_scales,
+        "state_linear_velocity_deadband": args.state_linear_velocity_deadband,
+        "state_angular_velocity_deadband": args.state_angular_velocity_deadband,
         "navigation_config": navigation_config_diagnostics(navigation_config),
         "controller_command_limits": command_limits_diagnostics(command_limits),
         "summary": summarize_results(results),
@@ -828,6 +876,8 @@ def main(args=None, shutdown=True):
         "collision_horizon",
         "profile_max_linear_velocity",
         "profile_max_angular_velocity",
+        "state_linear_velocity_deadband",
+        "state_angular_velocity_deadband",
         "command_max_linear_velocity",
         "command_max_angular_velocity",
         "soft_cost_radius",
@@ -847,6 +897,7 @@ def main(args=None, shutdown=True):
     if navigation_config.controller.min_lookahead_distance > navigation_config.controller.max_lookahead_distance:
         raise ValueError("--min-lookahead-distance must be less than or equal to --max-lookahead-distance")
     _, episodes = load_benchmark(args.benchmark)
+    episodes = filter_episodes(episodes, args.episode_ids)
 
     with gm.unlocked():
         gm.USE_GPU_DYNAMICS = False
