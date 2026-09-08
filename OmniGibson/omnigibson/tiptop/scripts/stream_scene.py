@@ -6,7 +6,7 @@ WebRTC (``OMNIGIBSON_REMOTE_STREAMING=webrtc``, and then NOT ``OMNIGIBSON_HEADLE
 windowless, and R1ProSim.place_robot only aims the viewport while gm.HEADLESS is false). Steps forever until
 interrupted.
 
-    cd <repo> && CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 OMNIGIBSON_HEADLESS=1 \\
+    cd <repo> && CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 OMNIGIBSON_HEADLESS=1 \\
         ./b1k/bin/python OmniGibson/omnigibson/tiptop/scripts/stream_scene.py --activity assembling_gift_baskets \\
         --place wicker_basket.n.01_2:table.n.02_1:0.20,0.50 --torso 1.2 -1.7 -0.9 0.0 \\
         --stand-for swiss_cheese.n.01_1,wicker_basket.n.01_2 --state-stream localhost:8765

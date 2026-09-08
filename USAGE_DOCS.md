@@ -29,15 +29,15 @@ keeps the original). That patch is NOT in git — re-apply it on any fresh M2T2 
 Always pin, in every launch shell. `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes indices match `nvidia-smi`:
 
 ```bash
-export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   # check nvidia-smi first; 2 was free on 2026-09-04
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4   # check nvidia-smi first; temporary: 4 since 2026-09-05 (coworkers took 0-3; it was 2)
 ```
 
 - **Leave `OMNIGIBSON_GPU_ID` unset.** It maps to `--/renderer/activeGpu=N --/physics/cudaDevice=N`
-  (`simulator.py:172`), and under the mask CUDA ordinal 2 does not exist — PhysX would target a missing device.
+  (`simulator.py:172`), and under the mask CUDA ordinal 4 does not exist — PhysX would target a missing device.
 - `CUDA_VISIBLE_DEVICES` **does** pin Isaac Sim's Vulkan renderer, not just compute: Kit drops every Vulkan device
   whose CUDA context fails. Verify in the Kit log's `[gpu.foundation]` table
   (`OmniGibson/appdata/local/logs/Kit/OmniGibson/3.9/kit_*.log`): the `Active | Yes: 0` row's **Bus-ID** must be the
-  target card's (`0x75` = GPU 2). The 14 `Skipping NVIDIA GPU due CUDA being in bad state` warnings are the 7 masked
+  target card's (`0x84` = GPU 4; `0x75` = GPU 2). The 14 `Skipping NVIDIA GPU due CUDA being in bad state` warnings are the 7 masked
   cards and are expected.
 - The service launchers now take `TIPTOP_GPU` / `M2T2_GPU` (index or UUID); unset = unchanged laptop behaviour.
 
@@ -47,7 +47,7 @@ Every shell that launches anything needs the GPU pin. Check `nvidia-smi` first �
 
 ```bash
 cd ~/projects/BEHAVIOR-1K
-export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4   # temporary default, see "GPU pinning"
 ```
 
 **1. Services** (needed for `live` / `task`; not for `capture` or `stream_scene`). The planner answers `/health`
@@ -56,8 +56,8 @@ recording per planner process, gone when the planner exits. One terminal or tmux
 so Ctrl-C stops them. What the pipeline does and what every flag means: `OmniGibson/omnigibson/tiptop/README.md`.
 
 ```bash
-M2T2_GPU=2 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
-TIPTOP_GPU=2 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
+M2T2_GPU=4 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
+TIPTOP_GPU=4 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
   OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh
 
 curl -s localhost:8123/health; curl -s localhost:8765/health    # {"status":"healthy"...} and OK
