@@ -309,10 +309,14 @@ def command_limits_diagnostics(command_limits):
 
 
 def parse_safety_slowdown_scales(value):
-    if value == "nav2py-default":
+    if value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        scales = tuple(float(scale) for scale in value)
+    elif value == "nav2py-default":
         return None
-
-    scales = tuple(float(part.strip()) for part in value.split(",") if part.strip())
+    else:
+        scales = tuple(float(part.strip()) for part in value.split(",") if part.strip())
     if not scales:
         raise ValueError("--safety-slowdown-scales must contain at least one value")
     if any(scale <= 0.0 or scale >= 1.0 for scale in scales):
