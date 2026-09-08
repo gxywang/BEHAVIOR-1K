@@ -241,7 +241,10 @@ class TiptopSim:
     def _init_state(self) -> None:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self.recorders = []  # executor.VideoRecorder instances, fed from step(); the caption is stamped on each frame
+        self.video_caption = None
         self.last_obs = None
+        self.last_gripper = self.OPEN
         self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
         self.capture_object_aabb_min_z = {}  # where each tracked object rested at the last capture
         self._stream_meshes = {}
@@ -299,6 +302,12 @@ class TiptopSim:
         self.last_obs = self.env.step(self.action(q_arm, gripper))[0]
         if self.state_stream is not None:
             self.state_stream.on_step(self)
+        if self.recorders:
+            views = None
+            for recorder in self.recorders:
+                if recorder.due():
+                    views = self.video_views() if views is None else views
+                    recorder.write(views, self.video_caption)
         return self.last_obs
 
     def mirror_q(self) -> np.ndarray:
@@ -325,17 +334,22 @@ class TiptopSim:
                 position=th.tensor(eye, dtype=th.float32), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
 
-    def stream_images(self) -> dict:
-        """JPEGs for the mirror: the capture camera as the robot sees it, and the overview camera."""
-        images = {}
+    def video_views(self) -> dict:
+        """rgb views for the video and the mirror, {name: (H, W, 3) uint8}: the capture camera as the robot sees it
+        (first), then the overview camera."""
+        views = {}
         rgb = self.camera_rgb()
         if rgb is not None:
-            images[self.STREAM_CAMERA] = jpeg_bytes(rgb)
+            views[self.STREAM_CAMERA] = rgb
         if self.overview is not None:
             over = self.overview.get_obs()[0].get("rgb")
             if over is not None and over.numel():
-                images["overview"] = jpeg_bytes(over.cpu().numpy().astype(np.uint8))
-        return images
+                views["overview"] = over.cpu().numpy().astype(np.uint8)[..., :3]
+        return views
+
+    def stream_images(self) -> dict:
+        """JPEGs for the mirror: ``video_views``."""
+        return {name: jpeg_bytes(rgb) for name, rgb in self.video_views().items()}
 
     def stream_scene(self) -> dict:
         """Every mirrored object's mesh in its own frame plus its current base-frame pose (see SimStateStream)."""

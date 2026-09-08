@@ -114,7 +114,10 @@ predicates; the best 2025 submission reached 0.31 on this task, none completed i
 placed three (M2T2 returned no grasps for the bow, see "Known limits"). Outputs: `runs/demo/round_0N/`
 with `capture.json` (poses, intrinsics, validation), `rgb.png`, `depth.png`, `gt_masks.png`, `obs.h5`,
 `tiptop_plan.json`, `server_response.json`, `live.mp4`, `live_result.json` (tracking errors, gripper events, the
-goal status, final object poses, and `perception`: the pairing above), and `sequential_summary.json`; on the
+goal status, final object poses, and `perception`: the pairing above), and `sequential_summary.json` plus
+`full.mp4`, the whole run in one video (every round with its captures, holds and arm switches; captioned with the
+round's goal). Videos show the capture camera on the left and, down the right, the overview and the left wrist
+camera; they are fed from every second simulator step at 15 fps, so they play in simulated time; on the
 planner side `tiptop/tiptop_server_outputs/<timestamp>/` per request (its log, `masks_viz.png`, the cuTAMP
 environment, grasps, `metadata.json`).
 
@@ -152,7 +155,7 @@ simulator's cameras and the last request's masks on the right.
 | `r1pro_left/...` (`panda/...`) | the planner's robot model at the simulator's current joints | planner (URDF); joints from the simulator |
 | `world/sim/<task name>` | green: the simulator's own meshes of the task objects at their simulated poses; grey-blue: furniture named on the command line (`--place` supports, `--near`, `--stage-support`) | simulator, meshes once, poses every 2 env steps |
 | `world/objects/<label>`, `grasps/<label>/...`, `world/table`, `pcd`, `cam` | grey: what perception reconstructed for the *last* request -- hulls, the top 30 grasps of the goal's objects, table plane, cloud, camera -- cleared when the next request arrives | planner |
-| `sim/head_cam`, `sim/wrist_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | the head camera, the left wrist camera, a third-person view over the robot's left shoulder | simulator, every 6 env steps |
+| `sim/head_cam`, `sim/wrist_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | the head camera, the left wrist camera, a third-person view over the robot's left shoulder (ahead and to the right with `--overview front`) | simulator, every 6 env steps |
 | `masks` | the last request's image with its masks and boxes (`rgb`, `bboxes`, `obj_pcd/*` are logged too but hidden: the same content) | planner |
 
 Names: `world/sim/*` uses the simulator's task names (`candle_4` is `candle.n.01_4`); `world/objects/*` uses
@@ -204,7 +207,9 @@ picks and holds with the left arm on the usual planner, then `adopt_embodiment` 
 (`r1pro_right`, a second `tiptop-server` on that port; nothing moves, the left gripper keeps its close command and
 the left joints are held where they are) and the press round captures in place, with the held object in the head
 camera's view, and presses with a fingertip of the open right gripper. The Rerun mirror keeps reporting the left
-embodiment's joints. Bring-up for it:
+embodiment's joints. `--overview front` puts the third-person camera ahead and to the right of the robot, looking
+back at both hands (the default stands over the left shoulder, where the pressing hand is hidden by the torso);
+`full.mp4` in the output directory is the whole run. Bring-up for it:
 
 ```bash
 M2T2_GPU=4 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
@@ -216,7 +221,7 @@ TIPTOP_GPU=4 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro_right.yml TIPTOP_PORT=
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live --embodiment r1pro --activity turning_on_radio \
   --stand-for radio_receiver.n.01_1 --goal "holding(radio_receiver.n.01_1);toggled_on(radio_receiver.n.01_1)" \
   --sequential --press-port 8766 --grasping-mode sticky --task "pick up the radio and press its button" \
-  --host localhost --port 8765 --out-dir runs/radio_bimanual
+  --host localhost --port 8765 --overview front --out-dir runs/radio_bimanual
 ```
 
 ## CLI
@@ -237,7 +242,8 @@ set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene
 `--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`,
 `--no-gt`; the goal `--goal "pred(a,b);..."` (BDDL names with `--activity`), `--task`; execution
 `--grasping-mode physical|assisted|sticky`, `--gripper-hold-steps`, `--finger-max-effort`, `--settle-steps`,
-`--no-video`; `--scene capture.json` reuses an earlier capture's settled object poses; `--not-load` drops object
+`--no-video`, `--overview shoulder|front` (where the third-person camera stands); `--scene capture.json` reuses an
+earlier capture's settled object poses; `--not-load` drops object
 categories from the scene. `--help` on a subcommand lists them with defaults.
 
 Panda tabletop (no BEHAVIOR scene, `TIPTOP_CONFIG=tiptop/config/tiptop_sim_panda.yml` on the planner):

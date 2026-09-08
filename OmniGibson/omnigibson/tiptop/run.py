@@ -144,6 +144,13 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--grasping-mode", default="physical", choices=["physical", "assisted", "sticky"])
     p.add_argument("--settle-steps", type=int, default=90, help="env steps to let objects settle after reset")
     p.add_argument("--no-video", action="store_true")
+    p.add_argument(
+        "--overview",
+        choices=["shoulder", "front"],
+        default="shoulder",
+        help="third-person camera in the video and the mirror: over the left shoulder at the workspace, or ahead and "
+        "to the right looking back at both hands (the two-hands demo)",
+    )
     p.add_argument("--gripper-hold-steps", type=int, default=25)
     p.add_argument("--scene", default=None, help="capture.json of an earlier capture: reuse its settled object poses")
     p.add_argument(
@@ -203,6 +210,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
         segmentation=args.seg_instance,  # the annotator is opt-in; masks come from geometry
     )
     sim = R1ProSim(cfg, camera=args.camera)
+    sim.overview_view = args.overview
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
@@ -603,12 +611,19 @@ def do_execute(
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
-    video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4", fps=15, every=2)
+    video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4")
     # a press ends as soon as the simulator's toggle flips (the plan pushes a little past the surface)
     press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
     press_done = (lambda: all(sim.toggled(name) for name in press_targets)) if press_targets else None
-    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video, press_done=press_done)
-    stats = executor.execute(plan)
+    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, press_done=press_done)
+    if video is not None:
+        sim.recorders.append(video)
+    try:
+        stats = executor.execute(plan)
+    finally:
+        if video is not None:
+            sim.recorders.remove(video)
+            video.close()
     if press_targets:
         stats["buttons"] = {name: sim.press_state(name) for name in press_targets}
         log.info(f"buttons after the plan: {stats['buttons']}")
@@ -628,8 +643,6 @@ def do_execute(
         log.info(f"goal object AABBs: {success['poses']}")
     else:
         success = check_success(sim, parse_goal(args.goal))
-    if video is not None:
-        video.close()
     result = {
         "plan_summary": plan_summary(plan),
         "execution": stats,
@@ -752,9 +765,18 @@ def main(argv=None):
             atoms_all = parse_goal(args.goal)
             rounds = [[atom] for atom in atoms_all] if args.sequential else [atoms_all]
             outcomes = []
+            full = None
+            if args.sequential and not args.no_video:  # the whole run, rounds and the holds between them
+                from omnigibson.tiptop.executor import VideoRecorder
+
+                full = VideoRecorder(out_dir / "full.mp4")
+                sim.recorders.append(full)
             for i, atoms in enumerate(rounds):
                 round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
                 round_dir.mkdir(parents=True, exist_ok=True)
+                sim.video_caption = f"round {i}: " + "; ".join(
+                    f"{a['predicate']}({', '.join(a['args'])})" for a in atoms
+                )
                 try:
                     if args.sequential and args.restand and args.activity and len(atoms[0]["args"]) == 2:
                         sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
@@ -763,6 +785,7 @@ def main(argv=None):
                     if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
                         sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
                         round_client = press_client
+                        sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
                     outcomes.append(
                         live_round(sim, args, round_client, round_dir, atoms, hints=goal_hints(sim, args, atoms))
                     )
@@ -773,6 +796,11 @@ def main(argv=None):
                     outcomes.append({"error": f"{type(e).__name__}: {e}"})
                 if args.sequential:
                     log.info(f"round {i} {atoms}: {outcomes[-1].get('success', outcomes[-1].get('error'))}")
+            if full is not None:
+                sim.video_caption = "done: " + str(sim.goal_status().get("success")) if args.activity else "done"
+                sim.hold(30, sim.last_gripper)  # a second of the final state closes the video
+                sim.recorders.remove(full)
+                full.close()
             if args.sequential:
                 summary = {"rounds": outcomes}
                 if args.activity:

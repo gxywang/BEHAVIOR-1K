@@ -30,7 +30,6 @@ from omnigibson.tiptop.scene import (
     OBJECT_PRESETS,
     OVERVIEW_CAM,
     TiptopSim,
-    jpeg_bytes,
     look_at_quat_xyzw,
     overview_cam_config,
 )
@@ -268,6 +267,7 @@ class R1ProSim(TiptopSim):
         self.robot_cam = self.robot.sensors[self.cam_name]
         self.wrist_cam_name = f"{self.robot.name}:{CAMERA_LINKS['wrist']}:Camera:0"
         self.STREAM_CAMERA = f"{camera}_cam"  # the capture camera's image in the Rerun mirror
+        self.overview_view = "shoulder"  # where place_robot puts the overview camera; "front" for the two-hands demo
         self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
@@ -826,10 +826,15 @@ class R1ProSim(TiptopSim):
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
-        # third-person view of the workspace over the robot's left shoulder: the overview camera in the Rerun
-        # mirror, and the Isaac Sim viewport when there is one
-        eye = (x - 1.5 * math.cos(yaw) - 1.1 * math.sin(yaw), y - 1.5 * math.sin(yaw) + 1.1 * math.cos(yaw), 1.7)
-        target = (x + 0.7 * math.cos(yaw), y + 0.7 * math.sin(yaw), 0.55)
+        # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
+        # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
+        # back at the chest, where both hands and what they hold are in view ("front", the two-hands demo)
+        if self.overview_view == "front":
+            dx, dy, z, tx, tz = 1.15, -0.75, 1.35, 0.3, 0.9
+        else:
+            dx, dy, z, tx, tz = -1.5, 1.1, 1.7, 0.7, 0.55
+        eye = (x + dx * math.cos(yaw) - dy * math.sin(yaw), y + dx * math.sin(yaw) + dy * math.cos(yaw), z)
+        target = (x + tx * math.cos(yaw), y + tx * math.sin(yaw), tz)
         self.aim_overview(eye, target)
         if not gm.HEADLESS:
             og.sim.viewer_camera.set_position_orientation(
@@ -876,10 +881,12 @@ class R1ProSim(TiptopSim):
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
 
-    def adopt_embodiment(self, embodiment: dict, tol: float = 0.03) -> None:
+    def adopt_embodiment(self, embodiment: dict, tol: float = 0.05) -> None:
         """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
         something up. The joints the new embodiment locks (torso, the other arm) must already be where it expects
-        them within ``tol``; fingers are the gripper state and are not checked. The arm that planned so far keeps
+        them within ``tol`` (a loaded wrist settles up to ~0.035 rad short of its target under a held object; the
+        new planner only uses these values for the other arm's own collision spheres); fingers are the gripper
+        state and are not checked. The arm that planned so far keeps
         its last gripper command (a held object stays held) and its joints are held at their current values.
         The capture no longer swings an arm out of the camera's view (the held object should be seen), and the
         Rerun mirror keeps reporting the first embodiment's joints."""
@@ -1010,10 +1017,10 @@ class R1ProSim(TiptopSim):
             return None
         return self.last_obs[self.robot.name][sensor_name]["rgb"][..., :3].cpu().numpy().astype(np.uint8)
 
-    def stream_images(self) -> dict:
-        """The capture camera, the left wrist camera and the overview, as JPEGs for the Rerun mirror."""
-        images = super().stream_images()
+    def video_views(self) -> dict:
+        """The capture camera, the overview and the left wrist camera (video and Rerun mirror)."""
+        views = super().video_views()
         wrist = self._robot_rgb(self.wrist_cam_name)
         if wrist is not None and self.wrist_cam_name != self.cam_name:
-            images["wrist_cam"] = jpeg_bytes(wrist)
-        return images
+            views["wrist_cam"] = wrist
+        return views

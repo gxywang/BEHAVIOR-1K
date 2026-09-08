@@ -10,17 +10,58 @@ from omnigibson.tiptop.protocol import resample_trajectory
 log = logging.getLogger(__name__)
 
 
+def compose_views(views: dict, column_width: int = 560, caption: str | None = None) -> np.ndarray:
+    """One video frame from the simulator's views ({name: (H, W, 3) uint8}, the capture camera first): the first
+    view full size on the left, the others scaled to ``column_width`` and stacked down the right, each labelled;
+    ``caption`` goes in the top-left corner."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    names = list(views)
+    main = Image.fromarray(np.ascontiguousarray(views[names[0]][..., :3]))
+    tiles, left = [], main.height
+    for name in names[1:]:
+        img = Image.fromarray(np.ascontiguousarray(views[name][..., :3]))
+        scale = min(column_width / img.width, left / img.height)
+        if scale <= 0:
+            break
+        img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.BILINEAR)
+        tiles.append((name, img))
+        left -= img.height
+    canvas = Image.new("RGB", (main.width + (column_width if tiles else 0), main.height))
+    canvas.paste(main, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=20)
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    y = 0
+    for name, img in tiles:
+        canvas.paste(img, (main.width + (column_width - img.width) // 2, y))
+        draw.text((main.width + 6, y + 4), name, fill=(255, 255, 255), font=font, stroke_width=2, stroke_fill=(0, 0, 0))
+        y += img.height
+    if caption:
+        draw.text((8, 6), caption, fill=(255, 255, 255), font=font, stroke_width=2, stroke_fill=(0, 0, 0))
+    return np.asarray(canvas)
+
+
 class VideoRecorder:
-    def __init__(self, path, fps: int = 15, every: int = 2):
+    """Writes every ``every``-th simulator step as one composed frame (``compose_views``). Register it in
+    ``sim.recorders``: the simulator feeds it from ``step()``, so holds, captures and arm switches are in the video
+    too, not only the executed plan."""
+
+    def __init__(self, path, fps: int = 15, every: int = 2, column_width: int = 560):
         import imageio
 
-        self.path, self.every, self.count = str(path), every, 0
+        self.path, self.every, self.count, self.column_width = str(path), every, 0, column_width
         self.writer = imageio.get_writer(self.path, fps=fps, codec="libx264", quality=7, macro_block_size=None)
 
-    def add(self, frame: np.ndarray | None) -> None:
+    def due(self) -> bool:
         self.count += 1
-        if frame is not None and self.count % self.every == 0:
-            self.writer.append_data(frame)
+        return self.count % self.every == 0
+
+    def write(self, views: dict, caption: str | None = None) -> None:
+        if views:
+            self.writer.append_data(compose_views(views, self.column_width, caption))
 
     def close(self) -> None:
         self.writer.close()
@@ -36,7 +77,6 @@ class PlanExecutor:
         gripper_hold_steps: int = 25,
         converge_tol: float = 0.01,
         converge_max_steps: int = 90,
-        video: VideoRecorder | None = None,
         press_done=None,
     ):
         """``press_done``: no-argument callable; a ``Push(...)`` trajectory stops as soon as it returns True (the
@@ -45,7 +85,6 @@ class PlanExecutor:
         self.gripper_hold_steps = gripper_hold_steps
         self.converge_tol = converge_tol
         self.converge_max_steps = converge_max_steps
-        self.video = video
         self.press_done = press_done
         self.gripper = sim.OPEN
         self.n_steps = 0
@@ -53,8 +92,6 @@ class PlanExecutor:
     def _step(self, q_arm) -> np.ndarray:
         self.sim.step(q_arm, self.gripper)
         self.n_steps += 1
-        if self.video is not None:
-            self.video.add(self.sim.camera_rgb())
         return self.sim.q_arm()
 
     def converge(self, q_target, tol=None, max_steps=None, stop=None) -> float:

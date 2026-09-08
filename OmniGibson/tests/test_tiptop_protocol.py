@@ -256,3 +256,21 @@ def test_match_objects_per_object_tolerance():
     assert match_objects(perceived, simulated, 0.08)["radio_1"]["sim"] is None
     tolerance = {"radio_receiver_1": 0.15, "candle_1": 0.08}
     assert match_objects(perceived, simulated, tolerance)["radio_1"]["sim"] == "radio_receiver_1"
+
+
+def test_compose_views_layout():
+    import numpy as np
+
+    from omnigibson.tiptop.executor import compose_views
+
+    head = np.full((720, 720, 3), 10, np.uint8)
+    overview = np.full((360, 640, 4), 200, np.uint8)  # rgba from the sensor is cut to rgb
+    wrist = np.full((480, 480, 3), 90, np.uint8)
+    frame = compose_views({"head_cam": head, "overview": overview, "wrist_cam": wrist}, column_width=560, caption="x")
+    assert frame.shape == (720, 1280, 3)
+    assert frame[700, 100].tolist() == [10, 10, 10]  # the capture camera fills the left
+    assert frame[300, 1000].tolist() == [200, 200, 200]  # overview scaled to 560x315 at the top right
+    assert frame[500, 1000].tolist() == [90, 90, 90]  # wrist under it, 405x405 centred in the column
+    assert frame[719, 745].tolist() == [0, 0, 0]  # padding beside the centred wrist tile
+    only = compose_views({"cam": head})
+    assert only.shape == (720, 720, 3)
