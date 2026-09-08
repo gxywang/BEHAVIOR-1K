@@ -22,6 +22,7 @@ from omnigibson.macros import gm
 
 DEFAULT_BENCHMARK = "outputs/navigation/nav_benchmark_test.json"
 DEFAULT_OUTPUT = "outputs/navigation/nav2py_results.json"
+PREINFLATED_COSTMAP_FOOTPRINT_RADIUS = 1e-6
 
 
 def parse_args(argv=None):
@@ -230,7 +231,8 @@ def select_costmap(costmap_bundle, costmap_source):
 
 def make_robot_profile(robot, nav2py_api, args, clearance_is_in_costmap=False):
     robot_radius = float(th.norm(robot.reset_joint_pos_aabb_extent[:2]).item() / 2.0)
-    radius = 0.01 if clearance_is_in_costmap else robot_radius
+    # OmniGibson-eroded maps already include robot clearance; nav2py only requires a positive radius.
+    radius = PREINFLATED_COSTMAP_FOOTPRINT_RADIUS if clearance_is_in_costmap else robot_radius
     footprint_padding = 0.0 if clearance_is_in_costmap else 0.2
     inflation_radius = 0.0 if clearance_is_in_costmap else robot_radius + 0.2
     max_linear_velocity = 0.75 if args.profile_max_linear_velocity is None else args.profile_max_linear_velocity
