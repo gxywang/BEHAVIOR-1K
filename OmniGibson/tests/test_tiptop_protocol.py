@@ -274,3 +274,108 @@ def test_compose_views_layout():
     assert frame[719, 745].tolist() == [0, 0, 0]  # padding beside the centred wrist tile
     only = compose_views({"cam": head})
     assert only.shape == (720, 720, 3)
+
+
+class _FakeSim:
+    """Joint-space stand-in for the executor: the arm reaches every target at once; toggling is scripted."""
+
+    OPEN, CLOSE, dt = 1.0, -1.0, 1 / 30
+
+    def __init__(self, flip_at):
+        import numpy as np
+
+        self.q = np.zeros(2, np.float32)
+        self.steps, self.flip_at, self.toggled, self.gripper_log = 0, flip_at, False, []
+        self.robot = type("R", (), {"is_grasping": staticmethod(lambda: 0)})()
+
+    def step(self, q, gripper):
+        import numpy as np
+
+        self.q = np.asarray(q, np.float32)
+        self.steps += 1
+        self.gripper_log.append(gripper)
+        if float(self.q[0]) >= self.flip_at:  # the finger reaches the button part-way through the press segment
+            self.toggled = True
+
+    def q_arm(self):
+        return self.q
+
+    def q_fingers(self):
+        import numpy as np
+
+        return np.zeros(2)
+
+    def hold(self, n, gripper, q_arm=None):
+        for _ in range(n):
+            self.step(self.q, gripper)
+
+
+def test_press_stops_only_the_press_segment_and_the_back_off_runs():
+    from omnigibson.tiptop.executor import PlanExecutor
+
+    sim = _FakeSim(flip_at=0.15)
+    seg = lambda label, a, b: {"type": "trajectory", "label": label, "positions": [[a, a], [b, b]], "dt": 5 * sim.dt}
+    plan = {
+        "q_init": [0.0, 0.0],
+        "steps": [
+            {"type": "gripper", "action": "close", "label": "Push(b)"},
+            seg("Push(b)", 0.0, 0.1),  # approach: ends before the button
+            seg("Push(b)", 0.1, 0.2),  # press: the button flips at 0.15 -> stopped early
+            seg("Push(b)", 0.2, 0.1),  # back-off: same label, must run to its end
+            {"type": "gripper", "action": "open", "label": "Push(b)"},
+        ],
+    }
+    ex = PlanExecutor(sim, gripper_hold_steps=2, press_done=lambda: sim.toggled)
+    stats = ex.execute(plan)
+    early = [t["stopped_early"] for t in stats["trajectories"]]
+    assert early == [False, True, False]
+    assert stats["trajectories"][2]["executed"] == stats["trajectories"][2]["resampled"]  # the back-off completed
+    assert abs(float(sim.q[0]) - 0.1) < 1e-6  # and the arm ended at the hover pose
+    assert sim.gripper_log[-1] == sim.OPEN and sim.gripper_log[2] == sim.CLOSE
+
+
+def test_button_tracker_carries_a_detected_button_through_a_grasp():
+    import numpy as np
+
+    from omnigibson.tiptop.scene import ButtonTracker
+
+    def pose(yaw, xyz):
+        c, s = np.cos(yaw), np.sin(yaw)
+        mat = np.eye(4)
+        mat[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+        mat[:3, 3] = xyz
+        return mat
+
+    tracker = ButtonTracker()
+    detected = {
+        "radio_button": {"position": [0.5, 0.1, 0.8], "normal": [-1.0, 0.0, 0.0], "radius": 0.01, "source": "detected"}
+    }
+    tracker.update(detected, held={})
+    assert tracker.current(lambda arm: None)["radio_button"]["position"] == [0.5, 0.1, 0.8]  # free object: unchanged
+    close = pose(0.0, [0.5, 0.1, 0.9])  # the gripper closes on the object, 10 cm above the button
+    tracker.grasped("radio", "left", close)
+    now = pose(np.pi / 2, [0.3, 0.4, 1.0])  # then lifts, moves and turns a quarter turn about z
+    current = tracker.current(lambda arm: now if arm == "left" else None)["radio_button"]
+    assert np.allclose(current["position"], [0.3, 0.4, 0.9], atol=1e-9)  # still 10 cm below the gripper
+    assert np.allclose(current["normal"], [0.0, -1.0, 0.0], atol=1e-9)  # the face turned with it
+    given = {"radio_button": {"position": [0, 0, 0], "normal": [1, 0, 0], "radius": 0.01, "source": "given"}}
+    tracker.update(given, held={"radio": ("left", now)})
+    assert np.allclose(
+        tracker.current(lambda arm: now)["radio_button"]["position"], [0.3, 0.4, 0.9]
+    )  # a prior echoed back changes nothing
+
+
+def test_turn_about_axis():
+    import numpy as np
+
+    from omnigibson.tiptop.protocol import turn_about_axis
+
+    assert abs(turn_about_axis([0, 0, 1], [1, 0, 0], [0, 1, 0]) - np.pi / 2) < 1e-9  # x to y: +90 deg about z
+    assert abs(turn_about_axis([0, 0, 1], [0, 1, 0], [1, 0, 0]) + np.pi / 2) < 1e-9
+    assert abs(turn_about_axis([0, 0, -1], [1, 0, 0], [0, 1, 0]) + np.pi / 2) < 1e-9  # the axis sign flips the turn
+    away = turn_about_axis([0, 0, 1], [0.78, 0.62, 0.05], [-0.5, -0.86, 0.0])  # facing away: 159 deg apart in the plane
+    assert (
+        abs(abs(away) - np.arccos(np.dot([0.78, 0.62], [-0.5, -0.86]) / np.hypot(0.78, 0.62) / np.hypot(0.5, 0.86)))
+        < 1e-6
+    )
+    assert turn_about_axis([0, 0, 1], [0, 0, 1], [1, 0, 0]) == 0.0  # nothing to turn in the plane

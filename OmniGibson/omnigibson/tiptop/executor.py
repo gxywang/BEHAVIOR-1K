@@ -88,6 +88,7 @@ class PlanExecutor:
         self.press_done = press_done
         self.gripper = sim.OPEN
         self.n_steps = 0
+        self.close_eef = None  # base-frame eef pose at the last gripper close (where a held object was taken)
 
     def _step(self, q_arm) -> np.ndarray:
         self.sim.step(q_arm, self.gripper)
@@ -114,6 +115,8 @@ class PlanExecutor:
         q_hold = self.sim.q_arm() if q_hold is None else q_hold
         for _ in range(self.gripper_hold_steps):
             self._step(q_hold)
+        if action == "close" and hasattr(self.sim, "eef_pose_base"):
+            self.close_eef = self.sim.eef_pose_base(getattr(self.sim, "arm", None))
 
     def execute(self, plan: dict) -> dict:
         """Execute a parsed plan; returns tracking statistics."""
@@ -122,11 +125,13 @@ class PlanExecutor:
         if plan.get("q_init") is not None:
             stats["start_error_rad"] = self.home_to(plan["q_init"])
         q_last = self.sim.q_arm()
+        pressed = set()  # Push ops whose button has flipped: their remaining segments (the back-off) run unstopped
         for i, step in enumerate(plan["steps"]):
             if step["type"] == "trajectory":
                 traj = resample_trajectory(step["positions"], step["dt"], self.sim.dt)
                 start_gap = float(np.abs(traj[0] - self.sim.q_arm()).max())
-                stop = self.press_done if (self.press_done is not None and step["label"].startswith("Push(")) else None
+                pressing = step["label"].startswith("Push(") and step["label"] not in pressed
+                stop = self.press_done if (self.press_done is not None and pressing) else None
                 errs = []
                 stopped_early = False
                 for q in traj:
@@ -135,6 +140,8 @@ class PlanExecutor:
                         stopped_early = True
                         break
                 final_err = self.converge(traj[-1], stop=stop) if not stopped_early else float(errs[-1])
+                if stopped_early:
+                    pressed.add(step["label"])
                 q_last = traj[-1]
                 stats["trajectories"].append(
                     {

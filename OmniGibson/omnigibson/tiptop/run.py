@@ -143,6 +143,11 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--grasping-mode", default="physical", choices=["physical", "assisted", "sticky"])
     p.add_argument("--settle-steps", type=int, default=90, help="env steps to let objects settle after reset")
+    p.add_argument(
+        "--gt-buttons",
+        action="store_true",
+        help="with --no-gt: still describe toggle buttons by their true pose instead of detecting them",
+    )
     p.add_argument("--no-video", action="store_true")
     p.add_argument(
         "--overview",
@@ -317,10 +322,26 @@ def do_capture(
             if sim.last_capture_rgb is not None:  # what the camera saw when a goal object was missing
                 imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
             raise
-    # toggle buttons are too small to perceive: the goal's are described by pose (gt_buttons)
-    buttons = sim.button_hints(bddl_atoms, category_level=no_gt) if args.activity else {}
+    # toggle buttons: described by pose (gt_buttons) with ground-truth masks or --gt-buttons; with --no-gt the
+    # planner looks for "<object>_button" in a zoomed view of the object, so the label goes into gt_labels
+    buttons = (
+        sim.button_hints(bddl_atoms, category_level=no_gt) if args.activity and (not no_gt or args.gt_buttons) else {}
+    )
     if buttons:
         request["gt_buttons"] = buttons
+    elif no_gt:
+        # every button the whole goal presses, in every round: seen on the table before the pick, its detected pose
+        # is carried through the grasp (ButtonTracker) and sent as a prior a fresh detection may override
+        _, goal_atoms = sim.tiptop_goal(parse_goal(args.goal), category_level=True)
+        button_labels = {a for atom in goal_atoms if atom["predicate"] == "pressed" for a in atom["args"]}
+        if button_labels:
+            request["gt_labels"] = sorted(set(request["gt_labels"]) | button_labels)
+        tracked = sim.buttons.current(sim.eef_pose_base)
+        if tracked:
+            request["gt_buttons"] = tracked
+            log.info(f"button poses carried from earlier rounds: {tracked}")
+    if getattr(sim, "held_objects", None):  # what the other hand holds: an obstacle the planner must not pick up
+        request["held_labels"] = sorted(sim.held_objects)
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
@@ -337,7 +358,7 @@ def do_capture(
     meta = {
         "task": args.task,
         "goal_atoms": atoms,
-        "gt_labels": labels,
+        "gt_labels": request.get("gt_labels", labels),
         "intrinsics": request["intrinsics"].tolist(),
         "world_from_cam": request["world_from_cam"].tolist(),
         "q_init": request["q_init"].tolist(),
@@ -356,12 +377,13 @@ def goal_hints(sim, args, atoms: list[dict]) -> dict | None:
     if not (args.activity and args.no_gt):
         return None
     _, tiptop_atoms = sim.tiptop_goal(atoms, category_level=True)
-    return {
-        label: sim.base_hint(bddl)
-        for atom, tiptop_atom in zip(atoms, tiptop_atoms)
-        if atom["predicate"] != "toggled_on"  # buttons go by pose in gt_buttons, not by hint
-        for bddl, label in zip(atom["args"], tiptop_atom["args"])
-    }
+    hints = {}
+    for atom, tiptop_atom in zip(atoms, tiptop_atoms):
+        for bddl, label in zip(atom["args"], tiptop_atom["args"]):
+            if atom["predicate"] == "toggled_on":  # the button's object: the instance meant gets the plain label
+                label = label[: -len("_button")]
+            hints[label] = sim.base_hint(bddl)
+    return hints
 
 
 def setup_logging() -> None:
@@ -454,6 +476,9 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict 
         f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
     )
     match = perception_report(request, extras, response)
+    if response.get("buttons"):  # detected buttons: kept for later rounds (an object in hand moves with its gripper)
+        held = {label: (arm, sim.eef_pose_base(arm)) for label, arm in getattr(sim, "held_objects", {}).items()}
+        sim.buttons.update(response["buttons"], held)
     return do_execute(sim, args, out_dir, response["plan"], tag="live", atoms=atoms, extra={"perception": match})
 
 
@@ -618,9 +643,20 @@ def do_execute(
     executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, press_done=press_done)
     if video is not None:
         sim.recorders.append(video)
+    if press_targets and args.grasping_mode != "physical":
+        sim.block_grasping(getattr(sim, "arm", None))  # the press closes the gripper; it must not grasp the object
     try:
         stats = executor.execute(plan)
+        # an object picked up this round: its buttons now move with the gripper that closed on it
+        for atom in atoms:
+            if atom["predicate"] == "holding" and executor.close_eef is not None and args.activity:
+                label = sim.tiptop_goal([atom], category_level=args.no_gt)[1][0]["args"][0]
+                arm = getattr(sim, "arm", None)
+                sim.held_objects = {**getattr(sim, "held_objects", {}), label: arm}
+                sim.buttons.grasped(label, arm, executor.close_eef)
     finally:
+        if press_targets and args.grasping_mode != "physical":
+            sim.unblock_grasping()
         if video is not None:
             sim.recorders.remove(video)
             video.close()
@@ -783,7 +819,13 @@ def main(argv=None):
                         sim.hold(args.settle_steps, sim.OPEN)
                     round_client = client
                     if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
-                        sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
+                        holding_arm = sim.arm
+                        for atom in atoms:  # a held object is turned so its button faces the free hand
+                            label = sim.tiptop_goal([atom], category_level=args.no_gt)[1][0]["args"][0]
+                            if sim.buttons.specs.get(label, {}).get("arm"):
+                                sim.present_button(label)
+                        # the other arm presses; this one keeps holding (its wrist roll may have turned)
+                        sim.adopt_embodiment(press_meta["embodiment"], free_joints=(f"{holding_arm}_arm_joint7",))
                         round_client = press_client
                         sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
                     outcomes.append(

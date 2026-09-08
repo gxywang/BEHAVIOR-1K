@@ -191,22 +191,37 @@ Chosen by what the request carries:
   the task definition. Grounding DINO (prompts per category in `tiptop_sim_r1pro.yml`, e.g. "round cookie") finds
   boxes in the head-camera image, SAM2 segments them; `robot_mask`, the robot's own pixels, keeps SAM2 off an
   occluding gripper (only available with `--seg-instance`). Instances are numbered by box size, largest first.
+  A `<label>_button` label (toggle buttons, below) is found afterwards in a zoomed view of that object's box.
 - **Gemini** (`perception.detector: gemini`, tiptop's upstream default): Gemini detects the objects and translates
   the task; needs `GOOGLE_API_KEY`; atoms sent with the request take precedence.
 
-Toggle buttons (`toggled_on(obj)` goals, e.g. `turning_on_radio`) are the third mode: the button is a 2 cm marker
-on the object, far too small to perceive, so `button_hints` sends its pose instead (`gt_buttons`: base-frame
-position, the outward normal of the face it sits on from the object's own mesh, and the radius within which
-OmniGibson counts a finger), the atom goes out as `pressed(<label>_button)`, and the planner's `Push` plans hover,
-press and back-off along that normal. The executor closes the gripper for the press and stops the press segment
-as soon as the simulator's `ToggledOn` flips (a finger on the object inside that radius for 5 steps), before a
-sticky grasp could take the object; the round is scored by the task's own `toggled_on`.
+Toggle buttons (`toggled_on(obj)` goals, e.g. `turning_on_radio`): the button is a 2 cm marker on the object and
+the atom goes out as `pressed(<label>_button)`. With oracle masks (or `--no-gt --gt-buttons`) `button_hints` sends
+its pose (`gt_buttons`: base-frame position, the outward normal of the face it sits on from the object's own mesh,
+and the radius within which OmniGibson counts a finger). With `--no-gt` the planner finds it: the label goes into
+`gt_labels`, Grounding DINO looks for it (`phrases` in the planner config, "small red button" for the radio) in a
+zoomed view of the detected object's box, SAM2 masks it in a zoomed crop, and the mask's depth points give the
+position, a plane through the surrounding depth points the normal (0.7 cm and 4 deg off the true button on the
+held radio). The button label is asked for in every round, so the button is first seen on the table before the
+pick (in the hand it often sits at the image border); the planner reports what it detected (`buttons` in the
+response) and `ButtonTracker` keeps it: once the object is grasped, the pose moves with the gripper that closed
+on it (p_now = T_eef_now inv(T_eef_at_close) p_then, the arm's own kinematics; 1.6 cm off after a 43 cm lift with
+a 137 deg turn) and is sent as `gt_buttons`, a prior that a fresh detection in the press round overrides when it
+lands within 5 cm. Before the arms switch, `present_button` turns the holding wrist (roll joint, range +-90 deg,
+its axis measured with a small probe turn) so the tracked face normal points at the right arm as far as the range
+allows; `adopt_embodiment` leaves that joint out of its check. The request also names what the other hand holds
+(`held_labels`), which the planner keeps as an obstacle rather than something to pick up. Either way the planner's
+`Push` plans hover, press and back-off along the normal with the gripper closed. The executor stops the press segment as soon as the simulator's `ToggledOn` flips (a finger on the object
+inside that radius for 5 steps) and lets the back-off run; meanwhile the bridge keeps OmniGibson's sticky or
+assisted grasp off the pressing arm (`block_grasping`), since a closed gripper touching an object for 0.3 s would
+otherwise attach it. The round is scored by the task's own `toggled_on`.
 
 Two hands (`--press-port`): with `--sequential` and a goal like `holding(radio);toggled_on(radio)`, the first round
 picks and holds with the left arm on the usual planner, then `adopt_embodiment` switches to planning the right arm
 (`r1pro_right`, a second `tiptop-server` on that port; nothing moves, the left gripper keeps its close command and
 the left joints are held where they are) and the press round captures in place, with the held object in the head
-camera's view, and presses with a fingertip of the open right gripper. The Rerun mirror keeps reporting the left
+camera's view, and presses with the closed right gripper (its press point is the midpoint of the fingertips). The
+Rerun mirror keeps reporting the left
 embodiment's joints. `--overview front` puts the third-person camera ahead and to the right of the robot, looking
 back at both hands (the default stands over the left shoulder, where the pressing hand is hidden by the torso);
 `full.mp4` in the output directory is the whole run. Bring-up for it:
@@ -222,6 +237,7 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live --embodimen
   --stand-for radio_receiver.n.01_1 --goal "holding(radio_receiver.n.01_1);toggled_on(radio_receiver.n.01_1)" \
   --sequential --press-port 8766 --grasping-mode sticky --task "pick up the radio and press its button" \
   --host localhost --port 8765 --overview front --out-dir runs/radio_bimanual
+    # add --no-gt for Grounding DINO + SAM2 on the radio and its button instead of oracle masks and the button's pose
 ```
 
 ## CLI
@@ -240,7 +256,8 @@ Flags shared by all: `--embodiment franka|r1pro`, `--activity NAME` (+ `--activi
 set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene-objects`; the base
 `--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
 `--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`,
-`--no-gt`; the goal `--goal "pred(a,b);..."` (BDDL names with `--activity`), `--task`; execution
+`--no-gt` (`--gt-buttons` keeps the buttons' true poses with detected masks); the goal `--goal "pred(a,b);..."`
+(BDDL names with `--activity`), `--task`; execution
 `--grasping-mode physical|assisted|sticky`, `--gripper-hold-steps`, `--finger-max-effort`, `--settle-steps`,
 `--no-video`, `--overview shoulder|front` (where the third-person camera stands); `--scene capture.json` reuses an
 earlier capture's settled object poses; `--not-load` drops object

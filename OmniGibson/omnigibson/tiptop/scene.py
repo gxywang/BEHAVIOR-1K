@@ -200,6 +200,50 @@ def make_env_config(objects=("mug", "bowl"), grasping_mode: str = "physical") ->
     }
 
 
+class ButtonTracker:
+    """Buttons the planner detected, kept across rounds. A button belongs to the object its label names
+    (``<object>_button``); once that object is grasped it moves rigidly with the gripper, so the pose detected
+    earlier is carried along with the arm's own kinematics: p_now = T_eef_now @ inv(T_eef_at_grasp) @ p_then."""
+
+    def __init__(self):
+        self.specs = {}  # label -> {position, normal, radius} (base frame) as detected, and the eef pose then if held
+
+    def update(self, buttons: dict, held: dict) -> None:
+        """Record the planner's detected buttons; ``held`` maps an object label to (arm, 4x4 eef pose now) for
+        objects in hand at the time of the capture (their detection is relative to that gripper pose)."""
+        for label, spec in (buttons or {}).items():
+            if spec.get("source") != "detected":
+                continue
+            parent = label[: -len("_button")]
+            entry = {k: [float(v) for v in spec[k]] for k in ("position", "normal")}
+            entry["radius"] = float(spec["radius"])
+            entry["arm"], entry["eef"] = held[parent] if parent in held else (None, None)
+            self.specs[label] = entry
+            log.info(
+                f"tracking button {label} at {np.round(entry['position'], 3).tolist()}"
+                + (f" (in the {entry['arm']} hand)" if entry["arm"] else "")
+            )
+
+    def grasped(self, parent: str, arm: str, eef: np.ndarray) -> None:
+        """The object ``parent`` was just grasped by ``arm`` whose eef pose is ``eef``: its buttons now move with it."""
+        for label, entry in self.specs.items():
+            if label[: -len("_button")] == parent and entry["arm"] is None:
+                entry["arm"], entry["eef"] = arm, np.asarray(eef, dtype=np.float64)
+                log.info(f"button {label}: its object is now in the {arm} hand; its pose follows the gripper")
+
+    def current(self, eef_pose_base) -> dict:
+        """gt_buttons for the next request: every tracked button at its pose now (``eef_pose_base(arm)`` -> 4x4)."""
+        out = {}
+        for label, entry in self.specs.items():
+            position, normal = np.asarray(entry["position"]), np.asarray(entry["normal"])
+            if entry["arm"] is not None:
+                motion = eef_pose_base(entry["arm"]) @ np.linalg.inv(entry["eef"])
+                position = motion[:3, :3] @ position + motion[:3, 3]
+                normal = motion[:3, :3] @ normal
+            out[label] = {"position": position.tolist(), "normal": normal.tolist(), "radius": entry["radius"]}
+        return out
+
+
 class TiptopSim:
     """Owns the OmniGibson environment and produces TiPToP observations / executes joint targets."""
 
@@ -241,6 +285,7 @@ class TiptopSim:
     def _init_state(self) -> None:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self.buttons = ButtonTracker()  # detected buttons carried across rounds (and through a grasp)
         self.recorders = []  # executor.VideoRecorder instances, fed from step(); the caption is stamped on each frame
         self.video_caption = None
         self.last_obs = None
@@ -321,6 +366,38 @@ class TiptopSim:
         q = self.q_arm() if q_arm is None else q_arm
         for _ in range(n_steps):
             self.step(q, gripper)
+
+    def eef_pose_base(self, arm: str | None = None) -> np.ndarray:
+        """4x4 base-frame pose of the arm's end-effector link (the robot's default arm when ``arm`` is None)."""
+        link = self.robot.eef_links[arm or self.robot.default_arm]
+        pos, quat = self.to_base(*link.get_position_orientation())
+        mat = np.eye(4)
+        mat[:3, :3] = T.quat2mat(quat).cpu().numpy()
+        mat[:3, 3] = pos.cpu().numpy()
+        return mat
+
+    def block_grasping(self, arm: str | None = None) -> None:
+        """Keep OmniGibson's assisted/sticky grasp off ``arm`` (None: every arm) until ``unblock_grasping``: a closed
+        gripper pressing a button must not pick up what it touches (a grasp starts after 0.3 s of finger contact
+        while the gripper is commanded closed). Wraps the robot's per-arm candidate search; a grasp the arm already
+        holds is not released."""
+        robot = self.robot
+        if not hasattr(self, "_in_hand_object"):
+            self._in_hand_object = robot._calculate_in_hand_object
+        original = self._in_hand_object
+
+        def blocked(candidate_arm="default", *args, **kwargs):
+            if arm is None or candidate_arm == arm:
+                return None
+            return original(candidate_arm, *args, **kwargs)
+
+        robot._calculate_in_hand_object = blocked
+        log.info(f"grasping blocked for the {arm or 'whole robot'} (a press must not attach the button's object)")
+
+    def unblock_grasping(self) -> None:
+        if hasattr(self, "_in_hand_object"):
+            self.robot._calculate_in_hand_object = self._in_hand_object
+            del self._in_hand_object
 
     def camera_rgb(self) -> np.ndarray | None:
         if self.last_obs is None or "external" not in self.last_obs:
