@@ -295,10 +295,18 @@ class TiptopSim:
         return {self.robot.name: a}
 
     def step(self, q_arm, gripper: float):
+        self.last_gripper = float(gripper)
         self.last_obs = self.env.step(self.action(q_arm, gripper))[0]
         if self.state_stream is not None:
             self.state_stream.on_step(self)
         return self.last_obs
+
+    def mirror_q(self) -> np.ndarray:
+        """Planned joints for the Rerun mirror (the embodiment the mirror was attached with; see R1ProSim)."""
+        return self.q_arm()
+
+    def mirror_fingers(self) -> np.ndarray:
+        return self.q_fingers()
 
     def hold(self, n_steps: int, gripper: float = OPEN, q_arm=None):
         q = self.q_arm() if q_arm is None else q_arm

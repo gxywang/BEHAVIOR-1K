@@ -199,6 +199,26 @@ press and back-off along that normal. The executor closes the gripper for the pr
 as soon as the simulator's `ToggledOn` flips (a finger on the object inside that radius for 5 steps), before a
 sticky grasp could take the object; the round is scored by the task's own `toggled_on`.
 
+Two hands (`--press-port`): with `--sequential` and a goal like `holding(radio);toggled_on(radio)`, the first round
+picks and holds with the left arm on the usual planner, then `adopt_embodiment` switches to planning the right arm
+(`r1pro_right`, a second `tiptop-server` on that port; nothing moves, the left gripper keeps its close command and
+the left joints are held where they are) and the press round captures in place, with the held object in the head
+camera's view, and presses with a fingertip of the open right gripper. The Rerun mirror keeps reporting the left
+embodiment's joints. Bring-up for it:
+
+```bash
+M2T2_GPU=4 OmniGibson/omnigibson/tiptop/scripts/start_m2t2.sh
+TIPTOP_GPU=4 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
+  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh
+TIPTOP_GPU=4 TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro_right.yml TIPTOP_PORT=8766 TIPTOP_RERUN_MODE=connect \
+  TIPTOP_RERUN_URL=rerun+http://127.0.0.1:9876/proxy TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40 \
+  OmniGibson/omnigibson/tiptop/scripts/start_tiptop_server.sh
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live --embodiment r1pro --activity turning_on_radio \
+  --stand-for radio_receiver.n.01_1 --goal "holding(radio_receiver.n.01_1);toggled_on(radio_receiver.n.01_1)" \
+  --sequential --press-port 8766 --grasping-mode sticky --task "pick up the radio and press its button" \
+  --host localhost --port 8765 --out-dir runs/radio_bimanual
+```
+
 ## CLI
 
 `python -m omnigibson.tiptop.run <subcommand>`, inside the sim env, with `OMNIGIBSON_HEADLESS=1` (or unset for the
@@ -286,8 +306,10 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 - Planner variance: the same capture can fail once with "Motion planning failed for 32/74 satisfying particles"
   and succeed next time (grasp sampling differs per call). Retry before debugging.
 - Teleports (`--place`, `--stand-for`, `--torso`) are scaffolding the rules forbid during evaluation.
-- Pressing needs an empty hand (`Push` requires `HandEmpty`), so "hold the radio and press its button" is not one
-  plan for one arm: press first, set it down first, or press with the other arm (no right-arm embodiment yet).
+- Pressing needs an empty hand (`Push` requires `HandEmpty`), so "hold the radio and press its button" is two
+  plans for two arms (`--press-port`), not one. The held object is wherever the grasp left it: nothing yet turns
+  the button toward a camera or the free hand, and the right arm's model locks the left arm at its ready pose, so
+  the left hand has to be home (the holding plan ends there) when the switch happens.
 - Perception's table used to be whatever plane most objects' contact points touched; on the radio (its underside
   hidden, 8 cm above the glass) that was a tilted plane through its own face, which cut its hull to the top slab.
   The planner now takes only near-horizontal planes and allows contact points up to 10 cm above the table.

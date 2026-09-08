@@ -211,8 +211,8 @@ class SimStateStream:
         try:
             msg = {
                 "type": "sim_state",
-                "q": np.asarray(sim.q_arm(), dtype=np.float32),
-                "q_gripper": float(sim.q_fingers()[0]),
+                "q": np.asarray(sim.mirror_q(), dtype=np.float32),
+                "q_gripper": float(sim.mirror_fingers()[0]),
                 "objects": sim.object_poses_base_mats(),
             }
             if self.sent % self.image_every == 0:

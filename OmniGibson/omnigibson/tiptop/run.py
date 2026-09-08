@@ -673,6 +673,14 @@ def main(argv=None):
     p_live.add_argument(
         "--no-state-stream", action="store_true", help="do not mirror the simulator into the server's Rerun view"
     )
+    p_live.add_argument("--press-host", default=None, help="host of the planner for the other arm (default --host)")
+    p_live.add_argument(
+        "--press-port",
+        type=int,
+        default=None,
+        help="with --sequential: rounds whose goals are all toggled_on(...) are planned by a second tiptop-server on "
+        "this port serving the other arm (r1pro_right); the first arm keeps holding what it picked up",
+    )
     p_task = sub.add_parser("task", help="work through a challenge task's whole inside(item, container) goal")
     add_common(p_task)
     p_task.add_argument("--host", default="localhost")
@@ -713,6 +721,14 @@ def main(argv=None):
             sim = build_sim(args, embodiment=metadata.get("embodiment"))
             if not args.no_state_stream:
                 stream = open_state_stream(f"{args.host}:{args.port}", sim)
+            press_client = press_meta = None
+            if getattr(args, "press_port", None):
+                press_client = TiptopClient(
+                    args.press_host or args.host, args.press_port, expected_robot_type="r1pro_right", expected_dof=None
+                )
+                press_client.wait_for_server()
+                press_meta = press_client.fetch_metadata()
+                press_client.check_embodiment()
         elif args.cmd == "replay":
             with open(args.plan) as f:
                 plan_json = json.load(f)
@@ -743,7 +759,13 @@ def main(argv=None):
                     if args.sequential and args.restand and args.activity and len(atoms[0]["args"]) == 2:
                         sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
                         sim.hold(args.settle_steps, sim.OPEN)
-                    outcomes.append(live_round(sim, args, client, round_dir, atoms, hints=goal_hints(sim, args, atoms)))
+                    round_client = client
+                    if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
+                        sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
+                        round_client = press_client
+                    outcomes.append(
+                        live_round(sim, args, round_client, round_dir, atoms, hints=goal_hints(sim, args, atoms))
+                    )
                 except Exception as e:
                     if not args.sequential:
                         raise

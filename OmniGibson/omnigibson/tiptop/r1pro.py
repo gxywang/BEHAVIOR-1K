@@ -254,6 +254,11 @@ class R1ProSim(TiptopSim):
         self.env = og.Environment(configs=config)
         self.robot = self.env.robots[0]
         self.arm = "left"
+        self.other_arm = "right"
+        self.other_gripper = self.OPEN  # the arm that is not planned keeps this gripper command (see adopt_embodiment)
+        self.last_gripper = self.OPEN
+        self.mirror_arm_idx = None  # set when the planned arm changes: the Rerun mirror keeps the first embodiment
+        self.mirror_gripper_idx = None
         self.joint_index = {name: i for i, name in enumerate(self.robot.joints.keys())}
         self.planned_joints = list(self.robot.arm_joint_names[self.arm])  # replaced by apply_posture (torso + arm)
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
@@ -871,6 +876,52 @@ class R1ProSim(TiptopSim):
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
 
+    def adopt_embodiment(self, embodiment: dict, tol: float = 0.03) -> None:
+        """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
+        something up. The joints the new embodiment locks (torso, the other arm) must already be where it expects
+        them within ``tol``; fingers are the gripper state and are not checked. The arm that planned so far keeps
+        its last gripper command (a held object stays held) and its joints are held at their current values.
+        The capture no longer swings an arm out of the camera's view (the held object should be seen), and the
+        Rerun mirror keeps reporting the first embodiment's joints."""
+        arm = embodiment["arm"]
+        if arm == self.arm:
+            return
+        locked = {j: float(v) for j, v in embodiment["locked_joints"].items()}
+        unknown = [j for j in list(locked) + list(embodiment["joint_names"]) if j not in self.joint_index]
+        if unknown:
+            raise ValueError(f"joints unknown to the simulator: {unknown}")
+        q = self.robot.get_joint_positions()
+        errs = {j: abs(float(q[self.joint_index[j]]) - v) for j, v in locked.items() if "finger" not in j}
+        worst = max(errs, key=errs.get)
+        if errs[worst] > tol:
+            raise RuntimeError(
+                f"{embodiment['robot_type']} locks {worst} at {locked[worst]:.3f} rad but the simulator has it at "
+                f"{float(q[self.joint_index[worst]]):.3f} (off by {errs[worst]:.3f} > {tol})"
+            )
+        if self.mirror_arm_idx is None:
+            self.mirror_arm_idx, self.mirror_gripper_idx = self.arm_idx, self.gripper_idx
+        self.other_arm, self.other_gripper = self.arm, self.last_gripper
+        self.arm = arm
+        self.planned_joints = list(embodiment["joint_names"])
+        self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
+        self.gripper_idx = self.robot.gripper_control_idx[arm]
+        self.posture = {j: float(q[self.joint_index[j]]) for j in locked if "finger" not in j}  # hold, do not move
+        self.q_home = [float(v) for v in embodiment["q_home"]]
+        self.look_arm = None
+        log.info(
+            f"planning the {arm} arm from here on ({embodiment['robot_type']}: {len(self.planned_joints)} joints); "
+            f"the {self.other_arm} arm holds its posture with gripper command {self.other_gripper:+.0f}; "
+            f"worst locked-joint error {errs[worst]:.4f} rad on {worst}"
+        )
+
+    def mirror_q(self) -> np.ndarray:
+        idx = self.arm_idx if self.mirror_arm_idx is None else self.mirror_arm_idx
+        return self.robot.get_joint_positions()[idx].cpu().numpy()
+
+    def mirror_fingers(self) -> np.ndarray:
+        idx = self.gripper_idx if self.mirror_gripper_idx is None else self.mirror_gripper_idx
+        return self.robot.get_joint_positions()[idx].cpu().numpy()
+
     def camera_floor_distance(self, surface_z: float) -> float:
         """How far ahead of the base (m) the head camera's bottom image edge meets a horizontal surface at ``surface_z``.
 
@@ -919,9 +970,9 @@ class R1ProSim(TiptopSim):
         a = th.zeros(self.robot.action_dim, dtype=th.float32)
         a[idx["trunk"]] = th.tensor([targets[j] for j in self.robot.trunk_joint_names], dtype=th.float32)
         a[idx["arm_left"]] = th.tensor([targets[j] for j in self.robot.arm_joint_names["left"]], dtype=th.float32)
-        a[idx["gripper_left"]] = float(gripper)
+        a[idx[f"gripper_{self.arm}"]] = float(gripper)
         a[idx["arm_right"]] = th.tensor([targets[j] for j in self.robot.arm_joint_names["right"]], dtype=th.float32)
-        a[idx["gripper_right"]] = self.OPEN
+        a[idx[f"gripper_{self.other_arm}"]] = float(self.other_gripper)
         # base: HolonomicBaseJointController in position mode takes deltas, zeros hold the base still
         return {self.robot.name: a}
 

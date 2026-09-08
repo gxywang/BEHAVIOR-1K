@@ -155,11 +155,15 @@ for k in range(25):
         "left_eef_link": link_rel("left_eef_link"),
         "right_eef_link": link_rel("right_eef_link"),
         "left_gripper_link": link_rel("left_gripper_link"),
+        "right_gripper_link": link_rel("right_gripper_link"),
         "torso_link4": link_rel("torso_link4"),
         "zed_link": link_rel("zed_link"),
         "left_realsense_link": link_rel("left_realsense_link"),
+        "right_realsense_link": link_rel("right_realsense_link"),
         "left_gripper_finger_link1": link_rel("left_gripper_finger_link1"),
         "left_gripper_finger_link2": link_rel("left_gripper_finger_link2"),
+        "right_gripper_finger_link1": link_rel("right_gripper_finger_link1"),
+        "right_gripper_finger_link2": link_rel("right_gripper_finger_link2"),
         "cams": {sname: rel(*s.get_position_orientation()) for sname, s in robot.sensors.items() if "Camera" in sname},
         "base_pose_world": [x.tolist() for x in robot.get_position_orientation()],
     }
@@ -167,9 +171,10 @@ for k in range(25):
 info["samples"] = samples
 # finger geometry: aabb of finger links at open/closed
 set_q({n: 0.05 for n in fing})
-info["finger_open_link_pos"] = {n: link_rel(n)[0] for n in ["left_gripper_finger_link1", "left_gripper_finger_link2"]}
+FINGER_LINKS = [f"{s}_gripper_finger_link{i}" for s in ("left", "right") for i in (1, 2)]
+info["finger_open_link_pos"] = {n: link_rel(n)[0] for n in FINGER_LINKS}
 set_q({n: 0.0 for n in fing})
-info["finger_closed_link_pos"] = {n: link_rel(n)[0] for n in ["left_gripper_finger_link1", "left_gripper_finger_link2"]}
+info["finger_closed_link_pos"] = {n: link_rel(n)[0] for n in FINGER_LINKS}
 with open(OUT, "w") as f:
     json.dump(info, f, indent=1)
 print("PROBE DONE", OUT)
