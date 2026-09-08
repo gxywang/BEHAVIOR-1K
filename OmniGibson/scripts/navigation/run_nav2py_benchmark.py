@@ -649,14 +649,18 @@ def action_from_nav2py_command(robot, command):
     return action
 
 
+def zero_robot_velocities(robot):
+    robot.set_linear_velocity(th.zeros(3))
+    robot.set_angular_velocity(th.zeros(3))
+    robot.set_joint_velocities(th.zeros(robot.n_dof), drive=False)
+
+
 def place_robot(robot, episode):
     position = th.tensor(episode["start_position"], dtype=th.float32)
     orientation = th.tensor(episode["start_quat"], dtype=th.float32)
     robot.set_joint_positions(robot.reset_joint_pos, drive=False)
     robot.set_position_orientation(position=position, orientation=orientation)
-    robot.set_linear_velocity(th.zeros(3))
-    robot.set_angular_velocity(th.zeros(3))
-    robot.set_joint_velocities(th.zeros(robot.n_dof), drive=False)
+    zero_robot_velocities(robot)
 
 
 def apply_deadband(value, deadband):
@@ -694,6 +698,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
 
     for _ in range(args.settle_steps):
         env.step({robot.name: controller_no_op_action(robot)})
+
+    zero_robot_velocities(robot)
 
     costmap, costmap_is_profile_inflated = select_costmap(costmap_bundle, args.costmap_source)
     navigator = make_navigator(
