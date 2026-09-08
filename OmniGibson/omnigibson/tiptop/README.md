@@ -191,6 +191,14 @@ Chosen by what the request carries:
 - **Gemini** (`perception.detector: gemini`, tiptop's upstream default): Gemini detects the objects and translates
   the task; needs `GOOGLE_API_KEY`; atoms sent with the request take precedence.
 
+Toggle buttons (`toggled_on(obj)` goals, e.g. `turning_on_radio`) are the third mode: the button is a 2 cm marker
+on the object, far too small to perceive, so `button_hints` sends its pose instead (`gt_buttons`: base-frame
+position, the outward normal of the face it sits on from the object's own mesh, and the radius within which
+OmniGibson counts a finger), the atom goes out as `pressed(<label>_button)`, and the planner's `Push` plans hover,
+press and back-off along that normal. The executor closes the gripper for the press and stops the press segment
+as soon as the simulator's `ToggledOn` flips (a finger on the object inside that radius for 5 steps), before a
+sticky grasp could take the object; the round is scored by the task's own `toggled_on`.
+
 ## CLI
 
 `python -m omnigibson.tiptop.run <subcommand>`, inside the sim env, with `OMNIGIBSON_HEADLESS=1` (or unset for the
@@ -278,6 +286,11 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 - Planner variance: the same capture can fail once with "Motion planning failed for 32/74 satisfying particles"
   and succeed next time (grasp sampling differs per call). Retry before debugging.
 - Teleports (`--place`, `--stand-for`, `--torso`) are scaffolding the rules forbid during evaluation.
+- Pressing needs an empty hand (`Push` requires `HandEmpty`), so "hold the radio and press its button" is not one
+  plan for one arm: press first, set it down first, or press with the other arm (no right-arm embodiment yet).
+- Perception's table used to be whatever plane most objects' contact points touched; on the radio (its underside
+  hidden, 8 cm above the glass) that was a tilted plane through its own face, which cut its hull to the top slab.
+  The planner now takes only near-horizontal planes and allows contact points up to 10 cm above the table.
 
 ## Tests
 

@@ -37,12 +37,16 @@ class PlanExecutor:
         converge_tol: float = 0.01,
         converge_max_steps: int = 90,
         video: VideoRecorder | None = None,
+        press_done=None,
     ):
+        """``press_done``: no-argument callable; a ``Push(...)`` trajectory stops as soon as it returns True (the
+        button flipped), so the fingers do not keep pushing against the surface for the rest of the segment."""
         self.sim = sim
         self.gripper_hold_steps = gripper_hold_steps
         self.converge_tol = converge_tol
         self.converge_max_steps = converge_max_steps
         self.video = video
+        self.press_done = press_done
         self.gripper = sim.OPEN
         self.n_steps = 0
 
@@ -53,13 +57,13 @@ class PlanExecutor:
             self.video.add(self.sim.camera_rgb())
         return self.sim.q_arm()
 
-    def converge(self, q_target, tol=None, max_steps=None) -> float:
+    def converge(self, q_target, tol=None, max_steps=None, stop=None) -> float:
         tol = self.converge_tol if tol is None else tol
         max_steps = self.converge_max_steps if max_steps is None else max_steps
         err = np.inf
         for _ in range(max_steps):
             err = float(np.abs(self._step(q_target) - q_target).max())
-            if err < tol:
+            if err < tol or (stop is not None and stop()):
                 break
         return err
 
@@ -85,10 +89,15 @@ class PlanExecutor:
             if step["type"] == "trajectory":
                 traj = resample_trajectory(step["positions"], step["dt"], self.sim.dt)
                 start_gap = float(np.abs(traj[0] - self.sim.q_arm()).max())
+                stop = self.press_done if (self.press_done is not None and step["label"].startswith("Push(")) else None
                 errs = []
+                stopped_early = False
                 for q in traj:
                     errs.append(float(np.abs(self._step(q) - q).max()))
-                final_err = self.converge(traj[-1])
+                    if stop is not None and stop():
+                        stopped_early = True
+                        break
+                final_err = self.converge(traj[-1], stop=stop) if not stopped_early else float(errs[-1])
                 q_last = traj[-1]
                 stats["trajectories"].append(
                     {
@@ -96,13 +105,16 @@ class PlanExecutor:
                         "label": step["label"],
                         "waypoints": int(len(step["positions"])),
                         "resampled": int(len(traj)),
+                        "executed": int(len(errs)),
                         "start_gap_rad": start_gap,
                         "max_tracking_error_rad": float(max(errs)),
                         "final_error_rad": final_err,
+                        "stopped_early": stopped_early,
                     }
                 )
                 log.info(
-                    f"[{i}] {step['label']}: {len(step['positions'])} wp -> {len(traj)} steps, "
+                    f"[{i}] {step['label']}: {len(step['positions'])} wp -> {len(traj)} steps"
+                    f"{f' (button flipped after {len(errs)})' if stopped_early else ''}, "
                     f"max lag {max(errs):.3f} rad, final err {final_err:.4f} rad"
                 )
             else:
@@ -165,6 +177,18 @@ def check_success(sim, atoms: list[dict]) -> dict:
                 "states": states,
                 "a_center": a_c.tolist(),
                 "b_aabb": [b_lo.tolist(), b_hi.tolist()],
+            }
+        elif pred == "toggled_on" and len(args) == 1:
+            from omnigibson.object_states import ToggledOn
+
+            a = sim.objects.get(args[0])
+            if a is None or ToggledOn not in a.states:
+                results[key] = {"success": None, "reason": "object not in scene or has no toggle button"}
+                continue
+            state = a.states[ToggledOn]
+            results[key] = {
+                "success": bool(state.get_value()),
+                "finger_on_button_steps": int(state.robot_can_toggle_steps),
             }
         elif pred == "holding" and len(args) == 1:
             a = sim.objects.get(args[0])

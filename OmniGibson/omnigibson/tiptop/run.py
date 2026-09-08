@@ -290,6 +290,7 @@ def do_capture(
     from omnigibson.tiptop.protocol import save_observation_h5
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
+    bddl_atoms = list(atoms)
     no_gt = args.no_gt
     if args.activity:
         # BDDL names -> request labels; --no-gt asks the detector for categories (any candle will do)
@@ -308,6 +309,10 @@ def do_capture(
             if sim.last_capture_rgb is not None:  # what the camera saw when a goal object was missing
                 imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
             raise
+    # toggle buttons are too small to perceive: the goal's are described by pose (gt_buttons)
+    buttons = sim.button_hints(bddl_atoms, category_level=no_gt) if args.activity else {}
+    if buttons:
+        request["gt_buttons"] = buttons
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
@@ -328,6 +333,7 @@ def do_capture(
         "intrinsics": request["intrinsics"].tolist(),
         "world_from_cam": request["world_from_cam"].tolist(),
         "q_init": request["q_init"].tolist(),
+        "gt_buttons": buttons,
         "validation": report,
         "extras": {k: v for k, v in extras.items() if k not in ("seg_instance",)},
     }
@@ -345,6 +351,7 @@ def goal_hints(sim, args, atoms: list[dict]) -> dict | None:
     return {
         label: sim.base_hint(bddl)
         for atom, tiptop_atom in zip(atoms, tiptop_atoms)
+        if atom["predicate"] != "toggled_on"  # buttons go by pose in gt_buttons, not by hint
         for bddl, label in zip(atom["args"], tiptop_atom["args"])
     }
 
@@ -382,7 +389,12 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
 
     perceived = response.get("objects") or {}
     simulated = {name: pose["aabb_center"] for name, pose in extras["object_poses_base"].items()}
-    match = match_objects({label: info["position"] for label, info in perceived.items()}, simulated, MATCH_MAX_DIST)
+    # a hull seen from one side is centred above the object's centre, by up to half its size
+    tolerance = {
+        name: max(MATCH_MAX_DIST, 0.5 * float(np.ptp(np.asarray(pose["aabb_corners"], dtype=np.float64), axis=0).max()))
+        for name, pose in extras["object_poses_base"].items()
+    }
+    match = match_objects({label: info["position"] for label, info in perceived.items()}, simulated, tolerance)
     goal_args = {a for atom in request.get("gt_atoms") or [] for a in atom["args"]}
     for label in sorted(perceived, key=lambda name: (name not in goal_args, name)):
         info, m = perceived[label], match[label]
@@ -391,8 +403,7 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
         if m["sim"] is None:
             nearest = f"{100 * m['dist']:.0f} cm" if m["dist"] is not None else "nothing tracked"
             (log.warning if role == "goal" else log.info)(
-                f"{head}: no simulated object within {100 * MATCH_MAX_DIST:.0f} cm (nearest {nearest}): "
-                "false detection or misplaced hull"
+                f"{head}: no simulated object within its allowance (nearest {nearest}): false detection or misplaced hull"
             )
         else:
             log.info(f"{head} = simulated {m['sim']} ({100 * m['dist']:.1f} cm off)")
@@ -593,8 +604,14 @@ def do_execute(
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
     video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4", fps=15, every=2)
-    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video)
+    # a press ends as soon as the simulator's toggle flips (the plan pushes a little past the surface)
+    press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
+    press_done = (lambda: all(sim.toggled(name) for name in press_targets)) if press_targets else None
+    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, video=video, press_done=press_done)
     stats = executor.execute(plan)
+    if press_targets:
+        stats["buttons"] = {name: sim.press_state(name) for name in press_targets}
+        log.info(f"buttons after the plan: {stats['buttons']}")
     if args.activity:
         success = sim.goal_status()
         success["all"] = success["success"]

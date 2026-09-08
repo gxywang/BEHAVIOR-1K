@@ -276,15 +276,18 @@ def points_to_pixels(points, intrinsics, world_from_cam) -> tuple:
     return np.stack([fx * cam[:, 0] / z + cx, fy * cam[:, 1] / z + cy], axis=-1), cam[:, 2]
 
 
-def match_objects(perceived: dict, simulated: dict, max_dist: float = MATCH_MAX_DIST) -> dict:
+def match_objects(perceived: dict, simulated: dict, max_dist=MATCH_MAX_DIST) -> dict:
     """Pair perceived objects with simulated ones by position ({name: [x, y, z]}, both in the same frame).
 
     Perception numbers instances by box size ("candle_2" is the second-largest candle the detector found) and
     the simulator by task instance, so a name never identifies an object across the two; a position does. Greedy by
     distance, each simulated object used once. Returns {perceived name: {"sim": simulated name or None, "dist":
     metres to it, or to the nearest simulated object when none is within ``max_dist``}}; a perceived object without
-    a partner is a false detection or a hull that landed somewhere else.
+    a partner is a false detection or a hull that landed somewhere else. ``max_dist`` is one distance, or one per
+    simulated name: a hull built from one view of a big object is centred well above the object (its underside is
+    never seen), so a large object gets a larger allowance.
     """
+    tolerance = max_dist if isinstance(max_dist, dict) else {name: float(max_dist) for name in simulated}
     pairs = sorted(
         (float(np.linalg.norm(np.asarray(p, dtype=np.float64) - np.asarray(s, dtype=np.float64))), p_name, s_name)
         for p_name, p in perceived.items()
@@ -295,7 +298,7 @@ def match_objects(perceived: dict, simulated: dict, max_dist: float = MATCH_MAX_
     for dist, p_name, s_name in pairs:
         if out[p_name]["dist"] is None:
             out[p_name]["dist"] = dist  # the nearest overall, for the report when nothing is close enough
-        if out[p_name]["sim"] is None and s_name not in used and dist <= max_dist:
+        if out[p_name]["sim"] is None and s_name not in used and dist <= tolerance[s_name]:
             out[p_name] = {"sim": s_name, "dist": dist}
             used.add(s_name)
     return out
@@ -314,6 +317,22 @@ def canonical_object_name(name: str) -> tuple:
 def rerun_name(name: str) -> str:
     """Entity-path-safe object name for the Rerun mirror ('table.n.02_1' -> 'table_n_02_1')."""
     return name.replace(".", "_").replace(" ", "_").replace("/", "_")
+
+
+def face_normal_local(vertices, point) -> np.ndarray:
+    """Outward unit normal of the face of ``vertices``' bounding box that ``point`` (same frame) is nearest to.
+
+    Which face of an object a button sits on: the box's six faces are candidates and the one with the smallest gap
+    to the point wins (a button 2 mm inside the +x face beats the top face 10 cm away).
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    lo, hi = vertices.min(axis=0), vertices.max(axis=0)
+    p = np.asarray(point, dtype=np.float64)
+    gaps = np.concatenate([p - lo, hi - p])  # to the -x -y -z faces, then the +x +y +z faces
+    k = int(np.argmin(gaps))
+    normal = np.zeros(3)
+    normal[k % 3] = 1.0 if k >= 3 else -1.0
+    return normal
 
 
 def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:

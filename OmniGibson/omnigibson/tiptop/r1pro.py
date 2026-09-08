@@ -34,6 +34,7 @@ from omnigibson.tiptop.scene import (
     look_at_quat_xyzw,
     overview_cam_config,
 )
+from omnigibson.tiptop.protocol import face_normal_local
 
 log = logging.getLogger(__name__)
 
@@ -310,13 +311,21 @@ class R1ProSim(TiptopSim):
         return dict(self.bddl_names)
 
     def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
-        """Translate BDDL goal atoms (inside/ontop/on/nextto/holding over BDDL names) for TiPToP.
+        """Translate BDDL goal atoms (inside/ontop/on/nextto/holding/toggled_on over BDDL names) for TiPToP.
 
         Returns the labels the request names and the atoms in TiPToP's predicates. Per instance ('candle_1', with
         ground-truth masks) or per category ('candle': the detector finds every instance and the goal takes the
-        best-scoring one, since the task does not care which candle goes into which basket).
+        best-scoring one, since the task does not care which candle goes into which basket). toggled_on(obj)
+        becomes pressed(<label>_button): the button is described by pose in the request (button_hints).
         """
-        predicates = {"inside": "on", "ontop": "on", "on": "on", "nextto": "near", "holding": "holding"}
+        predicates = {
+            "inside": "on",
+            "ontop": "on",
+            "on": "on",
+            "nextto": "near",
+            "holding": "holding",
+            "toggled_on": "pressed",
+        }
         label_of = {bddl: label for label, bddl in self.bddl_names.items()}
 
         def name(arg):
@@ -328,7 +337,10 @@ class R1ProSim(TiptopSim):
         for atom in atoms:
             if atom["predicate"] not in predicates:
                 raise ValueError(f"unsupported goal predicate {atom['predicate']!r} ({sorted(predicates)})")
-            out.append({"predicate": predicates[atom["predicate"]], "args": [name(a) for a in atom["args"]]})
+            args = [name(a) for a in atom["args"]]
+            if atom["predicate"] == "toggled_on":
+                args = [self.button_label(a) for a in args]
+            out.append({"predicate": predicates[atom["predicate"]], "args": args})
         if category_level:
             labels = sorted({bddl_category(b).replace(" ", "_") for b in self.bddl_names.values()})
         else:
@@ -375,6 +387,66 @@ class R1ProSim(TiptopSim):
                 if list(getattr(head, "terms", [])) == terms:
                     return bool(head.evaluate(task._evaluate_predicate))
         raise KeyError(f"{name}({', '.join(bddl_names)}) is not a goal predicate of this task")
+
+    @staticmethod
+    def button_label(label: str) -> str:
+        """Request label of an object's toggle button ('radio_receiver_1' -> 'radio_receiver_1_button')."""
+        return f"{label}_button"
+
+    def button_hints(self, atoms: list[dict], category_level: bool = False) -> dict:
+        """The toggle button of every toggled_on goal object, for the request's gt_buttons: base-frame position,
+        outward normal of the face it sits on, and the radius within which OmniGibson's ToggledOn counts a finger."""
+        from omnigibson.object_states import ToggledOn
+
+        out = {}
+        for atom in atoms:
+            if atom["predicate"] != "toggled_on":
+                continue
+            (bddl,) = atom["args"]
+            obj = self.scene_object(bddl)
+            if ToggledOn not in obj.states:
+                raise ValueError(f"{bddl} has no toggle button (no ToggledOn state)")
+            state = obj.states[ToggledOn]
+            pos_w = state.link.get_position_orientation()[0]
+            obj_pos, obj_quat = obj.get_position_orientation()
+            rot = T.quat2mat(obj_quat).cpu().numpy().astype(np.float64)
+            vertices, _ = self.mesh_local(obj)  # the object's own frame
+            p_local = rot.T @ (pos_w.cpu().numpy().astype(np.float64) - obj_pos.cpu().numpy().astype(np.float64))
+            n_world = rot @ face_normal_local(vertices, p_local)
+            identity = th.tensor([0.0, 0.0, 0.0, 1.0])
+            pos_b, _ = self.to_base(pos_w, identity)
+            tip_b, _ = self.to_base(pos_w + th.tensor(n_world, dtype=pos_w.dtype), identity)
+            label = bddl_category(bddl).replace(" ", "_") if category_level else self.label_of(bddl)
+            out[self.button_label(label)] = {
+                "position": [float(v) for v in pos_b],
+                "normal": [float(v) for v in (tip_b - pos_b)],
+                "radius": float(th.min(state.visual_marker.extent * state.scale * state.link.scale)),
+            }
+            log.info(
+                f"button of {bddl}: {self.button_label(label)} at {np.round(out[self.button_label(label)]['position'], 3).tolist()} "
+                f"(base), normal {np.round(out[self.button_label(label)]['normal'], 2).tolist()}, "
+                f"radius {out[self.button_label(label)]['radius']:.3f} m"
+            )
+        return out
+
+    def label_of(self, bddl: str) -> str:
+        """Request label of a tracked task object ('radio_receiver.n.01_1' -> 'radio_receiver_1')."""
+        for label, name in self.bddl_names.items():
+            if name == bddl:
+                return label
+        raise KeyError(f"{bddl} is not a tracked task object: {sorted(self.bddl_names.values())}")
+
+    def toggled(self, bddl: str) -> bool:
+        from omnigibson.object_states import ToggledOn
+
+        return bool(self.scene_object(bddl).states[ToggledOn].get_value())
+
+    def press_state(self, bddl: str) -> dict:
+        """ToggledOn value and how many consecutive steps a finger has been on the button (5 flip it)."""
+        from omnigibson.object_states import ToggledOn
+
+        state = self.scene_object(bddl).states[ToggledOn]
+        return {"toggled_on": bool(state.get_value()), "finger_on_button_steps": int(state.robot_can_toggle_steps)}
 
     def base_hint(self, name: str) -> list[float]:
         """Where a scene/task object is, in the robot base frame (TiPToP's world frame)."""

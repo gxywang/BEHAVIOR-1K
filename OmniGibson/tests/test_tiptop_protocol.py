@@ -234,3 +234,25 @@ def test_canonical_object_name_and_rerun_name():
     assert canonical_object_name("wicker_basket.n.01") == ("wicker_basket", "")
     assert canonical_object_name("breakfast_table_skczfi_0") == ("breakfast_table_skczfi", "0")
     assert rerun_name("table.n.02_1") == "table_n_02_1" and rerun_name("can of soda/1") == "can_of_soda_1"
+
+
+def test_face_normal_local_picks_the_nearest_face():
+    from omnigibson.tiptop.protocol import face_normal_local
+
+    box = np.array([[-0.069, -0.16, -0.118], [0.069, 0.16, 0.118]])  # the radio's local bounding box
+    # the toggle button: 2 mm inside the +x face, far from the others
+    assert face_normal_local(box, [0.0447 + 0.0022, 0.0421, -0.0125]).tolist() == [1.0, 0.0, 0.0]
+    assert face_normal_local(box, [0.0447, 0.0421, -0.0125]).tolist() == [1.0, 0.0, 0.0]
+    assert face_normal_local(box, [0.0, 0.0, 0.117]).tolist() == [0.0, 0.0, 1.0]  # on the top face
+    assert face_normal_local(box, [-0.068, 0.1, 0.0]).tolist() == [-1.0, 0.0, 0.0]  # on the -x face
+    assert face_normal_local(box, [0.0, -0.159, 0.0]).tolist() == [0.0, -1.0, 0.0]
+
+
+def test_match_objects_per_object_tolerance():
+    from omnigibson.tiptop.protocol import match_objects
+
+    perceived = {"radio_1": [0.70, 0.20, 0.60]}  # a hull centred 7 cm above a 24 cm radio
+    simulated = {"radio_receiver_1": [0.77, 0.22, 0.53], "candle_1": [0.30, 0.10, 0.45]}
+    assert match_objects(perceived, simulated, 0.08)["radio_1"]["sim"] is None
+    tolerance = {"radio_receiver_1": 0.15, "candle_1": 0.08}
+    assert match_objects(perceived, simulated, tolerance)["radio_1"]["sim"] == "radio_receiver_1"
