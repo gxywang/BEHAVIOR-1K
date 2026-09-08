@@ -39,7 +39,7 @@ path stays untouched.
 ## One round, step by step
 
 1. **Stand.** The base is teleported once per episode (`--stand-for`, `--near`, `--robot-pose`); the planner never
-   moves it. `--stand-for ITEM[,ITEM...],TARGET` searches a pose from which every named object is ahead, on the
+   moves it. `--stand-for [ITEM,...,]TARGET` (one name for a one-object task) searches a pose from which every named object is ahead, on the
    left, within the arm's reach and inside the head camera's view (see "R1Pro specifics").
 2. **Capture** (`R1ProSim.capture`). The left arm swings out of the head camera's view (`LOOK_ARM`), an external
    "shadow" camera with the head camera's intrinsics is moved onto its pose and renders rgb + `depth_linear` until two
@@ -205,7 +205,7 @@ Isaac GUI):
 
 Flags shared by all: `--embodiment franka|r1pro`, `--activity NAME` (+ `--activity-instance`, `--rooms`), scene
 set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene-objects`; the base
-`--stand-for ITEM[,ITEM...],TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
+`--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
 `--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`,
 `--no-gt`; the goal `--goal "pred(a,b);..."` (BDDL names with `--activity`), `--task`; execution
 `--grasping-mode physical|assisted|sticky`, `--gripper-hold-steps`, `--finger-max-effort`, `--settle-steps`,

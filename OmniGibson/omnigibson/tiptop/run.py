@@ -98,9 +98,9 @@ def add_common(p: argparse.ArgumentParser) -> None:
     r1.add_argument(
         "--stand-for",
         default=None,
-        metavar="ITEM[,ITEM...],TARGET",
-        help="choose the base pose once so every ITEM and the TARGET are in the left arm's reach "
-        "(navigation stand-in; alternative to --near / --robot-pose)",
+        metavar="[ITEM,...,]TARGET",
+        help="choose the base pose once so every ITEM and the TARGET are in the left arm's reach; a single name "
+        "for a one-object task (navigation stand-in; alternative to --near / --robot-pose)",
     )
     p.add_argument(
         "--no-gt",

@@ -643,8 +643,8 @@ class R1ProSim(TiptopSim):
         Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
         """
         pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
-        if len(pts) < 2:
-            raise ValueError("best_base_pose needs at least one item and the target")
+        if not pts:
+            raise ValueError("best_base_pose needs at least one point (the last one is the target)")
         half_widths = [0.0] * len(pts) if half_widths is None else list(half_widths)
         if support_z is None:
             min_dists = [0.0] * len(pts)
@@ -716,10 +716,11 @@ class R1ProSim(TiptopSim):
     def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9) -> dict:
         """Stand where every item and the target (the last name) are in the left arm's reach ("navigation done").
 
+        A single name is a target with no items (a one-object task such as turning_on_radio).
         ignore_names: objects that do not count as obstacles, resolved like place_robot_near's (unknown names raise).
         """
-        if len(names) < 2:
-            raise ValueError("place_robot_for needs ITEM[,ITEM...],TARGET")
+        if not names:
+            raise ValueError("place_robot_for needs [ITEM,...,]TARGET")
         objects = [self.scene_object(n) for n in names]
         points = [o.aabb_center.cpu().numpy()[:2] for o in objects]
         support_z = [float(o.aabb[0][2]) for o in objects]  # each object's bottom: the top of what it stands on

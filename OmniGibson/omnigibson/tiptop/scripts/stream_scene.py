@@ -33,7 +33,7 @@ def main() -> None:
     ap.add_argument("--not-load", default="ceilings", help="comma-separated categories to leave out")
     ap.add_argument("--place", action="append", default=[], metavar="OBJ:SUPPORT[:DX,DY]")
     ap.add_argument("--torso", type=float, nargs=4, default=None, metavar=("J1", "J2", "J3", "J4"))
-    ap.add_argument("--stand-for", default=None, metavar="ITEM[,ITEM...],TARGET", help="base pose reaching all")
+    ap.add_argument("--stand-for", default=None, metavar="[ITEM,...,]TARGET", help="base pose that reaches the objects")
     ap.add_argument("--state-stream", default=None, metavar="HOST:PORT", help="mirror into a tiptop-server's Rerun")
     ap.add_argument("--steps", type=int, default=300, help="steps between liveness lines")
     args = ap.parse_args()
