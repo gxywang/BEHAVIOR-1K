@@ -216,6 +216,10 @@ class _Episode:
     def held_names(self):
         return sorted(self.in_hand)
 
+    def release(self):
+        self.calls.append(("release",))
+        self.in_hand.clear()
+
     def support_of(self, bddl):
         return "table.n.02_1"
 
@@ -419,4 +423,31 @@ def test_assemble_gift_baskets_frees_a_full_hand_before_the_next_pick():
     ]
     assert rounds[3] == ("ontop", ("candle.n.01_1", "floor.n.01_1"))  # freed at the start of the bow's transfer
     assert rounds[4:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
+    assert not ep.in_hand
+
+
+def test_assemble_gift_baskets_releases_an_item_no_plan_can_put_down():
+    from omnigibson.tiptop.strategies import AssembleGiftBaskets
+
+    goal = [
+        {"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]},
+        {"predicate": "inside", "args": ["bow.n.01_1", "wicker_basket.n.01_1"]},
+    ]
+    positions = {
+        "table.n.02_1": (0, 0),
+        "wicker_basket.n.01_1": (2, 0),
+        "candle.n.01_1": (0.1, 0),
+        "bow.n.01_1": (0.2, 0),
+    }
+    # the candle's place fails, the put-down fails, and at the bow's transfer both put-downs fail too: release
+    ep = _Episode(
+        [{"held"}, set(), set(), set(), set(), {"held"}, {"placed"}],
+        on_table=["candle.n.01_1", "bow.n.01_1"],
+        positions=positions,
+    )
+    AssembleGiftBaskets(goal, attempts=1).run(ep)
+    kinds = [c[0] if c[0] != "round" else c[1] for c in ep.calls]
+    assert "release" in kinds
+    rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
+    assert rounds[-2:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
     assert not ep.in_hand

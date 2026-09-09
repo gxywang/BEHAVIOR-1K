@@ -163,7 +163,8 @@ class AssembleGiftBaskets(Strategy):
     @staticmethod
     def free_hand(ep, table: str) -> bool:
         """Put down whatever the hand still holds (a place that failed left it there) before the next pick: on the
-        plane where the robot stands, else from a fresh pose at the table. False when the hand stays full."""
+        plane where the robot stands, else from a fresh pose at the table, else by opening the hand where it is
+        (the item falls; better than a hand that stays full for the rest of the episode). False when it stays."""
         held = [name for name in ep.held_names()]
         if not held:
             return True
@@ -174,14 +175,13 @@ class AssembleGiftBaskets(Strategy):
             return True
         try:
             ep.stand_for(table)
+            ep.plan_and_execute([atom("ontop", name, table)])
         except Unreachable as e:
-            log.warning(f"{name}: {e}; the hand stays full")
-            return False
-        ep.plan_and_execute([atom("ontop", name, table)])
+            log.warning(f"{name}: {e}")
         if ep.holding(name):
-            log.warning(f"{name}: still in the hand after two put-downs; the hand stays full")
-            return False
-        return True
+            log.warning(f"{name}: no put-down plan; releasing it where the robot stands")
+            ep.release()
+        return not ep.holding(name)
 
 
 STRATEGIES = {cls.task: cls for cls in (TurnOnRadio, AssembleGiftBaskets)}

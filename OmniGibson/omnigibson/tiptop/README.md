@@ -288,6 +288,14 @@ the number as about 0.65 with the press as the source of variance):
 | turning_on_radio | 1 | 0.7 | 7/10 | 690 / 3224 | 2x no standing pose within 0.9 m, 1x press: no plan |
 | turning_on_radio | 2 | 0.7 | 7/10 | 784 / 3224 | 1x no standing pose within 1.0 m, 2x press: no plan (one after a planner CUDA fault) |
 | turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
+| assembling_gift_baskets | 1 (2 instances, stopped) | 0.31 | 0/2 | 11200 / 39090 | a failed put-down left the item in the hand and blocked every later pick; items knocked to the floor were re-picked |
+| assembling_gift_baskets | 2 | 0.6375 | 2/10 (16/16 twice; 15, 14, 13, 11, 11, 3, 3, 0 of 16) | 13600 / 39090 | 3 instances lost to one item no put-down plan could set down after a failed place (the hand stayed full); 45 stand attempts found no pose even at 1.1 m (a basket in a corner) |
+
+The gift-basket run took 25-40 min of wall time per instance (250 rounds of capture, plan and execution over the
+10 instances, 0 planner faults) for 110-600 s of simulated time; the challenge timeout was never reached. The pick
+and the carry work: 147 pick rounds executed, 103 place rounds executed, 88 items placed. What loses points is an
+object the hand cannot put down again after a failed place (pass 3 releases it as the last resort), baskets no base
+pose reaches, and places whose plan has no satisfying particles.
 
 What fails is not the pick (26 of 30 instances ended with the radio in the hand) but the press with the grasp the
 pick chose: the right arm has a plan when the switch ends up about 0.59 m ahead of the base facing right and none

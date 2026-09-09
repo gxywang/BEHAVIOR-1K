@@ -123,6 +123,12 @@ class Episode:
         """BDDL names of the task objects in the hands (the robot's own knowledge)."""
         return [self.sim.bddl_names[label] for label in self.sim.hands() if label in self.sim.bddl_names]
 
+    def release(self, steps: int = 45) -> None:
+        """Open the planned hand where it is and let whatever it holds fall (the last resort when no put-down
+        plan exists); the hand is then held open for ``steps`` env steps so the object clears it."""
+        self.sim.hold(steps, self.sim.OPEN)
+        self.records.append({"release": True, "step": self.sim.n_steps, "hands": dict(self.sim.hands())})
+
     def position(self, bddl: str) -> np.ndarray:
         return self.sim.scene_object(bddl).aabb_center.cpu().numpy()
 
