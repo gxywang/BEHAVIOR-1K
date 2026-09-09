@@ -363,3 +363,23 @@ def test_button_tracker_carries_a_detected_button_through_a_grasp():
     assert np.allclose(
         tracker.current(lambda arm: now)["radio_button"]["position"], [0.3, 0.4, 0.9]
     )  # a prior echoed back changes nothing
+
+
+def test_block_grasping_wraps_the_robot_for_both_call_styles():
+    from omnigibson.tiptop.scene import TiptopSim
+
+    class Robot:
+        def _calculate_in_hand_object(self, arm="default"):
+            return ("radio", "link", arm)
+
+    sim = TiptopSim.__new__(TiptopSim)
+    sim.robot = Robot()
+    sim.block_grasping("right")
+    assert sim.robot._calculate_in_hand_object(arm="right") is None  # keyword call, as OmniGibson does
+    assert sim.robot._calculate_in_hand_object("right") is None
+    assert sim.robot._calculate_in_hand_object(arm="left") == ("radio", "link", "left")
+    sim.unblock_grasping()
+    assert sim.robot._calculate_in_hand_object(arm="right") == ("radio", "link", "right")
+    sim.block_grasping(None)  # every arm
+    assert sim.robot._calculate_in_hand_object(arm="left") is None
+    sim.unblock_grasping()

@@ -387,10 +387,11 @@ class TiptopSim:
             self._in_hand_object = robot._calculate_in_hand_object
         original = self._in_hand_object
 
-        def blocked(candidate_arm="default", *args, **kwargs):
-            if arm is None or candidate_arm == arm:
+        def blocked(*args, **kwargs):  # OmniGibson calls it as _calculate_in_hand_object(arm=arm)
+            candidate = kwargs["arm"] if "arm" in kwargs else (args[0] if args else "default")
+            if arm is None or candidate == arm:
                 return None
-            return original(candidate_arm, *args, **kwargs)
+            return original(*args, **kwargs)
 
         robot._calculate_in_hand_object = blocked
         log.info(f"grasping blocked for the {arm or 'whole robot'} (a press must not attach the button's object)")
