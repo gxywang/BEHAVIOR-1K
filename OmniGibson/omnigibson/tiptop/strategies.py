@@ -7,6 +7,8 @@ knows how the planner is told about the scene (knowledge.py) or how it plans.
 
 import logging
 
+from omnigibson.tiptop.protocol import bddl_category
+
 log = logging.getLogger(__name__)
 
 
@@ -21,13 +23,13 @@ def atom(predicate: str, *args: str) -> dict:
 def task_goal_atoms(sim) -> list[dict]:
     """The task's goal as BDDL atoms: the first ground goal option (all options name the same predicates over the
     same objects up to their pairing, which is what a strategy needs to know)."""
-    task = sim.env.task
-    atoms = []
-    for head in task.ground_goal_state_options[0]:
-        terms = list(getattr(head, "terms", []))
-        if terms:
-            atoms.append(atom(terms[0], *terms[1:]))
-    return atoms
+    from bddl.condition_evaluation import HEAD
+
+    return [
+        atom(head.terms[0], *head.terms[1:])
+        for head in sim.env.task.ground_goal_state_options[0]
+        if isinstance(head, HEAD)  # a ground atom; the tasks here have no other compiled form in their goal
+    ]
 
 
 class Strategy:
@@ -105,10 +107,6 @@ class AssembleGiftBaskets(Strategy):
         super().__init__(goal)
         self.attempts = attempts
 
-    @staticmethod
-    def category(bddl: str) -> str:
-        return bddl.split(".n.")[0]
-
     def run(self, ep) -> None:
         pairs = [(a["args"][0], a["args"][1]) for a in self.goal if a["predicate"] == "inside" and len(a["args"]) == 2]
         if not pairs:
@@ -117,9 +115,9 @@ class AssembleGiftBaskets(Strategy):
         baskets = sorted(dict.fromkeys(c for _, c in pairs), key=lambda b: ep.distance(b, table))
         items_by_kind = {}
         for item, _ in pairs:
-            items_by_kind.setdefault(self.category(item), [])
-            if item not in items_by_kind[self.category(item)]:
-                items_by_kind[self.category(item)].append(item)
+            items_by_kind.setdefault(bddl_category(item), [])
+            if item not in items_by_kind[bddl_category(item)]:
+                items_by_kind[bddl_category(item)].append(item)
         log.info(f"{len(baskets)} baskets x {sorted(items_by_kind)}; baskets in order {baskets}")
         placed = set()
         for basket in baskets:
@@ -165,10 +163,10 @@ class AssembleGiftBaskets(Strategy):
         """Put down whatever the hand still holds (a place that failed left it there) before the next pick: on the
         plane where the robot stands, else from a fresh pose at the table, else by opening the hand where it is
         (the item falls; better than a hand that stays full for the rest of the episode). False when it stays."""
-        held = [name for name in ep.held_names()]
+        held = ep.held_names()
         if not held:
             return True
-        (name,) = held[:1]
+        name = held[0]
         log.info(f"{name} is still in the hand; putting it down before the next pick")
         ep.plan_and_execute([atom("ontop", name, ep.floor)], floor=True)
         if not ep.holding(name):

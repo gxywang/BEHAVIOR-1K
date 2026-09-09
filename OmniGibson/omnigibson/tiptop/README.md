@@ -56,8 +56,9 @@ a saved round), `run.py` (the CLI).
 3. **Request** (`protocol.build_request`, msgpack with numpy arrays, one websocket connection per request):
    `rgb, depth, intrinsics, world_from_cam` (OpenCV camera in the robot base frame), `task, q_init`, plus what the
    knowledge source knows (`knowledge.py`, `protocol.attach_knowledge`; see "What the planner is told"):
-   `gt_labels, gt_atoms` always, `gt_masks` and `gt_buttons` from the oracle source, `held_labels` / `in_hand` for
-   what the hands hold, `workspace_bounds` when the round works at the floor.
+   `gt_labels, gt_atoms` always, `gt_masks` from the oracle source, `gt_buttons` from the oracle source (true poses)
+   or the onboard source (detections carried from earlier rounds), `held_labels` / `in_hand` for what the hands
+   hold, `workspace_bounds` when the round works at the floor.
 4. **Plan** (`tiptop-server`, `_run_pipeline`). Masks → point cloud in the base frame → M2T2 grasps (associated to
    objects by contact point) → table plane by RANSAC + one convex hull per object → cuTAMP samples pick/place
    skeletons over 256 particles, cuRobo refines the motions → `{q_init, steps: [trajectory{positions, dt} |
@@ -159,7 +160,7 @@ simulator's cameras and the last request's masks on the right.
 | entity | what | from |
 |---|---|---|
 | `r1pro_left/...` (`panda/...`) | the planner's robot model at the simulator's current joints | planner (URDF); joints from the simulator |
-| `world/sim/<task name>` | green: the simulator's own meshes of the task objects at their simulated poses; grey-blue: furniture named on the command line (`--place` supports, `--near`, `--stage-support`) | simulator, meshes once, poses every 2 env steps |
+| `world/sim/<task name>` | green: the simulator's own meshes of the task objects at their simulated poses; grey-blue: furniture named on the command line (`--place` supports, `--near`) | simulator, meshes once, poses every 2 env steps |
 | `world/objects/<label>`, `grasps/<label>/...`, `world/table`, `pcd`, `cam` | grey: what perception reconstructed for the *last* request -- hulls, the top 30 grasps of the goal's objects, table plane, cloud, camera -- cleared when the next request arrives | planner |
 | `sim/head_cam`, `sim/wrist_cam` (R1Pro) or `sim/cam` (Panda), `sim/overview` | the head camera, the left wrist camera, a third-person view over the robot's left shoulder (ahead and to the right with `--overview front`) | simulator, every 6 env steps |
 | `masks` | the last request's image with its masks and boxes (`rgb`, `bboxes`, `obj_pcd/*` are logged too but hidden: the same content) | planner |
@@ -168,7 +169,8 @@ Names: `world/sim/*` uses the simulator's task names (`candle_4` is `candle.n.01
 perception's, which with ground-truth masks are the same names and with the detector number instances by box
 size (the largest keeps the plain label, then `_2`, `_3`, ...), so `candle_2` is usually a *different* candle in
 the two trees. Nothing is matched by name;
-the pairing is by position (`protocol.match_objects`, 8 cm), logged after every plan and saved with the result. A
+the pairing is by position (`protocol.match_objects`, within half the object's extent, since a hull seen from one
+side is centred above the object's centre), logged after every plan and saved with the result. A
 perceived object with no simulated partner is a false detection or a hull that landed somewhere else, and the
 goal object is the first line to read.
 
@@ -229,7 +231,7 @@ fixes where the object ends up after the lift, so the pick round keeps only the 
 facing the head camera (`tiptop/presenting.py`; the best few when none do), and the left arm's home pose holds
 the object in the camera's view. The request also names what the other hand holds (`held_labels`), which the
 planner keeps as an obstacle rather than something to pick up. Either way the planner's `Push` plans hover,
-press and back-off along the normal with the gripper closed. The executor stops the press segment as soon as the simulator's `ToggledOn` flips (a finger on the object
+press and back-off along the normal with the gripper closed. With the oracle source the executor stops the press segment as soon as the simulator's `ToggledOn` flips (the onboard source has no such signal: the press runs to its planned depth; a finger on the object
 inside that radius for 5 steps) and lets the back-off run; meanwhile the bridge keeps OmniGibson's sticky or
 assisted grasp off the pressing arm (`block_grasping`), since a closed gripper touching an object for 0.3 s would
 otherwise attach it. The round is scored by the task's own `toggled_on`.
@@ -337,7 +339,7 @@ Isaac GUI):
 | subcommand | does | own flags |
 |---|---|---|
 | `capture` | build the scene, write `obs.h5` + `capture.json` (offline input for `tiptop-h5`) | |
-| `live` | capture, plan on a running `tiptop-server`, execute, score | `--host --port --plan-timeout --no-state-stream --sequential --restand` |
+| `live` | capture, plan on a running `tiptop-server`, execute, score | `--host --port --press-host --press-port --plan-timeout --no-state-stream --sequential` |
 | `replay` | build the scene, execute a `tiptop_plan.json` | `--plan --state-stream HOST:PORT` |
 
 A whole challenge task on its test instances is `python -m omnigibson.tiptop.bench` (see "Benchmark").
@@ -473,3 +475,10 @@ a scripted episode, and the benchmark's summary.
   unfinished and a failure looked like a success; now the final state stays on screen for 3 s under the verdict,
   every frame carries the step count, and the file is a fragmented MP4 that plays during and after a killed run. The
   bench writes no per-round clips (the episode video covers them).
+- 2026-09-09 (hygiene pass, after an audit): the press stop signal comes from the knowledge source (the oracle knows
+  when a switch flips; the onboard source runs the press to its planned depth); the grasp-assist read handles
+  physical grasping; the task's floor is looked up, not assumed; per-episode state (``arm``, ``teleports``, the
+  grasp block) is declared and reset by ``begin_episode``; one ``recording`` block replaces three recorder
+  lifecycles; ``bddl_category`` replaces four name parsers; the base-pose search and footprint thresholds are named
+  constants; ``R1ProSim`` takes ``overview_view`` / ``look_arm`` as arguments; ``--restand``, ``predicate_holds``
+  and the planner's ``goal_hints`` are gone; ``obs.h5`` holds the whole request and ``replay.py`` re-plans a round.

@@ -14,6 +14,7 @@ per simulated second, from ``step``.
 import io
 import logging
 import time
+from contextlib import contextmanager
 
 import numpy as np
 import torch as th
@@ -251,7 +252,10 @@ class TiptopSim:
     def _init_state(self) -> None:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self.arm = self.robot.default_arm  # the arm the plans move (R1ProSim: the planner embodiment's arm)
         self.held_objects = {}  # tracked label -> arm, for objects a plan picked up (they move with that gripper)
+        self.teleports = 0  # base teleports so far (the navigation stand-in; the benchmark reports the count)
+        self._in_hand_object = None  # the robot's own grasp search while block_grasping() has it wrapped
         self.recorders = []  # executor.VideoRecorder instances, fed from step(); frame_caption() is stamped on each
         self.metrics = []  # omnigibson.metrics.MetricBase instances fed from step() (the challenge's own scoring)
         self.n_steps = 0  # env steps taken: holds, captures and plans all count, as they do for the challenge's timeout
@@ -334,6 +338,20 @@ class TiptopSim:
             raise EpisodeOver("success" if success else "timeout" if truncated else "terminated", self.n_steps)
         return self.last_obs
 
+    @contextmanager
+    def recording(self, path):
+        """Record every env step inside the block to the video at ``path`` (``executor.VideoRecorder``, fed from
+        ``step``); the file is closed on the way out, whatever ended the block."""
+        from omnigibson.tiptop.executor import VideoRecorder
+
+        recorder = VideoRecorder(path)
+        self.recorders.append(recorder)
+        try:
+            yield recorder
+        finally:
+            self.recorders.remove(recorder)
+            recorder.close()
+
     def frame_caption(self) -> str:
         """What is stamped on a video frame: the driver's ``video_caption`` line, then the env step count (over the
         episode's limit when known), so a viewer can tell where in the episode a frame is."""
@@ -345,6 +363,7 @@ class TiptopSim:
         the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``)."""
         self.n_steps = 0
         self.max_steps = max_steps
+        self.held_objects, self.teleports = {}, 0
         self.metrics = list(metrics)
         for metric in self.metrics:
             metric.reset(self.env)
@@ -369,12 +388,13 @@ class TiptopSim:
     def grasped_labels(self) -> dict | None:
         """{tracked label: arm} of the tracked objects the robot's grasp assist holds right now (sticky or assisted
         grasping): what the robot knows it carries, read from its own gripper. None in physical grasping mode,
-        where there is no such record."""
-        in_hand = getattr(self.robot, "_ag_obj_in_hand", None)
-        if in_hand is None:
+        where there is no such record (the robot keeps the dict, empty, in every mode)."""
+        if self.robot.grasping_mode == "physical":
             return None
         by_obj = {obj: label for label, obj in self.objects.items()}
-        return {by_obj[obj]: arm for arm, obj in in_hand.items() if obj is not None and obj in by_obj}
+        return {
+            by_obj[obj]: arm for arm, obj in self.robot._ag_obj_in_hand.items() if obj is not None and obj in by_obj
+        }
 
     def mirror_q(self) -> np.ndarray:
         """Planned joints for the Rerun mirror (the embodiment the mirror was attached with; see R1ProSim)."""
@@ -403,7 +423,7 @@ class TiptopSim:
         while the gripper is commanded closed). Wraps the robot's per-arm candidate search; a grasp the arm already
         holds is not released."""
         robot = self.robot
-        if not hasattr(self, "_in_hand_object"):
+        if self._in_hand_object is None:
             self._in_hand_object = robot._calculate_in_hand_object
         original = self._in_hand_object
 
@@ -417,9 +437,9 @@ class TiptopSim:
         log.info(f"grasping blocked for the {arm or 'whole robot'} (a press must not attach the button's object)")
 
     def unblock_grasping(self) -> None:
-        if hasattr(self, "_in_hand_object"):
+        if self._in_hand_object is not None:
             self.robot._calculate_in_hand_object = self._in_hand_object
-            del self._in_hand_object
+            self._in_hand_object = None
 
     def camera_rgb(self) -> np.ndarray | None:
         if self.last_obs is None or "external" not in self.last_obs:
@@ -656,7 +676,7 @@ class TiptopSim:
         """Does tracked object ``name`` correspond to one of the goal atoms' arguments?
 
         Atoms carry request labels: BDDL instance names for a task (``candle.n.01_2``), the per-instance label for
-        spawned objects (``candle_2``), or a bare category with ``--no-gt`` (``candle``), which matches any instance.
+        spawned objects (``candle_2``), or a bare category with ``--knowledge onboard`` (``candle``), which matches any instance.
         """
         nc, ni = canonical_object_name(name)
         for arg in goal_args:
@@ -672,7 +692,7 @@ class TiptopSim:
         Objects cut by the image border are the silent failure mode of the whole pipeline: the server reconstructs
         the visible sliver into a convex hull that runs *past* the real object, cuTAMP happily satisfies its
         StablePlacement constraint inside that phantom volume, and the item is released beside the container. Needs
-        no segmentation, so it also covers ``--no-gt`` captures, where nothing else checks the frame.
+        no segmentation, so it also covers ``--knowledge onboard`` captures, where nothing else checks the frame.
         """
         h, w = request["depth"].shape
         coverage = {}

@@ -164,7 +164,7 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
     oldest non-static data is dropped past it, and `--no-state-stream` on the client keeps per-step state and camera
     images out of it entirely); run long clients in their own
     cgroup with a cap and a high OOM score, e.g. `systemd-run --user --scope -p MemoryMax=18G choom -n 800 -- python
-    -m omnigibson.tiptop.run task ...`; give the box real swap (16 GB) before a long run; watch `rss_gb` in the
+    -m omnigibson.tiptop.bench ...`; give the box real swap (16 GB) before a long run; watch `rss_gb` in the
     per-transfer log lines for growth.
 
 ## R1Pro specifics
@@ -187,8 +187,9 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
 ## Files
 
 - Bridge (this directory): `protocol.py`, `client.py` (planning client + the Rerun mirror), `scene.py`, `executor.py`,
-  `run.py`, `r1pro.py`, `scripts/` (service launchers, `stream_scene.py`, `probe_r1pro.py`), tests in
-  `OmniGibson/tests/test_tiptop_protocol.py` and `test_tiptop_gt_masks.py` (neither needs Isaac Sim).
-- Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/config/tiptop_sim_{panda,r1pro}.yml`,
-  `tiptop/embodiments/` (R1Pro), `scripts/make_r1pro_embodiment.py`, `install/install-curobo.sh`,
-  `install/install-cutamp.sh`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.
+  `gt_masks.py`, `knowledge.py`, `strategies.py`, `bench.py`, `replay.py`, `run.py`, `r1pro.py`, `scripts/` (service
+  launchers, `stream_scene.py`, `probe_r1pro.py`), tests in `OmniGibson/tests/test_tiptop_protocol.py`,
+  `test_tiptop_knowledge.py` and `test_tiptop_gt_masks.py` (none needs Isaac Sim).
+- Planner side (`tiptop/` submodule): `tiptop/tiptop_websocket_server.py`, `tiptop/in_hand.py`, `tiptop/presenting.py`,
+  `tiptop/config/tiptop_sim_{panda,r1pro,r1pro_right}.yml`, `tiptop/embodiments/` (R1Pro), `scripts/make_r1pro_embodiment.py`,
+  `install/install-curobo.sh`, `install/install-cutamp.sh`, `install/patches/`, `docs/simulation.md`, `pixi.toml` + `pixi.lock`.

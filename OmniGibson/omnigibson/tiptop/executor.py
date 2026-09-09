@@ -95,7 +95,7 @@ class PlanExecutor:
         self.converge_max_steps = converge_max_steps
         self.press_done = press_done
         # start from the gripper's current command: a plan for an object already in the hand must keep it closed
-        self.gripper = getattr(sim, "last_gripper", sim.OPEN)
+        self.gripper = sim.last_gripper  # a hand that holds something stays closed through the plan's start
         self.n_steps = 0
         self.close_eef = None  # base-frame eef pose at the last gripper close (where a held object was taken)
 
@@ -124,8 +124,8 @@ class PlanExecutor:
         q_hold = self.sim.q_arm() if q_hold is None else q_hold
         for _ in range(self.gripper_hold_steps):
             self._step(q_hold)
-        if action == "close" and hasattr(self.sim, "eef_pose_base"):
-            self.close_eef = self.sim.eef_pose_base(getattr(self.sim, "arm", None))
+        if action == "close":
+            self.close_eef = self.sim.eef_pose_base(self.sim.arm)
 
     def execute(self, plan: dict) -> dict:
         """Execute a parsed plan; returns tracking statistics."""
@@ -174,11 +174,7 @@ class PlanExecutor:
                 fingers_before = self.sim.q_fingers().tolist()
                 self.set_gripper(step["action"], q_hold=q_last)
                 fingers_after = self.sim.q_fingers().tolist()
-                grasping = None
-                try:
-                    grasping = str(self.sim.robot.is_grasping())
-                except Exception:
-                    pass
+                grasping = str(self.sim.robot.is_grasping())
                 stats["gripper_events"].append(
                     {
                         "step": i,

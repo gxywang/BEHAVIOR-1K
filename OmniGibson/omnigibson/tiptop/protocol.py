@@ -2,8 +2,8 @@
 
 No OmniGibson imports: this module is usable (and unit-tested) without Isaac Sim. Formats mirror
 ``tiptop/tiptop_websocket_server.py``, ``tiptop/planning.py`` and ``tiptop/tiptop_offline.py`` at the submodule
-commit BEHAVIOR-1K pins (the simulator-side additions since tiptop v0.3.0 -- gt_* keys, robot_mask, goal_hints,
-the ``objects`` response, the mirror messages -- are described in tiptop/docs/simulation.md and listed in
+commit BEHAVIOR-1K pins (the simulator-side additions since tiptop v0.3.0 -- gt_* keys, robot_mask, held_labels,
+in_hand, workspace_bounds, the ``objects`` response, the mirror messages -- are described in tiptop/docs/simulation.md and listed in
 tiptop/CHANGELOG.md) and the reference IsaacLab client in tiptop-robot/droid-sim-evals.
 """
 
@@ -379,6 +379,11 @@ def match_objects(perceived: dict, simulated: dict, max_dist=MATCH_MAX_DIST) -> 
             out[p_name] = {"sim": s_name, "dist": dist}
             used.add(s_name)
     return out
+
+
+def bddl_category(name: str) -> str:
+    """The category of a BDDL instance name: 'wicker_basket.n.01_2' -> 'wicker_basket' (a bare category is itself)."""
+    return name.partition(".n.")[0]
 
 
 def canonical_object_name(name: str) -> tuple:

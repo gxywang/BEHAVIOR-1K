@@ -11,8 +11,8 @@ here and the URDF root of the planner model. Capture uses the head camera (``zed
 in a look posture that swings the arm out of the camera's view; with ``--seg-instance`` the robot's own pixels are
 also removed from the depth. Navigation is a stand-in: ``best_base_pose`` chooses where to stand for a set of
 objects (in reach, in the camera's view, on free floor), and ``place_robot`` teleports the base there. What the
-simulator knows and the robot could not (object poses, button poses, masks) is read only by ``knowledge.py``'s
-oracle source and by the base-pose search; both are privileged and say so.
+simulator knows and the robot could not (object poses, button poses, masks, a switch's state) is read only by
+``knowledge.py``'s oracle source and by the base-pose search; both are privileged and say so.
 """
 
 import logging
@@ -34,7 +34,10 @@ from omnigibson.tiptop.scene import (
     look_at_quat_xyzw,
     overview_cam_config,
 )
-from omnigibson.tiptop.protocol import face_normal_local
+from omnigibson.tiptop.protocol import bddl_category, face_normal_local
+from bddl.condition_evaluation import HEAD
+from omnigibson.objects.usd_object import USDObject
+from omnigibson.tasks.behavior_task import BehaviorTask
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +61,22 @@ ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox 
 CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
+# best_base_pose: the candidate grid around the objects' centroid and the score terms (lower is better)
+RING_START, RING_STEP = 0.25, 0.05  # m, rings out to the arm's reach
+RING_ANGLE_STEP = np.pi / 18  # 10 deg around the centroid
+YAW_OFFSETS = np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12)  # facing the centroid +-60 deg, 15 deg steps
+MIN_AHEAD = 0.15  # m every object must be ahead of the base at least
+MIN_SIDE = -0.30  # m to the right at most (the torso can turn a little); further left is preferred
+SIDE_TARGET, SIDE_WEIGHT = 0.15, 0.5  # objects less than SIDE_TARGET m to the left cost SIDE_WEIGHT per m short
+YAW_WEIGHT = 0.1  # per radian of turning away from the centroid
+HIDE_DEPTH, HIDE_MARGIN = 0.05, 0.06  # m: a container nearer by less than HIDE_DEPTH hides an item behind it, as
+# seen from the camera, when their bearings are within its angular half-width plus an item margin of HIDE_MARGIN
+# _footprint_free: what an AABB in the footprint means
+HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings and say nothing about the floor
+FLAT_COVERING_HEIGHT, GROUND_CLEARANCE = 0.08, 0.05  # m; boxes flatter than that on the ground are stood on
+# place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
+# over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
+OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
@@ -101,15 +120,21 @@ def bddl_predicate_class(name: str):
     raise ValueError(f"unknown BDDL predicate {name!r}; known: {sorted(c.__name__ for c in PREDICATE_TO_STATE)}")
 
 
-def bddl_category(bddl_name: str) -> str:
+def detector_phrase(bddl_name: str) -> str:
     """'butter_cookie.n.01_2' -> 'butter cookie', 'can__of__soda.n.01_1' -> 'can of soda' (what a detector is asked for)."""
-    return bddl_name.split(".n.")[0].replace("__", "_").replace("_", " ")
+    return bddl_category(bddl_name).replace("__", "_").replace("_", " ")
+
+
+def label_category(bddl_name: str) -> str:
+    """'butter_cookie.n.01_2' -> 'butter_cookie', 'can__of__soda.n.01_1' -> 'can_of_soda': the category as it appears
+    in request labels (single underscores)."""
+    return detector_phrase(bddl_name).replace(" ", "_")
 
 
 def bddl_label(bddl_name: str) -> str:
     """'butter_cookie.n.01_2' -> 'butter_cookie_2': the per-instance name used in requests and plans."""
     category, _, index = bddl_name.rpartition("_")
-    return f"{bddl_category(category).replace(' ', '_')}_{index}"
+    return f"{label_category(category)}_{index}"
 
 
 def make_r1pro_env_config(
@@ -277,13 +302,17 @@ class R1ProSim(TiptopSim):
 
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)
-    look_arm = LOOK_ARM  # joint overrides on top of q_home for the capture; None: capture in the ready posture
 
-    def __init__(self, config: dict, camera: str = "head"):
+    def __init__(self, config: dict, camera: str = "head", overview_view: str = "shoulder", look_arm=LOOK_ARM):
+        """``overview_view``: where ``place_robot`` puts the overview camera (``OVERVIEW_OFFSETS``); ``look_arm``:
+        joint overrides on top of q_home for the capture, None to capture in the ready posture."""
         self.config = config
+        self.overview_view = overview_view
+        self.look_arm = look_arm
         self.env = og.Environment(configs=config)
         self.robot = self.env.robots[0]
         self.arm = "left"
+        self.goal_initial = None  # the goal predicates' values when the episode began (mark_goal_initial)
         self.other_arm = "right"
         self.other_gripper = self.OPEN  # the arm that is not planned keeps this gripper command (see adopt_embodiment)
         self.last_gripper = self.OPEN
@@ -298,7 +327,6 @@ class R1ProSim(TiptopSim):
         self.robot_cam = self.robot.sensors[self.cam_name]
         self.wrist_cam_name = f"{self.robot.name}:{CAMERA_LINKS['wrist']}:Camera:0"
         self.STREAM_CAMERA = f"{camera}_cam"  # the capture camera's image in the Rerun mirror
-        self.overview_view = "shoulder"  # where place_robot puts the overview camera; "front" for the two-hands demo
         self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
@@ -327,18 +355,27 @@ class R1ProSim(TiptopSim):
     # ---------------------------------------------------------------- challenge task
     def task_scope(self) -> dict:
         """BDDL instance name -> simulated object for the loaded BehaviorTask (no agent, no floors, no systems)."""
-        scope = getattr(self.env.task, "object_scope", None) or {}
+        task = self.env.task
+        scope = task.object_scope if isinstance(task, BehaviorTask) else {}  # a DummyTask has no scope
         return {
             k: v
             for k, v in scope.items()
-            if v is not None and not k.startswith(("agent.", "floor.")) and hasattr(v, "aabb")
+            if isinstance(v, USDObject) and not k.startswith(("agent.", "floor."))  # systems have no pose
         }
+
+    def floor_name(self) -> str:
+        """The BDDL name of the loaded task's floor (``task_scope`` leaves floors out; a strategy puts things down
+        on it when nothing else will do)."""
+        names = [name for name in self.env.task.object_scope if name.startswith("floor.")]
+        if not names:
+            raise KeyError(f"the task {self.config['task'].get('activity_name')!r} has no floor in its scope")
+        return names[0]
 
     def track_task_objects(self, skip_categories=("table", "floor", "agent")) -> dict:
         """Track every task object under its per-instance label ('candle_1'); furniture the items rest on is skipped."""
         self.bddl_names = {}
         for bddl, obj in self.task_scope().items():
-            if bddl_category(bddl) in skip_categories:
+            if label_category(bddl) in skip_categories:
                 continue
             label = bddl_label(bddl)
             self.objects[label] = obj
@@ -367,11 +404,11 @@ class R1ProSim(TiptopSim):
         label_of = {bddl: label for label, bddl in self.bddl_names.items()}
 
         def name(arg):
-            if bddl_category(arg) in SUPPORT_CATEGORIES:
+            if label_category(arg) in SUPPORT_CATEGORIES:
                 return PLANNER_SUPPORT  # the planner's name for the support plane under the objects it sees
             if arg not in label_of:
                 raise ValueError(f"goal names {arg!r}, which is not a tracked task object: {sorted(label_of)}")
-            return bddl_category(arg).replace(" ", "_") if category_level else label_of[arg]
+            return label_category(arg) if category_level else label_of[arg]
 
         out = []
         for atom in atoms:
@@ -382,7 +419,7 @@ class R1ProSim(TiptopSim):
                 args = [self.button_label(a) for a in args]
             out.append({"predicate": predicates[atom["predicate"]], "args": args})
         if category_level:
-            labels = sorted({bddl_category(b).replace(" ", "_") for b in self.bddl_names.values()})
+            labels = sorted({label_category(b) for b in self.bddl_names.values()})
         else:
             labels = sorted(self.bddl_names)
         return labels, out
@@ -415,24 +452,16 @@ class R1ProSim(TiptopSim):
 
     @staticmethod
     def _goal_name(head) -> str:
-        terms = list(getattr(head, "terms", []))
-        return f"{terms[0]}({', '.join(terms[1:])})" if terms else str(head)
+        """'inside(candle.n.01_1, wicker_basket.n.01_2)' for a ground atom; other compiled forms print as they are."""
+        if not isinstance(head, HEAD):
+            return str(head)
+        return f"{head.terms[0]}({', '.join(head.terms[1:])})"
 
     def holds(self, predicate: str, *bddl_names: str) -> bool:
         """Evaluate any BDDL predicate ("ontop", "inside", "toggled_on", ...) over task objects with the task's own
         evaluator (privileged: the simulator's object states; a benchmark strategy uses it where the pipeline has
         no perception of its own yet)."""
         return bool(self.env.task._evaluate_predicate(bddl_predicate_class(predicate), *bddl_names))
-
-    def predicate_holds(self, name: str, *bddl_names: str) -> bool:
-        """Evaluate one grounded goal predicate (e.g. inside(item, container)) exactly as the challenge scorer does."""
-        task = self.env.task
-        terms = [name, *bddl_names]
-        for option in task.ground_goal_state_options:
-            for head in option:
-                if list(getattr(head, "terms", [])) == terms:
-                    return bool(head.evaluate(task._evaluate_predicate))
-        raise KeyError(f"{name}({', '.join(bddl_names)}) is not a goal predicate of this task")
 
     @staticmethod
     def button_label(label: str) -> str:
@@ -469,7 +498,7 @@ class R1ProSim(TiptopSim):
             identity = th.tensor([0.0, 0.0, 0.0, 1.0])
             pos_b, _ = self.to_base(th.tensor(pos_w, dtype=th.float32), identity)
             tip_b, _ = self.to_base(th.tensor(pos_w + n_world, dtype=th.float32), identity)
-            label = bddl_category(bddl).replace(" ", "_") if category_level else self.label_of(bddl)
+            label = label_category(bddl) if category_level else self.label_of(bddl)
             out[self.button_label(label)] = {
                 "position": [float(v) for v in pos_b],
                 "normal": [float(v) for v in (tip_b - pos_b)],
@@ -494,6 +523,7 @@ class R1ProSim(TiptopSim):
         raise KeyError(f"{bddl} is not a tracked task object: {sorted(self.bddl_names.values())}")
 
     def toggled(self, bddl: str) -> bool:
+        """The switch's ToggledOn state (privileged: the task's own predicate; read by the oracle knowledge source)."""
         from omnigibson.object_states import ToggledOn
 
         return bool(self.scene_object(bddl).states[ToggledOn].get_value())
@@ -513,7 +543,7 @@ class R1ProSim(TiptopSim):
         """Challenge-style score: 1 on full success, else the best goal option's newly satisfied fraction."""
         task = self.env.task
         values = self._goal_values()
-        initial = getattr(self, "goal_initial", None) or [[False] * len(v) for v in values]
+        initial = self.goal_initial or [[False] * len(v) for v in values]
         options = task.ground_goal_state_options
         best_i, best_new = 0, -1
         for i, (now, was) in enumerate(zip(values, initial)):
@@ -583,7 +613,7 @@ class R1ProSim(TiptopSim):
         r = ROBOT_FOOTPRINT
         corners = [(x + sx * r, y + sy * r) for sx in (-1, 1) for sy in (-1, 1)] + [(x, y)]
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
-        floors = [(lo, hi) for o, lo, hi in aabbs if getattr(o, "category", "") == "floors"]
+        floors = [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
         for cx, cy in corners:
             on_floor = False
             for lo, hi in floors:
@@ -592,24 +622,22 @@ class R1ProSim(TiptopSim):
                     break
             if not on_floor:
                 return False, f"no floor under ({cx:.2f}, {cy:.2f})"
-        seg_map = getattr(self.env.scene, "seg_map", None)
-        if seg_map is not None:
-            try:
-                room = seg_map.get_room_instance_by_point(th.tensor([x, y]))
-            except Exception:  # noqa: BLE001 - the map lookup is a best-effort filter
-                room = "unknown"
-            if room is None:
-                return False, "outside every room"
+        try:
+            room = self.env.scene.seg_map.get_room_instance_by_point(th.tensor([x, y]))
+        except Exception:  # noqa: BLE001 - a point off the map's raster raises inside the lookup; it is a filter only
+            room = "unknown"
+        if room is None:
+            return False, "outside every room"
         for obj, lo, hi in aabbs:
-            if obj is self.robot or obj in ignore or getattr(obj, "category", "") in FLOOR_COVERINGS:
+            if obj is self.robot or obj in ignore or obj.category in FLOOR_COVERINGS:
                 continue
-            if (hi[0] - lo[0]) * (hi[1] - lo[1]) > 20.0:
-                continue  # house-sized AABBs (merged walls, roof, ceilings) say nothing; the floor test handles walls
+            if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
+                continue  # merged walls, roof, ceilings say nothing; the floor test handles walls
             if lo[2] > ROBOT_HEIGHT:
                 continue  # entirely above the robot (roof, lamps)
-            if hi[2] - lo[2] < 0.08 and lo[2] < 0.05:
+            if hi[2] - lo[2] < FLAT_COVERING_HEIGHT and lo[2] < GROUND_CLEARANCE:
                 continue  # flat floor coverings (pavers, rugs, mats) are stood on, not avoided
-            if lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r and hi[2] > 0.05:
+            if lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r and hi[2] > GROUND_CLEARANCE:
                 return False, f"overlaps {obj.name}"
         return True, "free"
 
@@ -679,13 +707,13 @@ class R1ProSim(TiptopSim):
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         best, rejected, footprint = None, {}, {}  # footprint: (x, y) -> _footprint_free result (yaw-independent)
-        for radius in np.arange(0.25, reach + 0.05, 0.05):  # rings out to the reach itself
-            for angle in np.arange(0.0, 2 * np.pi, np.pi / 18):
+        for radius in np.arange(RING_START, reach + RING_STEP, RING_STEP):  # rings out to the reach itself
+            for angle in np.arange(0.0, 2 * np.pi, RING_ANGLE_STEP):
                 x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
                 if any(np.hypot(x - ax, y - ay) < AVOID_RADIUS for ax, ay in avoid):
                     rejected["tried before"] = rejected.get("tried before", 0) + 1
                     continue
-                for yaw_offset in np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12):
+                for yaw_offset in YAW_OFFSETS:
                     yaw = np.arctan2(mid[1] - y, mid[0] - x) + yaw_offset
                     fwd, left = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
                     rel = [p - np.array([x, y]) for p in pts]
@@ -694,7 +722,7 @@ class R1ProSim(TiptopSim):
                     dist = [float(np.linalg.norm(r)) for r in rel]
                     # the torso can turn, so a little to the right is acceptable; well to the left is preferred;
                     # all must be inside the head camera's view (about +-45 deg of forward; the camera sees +-50)
-                    if min(ahead) < 0.15 or min(side) < -0.3 or max(dist) > reach:
+                    if min(ahead) < MIN_AHEAD or min(side) < MIN_SIDE or max(dist) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
                     if any(d < m for d, m in zip(dist, min_dists)):  # cut by the bottom of the head camera's frame
@@ -704,9 +732,9 @@ class R1ProSim(TiptopSim):
                     # bearings apart by the container's angular half-width plus a margin for the item
                     bearing = [math.atan2(sd, ah) for ah, sd in zip(ahead, side)]
                     if any(
-                        dist[t] < dist[i] + 0.05
+                        dist[t] < dist[i] + HIDE_DEPTH
                         and abs(bearing[i] - bearing[t])
-                        < math.atan(TARGET_HALF_WIDTH / dist[t]) + math.atan(0.06 / dist[i])
+                        < math.atan(TARGET_HALF_WIDTH / dist[t]) + math.atan(HIDE_MARGIN / dist[i])
                         for i in range(t)
                     ):
                         rejected["container hides the item"] = rejected.get("container hides the item", 0) + 1
@@ -726,7 +754,10 @@ class R1ProSim(TiptopSim):
                         for br, d, hw in zip(bearing, dist, half_widths)
                     )
                     score = (
-                        max(dist) + 0.5 * max(0.0, 0.15 - min(side)) + 0.1 * abs(yaw_offset) + FRAMING_PENALTY * clipped
+                        max(dist)
+                        + SIDE_WEIGHT * max(0.0, SIDE_TARGET - min(side))
+                        + YAW_WEIGHT * abs(yaw_offset)
+                        + FRAMING_PENALTY * clipped
                     )
                     if best is None or score < best[0]:
                         key = (float(x), float(y))
@@ -783,14 +814,11 @@ class R1ProSim(TiptopSim):
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
-        self.teleports = getattr(self, "teleports", 0) + 1
+        self.teleports += 1
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
         # back at the chest, where both hands and what they hold are in view ("front", the two-hands demo)
-        if self.overview_view == "front":
-            dx, dy, z, tx, tz = 1.15, -0.75, 1.35, 0.3, 0.9
-        else:
-            dx, dy, z, tx, tz = -1.5, 1.1, 1.7, 0.7, 0.55
+        dx, dy, z, tx, tz = OVERVIEW_OFFSETS[self.overview_view]
         eye = (x + dx * math.cos(yaw) - dy * math.sin(yaw), y + dx * math.sin(yaw) + dy * math.cos(yaw), z)
         target = (x + tx * math.cos(yaw), y + tx * math.sin(yaw), tz)
         self.aim_overview(eye, target)

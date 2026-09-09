@@ -8,11 +8,15 @@ its object, and a button seen in an earlier round is carried through a grasp by 
 geometry (or Isaac's instance segmentation), and the true pose of every toggle button the task presses. That is
 privileged information the challenge forbids at evaluation time; it exists so planning and execution can be
 developed and measured without a detector. It lives in this module and in ``R1ProSim``'s ``oracle_masks`` /
-``button_hints`` and nowhere else, and a run that uses it says so (``report``). Both sources produce the same
-``SceneKnowledge``; the rest of the pipeline never asks which one it got.
+``button_hints`` / ``toggled``; the benchmark's ``Episode`` (bench.py) reads the simulator too, for the decisions a
+strategy makes between rounds, and says so in its own docstring. A run that uses this source says so (``report``).
+Both sources produce
+the same ``SceneKnowledge``; the rest of the pipeline never asks which one it got. The one thing a source tells the
+executor is ``press_done``: the oracle knows the instant a switch flips, the onboard source has no such signal.
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -135,7 +139,7 @@ class KnowledgeSource:
 
     def hands(self) -> tuple[list[str], list[str]]:
         """(labels in a hand the plan does not move, labels in the planned hand)."""
-        arm = getattr(self.sim, "arm", None) or self.sim.robot.default_arm
+        arm = self.sim.arm
         held = self.sim.hands()
         return sorted(self.label(l) for l, a in held.items() if a != arm), sorted(
             self.label(l) for l, a in held.items() if a == arm
@@ -151,6 +155,11 @@ class KnowledgeSource:
 
     def picked(self, tracked: str, arm: str, eef: np.ndarray) -> None:
         """A plan just closed ``arm`` (eef pose ``eef``, base frame) on the tracked object; what moves with it now."""
+
+    def press_done(self, bddl_targets: list[str]) -> Callable[[], bool] | None:
+        """A signal that the press of these switches has landed, for the executor to end the push on; None when the
+        source has no such signal and the push runs to its planned depth."""
+        return None
 
     def report(self) -> dict:
         return {"source": self.name, "privileged": self.privileged}
@@ -185,6 +194,9 @@ class OracleKnowledge(KnowledgeSource):
             in_hand=in_hand,
             workspace=FLOOR_WORKSPACE if floor else None,
         )
+
+    def press_done(self, bddl_targets):
+        return lambda: all(self.sim.toggled(name) for name in bddl_targets)
 
 
 class OnboardKnowledge(KnowledgeSource):

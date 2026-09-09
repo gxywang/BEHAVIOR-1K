@@ -470,3 +470,19 @@ def test_verdict_caption_tells_success_from_failure_and_lists_what_is_missing():
     first, second = text.split("\n")
     assert first == "RESULT: FAILED (strategy finished)  q_score 0.688  11/16 satisfied"
     assert second == "unsatisfied: " + ", ".join(missing[:3]) + " +2 more"
+
+
+def test_only_the_oracle_source_knows_when_a_switch_flips():
+    """The executor's press stop signal comes from the knowledge source: the oracle reads the simulator's switch
+    state, the onboard source has no such signal (the press runs to its planned depth)."""
+    from omnigibson.tiptop.knowledge import OnboardKnowledge, OracleKnowledge
+
+    sim = _Sim(_masks(radio_1=20))
+    sim.toggled_now = {"radio.n.01_1": False}
+    sim.toggled = lambda bddl: sim.toggled_now[bddl]
+    goal = [{"predicate": "toggled_on", "args": ["radio.n.01_1"]}]
+    done = OracleKnowledge(sim, goal).press_done(["radio.n.01_1"])
+    assert done() is False
+    sim.toggled_now["radio.n.01_1"] = True
+    assert done() is True
+    assert OnboardKnowledge(sim, goal).press_done(["radio.n.01_1"]) is None

@@ -15,6 +15,7 @@ simulator (masks, button poses; privileged, for development), `onboard` sends on
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import logging
 import sys
@@ -206,7 +207,7 @@ def parse_spawns(specs, flag: str = "--spawn") -> list[tuple[str, str, float, fl
 
 def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
     """The R1Pro in the scene the arguments describe, in the planner's posture, standing where they say."""
-    from omnigibson.tiptop.r1pro import HEAD_APERTURE_MM, R1ProSim, make_r1pro_env_config
+    from omnigibson.tiptop.r1pro import HEAD_APERTURE_MM, LOOK_ARM, R1ProSim, make_r1pro_env_config
 
     spawns, places = parse_spawns(args.spawn), parse_spawns(args.place, flag="--place")
     scene_model, room_instances = args.scene_model, None
@@ -231,16 +232,13 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         segmentation=args.seg_instance,  # the annotator is opt-in; oracle masks come from geometry
         max_steps=max_steps,
     )
-    sim = R1ProSim(cfg, camera=args.camera)
-    sim.overview_view = args.overview
+    sim = R1ProSim(cfg, camera=args.camera, overview_view=args.overview, look_arm=None if args.no_look else LOOK_ARM)
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
     sim.track_context(*{support for _, support, _, _ in places + spawns}, args.near)
     for name, support, dx, dy in places:
         sim.place_on(name, support, dx, dy)  # settles during the holds below
-    if args.no_look:
-        sim.look_arm = None
     apply_embodiment_posture(sim, args, embodiment)
     if args.robot_pose:
         sim.place_robot(*args.robot_pose)
@@ -399,7 +397,7 @@ def connect_planners(args):
     metadata = client.fetch_metadata()
     client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
     press_client = press_meta = None
-    if getattr(args, "press_port", None):
+    if args.press_port:
         press_client = TiptopClient(
             args.press_host or args.host, args.press_port, expected_robot_type=PRESS_ROBOT_TYPE, expected_dof=None
         )
@@ -532,45 +530,39 @@ def do_execute(
     objects whose AABBs are logged), else every --goal atom; ``score=False`` skips the task's goal evaluation and
     reports the goal objects' poses only. ``record`` writes the execution as ``<out_dir>/<tag>.mp4`` (unless
     --no-video). ``extra`` is saved with the result."""
-    from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
+    from omnigibson.tiptop.executor import PlanExecutor, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
-    video = VideoRecorder(out_dir / f"{tag}.mp4") if record and not args.no_video else None
-    # a press ends as soon as the simulator's toggle flips (the plan pushes a little past the surface)
+    # the plan pushes a little past the surface; a source that knows when the switch flips ends the push there
     press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
-    press_done = (lambda: all(sim.toggled(name) for name in press_targets)) if press_targets else None
+    press_done = knowledge.press_done(press_targets) if press_targets and knowledge is not None else None
     executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, press_done=press_done)
-    if video is not None:
-        sim.recorders.append(video)
-    if press_targets and args.grasping_mode != "physical":
-        sim.block_grasping(getattr(sim, "arm", None))  # the press closes the gripper; it must not grasp the object
-    try:
-        stats = executor.execute(plan)
-        note_hands(sim, atoms, executor, knowledge)
-    finally:
-        if press_targets and args.grasping_mode != "physical":
-            sim.unblock_grasping()
-        if video is not None:
-            sim.recorders.remove(video)
-            video.close()
+    block = press_targets and args.grasping_mode != "physical"  # the press closes the gripper; it must not grasp
+    with sim.recording(out_dir / f"{tag}.mp4") if record and not args.no_video else nullcontext():
+        if block:
+            sim.block_grasping(sim.arm)
+        try:
+            stats = executor.execute(plan)
+            note_hands(sim, atoms, executor, knowledge)
+        finally:
+            if block:
+                sim.unblock_grasping()
     if press_targets:
         stats["buttons"] = {name: sim.press_state(name) for name in press_targets}
         log.info(f"buttons after the plan: {stats['buttons']}")
     if args.activity:
         success = sim.goal_status() if score else {"success": None, "scored": False}
         success["all"] = success["success"]
-        # where the goal objects ended up relative to their targets (BDDL names)
-        success["poses"] = {}
-        for atom in atoms:
-            for name in atom["args"]:
-                try:
-                    obj = sim.scene_object(name)
-                    lo, hi = [v.cpu().numpy().round(3).tolist() for v in obj.aabb]
-                    success["poses"][name] = {"aabb": [lo, hi]}
-                except Exception:  # noqa: BLE001 - diagnostics only
-                    pass
+        # where the goal's task objects ended up (BDDL names; the floor is not an object with a box)
+        scope = sim.task_scope()
+        success["poses"] = {
+            name: {"aabb": [v.cpu().numpy().round(3).tolist() for v in scope[name].aabb]}
+            for atom in atoms
+            for name in atom["args"]
+            if name in scope
+        }
         log.info(f"goal object AABBs: {success['poses']}")
     else:
         success = check_success(sim, parse_goal(args.goal))
@@ -592,22 +584,19 @@ def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
     """Update what the hands hold after a plan: from the robot's grasp assist when it has one (sticky / assisted
     grasping), else from the plan's own goals (a holding goal took the object, a placement let it go). A newly
     taken object is reported to the knowledge source (a button on it moves with the gripper from now on)."""
-    arm = getattr(sim, "arm", None) or sim.robot.default_arm
     before = dict(sim.held_objects)
-    grasped = sim.grasped_labels()
-    if grasped is not None:
-        sim.held_objects = grasped
-    else:
+    if sim.grasped_labels() is None:  # physical grasping: the plan's goals are the only record
         for atom in atoms:
             if atom["predicate"] == "holding" and executor.close_eef is not None:
-                sim.held_objects[sim.tracked_label(atom["args"][0])] = arm
+                sim.held_objects[sim.tracked_label(atom["args"][0])] = sim.arm
             elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
                 sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
-    for label, holder in sim.held_objects.items():
+    after = sim.hands()  # the grasp assist's record where the robot has one
+    for label, holder in after.items():
         if label not in before and knowledge is not None and executor.close_eef is not None:
             knowledge.picked(label, holder, executor.close_eef)
-    if sim.held_objects != before:
-        log.info(f"hands now hold {sim.held_objects or 'nothing'}")
+    if after != before:
+        log.info(f"hands now hold {after or 'nothing'}")
 
 
 def main(argv=None):
@@ -629,11 +618,6 @@ def main(argv=None):
         action="store_true",
         help="one capture/plan/execute round per goal atom from where the robot stands, instead of one plan for the "
         "whole goal",
-    )
-    p_live.add_argument(
-        "--restand",
-        action="store_true",
-        help="with --sequential and --activity: teleport the base to a reachable pose before every round",
     )
     args = parser.parse_args(argv)
     setup_logging()
@@ -674,38 +658,29 @@ def main(argv=None):
         elif args.cmd == "live":
             rounds = [[atom] for atom in atoms_all] if args.sequential else [atoms_all]
             outcomes = []
-            full = None
-            if args.sequential and not args.no_video:  # the whole run, rounds and the holds between them
-                from omnigibson.tiptop.executor import VideoRecorder
-
-                full = VideoRecorder(out_dir / "full.mp4")
-                sim.recorders.append(full)
-            for i, atoms in enumerate(rounds):
-                round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
-                round_dir.mkdir(parents=True, exist_ok=True)
-                sim.video_caption = f"round {i}: {atom_text(atoms)}"
-                try:
-                    if args.sequential and args.restand and args.activity and len(atoms[0]["args"]) == 2:
-                        sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
-                        sim.hold(args.settle_steps, sim.OPEN)
-                    round_client = client
-                    if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
-                        sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
-                        round_client = press_client
-                        sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
-                    outcomes.append(live_round(sim, args, round_client, round_dir, atoms, knowledge))
-                except Exception as e:
-                    if not args.sequential:
-                        raise
-                    log.exception(f"round {i} {atoms} failed")
-                    outcomes.append({"error": f"{type(e).__name__}: {e}"})
-                if args.sequential:
-                    log.info(f"round {i} {atoms}: {outcomes[-1].get('success', outcomes[-1].get('error'))}")
-            if full is not None:
-                sim.video_caption = "done: " + str(sim.goal_status().get("success")) if args.activity else "done"
-                sim.hold(30, sim.last_gripper)  # a second of the final state closes the video
-                sim.recorders.remove(full)
-                full.close()
+            whole_run = args.sequential and not args.no_video  # one video of every round and the holds between
+            with sim.recording(out_dir / "full.mp4") if whole_run else nullcontext():
+                for i, atoms in enumerate(rounds):
+                    round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
+                    round_dir.mkdir(parents=True, exist_ok=True)
+                    sim.video_caption = f"round {i}: {atom_text(atoms)}"
+                    try:
+                        round_client = client
+                        if press_client is not None and all(atom["predicate"] == "toggled_on" for atom in atoms):
+                            sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one holds
+                            round_client = press_client
+                            sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
+                        outcomes.append(live_round(sim, args, round_client, round_dir, atoms, knowledge))
+                    except Exception as e:
+                        if not args.sequential:
+                            raise
+                        log.exception(f"round {i} {atoms} failed")
+                        outcomes.append({"error": f"{type(e).__name__}: {e}"})
+                    if args.sequential:
+                        log.info(f"round {i} {atoms}: {outcomes[-1].get('success', outcomes[-1].get('error'))}")
+                if whole_run:
+                    sim.video_caption = "done: " + str(sim.goal_status().get("success")) if args.activity else "done"
+                    sim.hold(30, sim.last_gripper)  # a second of the final state closes the video
             if args.sequential:
                 summary = {"rounds": outcomes, "knowledge": knowledge.report()}
                 if args.activity:

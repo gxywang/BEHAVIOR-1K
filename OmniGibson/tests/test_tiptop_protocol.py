@@ -317,6 +317,12 @@ class _FakeSim:
         self.q = np.zeros(2, np.float32)
         self.steps, self.flip_at, self.toggled, self.gripper_log = 0, flip_at, False, []
         self.robot = type("R", (), {"is_grasping": staticmethod(lambda: 0)})()
+        self.last_gripper, self.arm = self.OPEN, "0"  # what every real sim has: the gripper command and the arm
+
+    def eef_pose_base(self, arm):
+        import numpy as np
+
+        return np.eye(4)
 
     def step(self, q, gripper):
         import numpy as np
@@ -403,7 +409,7 @@ def test_block_grasping_wraps_the_robot_for_both_call_styles():
             return ("radio", "link", arm)
 
     sim = TiptopSim.__new__(TiptopSim)
-    sim.robot = Robot()
+    sim.robot, sim._in_hand_object = Robot(), None
     sim.block_grasping("right")
     assert sim.robot._calculate_in_hand_object(arm="right") is None  # keyword call, as OmniGibson does
     assert sim.robot._calculate_in_hand_object("right") is None
@@ -481,3 +487,81 @@ def test_video_recorder_file_plays_before_it_is_closed(tmp_path):
     assert read_before_close > 0
     recorder.close()
     assert read_before_close < readable_frames() == 150
+
+
+def test_grasped_labels_come_from_the_grasp_assist_and_not_from_physical_grasping():
+    """Physical grasping has no record of what the hand holds (the robot keeps the dict, empty, in every mode), so
+    the plans' own bookkeeping must stay in charge there."""
+    from types import SimpleNamespace
+
+    from omnigibson.tiptop.scene import TiptopSim
+
+    radio, candle = object(), object()
+    robot = SimpleNamespace(grasping_mode="sticky", _ag_obj_in_hand={"left": radio, "right": None})
+    sim = SimpleNamespace(robot=robot, objects={"radio_1": radio, "candle_1": candle})
+    assert TiptopSim.grasped_labels(sim) == {"radio_1": "left"}
+    robot._ag_obj_in_hand = {"left": None, "right": None}
+    assert TiptopSim.grasped_labels(sim) == {}
+    robot.grasping_mode = "physical"
+    assert TiptopSim.grasped_labels(sim) is None
+
+
+def test_bddl_category():
+    from omnigibson.tiptop.protocol import bddl_category
+
+    assert bddl_category("wicker_basket.n.01_2") == "wicker_basket"
+    assert bddl_category("candle") == "candle"
+
+
+def test_recording_registers_a_recorder_for_the_block_and_closes_it(tmp_path):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from omnigibson.tiptop.scene import TiptopSim
+
+    sim = SimpleNamespace(recorders=[])
+    with TiptopSim.recording(sim, tmp_path / "v.mp4") as recorder:
+        assert sim.recorders == [recorder]
+        assert recorder.due() is False and recorder.due() is True  # every second step
+        recorder.write({"cam": np.zeros((32, 32, 3), np.uint8)})
+    assert sim.recorders == [] and (tmp_path / "v.mp4").stat().st_size > 0
+
+
+def test_step_counts_and_scores_only_while_the_episode_is_open():
+    """The bench's tail after EpisodeOver (the verdict on screen) must not move the step count or the metrics."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from omnigibson.tiptop.scene import EpisodeOver, TiptopSim
+
+    fed = []
+    metric = SimpleNamespace(step=lambda env, action, obs, reward, terminated, truncated, info: fed.append(terminated))
+    done = {"now": False}
+    env = SimpleNamespace(step=lambda action: ({}, 0.0, done["now"], False, {"done": {"success": done["now"]}}))
+    sim = SimpleNamespace(
+        env=env,
+        robot=SimpleNamespace(name="robot0"),
+        metrics=[metric],
+        state_stream=None,
+        recorders=[],
+        stop_when_done=True,
+        episode_open=True,
+        n_steps=0,
+        max_steps=10,
+        video_caption="round 1",
+        last_gripper=1.0,
+    )
+    sim.action = lambda q, g: TiptopSim.action(sim, q, g)
+    sim.frame_caption = lambda: TiptopSim.frame_caption(sim)
+    TiptopSim.step(sim, [0.0, 0.0], 1.0)
+    assert sim.n_steps == 1 and fed == [False]
+    done["now"] = True
+    with pytest.raises(EpisodeOver) as over:
+        TiptopSim.step(sim, [0.0, 0.0], 1.0)
+    assert over.value.reason == "success" and over.value.steps == 2
+    assert TiptopSim.end_episode(sim) == 2
+    TiptopSim.step(sim, [0.0, 0.0], 1.0)  # the tail: not counted, not scored, no EpisodeOver
+    assert sim.n_steps == 2 and len(fed) == 2
+    assert TiptopSim.frame_caption(sim) == "round 1\nstep 2/10"

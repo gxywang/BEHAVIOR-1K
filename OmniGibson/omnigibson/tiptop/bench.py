@@ -22,7 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
-from omnigibson.tiptop.strategies import Unreachable
+from omnigibson.tiptop.protocol import bddl_category
+from omnigibson.tiptop.strategies import STRATEGIES, Unreachable
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -57,14 +58,16 @@ def verdict_caption(reason: str, success: bool, goal: dict) -> str:
 class Episode:
     """One task instance as a strategy sees it. The base moves by teleport (``stand_for``); the planner of an arm
     plans one round at a time (``plan_and_execute``, which never raises on a failed round: the strategy decides
-    what to do next); and the simulator answers what the pipeline cannot perceive yet (``holds``, ``holding``,
-    distances): privileged, and counted in the result."""
+    what to do next); and the simulator answers what the pipeline cannot perceive yet (``holds``, ``on_support``,
+    ``support_of``, positions and distances): privileged, used in every benchmark whatever ``--knowledge`` says, and
+    the result's ``bench.knowledge`` only describes what the planner was told. ``holding`` / ``held_names`` are the
+    robot's own grasp record, not privileged."""
 
     def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path):
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
         self.records = []  # one per round, in order
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
-        self.floor = next((n for n in sim.task_scope() if n.startswith("floor.")), "floor.n.01_1")
+        self.floor = sim.floor_name()
 
     # ---------------------------------------------------------------- moving
     def stand_for(self, *names: str) -> dict:
@@ -165,7 +168,7 @@ class Episode:
     def support_of(self, bddl: str) -> str:
         """The BDDL name of the table the object stands on (``on_support``), else the task's floor."""
         for name in self.sim.task_scope():
-            if name.split(".n.")[0] == "table" and self.on_support(bddl, name):
+            if bddl_category(name) == "table" and self.on_support(bddl, name):
                 return name
         return self.floor
 
@@ -199,8 +202,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",
     )
     args = p.parse_args(argv)
+    if args.task_name not in STRATEGIES:
+        p.error(f"no strategy for task {args.task_name!r}; known: {sorted(STRATEGIES)}")
+    # what run.py's helpers read: the challenge robot, the activity to load, the instruction the planner is given
     args.embodiment = "r1pro"
     args.activity = args.task_name
+    args.task = STRATEGIES[args.task_name].instruction
     return args
 
 
@@ -241,7 +248,6 @@ def main(argv=None) -> None:
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
         strategy = strategy_for(args.task_name, task_goal_atoms(sim), **strategy_kwargs(args))
-        args.task = strategy.instruction
         for index, instance_id in zip(args.instances, instance_ids):
             t0 = time.time()
             name = f"{args.task_name}_{instance_id}_0"
@@ -251,7 +257,6 @@ def main(argv=None) -> None:
             sim.env.reset()
             load_task_instance(sim.env, sim.robot, instance_id, mode=args.mode)
             sim.env.reset()  # episode_steps = 0, as the evaluator does before a rollout
-            sim.held_objects, sim.teleports = {}, 0
             sim.reset_embodiment(metadata["embodiment"])
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal)
             metrics = [AgentMetric(human), TaskMetric(human)]
