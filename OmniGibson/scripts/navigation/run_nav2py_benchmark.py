@@ -691,17 +691,20 @@ def place_robot(robot, episode):
 
 
 def look_at_orientation(camera_position, target_position):
-    direction = target_position - camera_position
-    direction = direction / th.norm(direction)
-    up = th.tensor([0.0, 0.0, 1.0], dtype=th.float32, device=direction.device)
-    up = up - th.dot(up, direction) * direction
-    if th.norm(up) < 1e-6:
-        up = th.tensor([0.0, 1.0, 0.0], dtype=th.float32, device=direction.device)
-        up = up - th.dot(up, direction) * direction
+    forward = target_position - camera_position
+    forward = forward / th.norm(forward)
+    world_up = th.tensor([0.0, 0.0, 1.0], dtype=th.float32, device=forward.device)
+    if th.norm(th.linalg.cross(forward, world_up)) < 1e-6:
+        world_up = th.tensor([0.0, 1.0, 0.0], dtype=th.float32, device=forward.device)
+
+    right = th.linalg.cross(forward, world_up)
+    right = right / th.norm(right)
+    up = th.linalg.cross(-forward, right)
     up = up / th.norm(up)
 
-    camera_orientation = T.vec2quat(direction, up)
-    return camera_orientation[0] if camera_orientation.dim() > 1 else camera_orientation
+    # USD cameras look along local -Z, so the local Z axis points away from the target.
+    rotation = th.stack([right, up, -forward], dim=1)
+    return T.mat2quat(rotation)
 
 
 def update_viewer_camera(robot, args):
