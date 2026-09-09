@@ -20,8 +20,10 @@ object within reach (1.1 m at most); *no plan* = the planner found no satisfying
 = the goal object had no pixels in the capture; *ran, not inside* = the place executed but the predicate stayed
 false (the item landed outside the rim or fell); *released* = the last-resort open of a hand no plan could empty.
 
-- **turning_on_radio**, three passes of the same strategy (pick with the left hand, press with the right while
-  holding): mean q_score **0.7 / 0.7 / 0.6**, 20 of 30 instances.
+- **turning_on_radio**, four passes of the same strategy (pick with the left hand, press with the right while
+  holding): mean q_score **0.7 / 0.7 / 0.6 / 0.7**, 27 of 40 instances. Pass 4 is the reference: recorded with the
+  current code, so each video ends on the flip with the button's marker turned green; the tails of passes 1-3 are a
+  frozen copy of their last frame, which predates the marker's colour change.
   - pass 1 (`runs/bench_radio_pass1`, 7/10): 302, 303 no base pose within 0.9 m (the search now widens to 1.1 m);
     309 press: no plan x2 after the pick.
   - pass 2 (`runs/bench_radio_pass2`, 7/10): 302 press: no plan x2 (two picks); 303 no base pose; 309 press: no
@@ -29,8 +31,11 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
   - pass 3 (`runs/bench_radio_pass3`, 6/10, final code): 301 press: no plan x4, even after a put-down and a re-pick;
     302 two pick rounds ran, the radio was never grasped (0.95 m reach), so no press; 307 the press ran twice
     without toggling, then the re-pick's press had no plan x2; 309 press: no plan x4 (three picks, one put-down).
+  - pass 4 (`runs/bench_radio_pass4`, 7/10, current code): 302 press: no plan x4 after three picks and a put-down;
+    308 press: no plan x4 after one pick and a put-down; 309 the press ran twice without toggling, then the re-pick's
+    press had no plan x2.
   - What fails is the right hand's press plan, which depends on the grasp the left hand chose (a switch left
-    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (26 of 30 instances ended with the radio in hand).
+    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (35 of 40 instances ended with the radio in hand).
 - **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
   - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
     from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
@@ -340,14 +345,15 @@ holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). B
 first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
 
 Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
-`runs/bench_radio_pass2`, `runs/bench_radio_pass3`; the same strategy scored 0.7, 0.7 and 0.6 in three passes, so read
-the number as about 0.65 with the press as the source of variance):
+`runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`; the same strategy scored 0.7, 0.7, 0.6 and
+0.7 in four passes, so read the number as about 0.68 with the press as the source of variance):
 
 | task | pass | mean q_score | successes | median env steps (of the timeout) | failure causes |
 |---|---|---|---|---|---|
 | turning_on_radio | 1 | 0.7 | 7/10 | 690 / 3224 | 2x no standing pose within 0.9 m, 1x press: no plan |
 | turning_on_radio | 2 | 0.7 | 7/10 | 784 / 3224 | 1x no standing pose within 1.0 m, 2x press: no plan (one after a planner CUDA fault) |
 | turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
+| turning_on_radio | 4 | 0.7 | 7/10 | 747 / 3224 | 2x press: no plan x4 even after a put-down and re-pick, 1x press executed twice without toggling then no plan for the re-pick; videos end on the flip (marker green) |
 | assembling_gift_baskets | 1 (2 instances, stopped) | 0.31 | 0/2 | 11200 / 39090 | a failed put-down left the item in the hand and blocked every later pick; items knocked to the floor were re-picked |
 | assembling_gift_baskets | 2 | 0.6375 | 2/10 (16/16 twice; 15, 14, 13, 11, 11, 3, 3, 0 of 16) | 13600 / 39090 | 3 instances lost to one item no put-down plan could set down after a failed place (the hand stayed full); 45 stand attempts found no pose even at 1.1 m (a basket in a corner) |
 | assembling_gift_baskets | 3 | 0.875 | 2/10 (16/16 twice; 15, 15, 15, 15, 14, 13, 11, 10 of 16) | 16000 / 39090 | the last-resort release ended the stuck-item loops (4 releases, 27 failed of 374 rounds); what remains is one or two items per instance: bows no base pose reaches (3 instances), a basket in a corner (1), places with no satisfying plan (2) |
@@ -519,7 +525,9 @@ a scripted episode, and the benchmark's summary.
   unfinished and a failure looked like a success; now the final state stays on screen for 3 s under the verdict,
   every frame carries the step count, and the file is a fragmented MP4 that plays during and after a killed run. The
   bench writes no per-round clips (the episode video covers them). assembling_gift_baskets pass 3 (the last-resort
-  release): 0.875 on the 10 public instances.
+  release): 0.875 on the 10 public instances. turning_on_radio pass 4, recorded with this code: 0.7; its videos end
+  on the flip with the marker green (OmniGibson's ToggledOn flips after 5 steps of fingertip overlap with the
+  button's marker, before any visible push, and the task ends that step).
 - 2026-09-09 (hygiene pass, after an audit): the press stop signal comes from the knowledge source (the oracle knows
   when a switch flips; the onboard source runs the press to its planned depth); the grasp-assist read handles
   physical grasping; the task's floor is looked up, not assumed; per-episode state (``arm``, ``teleports``, the
