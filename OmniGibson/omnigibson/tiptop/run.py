@@ -454,10 +454,19 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
 
 
 def live_round(
-    sim, args, client, out_dir: Path, atoms: list[dict], knowledge, floor: bool = False, score: bool = True
+    sim,
+    args,
+    client,
+    out_dir: Path,
+    atoms: list[dict],
+    knowledge,
+    floor: bool = False,
+    score: bool = True,
+    record: bool = True,
 ) -> dict:
     """Capture, ask the server for a plan for these atoms, save it and execute it (``score``: evaluate the task's
-    goal afterwards; a benchmark scores once at the end instead, the whole goal costs 46 s on the gift-basket task)."""
+    goal afterwards; a benchmark scores once at the end instead, the whole goal costs 46 s on the gift-basket task;
+    ``record``: write this round's own clip, ``<out_dir>/live.mp4``; a driver recording the whole run passes False)."""
     from omnigibson.tiptop.client import TiptopPlanningError
 
     request, extras = do_capture(sim, args, out_dir, atoms, knowledge, floor=floor)
@@ -503,6 +512,7 @@ def live_round(
         knowledge=knowledge,
         extra={"perception": match},
         score=score,
+        record=record,
     )
 
 
@@ -516,16 +526,18 @@ def do_execute(
     knowledge=None,
     extra: dict | None = None,
     score: bool = True,
+    record: bool = True,
 ) -> dict:
     """Execute a plan and check the goal: the task's own with --activity (``atoms``, default --goal, then names the
     objects whose AABBs are logged), else every --goal atom; ``score=False`` skips the task's goal evaluation and
-    reports the goal objects' poses only. ``extra`` is saved with the result."""
+    reports the goal objects' poses only. ``record`` writes the execution as ``<out_dir>/<tag>.mp4`` (unless
+    --no-video). ``extra`` is saved with the result."""
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
-    video = None if args.no_video else VideoRecorder(out_dir / f"{tag}.mp4")
+    video = VideoRecorder(out_dir / f"{tag}.mp4") if record and not args.no_video else None
     # a press ends as soon as the simulator's toggle flips (the plan pushes a little past the surface)
     press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
     press_done = (lambda: all(sim.toggled(name) for name in press_targets)) if press_targets else None

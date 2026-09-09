@@ -38,6 +38,20 @@ from omnigibson.tiptop.run import (
 log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
+EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
+UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
+
+
+def verdict_caption(reason: str, success: bool, goal: dict) -> str:
+    """What the video's tail says (``goal`` as ``goal_status`` reports it): outcome, score, satisfied count, then the
+    first unsatisfied atoms, so success and failure can be told apart on screen."""
+    head = "RESULT: SUCCESS" if success else f"RESULT: FAILED ({reason})"
+    head += f"  q_score {goal['q_score']:.3g}  {len(goal['satisfied'])}/{goal['total']} satisfied"
+    missing = goal["unsatisfied"]
+    if not missing:
+        return head
+    more = f" +{len(missing) - UNSATISFIED_SHOWN} more" if len(missing) > UNSATISFIED_SHOWN else ""
+    return f"{head}\nunsatisfied: {', '.join(missing[:UNSATISFIED_SHOWN])}{more}"
 
 
 class Episode:
@@ -58,6 +72,7 @@ class Episode:
         second call for the same objects stands somewhere else; when nothing is found within the arm's usual
         reach, the search is widened to ``REACH_FAR`` (the torso leans that far) before giving up."""
         avoid = self.stood.setdefault(names, [])
+        self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
         try:
             pose = self.sim.place_robot_for(*names, avoid=avoid)
         except RuntimeError as e:
@@ -89,14 +104,16 @@ class Episode:
         i = len(self.records)
         round_dir = self.out_dir / f"r{i:02d}_{arm}_{atoms[0]['predicate']}"
         round_dir.mkdir(parents=True, exist_ok=True)
-        self.sim.video_caption = f"{atom_text(atoms)} [{arm} arm]"
+        self.sim.video_caption = f"round {i}: {atom_text(atoms)} [{arm} arm]"
         record = {"round": i, "atoms": atoms, "arm": arm, "dir": str(round_dir), "step": self.sim.n_steps}
         t0 = time.time()
         try:
             self.use_arm(arm)
             client = self.planners[arm][0]
             client.wait_for_server(timeout_s=300.0)  # a planner relaunched after a CUDA fault comes back in ~1 min
-            result = live_round(self.sim, self.args, client, round_dir, atoms, self.knowledge, floor=floor, score=False)
+            result = live_round(  # the episode's video covers the round; no clip of its own
+                self.sim, self.args, client, round_dir, atoms, self.knowledge, floor=floor, score=False, record=False
+            )
             record["env_steps"] = result.get("execution", {}).get("env_steps")
         except EpisodeOver:
             record["error"] = "episode over"
@@ -126,6 +143,7 @@ class Episode:
     def release(self, steps: int = 45) -> None:
         """Open the planned hand where it is and let whatever it holds fall (the last resort when no put-down
         plan exists); the hand is then held open for ``steps`` env steps so the object clears it."""
+        self.sim.video_caption = f"release [{self.sim.arm} arm]"
         self.sim.hold(steps, self.sim.OPEN)
         self.records.append({"release": True, "step": self.sim.n_steps, "hands": dict(self.sim.hands())})
 
@@ -237,7 +255,7 @@ def main(argv=None) -> None:
             sim.reset_embodiment(metadata["embodiment"])
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal)
             metrics = [AgentMetric(human), TaskMetric(human)]
-            sim.begin_episode(metrics, stop_when_done=True)  # from here on every env step counts
+            sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps)  # from here on every step counts
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")
             if video is not None:
                 sim.recorders.append(video)
@@ -254,20 +272,24 @@ def main(argv=None) -> None:
             except Exception as e:  # noqa: BLE001 - score what happened and go on to the next instance
                 log.exception(f"instance {instance_id} crashed")
                 reason = f"crash: {type(e).__name__}: {e}"
-            finally:
-                if video is not None:
-                    sim.recorders.remove(video)
-                    video.close()
-            sim.stop_when_done = False
+            steps = sim.end_episode()  # scored on the state now; the video tail below counts for nothing
             success = bool(sim.env.task.success)
+            goal = sim.goal_status()
             aggregated = {}
             for metric in metrics:
                 aggregated.update(metric.aggregate(sim.env))
+            if video is not None:
+                sim.video_caption = verdict_caption(reason, success, goal)
+                try:
+                    sim.hold(EPILOGUE_STEPS, sim.last_gripper)  # the final state and the verdict stay on screen
+                finally:
+                    sim.recorders.remove(video)
+                    video.close()
             result = {
                 "task": args.task_name,
                 "instance_id": int(instance_id),
                 "rollout_id": 0,
-                "steps": sim.n_steps,
+                "steps": steps,
                 "success": success,
                 **aggregated,
                 "bench": {
@@ -276,7 +298,8 @@ def main(argv=None) -> None:
                     "wall_time_s": round(time.time() - t0, 1),
                     "knowledge": knowledge.report(),
                     "teleports": sim.teleports,
-                    "goal": sim.goal_status(),
+                    "goal": goal,
+                    "video": None if video is None else str(Path(video.path).relative_to(out_dir)),
                     "rounds": episode.records if episode is not None else [],
                 },
             }
@@ -285,7 +308,7 @@ def main(argv=None) -> None:
             results.append(result)
             log.info(
                 f"RESULT instance {instance_id}: q_score {result.get('q_score', {}).get('final')} success {success} "
-                f"steps {sim.n_steps}/{max_steps} ({reason}); teleports {sim.teleports}; {result['bench']['wall_time_s']}s"
+                f"steps {steps}/{max_steps} ({reason}); teleports {sim.teleports}; {result['bench']['wall_time_s']}s"
             )
             write_summary(out_dir, args, results, max_steps)
     except Exception:

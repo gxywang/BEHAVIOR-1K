@@ -44,6 +44,12 @@ def compose_views(views: dict, column_width: int = 560, caption: str | None = No
     return np.asarray(canvas)
 
 
+# A fragmented MP4 (a fragment every 2 s) keeps its index in every fragment instead of at the end of the file, so the
+# video plays up to the last flushed fragment while a run is still going, and after a run that was killed or crashed
+# before close(). The encoder's look-ahead still holds the last few seconds until close().
+FRAGMENTED_MP4 = ["-movflags", "empty_moov+default_base_moof+frag_keyframe", "-frag_duration", "2000000"]
+
+
 class VideoRecorder:
     """Writes every ``every``-th simulator step as one composed frame (``compose_views``). Register it in
     ``sim.recorders``: the simulator feeds it from ``step()``, so holds, captures and arm switches are in the video
@@ -53,7 +59,9 @@ class VideoRecorder:
         import imageio
 
         self.path, self.every, self.count, self.column_width = str(path), every, 0, column_width
-        self.writer = imageio.get_writer(self.path, fps=fps, codec="libx264", quality=7, macro_block_size=None)
+        self.writer = imageio.get_writer(
+            self.path, fps=fps, codec="libx264", quality=7, macro_block_size=None, output_params=FRAGMENTED_MP4
+        )
 
     def due(self) -> bool:
         self.count += 1

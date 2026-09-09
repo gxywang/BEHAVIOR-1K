@@ -216,8 +216,12 @@ def load_plan_json(path) -> dict:
 # --------------------------------------------------------------------------------------------------------------------
 # Offline H5 observation (droid-sim-evals layout consumed by `tiptop-h5`)
 # --------------------------------------------------------------------------------------------------------------------
+KNOWLEDGE_JSON_KEYS = ("gt_buttons", "held_labels", "in_hand", "workspace_bounds")  # stored as JSON text datasets
+
+
 def save_observation_h5(path, request: dict, cam_pos_base, cam_quat_wxyz_ros, extra: dict | None = None) -> None:
-    """Write an observation in the droid-sim-evals H5 layout plus optional ground-truth datasets.
+    """Write an observation in the droid-sim-evals H5 layout plus the knowledge keys of the request, so the file is
+    the whole request (``request_from_observation`` rebuilds it).
 
     ``cam_pos_base`` / ``cam_quat_wxyz_ros`` describe the OpenCV camera frame in the robot base frame (they duplicate
     request['world_from_cam']). The attribute ``pos_w_z_offset_m = 0`` tells the tiptop fork's loader that the stored
@@ -236,10 +240,14 @@ def save_observation_h5(path, request: dict, cam_pos_base, cam_quat_wxyz_ros, ex
         f.create_dataset("task", data=request["task"])
         f.attrs["pos_w_z_offset_m"] = 0.0
         f.attrs["source"] = "omnigibson.tiptop"
-        if "gt_masks" in request:
-            f.create_dataset("gt_masks", data=request["gt_masks"].astype(np.uint8), compression="gzip")
+        if "gt_labels" in request:  # what the client knew (attach_knowledge), so the file is the whole request
             f.create_dataset("gt_labels", data=np.array(request["gt_labels"], dtype=h5py.string_dtype()))
             f.create_dataset("gt_atoms", data=json.dumps(request["gt_atoms"]))
+        if "gt_masks" in request:
+            f.create_dataset("gt_masks", data=request["gt_masks"].astype(np.uint8), compression="gzip")
+        for key in KNOWLEDGE_JSON_KEYS:
+            if key in request:
+                f.create_dataset(key, data=json.dumps(request[key]))
         if "robot_mask" in request:
             f.create_dataset("robot_mask", data=request["robot_mask"].astype(np.uint8), compression="gzip")
         for key, value in (extra or {}).items():
@@ -271,14 +279,41 @@ def load_observation_h5(path) -> dict:
             "task": task,
             "q_init": np.asarray(f["q_init"][()], dtype=np.float32).reshape(-1),
         }
+        if "gt_labels" in f:
+            obs["gt_labels"] = [s.decode() if isinstance(s, bytes) else str(s) for s in f["gt_labels"][:]]
+            obs["gt_atoms"] = _json_dataset(f["gt_atoms"])
         if "gt_masks" in f:
             obs["gt_masks"] = f["gt_masks"][:]
-            obs["gt_labels"] = [s.decode() if isinstance(s, bytes) else str(s) for s in f["gt_labels"][:]]
-            atoms = f["gt_atoms"][()]
-            obs["gt_atoms"] = json.loads(atoms.decode() if isinstance(atoms, bytes) else atoms)
+        for key in KNOWLEDGE_JSON_KEYS:
+            if key in f:
+                obs[key] = _json_dataset(f[key])
         if "robot_mask" in f:
             obs["robot_mask"] = f["robot_mask"][:].astype(bool)
     return obs
+
+
+def _json_dataset(dataset):
+    raw = dataset[()]
+    return json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+
+
+def request_from_observation(obs: dict) -> dict:
+    """The planner request a saved observation was (``load_observation_h5``): the frame, and the knowledge keys the
+    file has, validated the way ``attach_knowledge`` validates a live request. Replaying a round is
+    ``client.plan(request_from_observation(load_observation_h5(round_dir / "obs.h5")))``."""
+    request = {key: obs[key] for key in ("rgb", "depth", "intrinsics", "world_from_cam", "task", "q_init")}
+    if "gt_labels" in obs:
+        attach_knowledge(
+            request,
+            obs["gt_labels"],
+            obs["gt_atoms"],
+            masks=obs.get("gt_masks"),
+            buttons=obs.get("gt_buttons"),
+            held=obs.get("held_labels", ()),
+            in_hand=obs.get("in_hand", ()),
+            workspace=obs.get("workspace_bounds"),
+        )
+    return request
 
 
 # --------------------------------------------------------------------------------------------------------------------

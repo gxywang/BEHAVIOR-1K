@@ -112,6 +112,36 @@ def test_h5_roundtrip(tmp_path):
         assert json.loads(f.attrs["note"]) == {"a": 1}
 
 
+def test_saved_observation_is_the_whole_request(tmp_path):
+    """Every knowledge key survives the file, so a round replays exactly (masks or not)."""
+    from omnigibson.tiptop.protocol import attach_knowledge, request_from_observation
+
+    req = _request()
+    button = {"position": [0.6, 0.0, 0.8], "normal": [0.0, -1.0, 0.0], "radius": 0.02}
+    attach_knowledge(
+        req,
+        req["gt_labels"],
+        req["gt_atoms"],
+        masks=req["gt_masks"],
+        buttons={"mug_button": button},
+        held=["bowl"],
+        in_hand=["mug"],
+        workspace=[[0.05, -0.8, -0.05], [1.3, 0.8, 1.6]],
+    )
+    save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
+    again = request_from_observation(load_observation_h5(tmp_path / "obs.h5"))
+    assert set(again) == set(req)
+    for key in ("gt_labels", "gt_atoms", "gt_buttons", "held_labels", "in_hand", "workspace_bounds", "task"):
+        assert again[key] == req[key], key
+    assert np.array_equal(again["gt_masks"], req["gt_masks"]) and np.array_equal(again["q_init"], req["q_init"])
+
+    onboard = _request()  # a detector round: labels and the goal, no masks
+    del onboard["gt_masks"]
+    save_observation_h5(tmp_path / "onboard.h5", onboard, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
+    again = request_from_observation(load_observation_h5(tmp_path / "onboard.h5"))
+    assert again["gt_labels"] == onboard["gt_labels"] and "gt_masks" not in again and "gt_buttons" not in again
+
+
 def test_depth_to_points_pinhole():
     depth = np.full((4, 6), 2.0, dtype=np.float32)
     K = np.array([[10.0, 0, 3], [0, 10.0, 2], [0, 0, 1]])
@@ -406,3 +436,48 @@ def test_executor_keeps_a_closed_gripper_at_the_start_of_a_plan():
     }
     executor.execute(plan)
     assert sim.gripper_log[0] == sim.CLOSE and sim.gripper_log[-1] == sim.OPEN
+
+
+def test_compose_views_stamps_a_multi_line_caption():
+    import numpy as np
+
+    from omnigibson.tiptop.executor import compose_views
+
+    cam = np.zeros((240, 320, 3), np.uint8)
+    one = compose_views({"cam": cam}, caption="round 1: holding(radio)")
+    two = compose_views({"cam": cam}, caption="round 1: holding(radio)\nstep 534/3224")
+    assert one.shape == two.shape == (240, 320, 3)
+    assert (one[:24] == two[:24]).all()  # the first line is the same
+    assert (two[40:70] > 0).any() and not (one[40:70] > 0).any()  # the second line lands under it
+
+
+def test_video_recorder_file_plays_before_it_is_closed(tmp_path):
+    """A run that is killed leaves a playable video: fragments are flushed while writing (fragmented MP4)."""
+    import time
+
+    import cv2
+    import numpy as np
+
+    from omnigibson.tiptop.executor import VideoRecorder
+
+    rng = np.random.default_rng(0)
+    recorder = VideoRecorder(tmp_path / "run.mp4", fps=15, every=1)
+    for _ in range(150):  # 10 s of video: several 2 s fragments, well past the encoder's look-ahead
+        assert recorder.due()
+        recorder.write({"cam": rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)})
+
+    def readable_frames() -> int:
+        capture, n = cv2.VideoCapture(str(tmp_path / "run.mp4")), 0
+        while capture.read()[0]:
+            n += 1
+        capture.release()
+        return n
+
+    deadline = time.time() + 10  # the encoder runs in its own process: the first fragments land within ~0.2 s
+    read_before_close = readable_frames()
+    while read_before_close == 0 and time.time() < deadline:
+        time.sleep(0.1)
+        read_before_close = readable_frames()
+    assert read_before_close > 0
+    recorder.close()
+    assert read_before_close < readable_frames() == 150

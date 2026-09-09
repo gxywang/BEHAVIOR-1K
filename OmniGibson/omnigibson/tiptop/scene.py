@@ -252,11 +252,13 @@ class TiptopSim:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
         self.held_objects = {}  # tracked label -> arm, for objects a plan picked up (they move with that gripper)
-        self.recorders = []  # executor.VideoRecorder instances, fed from step(); the caption is stamped on each frame
+        self.recorders = []  # executor.VideoRecorder instances, fed from step(); frame_caption() is stamped on each
         self.metrics = []  # omnigibson.metrics.MetricBase instances fed from step() (the challenge's own scoring)
         self.n_steps = 0  # env steps taken: holds, captures and plans all count, as they do for the challenge's timeout
+        self.max_steps = None  # the episode's step limit when known (shown in the frame caption)
+        self.episode_open = True  # env steps count (n_steps, metrics) until end_episode(); a video tail does not
         self.stop_when_done = False  # raise EpisodeOver when the task reports success or its step limit (benchmark)
-        self.video_caption = None
+        self.video_caption = None  # what the robot is doing now, one line, set by the driver (run.py, bench.py)
         self.last_obs = None
         self.last_gripper = self.OPEN
         self.last_capture_rgb = None  # the last frame capture() rendered, for saving next to an error
@@ -315,30 +317,46 @@ class TiptopSim:
         self.last_gripper = float(gripper)
         action = self.action(q_arm, gripper)
         self.last_obs, reward, terminated, truncated, info = self.env.step(action)
-        self.n_steps += 1
-        for metric in self.metrics:
-            metric.step(self.env, action[self.robot.name], self.last_obs, reward, terminated, truncated, info)
+        if self.episode_open:
+            self.n_steps += 1
+            for metric in self.metrics:
+                metric.step(self.env, action[self.robot.name], self.last_obs, reward, terminated, truncated, info)
         if self.state_stream is not None:
             self.state_stream.on_step(self)
         if self.recorders:
-            views = None
+            views, caption = None, self.frame_caption()
             for recorder in self.recorders:
                 if recorder.due():
                     views = self.video_views() if views is None else views
-                    recorder.write(views, self.video_caption)
+                    recorder.write(views, caption)
         if self.stop_when_done and (terminated or truncated):
             success = bool((info or {}).get("done", {}).get("success", False))
             raise EpisodeOver("success" if success else "timeout" if truncated else "terminated", self.n_steps)
         return self.last_obs
 
-    def begin_episode(self, metrics=(), stop_when_done: bool = False) -> None:
+    def frame_caption(self) -> str:
+        """What is stamped on a video frame: the driver's ``video_caption`` line, then the env step count (over the
+        episode's limit when known), so a viewer can tell where in the episode a frame is."""
+        steps = f"step {self.n_steps}" + (f"/{self.max_steps}" if self.max_steps else "")
+        return f"{self.video_caption}\n{steps}" if self.video_caption else steps
+
+    def begin_episode(self, metrics=(), stop_when_done: bool = False, max_steps: int | None = None) -> None:
         """Start counting from zero for a scored episode: env steps, the metrics fed from ``step`` (each is reset on
         the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``)."""
         self.n_steps = 0
+        self.max_steps = max_steps
         self.metrics = list(metrics)
         for metric in self.metrics:
             metric.reset(self.env)
         self.stop_when_done = stop_when_done
+        self.episode_open = True
+
+    def end_episode(self) -> int:
+        """The episode is over: env steps from here on (a video tail showing the final state) are neither counted
+        nor scored and no longer raise ``EpisodeOver``. Returns the episode's step count."""
+        self.episode_open = False
+        self.stop_when_done = False
+        return self.n_steps
 
     def hands(self) -> dict:
         """{tracked label: arm} of what the hands hold now: the grasp assist's own record when the robot has one

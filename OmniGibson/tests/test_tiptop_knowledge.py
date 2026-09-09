@@ -451,3 +451,22 @@ def test_assemble_gift_baskets_releases_an_item_no_plan_can_put_down():
     rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
     assert rounds[-2:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
     assert not ep.in_hand
+
+
+def test_verdict_caption_tells_success_from_failure_and_lists_what_is_missing():
+    from omnigibson.tiptop.bench import verdict_caption
+
+    done = {
+        "success": True,
+        "q_score": 1.0,
+        "satisfied": ["toggled_on(radio_receiver.n.01_1)"],
+        "unsatisfied": [],
+        "total": 1,
+    }
+    assert verdict_caption("success", True, done) == "RESULT: SUCCESS  q_score 1  1/1 satisfied"
+    missing = [f"inside(candle.n.01_{i}, wicker_basket.n.01_1)" for i in range(1, 6)]
+    partial = {"success": False, "q_score": 0.6875, "satisfied": ["x"] * 11, "unsatisfied": missing, "total": 16}
+    text = verdict_caption("strategy finished", False, partial)
+    first, second = text.split("\n")
+    assert first == "RESULT: FAILED (strategy finished)  q_score 0.688  11/16 satisfied"
+    assert second == "unsatisfied: " + ", ".join(missing[:3]) + " +2 more"

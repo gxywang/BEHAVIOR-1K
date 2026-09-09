@@ -40,7 +40,8 @@ Modules in this directory: `protocol.py` (wire and file formats, no OmniGibson i
 client and the Rerun mirror), `scene.py` (the simulator: stepping, capture, episode accounting), `r1pro.py` (the
 R1Pro in a BEHAVIOR scene: posture, cameras, task scope, base-pose search), `knowledge.py` (what the client tells
 the planner beyond the image: an oracle source and an onboard source), `executor.py` (plan execution, video),
-`strategies.py` (how a task is split into rounds), `bench.py` (the challenge-style benchmark), `run.py` (the CLI).
+`strategies.py` (how a task is split into rounds), `bench.py` (the challenge-style benchmark), `replay.py` (re-plan
+a saved round), `run.py` (the CLI).
 
 ## One round, step by step
 
@@ -263,11 +264,27 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live --embodimen
 (`omnigibson.eval.eval`): the same public test instances (indices 0-9 are the reported ones; the evaluator's own
 `load_task_instance` loads them), the same timeout (1.5x the mean human demonstration length, in env steps; every
 hold, capture and plan counts), the same metrics (`TaskMetric`, `AgentMetric`), the same result JSON per rollout
-under `<out>/json/`, plus `summary.json` with the mean q_score and `videos/<task>_<instance>_0.mp4`. Two things
-are stand-ins, and every result says so (`bench.knowledge`, `bench.teleports`): the base is teleported to the pose
-`best_base_pose` picks for each round instead of navigating, and with `--knowledge oracle` the planner is told the
-simulator's masks and button poses. A number from this benchmark bounds the manipulation part of the pipeline; it
-is not a challenge score.
+under `<out>/json/`, plus `summary.json` with the mean q_score. Two things are stand-ins, and every result says so
+(`bench.knowledge`, `bench.teleports`): the base is teleported to the pose `best_base_pose` picks for each round
+instead of navigating, and with `--knowledge oracle` the planner is told the simulator's masks and button poses. A
+number from this benchmark bounds the manipulation part of the pipeline; it is not a challenge score.
+
+Outputs per instance: `videos/<task>_<instance>_0.mp4` is the whole episode in one video, every env step from the
+first teleport to the end (the capture camera left, the overview and the wrist camera right), each frame stamped
+with what the robot is doing (`teleport: stand for ...`, `round N: holding(...) [left arm]`, `release`) and the
+step count over the timeout; after the episode the final state stays on screen for 3 s under the verdict
+(`RESULT: SUCCESS q_score 1 1/1 satisfied`, or `RESULT: FAILED (...) q_score 0.688 11/16 satisfied` with the first
+unsatisfied atoms). The file is a fragmented MP4, so it plays while the run is still going and after a killed run.
+`<task>_<instance>_0/rNN_<arm>_<predicate>/` is one directory per planning round with the planner's exact request
+(`obs.h5`, `capture.json`, the `rgb.png`/`depth.png`/`gt_masks.png` it saw), its answer (`server_response.json`,
+`tiptop_plan.json`) and the execution's outcome (`live_result.json`); a failed round has the request and the error
+only. They are for replaying a round against a planner, not videos: the bench writes no per-round clip. The result
+JSON's `bench.video` names the video and `bench.rounds` lists the rounds with their env step. To re-plan a saved
+round without the simulator (does a planner failure reproduce?):
+
+```bash
+./b1k/bin/python -m omnigibson.tiptop.replay runs/bench_radio/turning_on_radio_301_0/r02_right_toggled_on --port 8766 --repeats 3
+```
 
 The task strategies (`strategies.py`) decide the rounds: `turning_on_radio` picks the radio up with the left
 hand and presses the switch with the right (the second planner on `--press-port` is required: a held radio
@@ -452,3 +469,7 @@ a scripted episode, and the benchmark's summary.
   challenge-style benchmark with task strategies; turning_on_radio 0.7 / 0.7 / 0.6 and assembling_gift_baskets
   0.6375 on the 10 public instances (oracle knowledge, teleported base); cuRobo collision caches sized at build
   time after four CUDA faults.
+- 2026-09-09 (later): the benchmark video ended at the instant the goal predicate flipped, so a press looked
+  unfinished and a failure looked like a success; now the final state stays on screen for 3 s under the verdict,
+  every frame carries the step count, and the file is a fragmented MP4 that plays during and after a killed run. The
+  bench writes no per-round clips (the episode video covers them).
