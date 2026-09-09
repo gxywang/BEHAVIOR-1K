@@ -81,10 +81,65 @@ def resolve_instance_ids(task_name: str, instance_indices: list[int], mode: str 
         else TEST_INSTANCE_IDS[NUM_PUBLIC_TEST_INSTANCES:]
     )
     num_split_instances = NUM_PUBLIC_TEST_INSTANCES if mode == "public_test" else NUM_HIDDEN_TEST_INSTANCES
-    assert set(instance_indices).issubset(
-        set(range(num_split_instances))
-    ), f"Instance indices must be in range({num_split_instances}) for mode {mode}"
+    assert set(instance_indices).issubset(set(range(num_split_instances))), (
+        f"Instance indices must be in range({num_split_instances}) for mode {mode}"
+    )
     return [int(test_instances[i]) for i in instance_indices]
+
+
+def load_task_instance(env, robot: Robot, instance_id: int, mode: str = "public_test") -> None:
+    """Load one pre-sampled task instance into a running BehaviorTask environment: the objects' states and the
+    robot's start pose from the instance file of ``mode`` (train / public_test / hidden_test), settled for 25
+    physics steps with every task entity held still, then written as the scene's initial state and reset to.
+    The robot must already be in a clean configuration (reset the environment first)."""
+    scene_model = env.task.scene_name
+    tro_filename = env.task.get_cached_activity_scene_filename(
+        scene_model=scene_model,
+        activity_name=env.task.activity_name,
+        activity_definition_id=env.task.activity_definition_id,
+        activity_instance_id=instance_id,
+    )
+    tro_file_path = get_task_instance_path(
+        scene_model,
+        f"{scene_model}_task_{env.task.activity_name}_instances/{tro_filename}-tro_state",
+        mode=mode,
+    )
+    if tro_file_path is None:
+        raise FileNotFoundError(
+            f"Could not find 2026 {mode} task instance {instance_id} for {env.task.activity_name} in scene {scene_model}."
+        )
+
+    with open(tro_file_path, "r") as f:
+        tro_state = recursively_convert_to_torch(json.load(f))
+    for tro_key, tro_state in tro_state.items():
+        if tro_key == "robot_poses":
+            presampled_robot_poses = {key.lower(): value for key, value in tro_state.items()}
+            if "robot" in presampled_robot_poses:
+                available_poses = presampled_robot_poses["robot"]
+            elif robot.model in presampled_robot_poses:
+                logger.info("No generic presampled robot pose found, using robot-specific pose.")
+                available_poses = presampled_robot_poses[robot.model]
+            else:
+                raise KeyError(f"No generic or model-specific presampled robot pose found for {robot.model}!")
+            robot.set_position_orientation(available_poses[0]["position"], available_poses[0]["orientation"])
+            env.scene.write_task_metadata(key=tro_key, data=tro_state)
+        else:
+            env.task.object_scope[tro_key].load_state(tro_state, serialized=False)
+
+    if env.task.activity_name in LIGHT_EVAL_TASKS:
+        set_light_control_toggles(env.task.object_scope.values(), True)
+
+    # Keep all task-relevant entities (including the robot/agent) still while the scene settles,
+    # so the snapshotted per-instance initial state is stable.
+    og.sim.update_handles()
+    for _ in range(25):
+        og.sim.step_physics()
+        for inst, entity in env.task.object_scope.items():
+            if not is_system_bddl_inst(inst) and entity is not None:
+                entity.keep_still()
+
+    env.scene.update_initial_file()
+    env.scene.reset()
 
 
 class Evaluator:
@@ -189,8 +244,7 @@ class Evaluator:
                 missing_camera_sensors.append(f"{camera_id}: {sensor_name}")
         if missing_camera_sensors:
             raise ValueError(
-                "Configured eval.camera_sensor_names entries were not found in robot.sensors: "
-                f"{missing_camera_sensors}"
+                f"Configured eval.camera_sensor_names entries were not found in robot.sensors: {missing_camera_sensors}"
             )
 
         if self.cfg.get("write_video", False):
@@ -276,57 +330,7 @@ class Evaluator:
         self._video_writer = video_writer
 
     def load_task_instance(self, instance_id: int) -> None:
-        scene_model = self.env.task.scene_name
-        tro_filename = self.env.task.get_cached_activity_scene_filename(
-            scene_model=scene_model,
-            activity_name=self.env.task.activity_name,
-            activity_definition_id=self.env.task.activity_definition_id,
-            activity_instance_id=instance_id,
-        )
-        mode = self.cfg.get("mode", "public_test")
-        tro_file_path = get_task_instance_path(
-            scene_model,
-            f"{scene_model}_task_{self.env.task.activity_name}_instances/{tro_filename}-tro_state",
-            mode=mode,
-        )
-        if tro_file_path is None:
-            raise FileNotFoundError(
-                f"Could not find 2026 {mode} task instance {instance_id} for "
-                f"{self.env.task.activity_name} in scene {scene_model}."
-            )
-
-        with open(tro_file_path, "r") as f:
-            tro_state = recursively_convert_to_torch(json.load(f))
-        for tro_key, tro_state in tro_state.items():
-            if tro_key == "robot_poses":
-                presampled_robot_poses = {key.lower(): value for key, value in tro_state.items()}
-                if "robot" in presampled_robot_poses:
-                    available_poses = presampled_robot_poses["robot"]
-                elif self.robot.model in presampled_robot_poses:
-                    logger.info("No generic presampled robot pose found, using robot-specific pose.")
-                    available_poses = presampled_robot_poses[self.robot.model]
-                else:
-                    raise KeyError(f"No generic or model-specific presampled robot pose found for {self.robot.model}!")
-                self.robot.set_position_orientation(available_poses[0]["position"], available_poses[0]["orientation"])
-                self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
-            else:
-                self.env.task.object_scope[tro_key].load_state(tro_state, serialized=False)
-
-        if self.should_sync_lights:
-            set_light_control_toggles(self.env.task.object_scope.values(), True)
-
-        # Keep all task-relevant entities (including the robot/agent) still while the scene settles,
-        # so the snapshotted per-instance initial state is stable. The robot must already be in a clean
-        # configuration when this is called -- eval.py resets before load_task_instance for this reason.
-        og.sim.update_handles()
-        for _ in range(25):
-            og.sim.step_physics()
-            for inst, entity in self.env.task.object_scope.items():
-                if not is_system_bddl_inst(inst) and entity is not None:
-                    entity.keep_still()
-
-        self.env.scene.update_initial_file()
-        self.env.scene.reset()
+        load_task_instance(self.env, self.robot, instance_id, mode=self.cfg.get("mode", "public_test"))
         self._reset_light_synchronizer()
 
     def _preprocess_obs(self, obs: dict) -> dict:
@@ -422,4 +426,4 @@ class Evaluator:
         sys.exit(0)
 
 
-__all__ = ["Evaluator", "resolve_instance_ids"]
+__all__ = ["Evaluator", "load_task_instance", "resolve_instance_ids"]

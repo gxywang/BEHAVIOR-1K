@@ -9,9 +9,10 @@ in the tiptop submodule.
 World frame for TiPToP = the robot's ``base_link`` (floor level), which is both ``robot.get_position_orientation()``
 here and the URDF root of the planner model. Capture uses the head camera (``zed_link``) or the left wrist camera,
 in a look posture that swings the arm out of the camera's view; with ``--seg-instance`` the robot's own pixels are
-also removed from the depth. Navigation is out of scope: the base is teleported once, to a pose from which the
-named objects are in reach and in view (``--stand-for``), next to a piece of furniture (``--near``) or to an
-explicit pose.
+also removed from the depth. Navigation is a stand-in: ``best_base_pose`` chooses where to stand for a set of
+objects (in reach, in the camera's view, on free floor), and ``place_robot`` teleports the base there. What the
+simulator knows and the robot could not (object poses, button poses, masks) is read only by ``knowledge.py``'s
+oracle source and by the base-pose search; both are privileged and say so.
 """
 
 import logging
@@ -57,7 +58,10 @@ ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox 
 CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
+AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
+SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
+PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
 
 
 def embodiment_meta_path(robot_type: str = ROBOT_TYPE) -> Path:
@@ -86,6 +90,17 @@ def challenge_task_info(activity: str) -> tuple[str, list[str]]:
     return str(tasks[activity][0]["scene_model"]), list(TASK_NAMES_TO_ROOMS[activity])
 
 
+def bddl_predicate_class(name: str):
+    """The BDDL predicate class for a predicate name as written in a task definition ('ontop', 'toggled_on')."""
+    from omnigibson.utils.bddl_utils import PREDICATE_TO_STATE
+
+    key = name.replace("_", "").lower()
+    for cls in PREDICATE_TO_STATE:
+        if cls.__name__.lower() == key:
+            return cls
+    raise ValueError(f"unknown BDDL predicate {name!r}; known: {sorted(c.__name__ for c in PREDICATE_TO_STATE)}")
+
+
 def bddl_category(bddl_name: str) -> str:
     """'butter_cookie.n.01_2' -> 'butter cookie', 'can__of__soda.n.01_1' -> 'can of soda' (what a detector is asked for)."""
     return bddl_name.split(".n.")[0].replace("__", "_").replace("_", " ")
@@ -111,13 +126,16 @@ def make_r1pro_env_config(
     activity_instance_id: int = 0,
     load_room_instances=None,
     segmentation: bool = True,
+    max_steps: int = 10**8,
 ) -> dict:
     """OmniGibson config: BEHAVIOR scene + R1Pro with absolute joint controllers on every group.
 
     Spawned objects start high above the floor and are placed onto furniture by R1ProSim.place_on(). With
     ``activity`` the scene is a challenge task instance (BehaviorTask, pre-sampled objects, the evaluator's rooms).
-    ``segmentation=False`` renders rgb + depth only (what the challenge allows); ground-truth masks then come from
-    object geometry instead of the annotator, and the robot is not masked out of the depth.
+    ``segmentation=False`` renders rgb + depth only (what the challenge allows); oracle masks then come from object
+    geometry instead of the annotator, and the robot is not masked out of the depth. ``max_steps`` is the task's own
+    timeout (env steps), the challenge's 1.5x mean human demonstration length in a benchmark; effectively none
+    otherwise.
 
     Cameras: the robot camera TiPToP uses renders rgb only (video); an external "shadow" VisionSensor with the same
     intrinsics provides rgb + depth_linear + seg_instance for the capture frame after being moved onto the robot
@@ -175,7 +193,7 @@ def make_r1pro_env_config(
             "online_object_sampling": False,
             "debug_object_sampling": False,
             "highlight_task_relevant_objects": False,
-            "termination_config": {"max_steps": 10**8},
+            "termination_config": {"max_steps": int(max_steps)},
             "reward_config": {"r_potential": 1.0},
             "include_obs": False,
         }
@@ -332,9 +350,11 @@ class R1ProSim(TiptopSim):
         """Translate BDDL goal atoms (inside/ontop/on/nextto/holding/toggled_on over BDDL names) for TiPToP.
 
         Returns the labels the request names and the atoms in TiPToP's predicates. Per instance ('candle_1', with
-        ground-truth masks) or per category ('candle': the detector finds every instance and the goal takes the
+        oracle masks) or per category ('candle': the detector finds every instance and the goal takes the
         best-scoring one, since the task does not care which candle goes into which basket). toggled_on(obj)
-        becomes pressed(<label>_button): the button is described by pose in the request (button_hints).
+        becomes pressed(<label>_button): the button is described by pose (button_hints) or found by the detector.
+        A table or floor named as a support becomes the planner's own support plane, "table" (whatever horizontal
+        plane the objects in view rest on), so an object can be put down where the robot stands.
         """
         predicates = {
             "inside": "on",
@@ -347,6 +367,8 @@ class R1ProSim(TiptopSim):
         label_of = {bddl: label for label, bddl in self.bddl_names.items()}
 
         def name(arg):
+            if bddl_category(arg) in SUPPORT_CATEGORIES:
+                return PLANNER_SUPPORT  # the planner's name for the support plane under the objects it sees
             if arg not in label_of:
                 raise ValueError(f"goal names {arg!r}, which is not a tracked task object: {sorted(label_of)}")
             return bddl_category(arg).replace(" ", "_") if category_level else label_of[arg]
@@ -396,6 +418,12 @@ class R1ProSim(TiptopSim):
         terms = list(getattr(head, "terms", []))
         return f"{terms[0]}({', '.join(terms[1:])})" if terms else str(head)
 
+    def holds(self, predicate: str, *bddl_names: str) -> bool:
+        """Evaluate any BDDL predicate ("ontop", "inside", "toggled_on", ...) over task objects with the task's own
+        evaluator (privileged: the simulator's object states; a benchmark strategy uses it where the pipeline has
+        no perception of its own yet)."""
+        return bool(self.env.task._evaluate_predicate(bddl_predicate_class(predicate), *bddl_names))
+
     def predicate_holds(self, name: str, *bddl_names: str) -> bool:
         """Evaluate one grounded goal predicate (e.g. inside(item, container)) exactly as the challenge scorer does."""
         task = self.env.task
@@ -411,34 +439,41 @@ class R1ProSim(TiptopSim):
         """Request label of an object's toggle button ('radio_receiver_1' -> 'radio_receiver_1_button')."""
         return f"{label}_button"
 
-    def button_hints(self, atoms: list[dict], category_level: bool = False) -> dict:
-        """The toggle button of every toggled_on goal object, for the request's gt_buttons: base-frame position,
-        outward normal of the face it sits on, and the radius within which OmniGibson's ToggledOn counts a finger."""
+    def button_world(self, bddl: str) -> tuple[np.ndarray, np.ndarray, float]:
+        """A toggle button as the simulator knows it (privileged): world position, the outward unit normal of the
+        object face it sits on (from the object's own mesh), and the radius within which ToggledOn counts a finger."""
         from omnigibson.object_states import ToggledOn
 
+        obj = self.scene_object(bddl)
+        if ToggledOn not in obj.states:
+            raise ValueError(f"{bddl} has no toggle button (no ToggledOn state)")
+        state = obj.states[ToggledOn]
+        pos_w = state.link.get_position_orientation()[0].cpu().numpy().astype(np.float64)
+        obj_pos, obj_quat = obj.get_position_orientation()
+        rot = T.quat2mat(obj_quat).cpu().numpy().astype(np.float64)
+        vertices, _ = self.mesh_local(obj)  # the object's own frame
+        p_local = rot.T @ (pos_w - obj_pos.cpu().numpy().astype(np.float64))
+        n_world = rot @ face_normal_local(vertices, p_local)
+        radius = float(th.min(state.visual_marker.extent * state.scale * state.link.scale))
+        return pos_w, n_world, radius
+
+    def button_hints(self, atoms: list[dict], category_level: bool = False) -> dict:
+        """The toggle button of every toggled_on goal object, for the request's gt_buttons (privileged): base-frame
+        position, outward normal of the face it sits on, and the radius within which ToggledOn counts a finger."""
         out = {}
         for atom in atoms:
             if atom["predicate"] != "toggled_on":
                 continue
             (bddl,) = atom["args"]
-            obj = self.scene_object(bddl)
-            if ToggledOn not in obj.states:
-                raise ValueError(f"{bddl} has no toggle button (no ToggledOn state)")
-            state = obj.states[ToggledOn]
-            pos_w = state.link.get_position_orientation()[0]
-            obj_pos, obj_quat = obj.get_position_orientation()
-            rot = T.quat2mat(obj_quat).cpu().numpy().astype(np.float64)
-            vertices, _ = self.mesh_local(obj)  # the object's own frame
-            p_local = rot.T @ (pos_w.cpu().numpy().astype(np.float64) - obj_pos.cpu().numpy().astype(np.float64))
-            n_world = rot @ face_normal_local(vertices, p_local)
+            pos_w, n_world, radius = self.button_world(bddl)
             identity = th.tensor([0.0, 0.0, 0.0, 1.0])
-            pos_b, _ = self.to_base(pos_w, identity)
-            tip_b, _ = self.to_base(pos_w + th.tensor(n_world, dtype=pos_w.dtype), identity)
+            pos_b, _ = self.to_base(th.tensor(pos_w, dtype=th.float32), identity)
+            tip_b, _ = self.to_base(th.tensor(pos_w + n_world, dtype=th.float32), identity)
             label = bddl_category(bddl).replace(" ", "_") if category_level else self.label_of(bddl)
             out[self.button_label(label)] = {
                 "position": [float(v) for v in pos_b],
                 "normal": [float(v) for v in (tip_b - pos_b)],
-                "radius": float(th.min(state.visual_marker.extent * state.scale * state.link.scale)),
+                "radius": radius,
             }
             log.info(
                 f"button of {bddl}: {self.button_label(label)} at {np.round(out[self.button_label(label)]['position'], 3).tolist()} "
@@ -446,6 +481,10 @@ class R1ProSim(TiptopSim):
                 f"radius {out[self.button_label(label)]['radius']:.3f} m"
             )
         return out
+
+    def tracked_label(self, name: str) -> str:
+        """The tracked label of an object named in a goal atom: BDDL name -> per-instance label; a label stays."""
+        return self.label_of(name) if name in self.bddl_names.values() else name
 
     def label_of(self, bddl: str) -> str:
         """Request label of a tracked task object ('radio_receiver.n.01_1' -> 'radio_receiver_1')."""
@@ -465,113 +504,6 @@ class R1ProSim(TiptopSim):
 
         state = self.scene_object(bddl).states[ToggledOn]
         return {"toggled_on": bool(state.get_value()), "finger_on_button_steps": int(state.robot_can_toggle_steps)}
-
-    def base_hint(self, name: str) -> list[float]:
-        """Where a scene/task object is, in the robot base frame (TiPToP's world frame)."""
-        obj = self.scene_object(name)
-        pos_b, _ = self.to_base(obj.aabb_center, th.tensor([0.0, 0.0, 0.0, 1.0]))
-        return [float(v) for v in pos_b]
-
-    def _stage_geometry(self, name: str, support: str):
-        """Support AABB, the object's xy half extents and the AABBs of whatever else stands on the support's top."""
-        obj, sup = self.scene_object(name), self.scene_object(support)
-        lo, hi = [v.cpu().numpy() for v in sup.aabb]
-        olo, ohi = [v.cpu().numpy() for v in obj.aabb]
-        hx, hy = (ohi[0] - olo[0]) / 2, (ohi[1] - olo[1]) / 2
-        skip = {obj, sup, self.robot} | {self.scene_object(n) for n in self.contents_of(name)}
-        others = []
-        for other in self.env.scene.objects:
-            if other in skip:
-                continue
-            alo, ahi = [v.cpu().numpy() for v in other.aabb]
-            if ahi[2] < hi[2] - 0.02 or alo[2] > hi[2] + 0.6:
-                continue  # below the top or far above it
-            if ahi[0] < lo[0] or alo[0] > hi[0] or ahi[1] < lo[1] or alo[1] > hi[1]:
-                continue  # not over the support
-            others.append((alo, ahi))
-        return lo, hi, hx, hy, others
-
-    def free_spots_on(
-        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03
-    ) -> list[tuple[float, float, float]]:
-        """Every (x, y, gap) in world xy where ``name`` fits on top of ``support`` without overlapping anything.
-
-        (x, y) is taken as the object's AABB center (a ``step`` grid over the top, ``edge`` in from its rim; place_on
-        puts the object's origin there), gap the clearance to the nearest other object on the support (at least
-        ``clearance``).
-        """
-        lo, hi, hx, hy, others = self._stage_geometry(name, support)
-        spots = []
-        for x in np.arange(lo[0] + edge + hx, hi[0] - edge - hx + 1e-6, step):
-            for y in np.arange(lo[1] + edge + hy, hi[1] - edge - hy + 1e-6, step):
-                gap = min(
-                    (
-                        max(alo[0] - (x + hx), (x - hx) - ahi[0], alo[1] - (y + hy), (y - hy) - ahi[1])
-                        for alo, ahi in others
-                    ),
-                    default=1.0,
-                )
-                if gap < clearance:
-                    continue
-                spots.append((float(x), float(y), float(gap)))
-        return spots
-
-    def free_spot_on(
-        self, name: str, support: str, clearance: float = 0.02, edge: float = 0.04, step: float = 0.03, near=None
-    ):
-        """(dx, dy) from the support's center where ``name`` fits on top of it without overlapping anything.
-
-        Picks the spot with the most clearance, or the free spot closest to ``near`` (world xy) when given.
-        """
-        spots = self.free_spots_on(name, support, clearance=clearance, edge=edge, step=step)
-        if not spots:
-            others = self._stage_geometry(name, support)[-1]
-            raise RuntimeError(f"no free spot for {name} on {support} ({len(others)} objects on it)")
-        if near is not None:
-            near = np.asarray(near, dtype=np.float64)  # float64 like the grid (numpy >= 2 would narrow to float32)
-            x, y, gap = min(spots, key=lambda s: float(np.hypot(s[0] - near[0], s[1] - near[1])))
-        else:
-            x, y, gap = max(spots, key=lambda s: s[2])
-        lo, hi = [v.cpu().numpy() for v in self.scene_object(support).aabb]
-        cx, cy = ((lo + hi) / 2)[:2].tolist()
-        log.info(f"free spot for {name} on {support}: ({x:.2f}, {y:.2f}), clearance {gap:.2f} m")
-        return x - cx, y - cy
-
-    def contents_of(self, container: str) -> list[str]:
-        """Tracked task objects whose AABB center lies inside the container's AABB."""
-        lo, hi = [v.cpu().numpy() for v in self.scene_object(container).aabb]
-        inside = []
-        for label, bddl in self.bddl_names.items():
-            if bddl == container:
-                continue
-            c = self.objects[label].aabb_center.cpu().numpy()
-            if np.all(c > lo) and np.all(c < hi):
-                inside.append(bddl)
-        return inside
-
-    def move_with_contents(self, container: str, position, orientation=None) -> None:
-        """Teleport a container and whatever sits inside it by the same offset (stand-in for carrying it)."""
-        obj = self.scene_object(container)
-        pos0, quat0 = obj.get_position_orientation()
-        delta = th.as_tensor(position, dtype=th.float32) - pos0
-        contents = self.contents_of(container)
-        for name in [container, *contents]:
-            o = self.scene_object(name)
-            p, q = o.get_position_orientation()
-            quat = q if name != container or orientation is None else th.as_tensor(orientation, dtype=th.float32)
-            o.set_position_orientation(position=p + delta, orientation=quat)
-            o.keep_still()
-        log.info(f"moved {container} with {contents} by {np.round(delta.numpy(), 3).tolist()}")
-
-    def place_on_with_contents(self, container: str, support: str, dx: float, dy: float, lift: float = 0.01) -> None:
-        """place_on() for a container that may already hold items: they travel with it."""
-        obj, sup = self.scene_object(container), self.scene_object(support)
-        lo, hi = [v.cpu().numpy() for v in sup.aabb]
-        olo, ohi = [v.cpu().numpy() for v in obj.aabb]
-        center = (lo + hi) / 2
-        pos = obj.get_position_orientation()[0].numpy()
-        z = hi[2] + lift + (pos[2] - olo[2])  # keep the object's own origin height above its bottom
-        self.move_with_contents(container, [center[0] + dx, center[1] + dy, z])
 
     def mark_goal_initial(self) -> None:
         """Remember which goal predicates already hold, as the challenge metric does (no credit for those)."""
@@ -715,12 +647,12 @@ class R1ProSim(TiptopSim):
         return 0.5 * math.hypot(ex, ey)
 
     def best_base_pose(
-        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, support_z=None
+        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, support_z=None, avoid=()
     ) -> tuple[tuple | None, dict]:
         """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
         the left arm's reach.
 
-        Candidates on rings around the points' centroid, facing it; scored by the farthest point's distance and
+        Candidates on rings (0.25 m to ``reach``) around the points' centroid, facing it; scored by the farthest point's distance and
         how far left the points are (lower is better), rejected when a point is behind the robot, well to its right,
         out of reach, outside the head camera's view, hidden behind the container, or the footprint is not free
         (``ignore``: objects that do not count; ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken
@@ -729,7 +661,8 @@ class R1ProSim(TiptopSim):
         ``half_widths``: each point's xy radius, so the view test can keep the object's *edges* in frame and not just
         its centre; None reproduces the point test for callers that pass bare positions. ``support_z``: the world
         height each object stands at (one value, or one per point), so the head camera's reach for it can be
-        measured (``camera_floor_distance``); None skips that test.
+        measured (``camera_floor_distance``); None skips that test. ``avoid``: (x, y) poses already tried; candidates
+        within ``AVOID_RADIUS`` of one are rejected, so a retry gets a different viewpoint.
         Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
         """
         pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
@@ -746,9 +679,12 @@ class R1ProSim(TiptopSim):
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         best, rejected, footprint = None, {}, {}  # footprint: (x, y) -> _footprint_free result (yaw-independent)
-        for radius in np.arange(0.25, 0.95, 0.05):
+        for radius in np.arange(0.25, reach + 0.05, 0.05):  # rings out to the reach itself
             for angle in np.arange(0.0, 2 * np.pi, np.pi / 18):
                 x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
+                if any(np.hypot(x - ax, y - ay) < AVOID_RADIUS for ax, ay in avoid):
+                    rejected["tried before"] = rejected.get("tried before", 0) + 1
+                    continue
                 for yaw_offset in np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12):
                     yaw = np.arctan2(mid[1] - y, mid[0] - x) + yaw_offset
                     fwd, left = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
@@ -803,24 +739,30 @@ class R1ProSim(TiptopSim):
                             rejected[why] = rejected.get(why, 0) + 1
         return best, rejected
 
-    def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9) -> dict:
+    def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9, avoid=()) -> dict:
         """Stand where every item and the target (the last name) are in the left arm's reach ("navigation done").
 
-        A single name is a target with no items (a one-object task such as turning_on_radio).
-        ignore_names: objects that do not count as obstacles, resolved like place_robot_near's (unknown names raise).
+        A single name is a target with no items (a one-object task such as turning_on_radio). ignore_names:
+        objects that do not count as obstacles, resolved like place_robot_near's (unknown names raise). Objects
+        the robot holds never count (they travel with it). ``avoid``: (x, y) poses not to stand at again.
         """
         if not names:
             raise ValueError("place_robot_for needs [ITEM,...,]TARGET")
         objects = [self.scene_object(n) for n in names]
         points = [o.aabb_center.cpu().numpy()[:2] for o in objects]
         support_z = [float(o.aabb[0][2]) for o in objects]  # each object's bottom: the top of what it stands on
-        ignore = [self.scene_object(n) for n in ignore_names]
+        ignore = [self.scene_object(n) for n in ignore_names] + [self.objects[l] for l in (self.grasped_labels() or {})]
         log.info(
             f"head camera at z {float(self.robot_cam.get_position_orientation()[0][2]):.2f} m sees a surface at "
             f"z {min(support_z):.2f} from {self.camera_floor_distance(min(support_z)):.2f} m ahead"
         )
         best, rejected = self.best_base_pose(
-            points, ignore=ignore, reach=reach, half_widths=[self.xy_radius(n) for n in names], support_z=support_z
+            points,
+            ignore=ignore,
+            reach=reach,
+            half_widths=[self.xy_radius(n) for n in names],
+            support_z=support_z,
+            avoid=avoid,
         )
         if best is None:
             raise RuntimeError(
@@ -836,9 +778,12 @@ class R1ProSim(TiptopSim):
         return self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
+        """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
+        grasp assist along with the robot, so a carried object stays in the gripper."""
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
+        self.teleports = getattr(self, "teleports", 0) + 1
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
         # back at the chest, where both hands and what they hold are in view ("front", the two-hands demo)
@@ -893,6 +838,18 @@ class R1ProSim(TiptopSim):
             raise RuntimeError(
                 f"simulator does not hold the planner's locked posture: {worst} off by {errs[worst]:.3f} rad"
             )
+
+    def reset_embodiment(self, embodiment: dict) -> None:
+        """Plan ``embodiment``'s arm from the start of a fresh episode, no questions asked (``apply_posture`` follows
+        and teleports the joints): the other arm's gripper opens, the look posture is back, the mirror follows."""
+        self.arm = embodiment["arm"]
+        self.other_arm = "right" if self.arm == "left" else "left"
+        self.other_gripper = self.OPEN
+        self.planned_joints = list(embodiment["joint_names"])
+        self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
+        self.gripper_idx = self.robot.gripper_control_idx[self.arm]
+        self.look_arm = LOOK_ARM
+        self.mirror_arm_idx = self.mirror_gripper_idx = None
 
     def adopt_embodiment(self, embodiment: dict, tol: float = 0.05) -> None:
         """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
@@ -961,17 +918,19 @@ class R1ProSim(TiptopSim):
         return float(ahead[0])
 
     # ---------------------------------------------------------------- observation
-    def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
-        """Look with the arm out of the head camera's view, then return to the ready posture the plan starts from."""
-        if self.look_arm is None:
-            return super().capture(task, gt_labels=gt_labels, gt_atoms=gt_atoms)
+    def capture(self, task: str) -> tuple[dict, dict]:
+        """Look with the arm out of the head camera's view, then return to the ready posture the plan starts from.
+        A hand that holds something stays where it is: the held object is what the next plan is about and must be
+        seen, and the gripper keeps its command (the swing used to open it and drop the object)."""
+        if self.look_arm is None or self.arm in (self.hands() or {}).values():
+            return super().capture(task)
         ready = list(self.q_home)
         unknown = set(self.look_arm) - set(self.planned_joints)
         assert not unknown, f"look posture names joints the planner does not move: {unknown}"
         look = [float(self.look_arm.get(j, v)) for j, v in zip(self.planned_joints, ready)]
-        self.hold(LOOK_SETTLE_STEPS, self.OPEN, q_arm=look)
-        request, extras = super().capture(task, gt_labels=gt_labels, gt_atoms=gt_atoms)
-        self.hold(LOOK_SETTLE_STEPS, self.OPEN, q_arm=ready)
+        self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=look)
+        request, extras = super().capture(task)
+        self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=ready)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > 0.03:

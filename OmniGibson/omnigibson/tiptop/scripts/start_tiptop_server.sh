@@ -15,8 +15,17 @@ unset LD_LIBRARY_PATH  # the pixi env ships its own CUDA libraries; host CUDA on
 if [ -n "${TIPTOP_GPU:-}" ]; then export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$TIPTOP_GPU"; fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${TIPTOP_DIR:-$HERE/../../../../tiptop}"
-exec pixi run tiptop-server --config "${TIPTOP_CONFIG:-tiptop/config/tiptop_sim_panda.yml}" \
-  --host "${TIPTOP_HOST:-127.0.0.1}" --port "${TIPTOP_PORT:-8765}" --num-particles "${TIPTOP_PARTICLES:-128}" \
-  --max-planning-time "${TIPTOP_MAX_PLANNING_TIME:-30}" --rerun-mode "${TIPTOP_RERUN_MODE:-serve}" \
-  --rerun-url "${TIPTOP_RERUN_URL:-rerun+http://127.0.0.1:9876/proxy}" \
-  --rerun-web-port "${TIPTOP_RERUN_WEB_PORT:-9090}" --rerun-grpc-port "${TIPTOP_RERUN_GRPC_PORT:-9876}" "$@"
+# A CUDA fault (an illegal memory access inside cuRobo, seen a few times on the shared box) poisons the process: every
+# later plan fails at once. The server then exits with code 3 and is relaunched here; clients wait for /health.
+set +e
+while true; do
+  pixi run tiptop-server --config "${TIPTOP_CONFIG:-tiptop/config/tiptop_sim_panda.yml}" \
+    --host "${TIPTOP_HOST:-127.0.0.1}" --port "${TIPTOP_PORT:-8765}" --num-particles "${TIPTOP_PARTICLES:-128}" \
+    --max-planning-time "${TIPTOP_MAX_PLANNING_TIME:-30}" --rerun-mode "${TIPTOP_RERUN_MODE:-serve}" \
+    --rerun-url "${TIPTOP_RERUN_URL:-rerun+http://127.0.0.1:9876/proxy}" \
+    --rerun-web-port "${TIPTOP_RERUN_WEB_PORT:-9090}" --rerun-grpc-port "${TIPTOP_RERUN_GRPC_PORT:-9876}" "$@"
+  code=$?
+  [ "$code" -eq 3 ] || exit "$code"
+  echo "tiptop-server exited after a CUDA fault; relaunching" >&2
+  sleep 2
+done

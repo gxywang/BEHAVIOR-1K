@@ -86,7 +86,8 @@ class PlanExecutor:
         self.converge_tol = converge_tol
         self.converge_max_steps = converge_max_steps
         self.press_done = press_done
-        self.gripper = sim.OPEN
+        # start from the gripper's current command: a plan for an object already in the hand must keep it closed
+        self.gripper = getattr(sim, "last_gripper", sim.OPEN)
         self.n_steps = 0
         self.close_eef = None  # base-frame eef pose at the last gripper close (where a held object was taken)
 

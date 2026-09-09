@@ -337,7 +337,7 @@ def test_press_stops_only_the_press_segment_and_the_back_off_runs():
 def test_button_tracker_carries_a_detected_button_through_a_grasp():
     import numpy as np
 
-    from omnigibson.tiptop.scene import ButtonTracker
+    from omnigibson.tiptop.knowledge import ButtonTracker
 
     def pose(yaw, xyz):
         c, s = np.cos(yaw), np.sin(yaw)
@@ -383,3 +383,26 @@ def test_block_grasping_wraps_the_robot_for_both_call_styles():
     sim.block_grasping(None)  # every arm
     assert sim.robot._calculate_in_hand_object(arm="left") is None
     sim.unblock_grasping()
+
+
+def test_executor_keeps_a_closed_gripper_at_the_start_of_a_plan():
+    from omnigibson.tiptop.executor import PlanExecutor
+
+    sim = _FakeSim(flip_at=10**9)
+    sim.last_gripper = sim.CLOSE  # an object is in the hand from an earlier plan
+    executor = PlanExecutor(sim, gripper_hold_steps=1)
+    plan = {
+        "q_init": np.zeros(1, dtype=np.float32),
+        "steps": [
+            {
+                "type": "trajectory",
+                "label": "Place(a, grasp0, p1, table, q1)",
+                "positions": np.zeros((3, 1), np.float32),
+                "velocities": None,
+                "dt": sim.dt,
+            },
+            {"type": "gripper", "label": "Place(a, grasp0, p1, table, q1)", "action": "open"},
+        ],
+    }
+    executor.execute(plan)
+    assert sim.gripper_log[0] == sim.CLOSE and sim.gripper_log[-1] == sim.OPEN

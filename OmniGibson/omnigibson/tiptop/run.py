@@ -5,11 +5,13 @@ Run inside the sim env with OMNIGIBSON_HEADLESS=1 (or unset it for the GUI):
   python -m omnigibson.tiptop.run capture --out-dir runs/scene1
   python -m omnigibson.tiptop.run replay  --plan <tiptop_plan.json> --scene runs/scene1/capture.json --out-dir runs/replay
   python -m omnigibson.tiptop.run live    --host localhost --port 8765 --out-dir runs/live
-  python -m omnigibson.tiptop.run task    --embodiment r1pro --activity <task> --stage-support <furniture> --out-dir runs/task
 
-`capture` writes obs.h5 (droid-sim-evals layout + ground-truth masks) for `tiptop-h5`; `live` talks to `tiptop-server`
-and, unless --no-state-stream, mirrors the simulator into the server's Rerun view for the whole session; `task` works
-through a challenge task's whole inside(item, container) goal with a fresh base pose per transfer.
+`capture` writes obs.h5 (droid-sim-evals layout + the knowledge source's masks) for `tiptop-h5`; `live` talks to
+`tiptop-server` and, unless --no-state-stream, mirrors the simulator into the server's Rerun view for the whole
+session. A whole challenge task on its test instances is `python -m omnigibson.tiptop.bench`.
+
+What the planner is told beyond the image is chosen with --knowledge (see knowledge.py): `oracle` reads the
+simulator (masks, button poses; privileged, for development), `onboard` sends only what an agent knows.
 """
 
 import argparse
@@ -36,8 +38,13 @@ def parse_goal(goal: str) -> list[dict]:
     return atoms
 
 
+def atom_text(atoms: list[dict]) -> str:
+    return "; ".join(f"{a['predicate']}({', '.join(a['args'])})" for a in atoms)
+
+
 EXPECTED_ROBOT_TYPE = {"franka": "panda", "r1pro": "r1pro_left"}
 EXPECTED_DOF = {"franka": 7, "r1pro": None}  # r1pro: set from the server's embodiment metadata in check_embodiment()
+PRESS_ROBOT_TYPE = "r1pro_right"  # the second planner of a two-hands run
 
 
 def add_common(p: argparse.ArgumentParser) -> None:
@@ -86,7 +93,7 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="load a BEHAVIOR challenge task instead of spawning objects (e.g. assembling_gift_baskets); "
         "--goal then uses BDDL names, e.g. 'inside(candle.n.01_1,wicker_basket.n.01_1)'",
     )
-    r1.add_argument("--activity-instance", type=int, default=0, help="task instance id (0 = the template)")
+    r1.add_argument("--activity-instance", type=int, default=0, help="training instance id (0 = the template)")
     r1.add_argument(
         "--place",
         action="append",
@@ -103,16 +110,18 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "for a one-object task (navigation stand-in; alternative to --near / --robot-pose)",
     )
     p.add_argument(
-        "--no-gt",
-        action="store_true",
-        help="competition-style perception: send just the task's object names and goal atoms, no ground-truth masks "
-        "(the server runs its detector + SAM2 on the image)",
+        "--knowledge",
+        default="oracle",
+        choices=["oracle", "onboard"],
+        help="what the planner is told beyond the image: 'oracle' reads the simulator (instance masks, button poses; "
+        "privileged, for development), 'onboard' sends only the task's object names, the goal and the gripper "
+        "state, and the planner's detector does the rest",
     )
     r1.add_argument(
         "--seg-instance",
         action="store_true",
-        help="render Isaac instance segmentation on the capture camera; ground-truth masks otherwise come from object "
-        "geometry; the annotator segfaults in large BEHAVIOR scenes",
+        help="render Isaac instance segmentation on the capture camera (oracle masks then come from it instead of "
+        "the objects' geometry); the annotator segfaults in large BEHAVIOR scenes",
     )
     r1.add_argument(
         "--no-look", action="store_true", help="capture in the ready posture instead of swinging the arm out of view"
@@ -143,11 +152,6 @@ def add_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--grasping-mode", default="physical", choices=["physical", "assisted", "sticky"])
     p.add_argument("--settle-steps", type=int, default=90, help="env steps to let objects settle after reset")
-    p.add_argument(
-        "--gt-buttons",
-        action="store_true",
-        help="with --no-gt: still describe toggle buttons by their true pose instead of detecting them",
-    )
     p.add_argument("--no-video", action="store_true")
     p.add_argument(
         "--overview",
@@ -163,6 +167,23 @@ def add_common(p: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help="finger drive force in N (USD default 20; real Franka hand 70)",
+    )
+
+
+def add_planner_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--host", default="localhost")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--plan-timeout", type=float, default=900.0)
+    p.add_argument(
+        "--no-state-stream", action="store_true", help="do not mirror the simulator into the server's Rerun view"
+    )
+    p.add_argument("--press-host", default=None, help="host of the planner for the other arm (default --host)")
+    p.add_argument(
+        "--press-port",
+        type=int,
+        default=None,
+        help="a second tiptop-server on this port plans the other arm (r1pro_right) for rounds whose goals are all "
+        "toggled_on(...): the first arm keeps holding what it picked up",
     )
 
 
@@ -183,14 +204,9 @@ def parse_spawns(specs, flag: str = "--spawn") -> list[tuple[str, str, float, fl
     return spawns
 
 
-def build_r1pro_sim(args, embodiment: dict | None):
-    from omnigibson.tiptop.r1pro import (
-        HEAD_APERTURE_MM,
-        ROBOT_TYPE,
-        R1ProSim,
-        load_embodiment_meta,
-        make_r1pro_env_config,
-    )
+def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
+    """The R1Pro in the scene the arguments describe, in the planner's posture, standing where they say."""
+    from omnigibson.tiptop.r1pro import HEAD_APERTURE_MM, R1ProSim, make_r1pro_env_config
 
     spawns, places = parse_spawns(args.spawn), parse_spawns(args.place, flag="--place")
     scene_model, room_instances = args.scene_model, None
@@ -212,20 +228,50 @@ def build_r1pro_sim(args, embodiment: dict | None):
         activity=args.activity,
         activity_instance_id=args.activity_instance,
         load_room_instances=room_instances,
-        segmentation=args.seg_instance,  # the annotator is opt-in; masks come from geometry
+        segmentation=args.seg_instance,  # the annotator is opt-in; oracle masks come from geometry
+        max_steps=max_steps,
     )
     sim = R1ProSim(cfg, camera=args.camera)
     sim.overview_view = args.overview
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
-    sim.track_context(
-        *{support for _, support, _, _ in places + spawns}, args.near, getattr(args, "stage_support", None)
-    )
+    sim.track_context(*{support for _, support, _, _ in places + spawns}, args.near)
     for name, support, dx, dy in places:
         sim.place_on(name, support, dx, dy)  # settles during the holds below
     if args.no_look:
         sim.look_arm = None
+    apply_embodiment_posture(sim, args, embodiment)
+    if args.robot_pose:
+        sim.place_robot(*args.robot_pose)
+    elif args.stand_for:
+        sim.place_robot_for(*[n for n in args.stand_for.split(",") if n], ignore_names=[sp[0] for sp in spawns])
+    elif args.near:
+        sim.place_robot_near(args.near, side=args.side, standoff=args.standoff, ignore_names=[sp[0] for sp in spawns])
+    else:
+        log.info("no --stand-for / --near / --robot-pose: the robot stays where the scene put it")
+    for preset, support, dx, dy in spawns:
+        sim.place_on(preset, support, dx, dy)
+    sim.track(*[n for n in args.scene_objects.split(",") if n])
+    if args.scene:
+        with open(args.scene) as f:
+            poses = json.load(f)["extras"]["object_poses_world"]
+        sim.apply_object_poses({k: v for k, v in poses.items() if k in sim.objects})
+        log.info(f"applied object poses from {args.scene}")
+    if args.finger_max_effort is not None:
+        sim.set_finger_max_effort(args.finger_max_effort)
+    sim.hold(args.settle_steps, sim.OPEN)
+    if args.activity:
+        sim.mark_goal_initial()
+        log.info(f"task goal at start: {sim.goal_status()}")
+    return sim
+
+
+def apply_embodiment_posture(sim, args, embodiment: dict | None) -> dict:
+    """Hold the planner's locked joints and go to its home pose (``--torso`` overrides the torso entries); the
+    embodiment comes from the server metadata or a plan's provenance, else from the submodule's meta file."""
+    from omnigibson.tiptop.r1pro import ROBOT_TYPE, load_embodiment_meta
+
     if embodiment is None:
         embodiment = load_embodiment_meta()
         log.info(f"posture from {embodiment['robot_type']} meta file (no server metadata / plan provenance)")
@@ -251,29 +297,7 @@ def build_r1pro_sim(args, embodiment: dict | None):
     sim.apply_posture(
         embodiment["locked_joints"], q_home, settle_steps=args.settle_steps, joint_names=embodiment["joint_names"]
     )
-    if args.robot_pose:
-        sim.place_robot(*args.robot_pose)
-    elif args.stand_for:
-        sim.place_robot_for(*[n for n in args.stand_for.split(",") if n], ignore_names=[sp[0] for sp in spawns])
-    elif args.near:
-        sim.place_robot_near(args.near, side=args.side, standoff=args.standoff, ignore_names=[sp[0] for sp in spawns])
-    else:
-        log.warning("no --near / --robot-pose: the robot stays where the scene put it")
-    for preset, support, dx, dy in spawns:
-        sim.place_on(preset, support, dx, dy)
-    sim.track(*[n for n in args.scene_objects.split(",") if n])
-    if args.scene:
-        with open(args.scene) as f:
-            poses = json.load(f)["extras"]["object_poses_world"]
-        sim.apply_object_poses({k: v for k, v in poses.items() if k in sim.objects})
-        log.info(f"applied object poses from {args.scene}")
-    if args.finger_max_effort is not None:
-        sim.set_finger_max_effort(args.finger_max_effort)
-    sim.hold(args.settle_steps, sim.OPEN)
-    if args.activity:
-        sim.mark_goal_initial()
-        log.info(f"task goal at start: {sim.goal_status()}")
-    return sim
+    return embodiment
 
 
 def build_sim(args, embodiment: dict | None = None):
@@ -295,55 +319,20 @@ def build_sim(args, embodiment: dict | None = None):
     return sim
 
 
-def do_capture(
-    sim, args, out_dir: Path, atoms: list[dict] | None = None, hints: dict | None = None
-) -> tuple[dict, dict]:
+def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bool = False) -> tuple[dict, dict]:
+    """Render, attach what the knowledge source knows about ``atoms``, validate, and save the observation."""
     import imageio
 
+    from omnigibson.tiptop.knowledge import GoalNotVisible
     from omnigibson.tiptop.protocol import save_observation_h5
 
-    atoms = parse_goal(args.goal) if atoms is None else list(atoms)
-    no_gt = args.no_gt
-    if args.activity:
-        # BDDL names -> request labels; --no-gt asks the detector for categories (any candle will do)
-        labels, atoms = sim.tiptop_goal(atoms, category_level=no_gt)
-    else:
-        labels = sorted({a for atom in atoms for a in atom["args"] if a in sim.objects})
-    if no_gt:  # no segmentation rendered: send the names and the goal, no masks
-        request, extras = sim.capture(args.task)
-        request["gt_labels"], request["gt_atoms"] = list(labels), list(atoms)
-        if hints:
-            request["goal_hints"] = {k: [float(v) for v in vals] for k, vals in hints.items()}
-    else:
-        try:
-            request, extras = sim.capture(args.task, gt_labels=labels, gt_atoms=atoms)
-        except ValueError:
-            if sim.last_capture_rgb is not None:  # what the camera saw when a goal object was missing
-                imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
-            raise
-    # toggle buttons: described by pose (gt_buttons) with ground-truth masks or --gt-buttons, for every button the
-    # whole goal presses, in every round (the pick round chooses a grasp that presents it); with --no-gt the planner
-    # looks for "<object>_button" in a zoomed view of the object, so the label goes into gt_labels
-    buttons = (
-        sim.button_hints(parse_goal(args.goal), category_level=no_gt)
-        if args.activity and (not no_gt or args.gt_buttons)
-        else {}
-    )
-    if buttons:
-        request["gt_buttons"] = buttons
-    elif no_gt:
-        # every button the whole goal presses, in every round: seen on the table before the pick, its detected pose
-        # is carried through the grasp (ButtonTracker) and sent as a prior a fresh detection may override
-        _, goal_atoms = sim.tiptop_goal(parse_goal(args.goal), category_level=True)
-        button_labels = {a for atom in goal_atoms if atom["predicate"] == "pressed" for a in atom["args"]}
-        if button_labels:
-            request["gt_labels"] = sorted(set(request["gt_labels"]) | button_labels)
-        tracked = sim.buttons.current(sim.eef_pose_base)
-        if tracked:
-            request["gt_buttons"] = tracked
-            log.info(f"button poses carried from earlier rounds: {tracked}")
-    if sim.held_objects:  # what a hand already holds: an obstacle the planner must not pick up
-        request["held_labels"] = sorted(sim.held_objects)
+    request, extras = sim.capture(args.task)
+    try:
+        known = knowledge.describe(atoms, request, extras, floor=floor)
+    except GoalNotVisible:
+        imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)  # what the camera saw
+        raise
+    known.attach(request)
     report = sim.validate_capture(request, extras)
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
@@ -351,20 +340,19 @@ def do_capture(
     imageio.imwrite(out_dir / "rgb.png", request["rgb"])
     depth_vis = np.clip(request["depth"] / 2.0, 0, 1)
     imageio.imwrite(out_dir / "depth.png", (depth_vis * 255).astype(np.uint8))
-    seg_vis = np.zeros_like(request["rgb"])
-    if "gt_masks" in request:
+    if known.masks is not None:
+        seg_vis = np.zeros_like(request["rgb"])
         colors = [(255, 80, 80), (80, 200, 255), (120, 255, 120), (255, 220, 80)]
-        for i, mask in enumerate(request["gt_masks"]):
+        for i, mask in enumerate(known.masks):
             seg_vis[mask.astype(bool)] = colors[i % len(colors)]
         imageio.imwrite(out_dir / "gt_masks.png", seg_vis)
     meta = {
         "task": args.task,
-        "goal_atoms": atoms,
-        "gt_labels": request.get("gt_labels", labels),
+        "goal_atoms": known.atoms,
+        "knowledge": {**knowledge.report(), **known.summary()},
         "intrinsics": request["intrinsics"].tolist(),
         "world_from_cam": request["world_from_cam"].tolist(),
         "q_init": request["q_init"].tolist(),
-        "gt_buttons": buttons,
         "validation": report,
         "extras": {k: v for k, v in extras.items() if k not in ("seg_instance",)},
     }
@@ -372,20 +360,6 @@ def do_capture(
         json.dump(meta, f, indent=2)
     log.info(f"capture saved to {out_dir} (validation problems: {report['problems'] or 'none'})")
     return request, extras
-
-
-def goal_hints(sim, args, atoms: list[dict]) -> dict | None:
-    """Where each goal object is (base frame), so a category-level goal ('candle') acts on the instance meant."""
-    if not (args.activity and args.no_gt):
-        return None
-    _, tiptop_atoms = sim.tiptop_goal(atoms, category_level=True)
-    hints = {}
-    for atom, tiptop_atom in zip(atoms, tiptop_atoms):
-        for bddl, label in zip(atom["args"], tiptop_atom["args"]):
-            if atom["predicate"] == "toggled_on":  # the button's object: the instance meant gets the plain label
-                label = label[: -len("_button")]
-            hints[label] = sim.base_hint(bddl)
-    return hints
 
 
 def setup_logging() -> None:
@@ -408,6 +382,31 @@ def open_state_stream(hostport: str | None, sim):
     stream = SimStateStream(host or "localhost", int(port) if port else 8765)
     stream.attach(sim)  # keeps retrying on its own when the server is not there yet
     return stream
+
+
+def connect_planners(args):
+    """The planning server(s) of a live run, checked against the embodiments this client executes on, before Isaac
+    Sim starts: (client, its metadata, press client or None, its metadata or None)."""
+    from omnigibson.tiptop.client import TiptopClient
+
+    client = TiptopClient(
+        args.host,
+        args.port,
+        expected_robot_type=EXPECTED_ROBOT_TYPE[args.embodiment],
+        expected_dof=EXPECTED_DOF[args.embodiment],
+    )
+    client.wait_for_server()
+    metadata = client.fetch_metadata()
+    client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
+    press_client = press_meta = None
+    if getattr(args, "press_port", None):
+        press_client = TiptopClient(
+            args.press_host or args.host, args.press_port, expected_robot_type=PRESS_ROBOT_TYPE, expected_dof=None
+        )
+        press_client.wait_for_server()
+        press_meta = press_client.fetch_metadata()
+        press_client.check_embodiment()
+    return client, metadata, press_client, press_meta
 
 
 def perception_report(request: dict, extras: dict, response: dict) -> dict:
@@ -433,7 +432,15 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
         role = (
             "goal"
             if label in goal_args
-            else ("held" if info.get("held") else "movable" if info["movable"] else "surface")
+            else (
+                "in hand"
+                if info.get("in_hand")
+                else "held"
+                if info.get("held")
+                else "movable"
+                if info["movable"]
+                else "surface"
+            )
         )
         head = f"perceived {label!r} ({role}, {info['grasps']} grasps)"
         if m["sim"] is None:
@@ -446,11 +453,14 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
     return {label: dict(perceived[label], **match[label]) for label in perceived}
 
 
-def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict | None = None) -> dict:
-    """Capture, ask the server for a plan for these atoms, save it and execute it."""
+def live_round(
+    sim, args, client, out_dir: Path, atoms: list[dict], knowledge, floor: bool = False, score: bool = True
+) -> dict:
+    """Capture, ask the server for a plan for these atoms, save it and execute it (``score``: evaluate the task's
+    goal afterwards; a benchmark scores once at the end instead, the whole goal costs 46 s on the gift-basket task)."""
     from omnigibson.tiptop.client import TiptopPlanningError
 
-    request, extras = do_capture(sim, args, out_dir, atoms=atoms, hints=hints)
+    request, extras = do_capture(sim, args, out_dir, atoms, knowledge, floor=floor)
     try:
         response = client.plan(request, timeout_s=args.plan_timeout)
     except TiptopPlanningError:
@@ -482,161 +492,34 @@ def live_round(sim, args, client, out_dir: Path, atoms: list[dict], hints: dict 
         f"server planned in {response.get('server_timing', {}).get('infer_ms', 0) / 1000:.1f}s (round trip {response['client_roundtrip_s']:.1f}s), save_dir={response.get('save_dir')}"
     )
     match = perception_report(request, extras, response)
-    if response.get("buttons"):  # detected buttons: kept for later rounds (an object in hand moves with its gripper)
-        held = {label: (arm, sim.eef_pose_base(arm)) for label, arm in sim.held_objects.items()}
-        sim.buttons.update(response["buttons"], held)
-    return do_execute(sim, args, out_dir, response["plan"], tag="live", atoms=atoms, extra={"perception": match})
-
-
-def choose_stage_spot(
-    sim, item: str, container: str, support: str, radius: float = 1.2, spacing: float = 0.09, max_spots: int = 8
-) -> tuple[float, float]:
-    """(dx, dy) on ``support`` for the container: the free spot near ``item`` a base pose reaches together with it.
-
-    Of the free spots within ``radius`` of the item's AABB center (a crowded table has none within 0.7 m; two
-    points 1.2 m apart can still both be within reach of a base between them), the closest ``max_spots`` that lie
-    ``spacing`` apart (adjacent grid cells are near-duplicates) are searched, closest first, and the one whose best base
-    pose scores lowest wins; the container's origin goes to the spot, as place_on does (its AABB center follows within its
-    origin-to-center offset), and the container and its contents, about to move, do not count as obstacles. With no
-    reachable spot the closest one is used, as free_spot_on(near=) did, so place_robot_for still reports the
-    rejections. One scene_aabbs() snapshot serves every search, so staging costs seconds, not one AABB query per
-    candidate pose.
-    """
-    t0 = time.time()
-    near = sim.scene_object(item).aabb_center.cpu().numpy()[:2].astype(np.float64)
-    spots = [(float(np.hypot(x - near[0], y - near[1])), x, y) for x, y, _ in sim.free_spots_on(container, support)]
-    spots = sorted(s for s in spots if s[0] <= radius)
-    tried = []
-    for s in spots:
-        if all(np.hypot(s[1] - t[1], s[2] - t[2]) >= spacing for t in tried):
-            tried.append(s)
-            if len(tried) >= max_spots:
-                break
-    ignore = [sim.scene_object(n) for n in (container, *sim.contents_of(container))]
-    aabbs = sim.scene_aabbs()
-    half_widths = (sim.xy_radius(item), sim.xy_radius(container))  # keep both edges in frame, not just their centres
-    lo, hi = [v.cpu().numpy() for v in sim.scene_object(support).aabb]
-    support_z = (float(sim.scene_object(item).aabb[0][2]), float(hi[2]))  # the item where it is, the container on top
-    best = None
-    for d, x, y in tried:
-        pose, _ = sim.best_base_pose(
-            [near, (x, y)], ignore=ignore, aabbs=aabbs, half_widths=half_widths, support_z=support_z
-        )
-        if pose is not None and (best is None or pose[0] < best[0]):
-            best = (pose[0], d, x, y)
-    if best is None:
-        log.info(
-            f"staging {container} for {item}: no feasible spot ({len(tried)} of {len(spots)} spots within {radius} m "
-            f"searched, {time.time() - t0:.1f}s); falling back to the closest one"
-        )
-        return sim.free_spot_on(container, support, near=near)
-    score, d, x, y = best
-    cx, cy = ((lo + hi) / 2)[:2].tolist()
-    log.info(
-        f"staging {container} for {item}: spot ({x:.2f}, {y:.2f}), {d:.2f} m from the item, base-pose score "
-        f"{score:.2f} (best of {len(tried)} of {len(spots)} spots within {radius} m, {time.time() - t0:.1f}s)"
+    knowledge.learned(response)
+    return do_execute(
+        sim,
+        args,
+        out_dir,
+        response["plan"],
+        tag="live",
+        atoms=atoms,
+        knowledge=knowledge,
+        extra={"perception": match},
+        score=score,
     )
-    return x - cx, y - cy
-
-
-def run_task(sim, args, client, out_dir: Path) -> dict:
-    """Work through a challenge task's `inside` goal: every container gets one item of each type.
-
-    Navigation stand-ins: containers are teleported onto --stage-support one at a time, the base is teleported to a
-    reachable pose per transfer. Each transfer is one capture/plan/execute round; the item is verified with the
-    task's own `inside` predicate and, on failure, the next unplaced item of that type is tried.
-    """
-    import psutil  # ships with isaacsim-kernel; not an OmniGibson dependency, so imported here
-
-    from omnigibson.tiptop.r1pro import bddl_category
-
-    task = sim.env.task
-    pairs = []
-    for head in task.ground_goal_state_options[0]:
-        terms = list(getattr(head, "terms", []))
-        if terms and terms[0] == "inside" and len(terms) == 3:
-            pairs.append((terms[1], terms[2]))
-    if not pairs:
-        raise ValueError("task goal has no inside(item, container) predicates; nothing this driver can do")
-    containers = list(dict.fromkeys(c for _, c in pairs))
-    items_by_type = {}
-    for item, _ in pairs:
-        items_by_type.setdefault(bddl_category(item), []).append(item)
-    for cat in items_by_type:
-        items_by_type[cat] = list(dict.fromkeys(items_by_type[cat]))
-    log.info(f"task: {len(containers)} containers x {list(items_by_type)} ({len(pairs)} predicates)")
-
-    placed, transfers, n = set(), [], 0
-    type_failures = dict.fromkeys(items_by_type, 0)  # containers in a row a type failed for; skipped after 2
-    unreachable = set()  # items no base pose could reach together with a container: tried last from then on
-    for basket in containers:
-        home = sim.scene_object(basket).get_position_orientation()
-        for cat, items in items_by_type.items():
-            if type_failures[cat] >= 2:
-                log.info(f"skipping {cat}: failed for the last {type_failures[cat]} containers")
-                continue
-            candidates = [i for i in items if i not in placed]
-            if args.stage_support:  # items near the table's edge are the ones a base pose can reach
-                lo, hi = [v.cpu().numpy() for v in sim.scene_object(args.stage_support).aabb]
-
-                def edge_gap(name):
-                    c = sim.scene_object(name).aabb_center.cpu().numpy()
-                    return min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1])
-
-                candidates.sort(key=edge_gap)
-            candidates.sort(key=lambda name: name in unreachable)  # stable: keeps the edge order within each group
-            ok = False
-            for item in candidates[: args.attempts_per_item]:
-                n += 1
-                round_dir = out_dir / f"t{n:02d}_{bddl_category(item).replace(' ', '_')}_{basket.split('_')[-1]}"
-                round_dir.mkdir(parents=True, exist_ok=True)
-                record = {"item": item, "container": basket, "dir": str(round_dir)}
-                t0 = time.time()
-                try:
-                    if args.stage_support:  # bring the container (with what it holds) next to this item
-                        dx, dy = choose_stage_spot(sim, item, basket, args.stage_support)
-                        sim.place_on_with_contents(basket, args.stage_support, dx, dy)
-                        sim.hold(args.settle_steps, sim.OPEN)
-                    sim.place_robot_for(item, basket)
-                    sim.hold(args.settle_steps, sim.OPEN)
-                    atoms = [{"predicate": "inside", "args": [item, basket]}]
-                    live_round(sim, args, client, round_dir, atoms=atoms, hints=goal_hints(sim, args, atoms))
-                    # the goal names the category, so any item of this type that ended up inside counts
-                    now_inside = [i for i in items if i not in placed and sim.predicate_holds("inside", i, basket)]
-                    record["inside"], record["placed"] = bool(now_inside), now_inside
-                except Exception as e:  # noqa: BLE001 - one failed transfer must not end the task
-                    log.exception(f"transfer {n} {item} -> {basket} failed")
-                    record["inside"], record["error"] = False, f"{type(e).__name__}: {e}"
-                    if isinstance(e, RuntimeError) and str(e).startswith("no base pose"):
-                        unreachable.add(item)  # mid-table; the next container's candidates start with the others
-                record["seconds"] = round(time.time() - t0, 1)
-                record["rss_gb"] = round(psutil.Process().memory_info().rss / 1e9, 2)  # the last run died at 14 GB
-                transfers.append(record)
-                log.info(
-                    f"transfer {n}: {item} -> {basket}: "
-                    f"{'OK ' + str(record.get('placed')) if record['inside'] else 'failed'} "
-                    f"({record['seconds']}s, rss {record['rss_gb']} GB)"
-                )
-                if record["inside"]:
-                    placed.update(record["placed"])
-                    ok = True
-                    break
-            type_failures[cat] = 0 if ok else type_failures[cat] + 1
-        if args.stage_support:  # done with this container: back to the floor with its contents, freeing the table
-            sim.move_with_contents(basket, home[0], home[1])
-            sim.hold(args.settle_steps, sim.OPEN)
-    summary = {"transfers": transfers, "placed": sorted(placed), "task_goal": sim.goal_status()}
-    with open(out_dir / "task_summary.json", "w") as f:
-        json.dump(summary, f, indent=2, default=str)
-    log.info(f"TASK RESULT: {len(placed)}/{len(pairs)} items placed, {summary['task_goal']}")
-    return summary
 
 
 def do_execute(
-    sim, args, out_dir: Path, plan: dict, tag: str, atoms: list[dict] | None = None, extra: dict | None = None
+    sim,
+    args,
+    out_dir: Path,
+    plan: dict,
+    tag: str,
+    atoms: list[dict] | None = None,
+    knowledge=None,
+    extra: dict | None = None,
+    score: bool = True,
 ) -> dict:
     """Execute a plan and check the goal: the task's own with --activity (``atoms``, default --goal, then names the
-    objects whose AABBs are logged), else every --goal atom. ``extra`` is saved with the result."""
+    objects whose AABBs are logged), else every --goal atom; ``score=False`` skips the task's goal evaluation and
+    reports the goal objects' poses only. ``extra`` is saved with the result."""
     from omnigibson.tiptop.executor import PlanExecutor, VideoRecorder, check_success
     from omnigibson.tiptop.protocol import plan_summary
 
@@ -653,13 +536,7 @@ def do_execute(
         sim.block_grasping(getattr(sim, "arm", None))  # the press closes the gripper; it must not grasp the object
     try:
         stats = executor.execute(plan)
-        # an object picked up this round: its buttons now move with the gripper that closed on it
-        for atom in atoms:
-            if atom["predicate"] == "holding" and executor.close_eef is not None and args.activity:
-                label = sim.tiptop_goal([atom], category_level=args.no_gt)[1][0]["args"][0]
-                arm = getattr(sim, "arm", None)
-                sim.held_objects[label] = arm
-                sim.buttons.grasped(label, arm, executor.close_eef)
+        note_hands(sim, atoms, executor, knowledge)
     finally:
         if press_targets and args.grasping_mode != "physical":
             sim.unblock_grasping()
@@ -670,7 +547,7 @@ def do_execute(
         stats["buttons"] = {name: sim.press_state(name) for name in press_targets}
         log.info(f"buttons after the plan: {stats['buttons']}")
     if args.activity:
-        success = sim.goal_status()
+        success = sim.goal_status() if score else {"success": None, "scored": False}
         success["all"] = success["success"]
         # where the goal objects ended up relative to their targets (BDDL names)
         success["poses"] = {}
@@ -689,6 +566,7 @@ def do_execute(
         "plan_summary": plan_summary(plan),
         "execution": stats,
         "success": success,
+        "held": dict(sim.held_objects),
         "final_object_poses_world": sim.object_poses_world(),
         **(extra or {}),
     }
@@ -696,6 +574,28 @@ def do_execute(
         json.dump(result, f, indent=2)
     log.info(f"success check: {json.dumps(success)}")
     return result
+
+
+def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
+    """Update what the hands hold after a plan: from the robot's grasp assist when it has one (sticky / assisted
+    grasping), else from the plan's own goals (a holding goal took the object, a placement let it go). A newly
+    taken object is reported to the knowledge source (a button on it moves with the gripper from now on)."""
+    arm = getattr(sim, "arm", None) or sim.robot.default_arm
+    before = dict(sim.held_objects)
+    grasped = sim.grasped_labels()
+    if grasped is not None:
+        sim.held_objects = grasped
+    else:
+        for atom in atoms:
+            if atom["predicate"] == "holding" and executor.close_eef is not None:
+                sim.held_objects[sim.tracked_label(atom["args"][0])] = arm
+            elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
+                sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
+    for label, holder in sim.held_objects.items():
+        if label not in before and knowledge is not None and executor.close_eef is not None:
+            knowledge.picked(label, holder, executor.close_eef)
+    if sim.held_objects != before:
+        log.info(f"hands now hold {sim.held_objects or 'nothing'}")
 
 
 def main(argv=None):
@@ -711,9 +611,7 @@ def main(argv=None):
     )
     p_live = sub.add_parser("live", help="capture, ask a running tiptop-server for a plan, execute it")
     add_common(p_live)
-    p_live.add_argument("--host", default="localhost")
-    p_live.add_argument("--port", type=int, default=8765)
-    p_live.add_argument("--plan-timeout", type=float, default=900.0)
+    add_planner_args(p_live)
     p_live.add_argument(
         "--sequential",
         action="store_true",
@@ -725,65 +623,25 @@ def main(argv=None):
         action="store_true",
         help="with --sequential and --activity: teleport the base to a reachable pose before every round",
     )
-    p_live.add_argument(
-        "--no-state-stream", action="store_true", help="do not mirror the simulator into the server's Rerun view"
-    )
-    p_live.add_argument("--press-host", default=None, help="host of the planner for the other arm (default --host)")
-    p_live.add_argument(
-        "--press-port",
-        type=int,
-        default=None,
-        help="with --sequential: rounds whose goals are all toggled_on(...) are planned by a second tiptop-server on "
-        "this port serving the other arm (r1pro_right); the first arm keeps holding what it picked up",
-    )
-    p_task = sub.add_parser("task", help="work through a challenge task's whole inside(item, container) goal")
-    add_common(p_task)
-    p_task.add_argument("--host", default="localhost")
-    p_task.add_argument("--port", type=int, default=8765)
-    p_task.add_argument("--plan-timeout", type=float, default=900.0)
-    p_task.add_argument("--no-state-stream", action="store_true")
-    p_task.add_argument(
-        "--stage-support",
-        default=None,
-        help="BDDL name of the furniture each container is brought onto before it is filled (e.g. table.n.02_1)",
-    )
-    p_task.add_argument("--attempts-per-item", type=int, default=2, help="candidate items tried per type per container")
     args = parser.parse_args(argv)
     setup_logging()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     import omnigibson as og
+    from omnigibson.tiptop.knowledge import make_knowledge
     from omnigibson.tiptop.protocol import load_plan_json
 
     exit_code = 0
     stream = None
     try:
         t0 = time.time()
-        client = None
-        if args.cmd in ("live", "task"):
-            from omnigibson.tiptop.client import TiptopClient
-
+        client = press_client = press_meta = None
+        if args.cmd == "live":
             # the server's embodiment metadata (locked posture, home pose) shapes the scene, so fetch it first
-            client = TiptopClient(
-                args.host,
-                args.port,
-                expected_robot_type=EXPECTED_ROBOT_TYPE[args.embodiment],
-                expected_dof=EXPECTED_DOF[args.embodiment],
-            )
-            client.wait_for_server()
-            metadata = client.fetch_metadata()
-            client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
+            client, metadata, press_client, press_meta = connect_planners(args)
             sim = build_sim(args, embodiment=metadata.get("embodiment"))
             if not args.no_state_stream:
                 stream = open_state_stream(f"{args.host}:{args.port}", sim)
-            press_client = press_meta = None
-            if getattr(args, "press_port", None):
-                press_client = TiptopClient(
-                    args.press_host or args.host, args.press_port, expected_robot_type="r1pro_right", expected_dof=None
-                )
-                press_client.wait_for_server()
-                press_meta = press_client.fetch_metadata()
-                press_client.check_embodiment()
         elif args.cmd == "replay":
             with open(args.plan) as f:
                 plan_json = json.load(f)
@@ -792,19 +650,16 @@ def main(argv=None):
         else:
             sim = build_sim(args)
         log.info(f"scene ready in {time.time() - t0:.1f}s (sim dt {sim.dt:.4f}s)")
+        atoms_all = parse_goal(args.goal)
+        knowledge = make_knowledge(args.knowledge, sim, atoms_all)
         if args.cmd == "capture":
-            do_capture(sim, args, out_dir)
-        elif args.cmd == "task":
-            if not args.activity:
-                raise ValueError("task needs --activity")
-            run_task(sim, args, client, out_dir)
+            do_capture(sim, args, out_dir, atoms_all, knowledge)
         elif args.cmd == "replay":
             plan = load_plan_json(args.plan)
             if args.embodiment == "r1pro" and not plan_json.get("embodiment"):
                 log.warning("plan has no embodiment provenance; assuming it was made for the local tiptop embodiment")
-            do_execute(sim, args, out_dir, plan, tag="replay")
+            do_execute(sim, args, out_dir, plan, tag="replay", knowledge=knowledge)
         elif args.cmd == "live":
-            atoms_all = parse_goal(args.goal)
             rounds = [[atom] for atom in atoms_all] if args.sequential else [atoms_all]
             outcomes = []
             full = None
@@ -816,9 +671,7 @@ def main(argv=None):
             for i, atoms in enumerate(rounds):
                 round_dir = out_dir / f"round_{i:02d}" if args.sequential else out_dir
                 round_dir.mkdir(parents=True, exist_ok=True)
-                sim.video_caption = f"round {i}: " + "; ".join(
-                    f"{a['predicate']}({', '.join(a['args'])})" for a in atoms
-                )
+                sim.video_caption = f"round {i}: {atom_text(atoms)}"
                 try:
                     if args.sequential and args.restand and args.activity and len(atoms[0]["args"]) == 2:
                         sim.place_robot_for(*atoms[0]["args"])  # navigation stand-in for this transfer
@@ -828,9 +681,7 @@ def main(argv=None):
                         sim.adopt_embodiment(press_meta["embodiment"])  # the other arm presses; this one keeps holding
                         round_client = press_client
                         sim.video_caption += f"  [{sim.arm} arm presses, {sim.other_arm} holds]"
-                    outcomes.append(
-                        live_round(sim, args, round_client, round_dir, atoms, hints=goal_hints(sim, args, atoms))
-                    )
+                    outcomes.append(live_round(sim, args, round_client, round_dir, atoms, knowledge))
                 except Exception as e:
                     if not args.sequential:
                         raise
@@ -844,7 +695,7 @@ def main(argv=None):
                 sim.recorders.remove(full)
                 full.close()
             if args.sequential:
-                summary = {"rounds": outcomes}
+                summary = {"rounds": outcomes, "knowledge": knowledge.report()}
                 if args.activity:
                     summary["task_goal"] = sim.goal_status()
                     log.info(f"task goal after {len(rounds)} rounds: {summary['task_goal']}")

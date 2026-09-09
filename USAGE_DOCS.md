@@ -92,7 +92,7 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live \
     --goal "inside(candle.n.01_4,wicker_basket.n.01_2);inside(swiss_cheese.n.01_1,wicker_basket.n.01_2);inside(butter_cookie.n.01_1,wicker_basket.n.01_2);inside(bow.n.08_3,wicker_basket.n.01_2)" \
     --task "prepare a gift basket: put the candle, the cheese, the cookie and the bow in the wicker basket" \
     --grasping-mode sticky --host localhost --port 8765 --out-dir runs/demo
-    # add --no-gt for detector + SAM2 instead of oracle masks
+    # add --knowledge onboard for detector + SAM2 instead of oracle masks
 
 # b) capture one frame only, no planner
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run capture \
@@ -133,7 +133,7 @@ request, ~30 MB each); delete old ones by hand.
 - **WebRTC streaming is unreliable on this GPU; Rerun is the view.** The client connects, gets a few frames, the
   encoder stops producing (`VideoEncoder: Could not get encoded frame`) and the client drops, over and over: the
   scene / black / scene cycle. The bundled StreamSDK 7.6.3 predates the card and no drop-in replacement exists for
-  Isaac Sim 5.1 (checked 2026-09-05; details and the dead ends in DEPLOYMENT.md item 14). What replaces it:
+  Isaac Sim 5.1 (checked 2026-09-05; details and the dead ends in DEPLOYMENT.md item 15). What replaces it:
   [Rerun](#bring-up) carries the robot's head and wrist cameras and a third-person overview from the simulator, and
   the bridge writes `live.mp4` per round. `stream_scene.py` and `OMNIGIBSON_REMOTE_STREAMING` still work when the
   stream happens to hold; treat a working picture as luck.

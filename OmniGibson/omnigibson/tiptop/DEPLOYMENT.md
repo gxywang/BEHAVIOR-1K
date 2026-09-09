@@ -94,10 +94,14 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    `perception.detector: grounding_dino` (both sim configs; `transformers` is in `pixi.lock`) the server fetches
    and loads both at start-up, before `/health` answers, whether or not requests then carry ground-truth masks.
    `GOOGLE_API_KEY` is only needed with `perception.detector: gemini`.
-7. **cuTAMP patch.** `tiptop/install/install-cutamp.sh` applies `tiptop/install/patches/cutamp-*.patch` on top of
-   the pinned cuTAMP release (a `get_world_cfg` list-aliasing fix that otherwise crashes every plan skeleton tried
-   after the first motion-planning attempt with `KeyError: 'table'`). A cuTAMP checkout made without the script
-   needs `git apply` of the same patch; upstreaming it to tiptop-robot/cuTAMP is the real fix.
+7. **cuTAMP patches.** `tiptop/install/install-cutamp.sh` applies `tiptop/install/patches/cutamp-*.patch` in name
+   order on top of the pinned cuTAMP release: `01-world-cfg-alias` (a `get_world_cfg` list-aliasing fix that
+   otherwise crashes every plan skeleton tried after the first motion-planning attempt with `KeyError: 'table'`),
+   `02-press-button` (the `Push` operator: hover, press, back off along a button's normal), `03-initial-holding`
+   (a plan may start with an object in the gripper: `in_hand` requests). A cuTAMP checkout made without the script
+   needs `git apply` of the same patches in that order; the clone on shenlong-gpu-01 carries 01 and 02 as local
+   commits and 03 as its working tree, so `git diff` there regenerates 03. Upstreaming them to tiptop-robot/cuTAMP
+   is the real fix.
 8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; at server start cuRobo warms up MotionGen, the detector and SAM2 load and the Rerun viewer starts
    (`/health` is 200 only afterwards, ~40 s on the server).
@@ -116,12 +120,21 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    run unless the server metadata matches its embodiment: `robot_type: panda`, `dof: 7` for `--embodiment franka`
    (the launcher's default config), `robot_type: r1pro_left` with the dof from the embodiment metadata for
    `--embodiment r1pro` (`TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml`).
-11. **Sharing one GPU.** Laptop numbers: Isaac Sim 4-5 GB (GUI adds 1-2), planner 4 GB idle and 6.3 GB peak at
+11. **CUDA faults poison a planner.** `CUDA error: an illegal memory access was encountered` inside cuRobo's
+    batched IK (seen 2026-09-08/09 on shenlong-gpu-01 in Pick and Push particle initialisation, 3 times in ~30
+    requests on the right-arm planner) leaves the process unable to run any kernel; every later request fails in
+    20 ms with the same message. Cause found 2026-09-09: cuRobo sizes its collision caches from the placeholder
+    world the solvers are built with and re-creates them when a request brings more obstacles, which invalidates
+    the recorded CUDA graphs; the solvers are now built with caches for 64 cuboids and 64 meshes
+    (`tiptop/motion_planning.py`, `COLLISION_CACHE`). As a safety net the server exits with code 3 on such a fault
+    and `start_tiptop_server.sh` relaunches it (about a minute to `/health`); the benchmark waits for `/health`
+    before each request. A planner that answers every request with that error was started without the loop.
+12. **Sharing one GPU.** Laptop numbers: Isaac Sim 4-5 GB (GUI adds 1-2), planner 4 GB idle and 6.3 GB peak at
     128 particles, M2T2 1.3 GB. On a 96 GB card raise `TIPTOP_PARTICLES=256` and `TIPTOP_MAX_PLANNING_TIME=60`.
-12. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
+13. **Planner variance.** The same observation can fail once with "Motion planning failed for 32/59 satisfying
     particle(s)" and succeed on the next request (M2T2 grasp sampling differs per call). Retry before debugging.
-13. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
-14. **WebRTC streaming is unreliable on RTX PRO 6000 Blackwell; use Rerun.** The client connects, a few frames
+14. **Grasp physics.** Physical grasps of the thin YCB mug slip; demos and smoke tests use `--grasping-mode sticky`.
+15. **WebRTC streaming is unreliable on RTX PRO 6000 Blackwell; use Rerun.** The client connects, a few frames
     arrive, the encoder stops producing and the client drops, repeatedly -- one session: 4 `FIRST_FRAME_SENT`
     against 115 `VideoEncoder: Could not get encoded frame` and 24 `CLIENT_DISCONNECT_UNINTENDED`. The bundled
     StreamSDK 7.6.3 predates the card (device `0x2BB5`). `UseRefactoredVideoEncoder=1`, a StreamSDK regkey read
@@ -135,16 +148,16 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
     `omni.kit.livestream.webrtc` 10.x for Kit 110 / Isaac Sim 6.0 (python 3.12). Use Rerun (item 9), which carries
     the robot's head camera and a third-person view of the workspace from the simulator, plus the per-round
     `live.mp4`; none of them needs an encoder.
-15. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
+16. **Remote sim streaming.** With `OMNIGIBSON_REMOTE_STREAMING=webrtc` the Kit app is launched windowless, but
     `gm.HEADLESS` stays false, so the viewport-camera code in `scene.py` still runs — that is what aims the streamed
     view, and it is why you must NOT also set `OMNIGIBSON_HEADLESS=1`. Auxiliary sensor cameras are kept out of the
     streamed frame (`vision_sensor.py` checks `REMOTE_STREAMING`); everything else is identical.
-16. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
+17. **CI on `dev/tiptop`.** `tests.yml`/`profiling.yml` check out submodules; the private tiptop repo needs a token
     there (see USAGE_DOCS.md).
-17. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
+18. **Launcher paths.** `scripts/start_tiptop_server.sh` defaults to this repo's `tiptop/`, `scripts/start_m2t2.sh`
     to `~/tiptop-services/M2T2`; override with `TIPTOP_DIR` / `M2T2_DIR`. The laptop also has copies in
     `~/tiptop-services/bin/` that are not in git.
-18. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
+19. **System RAM, not just VRAM.** A whole-task run in a BEHAVIOR house scene was OOM-killed on the 30 GB laptop
     (2 GB swap) after 16 transfers: Isaac client 14 GB RSS, planner 4.4 GB, Rerun viewer 2.8 GB, M2T2 1.1 GB, plus
     the desktop. The kernel killed the client, which shared VSCode's cgroup, and took the editor session with it.
     Mitigations: the planner caps its viewer at `--rerun-memory-limit 2GB` (Rerun's own default is 75% of RAM; the

@@ -200,48 +200,14 @@ def make_env_config(objects=("mug", "bowl"), grasping_mode: str = "physical") ->
     }
 
 
-class ButtonTracker:
-    """Buttons the planner detected, kept across rounds. A button belongs to the object its label names
-    (``<object>_button``); once that object is grasped it moves rigidly with the gripper, so the pose detected
-    earlier is carried along with the arm's own kinematics: p_now = T_eef_now @ inv(T_eef_at_grasp) @ p_then."""
+class EpisodeOver(Exception):
+    """The task reported the episode done (its goal holds, or its step limit passed) while the pipeline was still
+    stepping; raised from ``TiptopSim.step`` when ``stop_when_done`` is set, so a benchmark scores at that step the
+    way the challenge evaluator stops there. ``reason`` is "success", "timeout" or "terminated"."""
 
-    def __init__(self):
-        self.specs = {}  # label -> {position, normal, radius} (base frame) as detected, and the eef pose then if held
-
-    def update(self, buttons: dict, held: dict) -> None:
-        """Record the planner's detected buttons; ``held`` maps an object label to (arm, 4x4 eef pose now) for
-        objects in hand at the time of the capture (their detection is relative to that gripper pose)."""
-        for label, spec in (buttons or {}).items():
-            if spec.get("source") != "detected":
-                continue
-            parent = label[: -len("_button")]
-            entry = {k: [float(v) for v in spec[k]] for k in ("position", "normal")}
-            entry["radius"] = float(spec["radius"])
-            entry["arm"], entry["eef"] = held[parent] if parent in held else (None, None)
-            self.specs[label] = entry
-            log.info(
-                f"tracking button {label} at {np.round(entry['position'], 3).tolist()}"
-                + (f" (in the {entry['arm']} hand)" if entry["arm"] else "")
-            )
-
-    def grasped(self, parent: str, arm: str, eef: np.ndarray) -> None:
-        """The object ``parent`` was just grasped by ``arm`` whose eef pose is ``eef``: its buttons now move with it."""
-        for label, entry in self.specs.items():
-            if label[: -len("_button")] == parent and entry["arm"] is None:
-                entry["arm"], entry["eef"] = arm, np.asarray(eef, dtype=np.float64)
-                log.info(f"button {label}: its object is now in the {arm} hand; its pose follows the gripper")
-
-    def current(self, eef_pose_base) -> dict:
-        """gt_buttons for the next request: every tracked button at its pose now (``eef_pose_base(arm)`` -> 4x4)."""
-        out = {}
-        for label, entry in self.specs.items():
-            position, normal = np.asarray(entry["position"]), np.asarray(entry["normal"])
-            if entry["arm"] is not None:
-                motion = eef_pose_base(entry["arm"]) @ np.linalg.inv(entry["eef"])
-                position = motion[:3, :3] @ position + motion[:3, 3]
-                normal = motion[:3, :3] @ normal
-            out[label] = {"position": position.tolist(), "normal": normal.tolist(), "radius": entry["radius"]}
-        return out
+    def __init__(self, reason: str, steps: int):
+        super().__init__(f"episode over after {steps} steps: {reason}")
+        self.reason, self.steps = reason, steps
 
 
 class TiptopSim:
@@ -285,13 +251,15 @@ class TiptopSim:
     def _init_state(self) -> None:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
-        self.buttons = ButtonTracker()  # detected buttons carried across rounds (and through a grasp)
-        self.held_objects = {}  # request label -> arm, for objects a plan picked up (they move with that gripper)
+        self.held_objects = {}  # tracked label -> arm, for objects a plan picked up (they move with that gripper)
         self.recorders = []  # executor.VideoRecorder instances, fed from step(); the caption is stamped on each frame
+        self.metrics = []  # omnigibson.metrics.MetricBase instances fed from step() (the challenge's own scoring)
+        self.n_steps = 0  # env steps taken: holds, captures and plans all count, as they do for the challenge's timeout
+        self.stop_when_done = False  # raise EpisodeOver when the task reports success or its step limit (benchmark)
         self.video_caption = None
         self.last_obs = None
         self.last_gripper = self.OPEN
-        self.last_capture_rgb = None  # set by capture(); read by run.py when a goal object is out of frame
+        self.last_capture_rgb = None  # the last frame capture() rendered, for saving next to an error
         self.capture_object_aabb_min_z = {}  # where each tracked object rested at the last capture
         self._stream_meshes = {}
 
@@ -345,7 +313,11 @@ class TiptopSim:
 
     def step(self, q_arm, gripper: float):
         self.last_gripper = float(gripper)
-        self.last_obs = self.env.step(self.action(q_arm, gripper))[0]
+        action = self.action(q_arm, gripper)
+        self.last_obs, reward, terminated, truncated, info = self.env.step(action)
+        self.n_steps += 1
+        for metric in self.metrics:
+            metric.step(self.env, action[self.robot.name], self.last_obs, reward, terminated, truncated, info)
         if self.state_stream is not None:
             self.state_stream.on_step(self)
         if self.recorders:
@@ -354,7 +326,37 @@ class TiptopSim:
                 if recorder.due():
                     views = self.video_views() if views is None else views
                     recorder.write(views, self.video_caption)
+        if self.stop_when_done and (terminated or truncated):
+            success = bool((info or {}).get("done", {}).get("success", False))
+            raise EpisodeOver("success" if success else "timeout" if truncated else "terminated", self.n_steps)
         return self.last_obs
+
+    def begin_episode(self, metrics=(), stop_when_done: bool = False) -> None:
+        """Start counting from zero for a scored episode: env steps, the metrics fed from ``step`` (each is reset on
+        the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``)."""
+        self.n_steps = 0
+        self.metrics = list(metrics)
+        for metric in self.metrics:
+            metric.reset(self.env)
+        self.stop_when_done = stop_when_done
+
+    def hands(self) -> dict:
+        """{tracked label: arm} of what the hands hold now: the grasp assist's own record when the robot has one
+        (sticky / assisted grasping; ``held_objects`` is brought up to date), else the bookkeeping from the plans."""
+        grasped = self.grasped_labels()
+        if grasped is not None:
+            self.held_objects = grasped
+        return dict(self.held_objects)
+
+    def grasped_labels(self) -> dict | None:
+        """{tracked label: arm} of the tracked objects the robot's grasp assist holds right now (sticky or assisted
+        grasping): what the robot knows it carries, read from its own gripper. None in physical grasping mode,
+        where there is no such record."""
+        in_hand = getattr(self.robot, "_ag_obj_in_hand", None)
+        if in_hand is None:
+            return None
+        by_obj = {obj: label for label, obj in self.objects.items()}
+        return {by_obj[obj]: arm for arm, obj in in_hand.items() if obj is not None and obj in by_obj}
 
     def mirror_q(self) -> np.ndarray:
         """Planned joints for the Rerun mirror (the embodiment the mirror was attached with; see R1ProSim)."""
@@ -477,12 +479,11 @@ class TiptopSim:
             og.sim.render()
         return self.cam.get_obs()
 
-    def capture(self, task: str, gt_labels=None, gt_atoms=None) -> tuple[dict, dict]:
-        """Render and assemble a TiPToP request (plus extras for H5/validation) in the robot base frame.
-
-        ``gt_labels`` are request names, normally keys of ``self.objects``. With instance segmentation a label that is
-        not a tracked object falls back to the raw segmentation name; the geometry path (no ``seg_instance`` rendered)
-        needs the object's meshes and raises for such labels.
+    def capture(self, task: str) -> tuple[dict, dict]:
+        """Render one frame and assemble a TiPToP request from the observation alone (rgb, z-depth, intrinsics,
+        the OpenCV camera pose in the robot base frame, the planned joints), plus ``extras`` for the H5 file, the
+        validation and the knowledge sources (``knowledge.py`` attaches labels, masks and buttons afterwards): the
+        camera pose in the world frame, the instance segmentation when it was rendered, every tracked object's pose.
         """
         obs, info = self._capture_obs()
         rgb = obs["rgb"][..., :3].cpu().numpy().astype(np.uint8)
@@ -506,41 +507,10 @@ class TiptopSim:
         cam_pos_b, cam_quat_b = self.to_base(cam_pos, cam_quat_cv)
         world_from_cam = T.pose2mat((cam_pos_b, cam_quat_b)).cpu().numpy().astype(np.float32)
 
-        gt = None
-        if gt_labels and seg is not None:
-            # labels are request names; tracked objects may carry a different simulator name (task objects)
-            masks = []
-            for label in gt_labels:
-                sim_name = self.objects[label].name if label in self.objects else label
-                ids = [i for i, n in id_to_name.items() if n == sim_name]
-                masks.append(np.isin(seg, ids) if ids else np.zeros(depth.shape, dtype=bool))
-            masks = np.stack(masks)
-            source = "instance segmentation"
-        elif gt_labels:  # no seg_instance rendered (segfaults in house scenes): oracle masks from depth + meshes
-            masks = self.geometry_masks(depth, intrinsics, cam_pos, cam_quat_cv, gt_labels)
-            source = "geometry (depth + object meshes)"
-        if gt_labels:
-            # a task tracks every object it names, most of them out of view; send the visible ones, but the goal's
-            # objects must be in the frame
-            counts = {label: int(m.sum()) for label, m in zip(gt_labels, masks)}
-            visible = [label for label in gt_labels if counts[label]]
-            hidden = [label for label in gt_labels if not counts[label]]
-            needed = sorted({a for atom in (gt_atoms or []) for a in atom["args"] if a in hidden})
-            if needed:
-                self.last_capture_rgb = rgb  # for the caller to save alongside the error
-                raise ValueError(f"goal objects {needed} are not visible in the capture (empty masks)")
-            log.info(
-                f"ground-truth masks from {source}: pixels per label "
-                f"{ {label: counts[label] for label in visible} }; not in view: {hidden or 'none'}"
-            )
-            gt = {
-                "labels": visible,
-                "masks": masks[[gt_labels.index(l) for l in visible]],
-                "atoms": list(gt_atoms or []),
-            }
-        request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm(), gt=gt)
+        request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm())
         if robot_mask.any():
             request["robot_mask"] = robot_mask  # the server keeps SAM2 off these pixels (occluding gripper)
+        self.last_capture_rgb = rgb
 
         object_poses_base = {}
         self.capture_object_aabb_min_z = {name: float(obj.aabb[0][2]) for name, obj in self.objects.items()}
@@ -566,6 +536,7 @@ class TiptopSim:
             "cam_quat_wxyz_ros": T.convert_quat(cam_quat_b, to="wxyz").cpu().numpy().tolist(),
             "cam_pos_world": cam_pos.cpu().numpy().tolist(),
             "cam_quat_xyzw_world_usd": cam_quat.cpu().numpy().tolist(),
+            "cam_quat_xyzw_world_cv": cam_quat_cv.cpu().numpy().tolist(),
             "base_pos_world": self.base_pose()[0].cpu().numpy().tolist(),
             "base_quat_xyzw_world": self.base_pose()[1].cpu().numpy().tolist(),
             "seg_instance": seg,
@@ -576,6 +547,37 @@ class TiptopSim:
             "sim_dt": self.dt,
         }
         return request, extras
+
+    def oracle_masks(self, request: dict, extras: dict, labels: list[str]) -> np.ndarray:
+        """(N, H, W) bool masks of tracked objects for the frame ``capture`` returned (privileged: simulator truth).
+        Isaac's instance segmentation when it was rendered, else from the objects' meshes and the depth image
+        (``geometry_masks``). A label out of view gets an all-False row."""
+        seg = extras["seg_instance"]
+        if seg is not None:
+            id_to_name = extras["id_to_name"]
+            masks = []
+            for label in labels:  # tracked objects may carry a different simulator name (task objects)
+                sim_name = self.objects[label].name if label in self.objects else label
+                ids = [i for i, n in id_to_name.items() if n == sim_name]
+                masks.append(np.isin(seg, ids) if ids else np.zeros(request["depth"].shape, dtype=bool))
+            return np.stack(masks)
+        cam_pos = th.tensor(extras["cam_pos_world"], dtype=th.float32)
+        cam_quat_cv = th.tensor(extras["cam_quat_xyzw_world_cv"], dtype=th.float32)
+        return self.geometry_masks(request["depth"], request["intrinsics"], cam_pos, cam_quat_cv, labels)
+
+    def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
+        """The request labels and TiPToP atoms for goal atoms over tracked object names (spawned presets: the
+        names are the labels and the predicates are TiPToP's already). R1ProSim translates BDDL names instead."""
+        labels = sorted({a for atom in atoms for a in atom["args"] if a in self.objects})
+        return labels, [dict(atom) for atom in atoms]
+
+    def button_hints(self, atoms: list[dict], category_level: bool = False) -> dict:
+        """Toggle buttons of the goal's objects by pose (privileged); none in the tabletop scene."""
+        return {}
+
+    def tracked_label(self, name: str) -> str:
+        """The tracked label of an object named in a goal atom (the name itself for spawned presets)."""
+        return name
 
     @staticmethod
     def trimesh_world(obj) -> trimesh.Trimesh:

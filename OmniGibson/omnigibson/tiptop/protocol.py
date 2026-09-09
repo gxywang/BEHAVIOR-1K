@@ -61,7 +61,7 @@ def unpackb(data: bytes):
 # Request / response
 # --------------------------------------------------------------------------------------------------------------------
 def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt: dict | None = None) -> dict:
-    """Validate and assemble one planning request.
+    """Validate and assemble one planning request: the observation alone.
 
     Args:
         rgb: (H, W, 3) uint8 RGB image.
@@ -70,9 +70,9 @@ def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt:
         world_from_cam: (4, 4) float32 pose of the OpenCV-convention camera frame (+x right, +y down, +z forward)
             expressed in the ROBOT BASE frame, which is TiPToP's world frame.
         task: natural-language instruction.
-        q_init: (7,) float32 arm joint positions (panda_joint1..7) the plan must start from.
-        gt: optional ground-truth perception {labels: [str], masks: (N, H, W) bool, atoms: [{predicate, args}]};
-            when present the server skips Gemini + SAM2 (requires the tiptop fork with the gt_* hook).
+        q_init: (dof,) float32 joint positions of the planned joints the plan must start from.
+        gt: optional {labels, masks, atoms}, forwarded to ``attach_knowledge`` (kept for the offline H5 path and
+            older callers; the client normally attaches what it knows afterwards, see ``knowledge.py``).
     """
     rgb = np.asarray(rgb)
     depth = np.asarray(depth, dtype=np.float32)
@@ -100,16 +100,58 @@ def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt:
         "q_init": q_init,
     }
     if gt is not None:
-        labels = [str(label) for label in gt["labels"]]
-        masks = np.asarray(gt["masks"]).astype(np.uint8)
-        if masks.shape != (len(labels), *rgb.shape[:2]):
-            raise ValueError(f"gt masks must be ({len(labels)}, H, W), got {masks.shape}")
-        request["gt_labels"] = labels
+        attach_knowledge(request, gt["labels"], gt.get("atoms", []), masks=gt["masks"])
+    return request
+
+
+def attach_knowledge(
+    request: dict, labels, atoms, masks=None, buttons: dict | None = None, held=(), in_hand=(), workspace=None
+) -> dict:
+    """Add what the client knows about the scene to a request built by ``build_request`` (validated, in place).
+
+    The wire keys are the server's (``gt_*`` historically; a ``gt_`` key does not mean simulator truth):
+        gt_labels: the object names the planner works with; with masks one per mask, else what the detector is
+            asked for (category names, and ``<object>_button`` for a toggle button to find on that object).
+        gt_atoms: the goal, [{"predicate", "args"}] over those names.
+        gt_masks: optional (N, H, W) bool instance masks aligned with ``labels``; the server then skips its detector.
+        gt_buttons: optional {label: {position, normal, radius}} poses of toggle buttons in the base frame (given
+            outright by an oracle, or carried from an earlier detection).
+        held_labels: objects in a hand the plan does not move: obstacles the planner must not try to pick up.
+        in_hand: objects in the planned hand: the plan starts holding them (a carry: pick here, place after moving).
+        workspace_bounds: optional [[x0, y0, z0], [x1, y1, z1]] base-frame box the planner should work in for this
+            request instead of its configured tabletop crop (a container on the floor needs the floor in it).
+    """
+    labels = [str(label) for label in labels]
+    request["gt_labels"] = labels
+    request["gt_atoms"] = [
+        {"predicate": str(atom["predicate"]), "args": [str(arg) for arg in atom["args"]]} for atom in atoms
+    ]
+    if masks is not None:
+        masks = np.asarray(masks).astype(np.uint8)
+        if masks.shape != (len(labels), *request["rgb"].shape[:2]):
+            raise ValueError(f"masks must be ({len(labels)}, H, W), got {masks.shape}")
         request["gt_masks"] = masks
-        request["gt_atoms"] = [
-            {"predicate": str(atom["predicate"]), "args": [str(arg) for arg in atom["args"]]}
-            for atom in gt.get("atoms", [])
-        ]
+    if buttons:
+        for label, button in buttons.items():
+            if len(button["position"]) != 3 or len(button["normal"]) != 3 or float(button["radius"]) <= 0:
+                raise ValueError(f"button {label!r} needs a 3-vector position and normal and a positive radius")
+        request["gt_buttons"] = {
+            str(label): {
+                "position": [float(v) for v in b["position"]],
+                "normal": [float(v) for v in b["normal"]],
+                "radius": float(b["radius"]),
+            }
+            for label, b in buttons.items()
+        }
+    if held:
+        request["held_labels"] = sorted(str(label) for label in held)
+    if in_hand:
+        request["in_hand"] = sorted(str(label) for label in in_hand)
+    if workspace is not None:
+        box = np.asarray(workspace, dtype=np.float64)
+        if box.shape != (2, 3) or not np.all(box[0] < box[1]):
+            raise ValueError(f"workspace must be [[x0, y0, z0], [x1, y1, z1]] with lo < hi, got {workspace}")
+        request["workspace_bounds"] = box.tolist()
     return request
 
 

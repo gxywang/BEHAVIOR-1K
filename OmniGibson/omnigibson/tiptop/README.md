@@ -27,14 +27,20 @@ installing the planner and grasp server on a new machine and the problems you wi
 Three isolated environments, by design (they cannot be merged: python 3.11 vs 3.12, numpy 1 vs 2, two cuRobo forks
 with the same import name, Isaac Sim's torch 2.7.0/cu128 vs the planner's 2.7.1/cu129): the sim env (`b1k` from
 `setup_uv.sh` on the server, a conda env on a laptop), the planner's pixi env in the `tiptop/` submodule, and
-M2T2's pixi env in a separate clone. Only websocket/HTTP crosses the boundaries. Simulator-only shortcuts
-(ground-truth masks, goal hints, the mirror) live in tiptop behind optional request fields, so the real-robot
-path stays untouched.
+M2T2's pixi env in a separate clone. Only websocket/HTTP crosses the boundaries. What a simulator client can add
+to a request (oracle masks, button poses, what the hands hold, the mirror) lives in tiptop behind optional request
+fields, so the real-robot path stays untouched.
 
 | Concern | Repo |
 |---|---|
 | Planner, perception, embodiments (cuRobo/cuTAMP configs, tool frame, gripper spheres), the wire protocol | **tiptop** (submodule `tiptop/`, private fork; runs in its own pixi env, deployable unchanged) |
-| Scenes, tasks, robot and controller configs, capture, plan execution, scoring, video, the Rerun mirror's sim side | **BEHAVIOR-1K** (this directory; needs Isaac Sim) |
+| Scenes, tasks, robot and controller configs, capture, what the planner is told (`knowledge.py`), plan execution, scoring, video, the Rerun mirror's sim side, task strategies and the benchmark | **BEHAVIOR-1K** (this directory; needs Isaac Sim) |
+
+Modules in this directory: `protocol.py` (wire and file formats, no OmniGibson imports), `client.py` (websocket
+client and the Rerun mirror), `scene.py` (the simulator: stepping, capture, episode accounting), `r1pro.py` (the
+R1Pro in a BEHAVIOR scene: posture, cameras, task scope, base-pose search), `knowledge.py` (what the client tells
+the planner beyond the image: an oracle source and an onboard source), `executor.py` (plan execution, video),
+`strategies.py` (how a task is split into rounds), `bench.py` (the challenge-style benchmark), `run.py` (the CLI).
 
 ## One round, step by step
 
@@ -44,13 +50,13 @@ path stays untouched.
 2. **Capture** (`R1ProSim.capture`). The left arm swings out of the head camera's view (`LOOK_ARM`), an external
    "shadow" camera with the head camera's intrinsics is moved onto its pose and renders rgb + `depth_linear` until two
    consecutive frames agree (the renderer accumulates over time after a teleport), then the arm returns to the ready
-   posture, which becomes the plan's `q_init`. Masks: ground truth from geometry (`gt_masks.py`: depth pixels within
-   8 mm of an object's mesh; Isaac's instance-segmentation annotator crashes in the house scenes), or none with
-   `--no-gt`. `validate_capture` warns when a goal object is cut by the image border (its hull would run past the
-   real object -- the silent failure mode of the pipeline).
+   posture, which becomes the plan's `q_init`. `validate_capture` warns when a goal object is cut by the image
+   border (its hull would run past the real object -- the silent failure mode of the pipeline).
 3. **Request** (`protocol.build_request`, msgpack with numpy arrays, one websocket connection per request):
-   `rgb, depth, intrinsics, world_from_cam` (OpenCV camera in the robot base frame), `task, q_init`, plus
-   `gt_labels, gt_atoms` and either `gt_masks` (oracle) or `goal_hints` + `robot_mask` (detector).
+   `rgb, depth, intrinsics, world_from_cam` (OpenCV camera in the robot base frame), `task, q_init`, plus what the
+   knowledge source knows (`knowledge.py`, `protocol.attach_knowledge`; see "What the planner is told"):
+   `gt_labels, gt_atoms` always, `gt_masks` and `gt_buttons` from the oracle source, `held_labels` / `in_hand` for
+   what the hands hold, `workspace_bounds` when the round works at the floor.
 4. **Plan** (`tiptop-server`, `_run_pipeline`). Masks → point cloud in the base frame → M2T2 grasps (associated to
    objects by contact point) → table plane by RANSAC + one convex hull per object → cuTAMP samples pick/place
    skeletons over 256 particles, cuRobo refines the motions → `{q_init, steps: [trajectory{positions, dt} |
@@ -104,7 +110,7 @@ What happens, and how long it takes (shenlong-gpu-01, 2026-09-05):
 |---|---|---|
 | scene + task load | the log; nothing in Rerun yet but the planner's robot at its home pose | 3-5 min |
 | stage + stand | `placed ... on table`, `head camera at z 1.25 m sees a surface at z 0.42 from 0.40 m ahead`, `standing for ...: (4.29, 5.68) yaw -165 deg, distances [0.77, 0.76, 0.58, 0.82, 0.58]`; the robot, its 21 green objects and three camera views appear in Rerun | 10 s |
-| per round: capture | `ground-truth masks from geometry: pixels per label {...}` | 8 s |
+| per round: capture | `oracle masks: pixels per label {...}` | 8 s |
 | per round: plan | `server planned in 3.3s`, then one `perceived 'candle_4' (goal, 173 grasps) = simulated candle_4 (2.4 cm off)` line per object; hulls and the goal object's grasps replace the previous round's in the 3D view | 3-4 s |
 | per round: execute | `[2] gripper close ... is_grasping=1`, the arm in the 3D view and the cameras; `live.mp4` written | 25-30 s |
 | per round: score | `round N ...: {'q_score': 0.0625 * (N+1), ...}` | 20 s |
@@ -134,9 +140,8 @@ Why it is set up this way (all measured in the scene):
   object beyond that plus 8 cm. Crouching the hips further (joint1 1.3, joint2
   -1.9) puts cuRobo's sphere model of the robot in self-collision at every tilt, so every plan fails with
   `INVALID_START_STATE_SELF_COLLISION`; deeper still (1.5, -2.2) the simulator cannot hold the locked right arm.
-- Oracle masks make the run about planning and execution; `--no-gt` runs the same set-up on the detector + SAM2
-  (competition style), where the instance the goal means is passed as a `goal_hint` and the pairing lines tell
-  you what the detector actually found.
+- Oracle masks make the run about planning and execution; `--knowledge onboard` runs the same set-up on the
+  detector + SAM2 (competition style), and the pairing lines tell you what the detector actually found.
 - `--sequential` gives one capture/plan/execute round per goal atom from where the robot stands; `--restand`
   teleports the base to a fresh pose before each round instead. `--stand-for` fails loudly, with its rejection
   counts, when no single pose reaches everything named.
@@ -178,27 +183,38 @@ viewer (needs a display). The R1Pro renders as a mesh-less set of frames unless 
 generated next to the URDF (gitignored, ~50 MB): `cd tiptop && pixi run python scripts/make_r1pro_embodiment.py
 --copy-meshes`, then `git -C tiptop checkout -- tiptop/embodiments/assets/r1pro/r1pro_left_meta.yml`.
 
-## Perception modes
+## What the planner is told
 
-Chosen by what the request carries:
+The planner works from the image and from what the request says about the scene. Where that comes from is one
+choice, `--knowledge`, made in `knowledge.py` and nowhere else; the rest of the pipeline never asks which source it
+got. Every run records the source in its results, and the oracle one logs a PRIVILEGED warning at start.
 
-- **Ground truth** (default): `gt_labels` (every tracked task object, `candle_4` style), `gt_masks` from geometry
-  (or from Isaac's annotator with `--seg-instance`, where it works: Rs_int, not the house scenes) and `gt_atoms`
-  per instance. Objects out of view are dropped from the request; a goal object out of view is an error. The
-  server skips detection and SAM2 and runs everything else unchanged. Fast and exact; for development.
-- **Competition style** (`--no-gt`): only `gt_labels` (categories: `candle`), `gt_atoms` and `goal_hints` (where the
-  instance the goal means is, so the closest detected instance gets the plain label), i.e. what an agent knows from
-  the task definition. Grounding DINO (prompts per category in `tiptop_sim_r1pro.yml`, e.g. "round cookie") finds
-  boxes in the head-camera image, SAM2 segments them; `robot_mask`, the robot's own pixels, keeps SAM2 off an
-  occluding gripper (only available with `--seg-instance`). Instances are numbered by box size, largest first.
-  A `<label>_button` label (toggle buttons, below) is found afterwards in a zoomed view of that object's box.
+- **`oracle`** (the default, for development): the simulator's truth. Labels per instance (`candle_4`), `gt_masks`
+  from geometry (`gt_masks.py`: depth pixels within 8 mm of an object's mesh; or Isaac's annotator with
+  `--seg-instance`, where it works: Rs_int, not the house scenes) and the true pose of every toggle button the task
+  presses (`gt_buttons`, sent in every round so the pick round can choose a grasp that presents it). Objects out of
+  view are dropped from the request; a goal object out of view is an error (`GoalNotVisible`). The server skips
+  detection and SAM2 and runs everything else unchanged. The challenge forbids all of this at evaluation time.
+- **`onboard`** (competition style): what an agent knows. Category names (`candle`), the goal atoms, the gripper
+  state (`held_labels`, `in_hand`), and for a toggle button its label (`<object>_button`) so the detector looks
+  for it; a button detected in an earlier round is carried through a grasp by the arm's kinematics and sent as a
+  prior (`ButtonTracker`). Grounding DINO (prompts per category in `tiptop_sim_r1pro.yml`, e.g. "round cookie")
+  finds boxes in the head-camera image, SAM2 segments them; `robot_mask`, the robot's own pixels, keeps SAM2 off
+  an occluding gripper (only available with `--seg-instance`). Instances are numbered by box size, largest first,
+  so a category-level goal acts on the largest (closest) instance.
 - **Gemini** (`perception.detector: gemini`, tiptop's upstream default): Gemini detects the objects and translates
   the task; needs `GOOGLE_API_KEY`; atoms sent with the request take precedence.
 
+Both sources report what the hands hold, read from the robot's own grasp assist (sticky / assisted grasping):
+`in_hand` names objects the planned arm holds, so a plan can start holding one (a carry: pick at the table, move,
+place into a basket on the floor), and `held_labels` names what the other hand holds, which stays an obstacle.
+The base pose search (`--stand-for`, the strategies) reads object poses from the simulator too: navigation is a
+teleport stand-in and is counted as one in the benchmark's results.
+
 Toggle buttons (`toggled_on(obj)` goals, e.g. `turning_on_radio`): the button is a 2 cm marker on the object and
-the atom goes out as `pressed(<label>_button)`. With oracle masks (or `--no-gt --gt-buttons`) `button_hints` sends
-its pose (`gt_buttons`: base-frame position, the outward normal of the face it sits on from the object's own mesh,
-and the radius within which OmniGibson counts a finger). With `--no-gt` the planner finds it: the label goes into
+the atom goes out as `pressed(<label>_button)`. The oracle source sends its pose (`button_hints` -> `gt_buttons`:
+base-frame position, the outward normal of the face it sits on from the object's own mesh, and the radius within
+which OmniGibson counts a finger). With the onboard source the planner finds it: the label goes into
 `gt_labels`, Grounding DINO looks for it (`phrases` in the planner config, "small red button" for the radio) in a
 zoomed view of the detected object's box, SAM2 masks it in a zoomed crop, and the mask's depth points give the
 position, a plane through the surrounding depth points the normal (0.7 cm and 4 deg off the true button on the
@@ -238,7 +254,38 @@ OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.run live --embodimen
   --stand-for radio_receiver.n.01_1 --goal "holding(radio_receiver.n.01_1);toggled_on(radio_receiver.n.01_1)" \
   --sequential --press-port 8766 --grasping-mode sticky --task "pick up the radio and press its button" \
   --host localhost --port 8765 --overview front --out-dir runs/radio_bimanual
-    # add --no-gt for Grounding DINO + SAM2 on the radio and its button instead of oracle masks and the button's pose
+    # add --knowledge onboard for Grounding DINO + SAM2 on the radio and its button instead of oracle masks and the button's pose
+```
+
+## Benchmark
+
+`python -m omnigibson.tiptop.bench` runs a whole challenge task the way the challenge evaluates a policy
+(`omnigibson.eval.eval`): the same public test instances (indices 0-9 are the reported ones; the evaluator's own
+`load_task_instance` loads them), the same timeout (1.5x the mean human demonstration length, in env steps; every
+hold, capture and plan counts), the same metrics (`TaskMetric`, `AgentMetric`), the same result JSON per rollout
+under `<out>/json/`, plus `summary.json` with the mean q_score and `videos/<task>_<instance>_0.mp4`. Two things
+are stand-ins, and every result says so (`bench.knowledge`, `bench.teleports`): the base is teleported to the pose
+`best_base_pose` picks for each round instead of navigating, and with `--knowledge oracle` the planner is told the
+simulator's masks and button poses. A number from this benchmark bounds the manipulation part of the pipeline; it
+is not a challenge score.
+
+The task strategies (`strategies.py`) decide the rounds: `turning_on_radio` picks the radio up with the left
+hand and presses the switch with the right (the second planner on `--press-port` is required: a held radio
+cannot slide away under the press, a free-standing one did, 20 cm across the glass table, without toggling); a
+failed pick is retried from a pose at least 15 cm away, and when the press finds no plan twice (the grasp left
+the switch out of the right hand's reach) the radio goes back on the table and is picked up again, once;
+`assembling_gift_baskets` does 16 transfers, each a pick at the table, a teleport to the basket with
+the item in the gripper (OmniGibson moves a grasp-assisted object with the robot) and a place round that starts
+holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). Baskets nearest the table come
+first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
+
+```bash
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name turning_on_radio \
+    --instances 0 1 2 3 4 5 6 7 8 9 --knowledge oracle --grasping-mode sticky --host localhost --port 8765 \
+    --press-port 8766 --overview front --out-dir runs/bench_radio
+OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name assembling_gift_baskets \
+    --instances 0 1 2 3 4 5 6 7 8 9 --knowledge oracle --grasping-mode sticky --torso 1.2 -1.7 -0.9 0.0 \
+    --host localhost --port 8765 --out-dir runs/bench_baskets
 ```
 
 ## CLI
@@ -251,14 +298,15 @@ Isaac GUI):
 | `capture` | build the scene, write `obs.h5` + `capture.json` (offline input for `tiptop-h5`) | |
 | `live` | capture, plan on a running `tiptop-server`, execute, score | `--host --port --plan-timeout --no-state-stream --sequential --restand` |
 | `replay` | build the scene, execute a `tiptop_plan.json` | `--plan --state-stream HOST:PORT` |
-| `task` | work through a challenge task's whole `inside(item, container)` goal: containers staged on `--stage-support` one at a time, a fresh base pose per transfer, items verified with the task's own predicate | `--host --port --plan-timeout --no-state-stream --stage-support --attempts-per-item` |
+
+A whole challenge task on its test instances is `python -m omnigibson.tiptop.bench` (see "Benchmark").
 
 Flags shared by all: `--embodiment franka|r1pro`, `--activity NAME` (+ `--activity-instance`, `--rooms`), scene
 set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene-objects`; the base
 `--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
-`--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`,
-`--no-gt` (`--gt-buttons` keeps the buttons' true poses with detected masks); the goal `--goal "pred(a,b);..."`
-(BDDL names with `--activity`), `--task`; execution
+`--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`;
+what the planner is told `--knowledge oracle|onboard`; the goal `--goal "pred(a,b);..."` (BDDL names with
+`--activity`), `--task`; execution
 `--grasping-mode physical|assisted|sticky`, `--gripper-hold-steps`, `--finger-max-effort`, `--settle-steps`,
 `--no-video`, `--overview shoulder|front` (where the third-person camera stands); `--scene capture.json` reuses an
 earlier capture's settled object poses; `--not-load` drops object
@@ -315,8 +363,7 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   the footprint (0.36 m half extent) is not on a floor inside a room and free of other objects. Score: the farthest
   object's distance, a penalty for objects not on the left, for turning, and for object edges falling outside the
   camera frame (a basket cut by the border reconstructs 8 cm too long and the item is released beside it -- seen
-  2026-09-04). `--stand-for` and `task` use it; `choose_stage_spot` (task) picks the container's spot on the table
-  with it.
+  2026-09-04). `--stand-for` and the benchmark's strategies use it.
 
 ## Known limits
 
@@ -331,10 +378,16 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (face cosine to the camera 0.04), the panel is a sliver, and the context test fails. The fix would be a look
   from the right wrist camera before the press (the face points at the right arm anyway), a precomputed right-arm
   look pose, a second shadow camera with the wrist optics, and a table fallback for close-up views. The demo therefore
-  uses the oracle button pose (`button_hints` -> `gt_buttons`); `--no-gt` remains an experiment.
-- One base pose per round: items farther than ~0.9 m from the container need the base to move while holding, which
-  the pipeline does not model; `task` mode re-stands and re-stages the container per transfer instead, and the
-  four baskets of the gift task sit on the floor (a floor-level pick or a carry).
+  uses the oracle button pose (`button_hints` -> `gt_buttons`); `--knowledge onboard` remains an experiment.
+- The base moves by teleport (`place_robot`), between rounds only: a carry is a pick round, a teleport with the
+  object in the gripper (OmniGibson moves a grasp-assisted object with the robot) and a place round that starts
+  holding it (`in_hand`). Nothing plans the base's path. While a hand holds something the capture keeps the arm
+  where it is and the gripper closed (the swing out of view used to open it and drop the object, 2026-09-09).
+- A planner can hit a CUDA fault (an illegal memory access in cuRobo, a few times in ~40 requests on the shared
+  server) and is useless afterwards; it exits and its launcher relaunches it, and the benchmark waits for
+  `/health` before each request (DEPLOYMENT item 11). Reachability: some instances put an object where no base
+  pose within 0.9 m is free (a radio at the far side of the table with a sofa behind it); the benchmark widens
+  the search to 1.1 m once (the torso leans) and then skips the object.
 - Placement goes onto the top face of the container's convex hull with a 1 cm surface shrink, which is less than a
   wicker rim: an item can be set down on the rim (2026-09-05, from a stretched 0.8 m reach) and topple the basket.
 - Flat objects (cheese slabs, bows) get few M2T2 grasps; the planner succeeds on them from close, orthogonal
@@ -352,9 +405,11 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 
 ## Tests
 
-`pytest OmniGibson/tests/test_tiptop_protocol.py OmniGibson/tests/test_tiptop_gt_masks.py` (no Isaac Sim): the
-msgpack-numpy wire format, request validation, plan parsing and resampling, the H5 layout, the name helpers, the
-position-based perception pairing, and the geometry masks.
+`pytest OmniGibson/tests/test_tiptop_protocol.py OmniGibson/tests/test_tiptop_gt_masks.py
+OmniGibson/tests/test_tiptop_knowledge.py` (no Isaac Sim): the msgpack-numpy wire format, request validation, plan
+parsing and resampling, the H5 layout, the name helpers, the position-based perception pairing, the geometry
+masks, the knowledge sources (what each attaches to a request, the button tracker), the task strategies against
+a scripted episode, and the benchmark's summary.
 
 ## History
 
