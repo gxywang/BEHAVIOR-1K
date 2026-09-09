@@ -13,7 +13,9 @@ import yaml
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.controllers import ControllerView
+from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
 from omnigibson.macros import gm
+from omnigibson.tasks.behavior_task import BehaviorTask
 
 
 CHALLENGE_SCENES = (
@@ -41,6 +43,9 @@ def parse_args():
         help="Override episode count per task template in each selected scene",
     )
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--skip-existing", action="store_true", help="Skip task benchmarks whose final output file already exists"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-distance", type=float, default=1.0)
     parser.add_argument("--max-distance", type=float, default=10.0)
@@ -316,9 +321,6 @@ def main():
         gm.ENABLE_TRANSITION_RULES = False
 
     robot_cfg = load_robot_config(args.robot_config)
-    from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
-    from omnigibson.tasks.behavior_task import BehaviorTask
-
     task_metadata = Path(gm.DATA_PATH) / "2026-challenge-task-instances" / "metadata" / "available_tasks.yaml"
     with open(task_metadata, "r", encoding="utf-8") as f:
         available_tasks = yaml.safe_load(f)
@@ -341,6 +343,10 @@ def main():
             if not task_names:
                 raise ValueError(f"No competition tasks found for scene {scene}")
             for task_name in task_names:
+                task_path = out_parent / f"{out_path.stem}_{scene}_{task_name}.json"
+                if args.skip_existing and task_path.is_file():
+                    print(f"Skipping existing task benchmark: {task_path}")
+                    continue
                 scene_instance = BehaviorTask.get_cached_activity_scene_filename(scene, task_name, 0, 0)
                 eps = sample_scene(
                     scene_model=scene,
@@ -351,7 +357,6 @@ def main():
                     args=args,
                     num_episodes=per_scene,
                 )
-                task_path = out_parent / f"{out_path.stem}_{scene}_{task_name}.json"
                 tmp_path = task_path.with_suffix(".json.tmp")
                 write_benchmark(path=tmp_path, args=args, robot_cfg=robot_cfg, episodes=eps)
                 tmp_path.replace(task_path)
