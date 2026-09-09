@@ -303,7 +303,6 @@ def do_capture(
     from omnigibson.tiptop.protocol import save_observation_h5
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
-    bddl_atoms = list(atoms)
     no_gt = args.no_gt
     if args.activity:
         # BDDL names -> request labels; --no-gt asks the detector for categories (any candle will do)
@@ -322,10 +321,13 @@ def do_capture(
             if sim.last_capture_rgb is not None:  # what the camera saw when a goal object was missing
                 imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)
             raise
-    # toggle buttons: described by pose (gt_buttons) with ground-truth masks or --gt-buttons; with --no-gt the
-    # planner looks for "<object>_button" in a zoomed view of the object, so the label goes into gt_labels
+    # toggle buttons: described by pose (gt_buttons) with ground-truth masks or --gt-buttons, for every button the
+    # whole goal presses, in every round (the pick round chooses a grasp that presents it); with --no-gt the planner
+    # looks for "<object>_button" in a zoomed view of the object, so the label goes into gt_labels
     buttons = (
-        sim.button_hints(bddl_atoms, category_level=no_gt) if args.activity and (not no_gt or args.gt_buttons) else {}
+        sim.button_hints(parse_goal(args.goal), category_level=no_gt)
+        if args.activity and (not no_gt or args.gt_buttons)
+        else {}
     )
     if buttons:
         request["gt_buttons"] = buttons
@@ -428,7 +430,11 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
     goal_args = {a for atom in request.get("gt_atoms") or [] for a in atom["args"]}
     for label in sorted(perceived, key=lambda name: (name not in goal_args, name)):
         info, m = perceived[label], match[label]
-        role = "goal" if label in goal_args else ("movable" if info["movable"] else "surface")
+        role = (
+            "goal"
+            if label in goal_args
+            else ("held" if info.get("held") else "movable" if info["movable"] else "surface")
+        )
         head = f"perceived {label!r} ({role}, {info['grasps']} grasps)"
         if m["sim"] is None:
             nearest = f"{100 * m['dist']:.0f} cm" if m["dist"] is not None else "nothing tracked"

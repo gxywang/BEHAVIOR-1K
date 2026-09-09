@@ -320,6 +320,18 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 
 ## Known limits
 
+- **Finding the radio's switch without oracle information does not work yet (2026-09-08).** The `turning_on_radio`
+  radio has two red controls: the power switch on its black round speaker panel, and a knob on its top edge. In the
+  task's placement the speaker panel faces away from the robot, so on the table only the knob is visible and every
+  detector phrase tried scores it like the switch. The detector now accepts a button only inside a dark
+  "black circle" context 2-6 times its size (`perception.grounding_dino.contexts`), which rejects the knob and keeps
+  the switch when its panel is in view; and when no button is seen before the pick the planner presents the object's
+  far side. But the radio hangs upright from a handle grasp and the two grasp families differ by a half turn, so the
+  speaker face can be turned toward either arm, never up toward the head camera: in the hand it is edge-on
+  (face cosine to the camera 0.04), the panel is a sliver, and the context test fails. The fix would be a look
+  from the right wrist camera before the press (the face points at the right arm anyway), a precomputed right-arm
+  look pose, a second shadow camera with the wrist optics, and a table fallback for close-up views. The demo therefore
+  uses the oracle button pose (`button_hints` -> `gt_buttons`); `--no-gt` remains an experiment.
 - One base pose per round: items farther than ~0.9 m from the container need the base to move while holding, which
   the pipeline does not model; `task` mode re-stands and re-stages the container per transfer instead, and the
   four baskets of the gift task sit on the floor (a floor-level pick or a carry).
