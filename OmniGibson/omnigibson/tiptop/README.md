@@ -446,3 +446,9 @@ a scripted episode, and the benchmark's summary.
   mirror had moved the wrong object).
 - 2026-09-05: the demo above with oracle masks, four items from one base pose, task score 0.25; wrist camera and
   layout in Rerun; camera reach measured per posture.
+- 2026-09-08: toggled_on goals (the radio): closed-gripper press, the two-hands hold-and-press with a second planner,
+  grasps chosen to present the button, detector experiments on the button (documented limit).
+- 2026-09-09: what the planner is told became one swappable source (`knowledge.py`); the carry (`in_hand`) and the
+  challenge-style benchmark with task strategies; turning_on_radio 0.7 / 0.7 / 0.6 and assembling_gift_baskets
+  0.6375 on the 10 public instances (oracle knowledge, teleported base); cuRobo collision caches sized at build
+  time after four CUDA faults.
