@@ -309,12 +309,15 @@ the number as about 0.65 with the press as the source of variance):
 | turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
 | assembling_gift_baskets | 1 (2 instances, stopped) | 0.31 | 0/2 | 11200 / 39090 | a failed put-down left the item in the hand and blocked every later pick; items knocked to the floor were re-picked |
 | assembling_gift_baskets | 2 | 0.6375 | 2/10 (16/16 twice; 15, 14, 13, 11, 11, 3, 3, 0 of 16) | 13600 / 39090 | 3 instances lost to one item no put-down plan could set down after a failed place (the hand stayed full); 45 stand attempts found no pose even at 1.1 m (a basket in a corner) |
+| assembling_gift_baskets | 3 | 0.875 | 2/10 (16/16 twice; 15, 15, 15, 15, 14, 13, 11, 10 of 16) | 16000 / 39090 | the last-resort release ended the stuck-item loops (4 releases, 27 failed of 374 rounds); what remains is one or two items per instance: bows no base pose reaches (3 instances), a basket in a corner (1), places with no satisfying plan (2) |
 
 The gift-basket run took 25-40 min of wall time per instance (250 rounds of capture, plan and execution over the
 10 instances, 0 planner faults) for 110-600 s of simulated time; the challenge timeout was never reached. The pick
-and the carry work: 147 pick rounds executed, 103 place rounds executed, 88 items placed. What loses points is an
-object the hand cannot put down again after a failed place (pass 3 releases it as the last resort), baskets no base
-pose reaches, and places whose plan has no satisfying particles.
+and the carry work: 147 pick rounds executed, 103 place rounds executed, 88 items placed. Pass 2 lost most of its
+points to an object the hand could not put down again after a failed place; pass 3's last-resort release (open the
+hand where it is) ended those loops and raised the mean to 0.875 (`runs/bench_baskets`, 27-33 min per instance).
+What remains costs one or two items per instance: a bow at the far edge of the table that no base pose reaches
+even at 1.1 m, a basket standing in a room corner, and places whose plan has no satisfying particles.
 
 What fails is not the pick (26 of 30 instances ended with the radio in the hand) but the press with the grasp the
 pick chose: the right arm has a plan when the switch ends up about 0.59 m ahead of the base facing right and none
@@ -474,7 +477,8 @@ a scripted episode, and the benchmark's summary.
 - 2026-09-09 (later): the benchmark video ended at the instant the goal predicate flipped, so a press looked
   unfinished and a failure looked like a success; now the final state stays on screen for 3 s under the verdict,
   every frame carries the step count, and the file is a fragmented MP4 that plays during and after a killed run. The
-  bench writes no per-round clips (the episode video covers them).
+  bench writes no per-round clips (the episode video covers them). assembling_gift_baskets pass 3 (the last-resort
+  release): 0.875 on the 10 public instances.
 - 2026-09-09 (hygiene pass, after an audit): the press stop signal comes from the knowledge source (the oracle knows
   when a switch flips; the onboard source runs the press to its planned depth); the grasp-assist read handles
   physical grasping; the task's floor is looked up, not assumed; per-episode state (``arm``, ``teleports``, the
