@@ -9,6 +9,47 @@ processes in separate Python environments and talk over a websocket.
 The runbook for the lab server (GPU pinning, tunnels, the exact shell lines) is [USAGE_DOCS.md](../../../USAGE_DOCS.md);
 installing the planner and grasp server on a new machine and the problems you will meet is [DEPLOYMENT.md](DEPLOYMENT.md).
 
+## Results
+
+2026-09-09, the challenge's public test instances 0-9, `python -m omnigibson.tiptop.bench` (the challenge's metric,
+timeout and instance loading; see "Benchmark"). Oracle knowledge (masks and button poses from the simulator) and a
+teleported base, so these bound the manipulation part and are not challenge scores. Each run is
+`runs/bench_<task>_pass<N>/`: `json/` per instance, `summary.json` with a `what_failed` line per instance,
+`videos/` with one video per instance that ends on its verdict. Labels: *no base pose* = no free floor pose put the
+object within reach (1.1 m at most); *no plan* = the planner found no satisfying plan for the round; *not visible*
+= the goal object had no pixels in the capture; *ran, not inside* = the place executed but the predicate stayed
+false (the item landed outside the rim or fell); *released* = the last-resort open of a hand no plan could empty.
+
+- **turning_on_radio**, three passes of the same strategy (pick with the left hand, press with the right while
+  holding): mean q_score **0.7 / 0.7 / 0.6**, 20 of 30 instances.
+  - pass 1 (`runs/bench_radio_pass1`, 7/10): 302, 303 no base pose within 0.9 m (the search now widens to 1.1 m);
+    309 press: no plan x2 after the pick.
+  - pass 2 (`runs/bench_radio_pass2`, 7/10): 302 press: no plan x2 (two picks); 303 no base pose; 309 press: no
+    plan x2.
+  - pass 3 (`runs/bench_radio_pass3`, 6/10, final code): 301 press: no plan x4, even after a put-down and a re-pick;
+    302 two pick rounds ran, the radio was never grasped (0.95 m reach), so no press; 307 the press ran twice
+    without toggling, then the re-pick's press had no plan x2; 309 press: no plan x4 (three picks, one put-down).
+  - What fails is the right hand's press plan, which depends on the grasp the left hand chose (a switch left
+    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (26 of 30 instances ended with the radio in hand).
+- **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
+  - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
+    from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
+    put-down left the item in the hand and every later request named it; fixed for pass 2).
+  - pass 2 (`runs/bench_baskets_pass2`): mean **0.6375**, 303 and 310 complete. 301 11/16 bows 2 and 4 no base
+    pose (six attempts), no plan x2; 302 15/16 bow_4 no plan x2; 304 11/16 basket_2's items no plan x9; 305 0/16,
+    306 3/16, 309 3/16 the same loop: a failed place left the item in the hand and no put-down plan emptied it
+    (48 / 45 / 43 failed rounds, the table no base pose from where it stood); 307 14/16 bow_4 no base pose,
+    candle_1 not visible; 308 13/16 bow_1 no base pose x4, no plan x1.
+  - pass 3 (`runs/bench_baskets_pass3`, the last-resort release added): mean **0.875**, 304 and 310 complete.
+    301 11/16 bow_4 no base pose x4, no plan x3 (cheese_3, cookie_1); 302 14/16 bows 3 and 4 ran, not inside;
+    303 13/16 basket_4's cheese_2, cookie_1, bow_2 no plan x4, one released; 305 10/16 basket_4 in a room corner
+    (no base pose x5), bow_3 and candle_2 no base pose, no plan x3; 306 15/16 candle_2 no plan x4 and not visible
+    x2, one released; 307 15/16 bow_4 no base pose x2; 308 15/16 bow_1 no base pose x3, one released; 309 15/16
+    cheese_2 ran, not inside.
+  - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
+    reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
+    about 16k of the 39k allowed env steps per instance.
+
 ## Architecture
 
 ```
@@ -119,7 +160,7 @@ What happens, and how long it takes (shenlong-gpu-01, 2026-09-05):
 
 Result of that command: all four items ended up inside the basket, task score 0 → 0.25 (4 of its 16 `inside`
 predicates; the best 2025 submission reached 0.31 on this task, none completed it); a repeat the same night
-placed three (M2T2 returned no grasps for the bow, see "Known limits"). Outputs: `runs/demo/round_0N/`
+placed three (M2T2 returned no grasps for the bow, see "Known limits"). Outputs (now under `runs/archive/`): `runs/archive/demo/round_0N/`
 with `capture.json` (poses, intrinsics, validation), `rgb.png`, `depth.png`, `gt_masks.png`, `obs.h5`,
 `tiptop_plan.json`, `server_response.json`, `live.mp4`, `live_result.json` (tracking errors, gripper events, the
 goal status, final object poses, and `perception`: the pairing above), and `sequential_summary.json` plus
@@ -285,7 +326,7 @@ JSON's `bench.video` names the video and `bench.rounds` lists the rounds with th
 round without the simulator (does a planner failure reproduce?):
 
 ```bash
-./b1k/bin/python -m omnigibson.tiptop.replay runs/bench_radio/turning_on_radio_301_0/r02_right_toggled_on --port 8766 --repeats 3
+./b1k/bin/python -m omnigibson.tiptop.replay runs/bench_radio_pass3/turning_on_radio_301_0/r02_right_toggled_on --port 8766 --repeats 3
 ```
 
 The task strategies (`strategies.py`) decide the rounds: `turning_on_radio` picks the radio up with the left
@@ -299,7 +340,7 @@ holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). B
 first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
 
 Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
-`runs/bench_radio_pass2`, `runs/bench_radio`; the same strategy scored 0.7, 0.7 and 0.6 in three passes, so read
+`runs/bench_radio_pass2`, `runs/bench_radio_pass3`; the same strategy scored 0.7, 0.7 and 0.6 in three passes, so read
 the number as about 0.65 with the press as the source of variance):
 
 | task | pass | mean q_score | successes | median env steps (of the timeout) | failure causes |
@@ -315,7 +356,7 @@ The gift-basket run took 25-40 min of wall time per instance (250 rounds of capt
 10 instances, 0 planner faults) for 110-600 s of simulated time; the challenge timeout was never reached. The pick
 and the carry work: 147 pick rounds executed, 103 place rounds executed, 88 items placed. Pass 2 lost most of its
 points to an object the hand could not put down again after a failed place; pass 3's last-resort release (open the
-hand where it is) ended those loops and raised the mean to 0.875 (`runs/bench_baskets`, 27-33 min per instance).
+hand where it is) ended those loops and raised the mean to 0.875 (`runs/bench_baskets_pass3`, 27-33 min per instance).
 What remains costs one or two items per instance: a bow at the far edge of the table that no base pose reaches
 even at 1.1 m, a basket standing in a room corner, and places whose plan has no satisfying particles.
 
@@ -328,10 +369,10 @@ against 4 in the ~60 requests before the collision caches were sized (DEPLOYMENT
 ```bash
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name turning_on_radio \
     --instances 0 1 2 3 4 5 6 7 8 9 --knowledge oracle --grasping-mode sticky --host localhost --port 8765 \
-    --press-port 8766 --overview front --out-dir runs/bench_radio
+    --press-port 8766 --overview front --out-dir runs/bench_radio_pass4
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name assembling_gift_baskets \
     --instances 0 1 2 3 4 5 6 7 8 9 --knowledge oracle --grasping-mode sticky --torso 1.2 -1.7 -0.9 0.0 \
-    --host localhost --port 8765 --out-dir runs/bench_baskets
+    --host localhost --port 8765 --out-dir runs/bench_baskets_pass4
 ```
 
 ## CLI

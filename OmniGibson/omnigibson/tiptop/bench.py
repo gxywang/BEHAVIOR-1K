@@ -16,8 +16,10 @@ not a challenge score.
 import argparse
 import json
 import logging
+import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +43,44 @@ log = logging.getLogger("omnigibson.tiptop")
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
 UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
+
+
+def short_atom(atom: str) -> str:
+    """'inside(bow.n.08_4, wicker_basket.n.01_3)' -> 'inside(bow_4, wicker_basket_3)'."""
+    return re.sub(r"\.n\.\d+", "", atom)
+
+
+def what_failed(result: dict) -> str:
+    """One line on why an instance fell short, from its own records: the goal atoms left unsatisfied, the objects no
+    base pose reached, the rounds that failed by kind, the rounds that ran (by predicate), releases. Empty on success."""
+    if result["success"]:
+        return ""
+    bench, goal = result["bench"], result["bench"]["goal"]
+    rounds = bench["rounds"]
+    missing = goal["unsatisfied"]
+    parts = [
+        f"{len(missing)}/{goal['total']} unsatisfied: "
+        + ", ".join(short_atom(a) for a in missing[:UNSATISFIED_SHOWN])
+        + (" ..." if len(missing) > UNSATISFIED_SHOWN else "")
+    ]
+    if bench["reason"] not in ("strategy finished", "success"):
+        parts.append(bench["reason"])
+    unreachable = Counter(
+        ", ".join(short_atom(n) for n in x["stand_for"]) for x in rounds if "stand_for" in x and "error" in x
+    )
+    if unreachable:
+        parts.append("no base pose for " + ", ".join(f"{name} x{n}" for name, n in unreachable.items()))
+    failed = Counter(
+        x["error"].split(":")[0] for x in rounds if "round" in x and "error" in x and x["error"] != "episode over"
+    )
+    if failed:
+        parts.append("failed rounds: " + ", ".join(f"{kind} x{n}" for kind, n in failed.items()))
+    ran = Counter(f"{x['atoms'][0]['predicate']} [{x['arm']}]" for x in rounds if "round" in x and "error" not in x)
+    parts.append("rounds run: " + (", ".join(f"{k} x{n}" for k, n in ran.items()) if ran else "none"))
+    releases = sum(1 for x in rounds if x.get("release"))
+    if releases:
+        parts.append(f"released an item x{releases}")
+    return "; ".join(parts)
 
 
 def verdict_caption(reason: str, success: bool, goal: dict) -> str:
@@ -314,6 +354,7 @@ def main(argv=None) -> None:
             log.info(
                 f"RESULT instance {instance_id}: q_score {result.get('q_score', {}).get('final')} success {success} "
                 f"steps {steps}/{max_steps} ({reason}); teleports {sim.teleports}; {result['bench']['wall_time_s']}s"
+                + (f"; {what_failed(result)}" if not success else "")
             )
             write_summary(out_dir, args, results, max_steps)
     except Exception:
@@ -352,6 +393,7 @@ def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> d
                 "reason": r["bench"]["reason"],
                 "teleports": r["bench"]["teleports"],
                 "wall_time_s": r["bench"]["wall_time_s"],
+                "what_failed": what_failed(r),
             }
             for r in results
         ],

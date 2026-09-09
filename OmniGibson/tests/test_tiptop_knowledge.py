@@ -348,7 +348,15 @@ def test_bench_summary_means_the_q_scores():
             "q_score": {"final": 0.0},
             "success": False,
             "steps": 3224,
-            "bench": {"reason": "timeout", "teleports": 2, "wall_time_s": 200},
+            "bench": {
+                "reason": "timeout",
+                "teleports": 2,
+                "wall_time_s": 200,
+                "goal": {"total": 1, "unsatisfied": ["toggled_on(radio_receiver.n.01_1)"]},
+                "rounds": [
+                    {"round": 1, "atoms": [{"predicate": "holding", "args": ["radio_receiver.n.01_1"]}], "arm": "left"}
+                ],
+            },
         },
     ]
     import tempfile
@@ -357,6 +365,10 @@ def test_bench_summary_means_the_q_scores():
     with tempfile.TemporaryDirectory() as d:
         summary = write_summary(Path(d), args, results, 3224)
         assert summary["mean_q_score"] == 0.5 and summary["successes"] == 1 and len(summary["per_instance"]) == 2
+        assert summary["per_instance"][0]["what_failed"] == ""
+        assert summary["per_instance"][1]["what_failed"] == (
+            "1/1 unsatisfied: toggled_on(radio_receiver_1); timeout; rounds run: holding [left] x1"
+        )
         assert (Path(d) / "summary.json").exists()
 
 
@@ -486,3 +498,41 @@ def test_only_the_oracle_source_knows_when_a_switch_flips():
     sim.toggled_now["radio.n.01_1"] = True
     assert done() is True
     assert OnboardKnowledge(sim, goal).press_done(["radio.n.01_1"]) is None
+
+
+def test_what_failed_names_the_unsatisfied_atoms_the_unreachable_objects_and_the_failed_rounds():
+    from omnigibson.tiptop.bench import what_failed
+
+    goal = {
+        "total": 16,
+        "unsatisfied": [
+            "inside(bow.n.08_4, wicker_basket.n.01_3)",
+            "inside(candle.n.01_2, wicker_basket.n.01_4)",
+            "inside(swiss_cheese.n.01_1, wicker_basket.n.01_4)",
+            "inside(butter_cookie.n.01_2, wicker_basket.n.01_4)",
+        ],
+    }
+    rounds = [
+        {"stand_for": ["bow.n.08_4"], "error": "no free pose", "step": 10},
+        {"stand_for": ["bow.n.08_4"], "error": "no free pose", "step": 20},
+        {"round": 1, "atoms": [{"predicate": "holding", "args": ["candle.n.01_2"]}], "arm": "left"},
+        {
+            "round": 2,
+            "atoms": [{"predicate": "inside", "args": ["candle.n.01_2", "wicker_basket.n.01_4"]}],
+            "arm": "left",
+            "error": "TiptopPlanningError: planning failed: no satisfying particles",
+        },
+        {"round": 3, "atoms": [{"predicate": "ontop", "args": ["candle.n.01_2", "floor.n.01_1"]}], "arm": "left"},
+        {"release": True, "step": 300},
+    ]
+    result = {"success": False, "bench": {"goal": goal, "reason": "strategy finished", "rounds": rounds}}
+    text = what_failed(result)
+    assert text.split("; ") == [
+        "4/16 unsatisfied: inside(bow_4, wicker_basket_3), inside(candle_2, wicker_basket_4), "
+        "inside(swiss_cheese_1, wicker_basket_4) ...",
+        "no base pose for bow_4 x2",
+        "failed rounds: TiptopPlanningError x1",
+        "rounds run: holding [left] x1, ontop [left] x1",
+        "released an item x1",
+    ]
+    assert what_failed({"success": True, "bench": {}}) == ""
