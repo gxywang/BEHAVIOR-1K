@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -126,6 +127,23 @@ def parse_args(argv=None):
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
+    parser.add_argument(
+        "--visual-step-sleep",
+        type=float,
+        default=0.0,
+        help="Sleep this many seconds after each simulator step so non-headless runs are visible.",
+    )
+    parser.add_argument(
+        "--keep-open-on-complete",
+        action="store_true",
+        help="Wait before shutdown after the run finishes, useful for inspecting the non-headless viewer.",
+    )
+    parser.add_argument(
+        "--keep-open-seconds",
+        type=float,
+        default=None,
+        help="Seconds to keep the viewer open. If omitted with --keep-open-on-complete, wait for Enter.",
+    )
     return parser.parse_args(argv)
 
 
@@ -751,6 +769,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
             commanded_steps += 1
 
         env.step({robot.name: action_from_nav2py_command(robot, executed_command)})
+        if args.visual_step_sleep > 0.0:
+            time.sleep(args.visual_step_sleep)
         position, _ = robot.get_position_orientation()
         final_distance = xy_distance(position[:2], goal[:2])
         success = final_distance <= args.success_distance
@@ -889,9 +909,13 @@ def main(args=None, shutdown=True):
         "soft_cost_radius",
         "soft_cost_scaling_factor",
         "planner_cost_penalty",
+        "visual_step_sleep",
+        "keep_open_seconds",
     ):
         value = getattr(args, arg_name)
-        if value is not None and value <= 0.0:
+        if value is not None and value < 0.0:
+            raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
+        if arg_name not in {"visual_step_sleep", "keep_open_seconds"} and value is not None and value == 0.0:
             raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
 
     args.safety_slowdown_scales = parse_safety_slowdown_scales(args.safety_slowdown_scales)
@@ -979,6 +1003,8 @@ def main(args=None, shutdown=True):
         summary = summarize_results(results)
         print(f"\nSaved results to: {output}")
         print(f"Success rate: {summary['successes']}/{summary['total']} ({summary['success_rate']:.1%})")
+        if shutdown and args.keep_open_on_complete:
+            keep_viewer_open(args.keep_open_seconds)
     except Exception:
         if not shutdown:
             og.clear()
@@ -986,6 +1012,20 @@ def main(args=None, shutdown=True):
     finally:
         if shutdown:
             og.shutdown()
+
+
+def keep_viewer_open(seconds):
+    if seconds is not None:
+        print(f"\nKeeping viewer open for {seconds:.1f}s...")
+        time.sleep(seconds)
+        return
+
+    try:
+        input("\nRun complete. Press Enter to close OmniGibson...")
+    except EOFError:
+        print("\nRun complete. Press Ctrl+C to close OmniGibson.")
+        while True:
+            time.sleep(1.0)
 
 
 if __name__ == "__main__":

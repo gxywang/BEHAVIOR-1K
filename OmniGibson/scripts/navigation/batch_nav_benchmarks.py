@@ -109,6 +109,7 @@ def main():
 
     if args.mode == "run":
         os.environ.setdefault("OMNIGIBSON_HEADLESS", "1")
+        from run_nav2py_benchmark import keep_viewer_open
         from run_nav2py_benchmark import main as run_benchmark
         from run_nav2py_benchmark import parse_args as parse_run_args
         import omnigibson as og
@@ -138,6 +139,8 @@ def main():
             return 1 if failures else 0
         finally:
             if og.app is not None:
+                if run_args.keep_open_on_complete:
+                    keep_viewer_open(run_args.keep_open_seconds)
                 og.shutdown()
 
     script = Path(__file__).resolve().with_name("check_nav_benchmark.py")
