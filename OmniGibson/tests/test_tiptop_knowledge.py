@@ -205,12 +205,16 @@ class _Episode:
         return {}
 
     def holds(self, predicate, *args):
-        if predicate == "ontop" and args[1].startswith("table"):
-            return args[0] in self.on_table
         return (predicate, *args) in self.true
+
+    def on_support(self, item, support):
+        return item in self.on_table
 
     def holding(self, bddl):
         return bddl in self.in_hand
+
+    def held_names(self):
+        return sorted(self.in_hand)
 
     def support_of(self, bddl):
         return "table.n.02_1"
@@ -284,16 +288,17 @@ def test_assemble_gift_baskets_carries_items_and_tries_the_reachable_ones_first(
         "bow.n.01_2": (0.3, 0.0),
     }
     on_table = [n for n in positions if not n.startswith(("table", "wicker"))]
-    # basket 2 (closer) first: candle_2 picked and placed; bow_1 pick fails, bow_2 works; basket 1: candle_1, bow_1
-    outcomes = [{"held"}, {"placed"}, set(), {"held"}, {"placed"}, {"held"}, {"placed"}, {"held"}, {"placed"}]
+    # basket 2 (closer) first: candle_2 picked and placed; bow_1's pick fails twice, bow_2 works; basket 1: candle_1, bow_1
+    outcomes = [{"held"}, {"placed"}, set(), set(), {"held"}, {"placed"}, {"held"}, {"placed"}, {"held"}, {"placed"}]
     ep = _Episode(outcomes, on_table=on_table, positions=positions)
     AssembleGiftBaskets(goal, attempts=2).run(ep)
     rounds = [c for c in ep.calls if c[0] == "round"]
     assert rounds[0][1:3] == ("holding", ("candle.n.01_2",))
     assert rounds[1][1:3] == ("inside", ("candle.n.01_2", "wicker_basket.n.01_2"))
-    assert rounds[2][1:3] == ("holding", ("bow.n.01_1",)) and rounds[3][1:3] == ("holding", ("bow.n.01_2",))
-    assert rounds[4][1:3] == ("inside", ("bow.n.01_2", "wicker_basket.n.01_2"))
-    assert rounds[5][1:3] == ("holding", ("candle.n.01_1",)) and rounds[7][1:3] == ("holding", ("bow.n.01_1",))
+    assert rounds[2][1:3] == rounds[3][1:3] == ("holding", ("bow.n.01_1",))  # retried once from another pose
+    assert rounds[4][1:3] == ("holding", ("bow.n.01_2",))
+    assert rounds[5][1:3] == ("inside", ("bow.n.01_2", "wicker_basket.n.01_2"))
+    assert rounds[6][1:3] == ("holding", ("candle.n.01_1",)) and rounds[8][1:3] == ("holding", ("bow.n.01_1",))
     stands = [c for c in ep.calls if c[0] == "stand"]
     assert stands[0][1] == ("candle.n.01_2",) and stands[1][1] == ("wicker_basket.n.01_2",)  # pick, then carry
     assert ep.true == {
@@ -384,3 +389,34 @@ def test_turn_on_radio_gives_up_when_the_radio_is_unreachable():
     ep = _Episode([], arms=("left", "right"), unreachable={"radio_receiver.n.01_1"})
     TurnOnRadio(goal).run(ep)
     assert [c for c in ep.calls if c[0] == "round"] == []
+
+
+def test_assemble_gift_baskets_frees_a_full_hand_before_the_next_pick():
+    from omnigibson.tiptop.strategies import AssembleGiftBaskets
+
+    goal = [
+        {"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]},
+        {"predicate": "inside", "args": ["bow.n.01_1", "wicker_basket.n.01_1"]},
+    ]
+    positions = {
+        "table.n.02_1": (0, 0),
+        "wicker_basket.n.01_1": (2, 0),
+        "candle.n.01_1": (0.1, 0),
+        "bow.n.01_1": (0.2, 0),
+    }
+    # the candle's place fails and so does the first put-down: the next transfer starts by putting it down
+    ep = _Episode(
+        [{"held"}, set(), set(), {"placed"}, {"held"}, {"placed"}],
+        on_table=["candle.n.01_1", "bow.n.01_1"],
+        positions=positions,
+    )
+    AssembleGiftBaskets(goal, attempts=1).run(ep)
+    rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
+    assert rounds[:3] == [
+        ("holding", ("candle.n.01_1",)),
+        ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")),
+        ("ontop", ("candle.n.01_1", "floor.n.01_1")),
+    ]
+    assert rounds[3] == ("ontop", ("candle.n.01_1", "floor.n.01_1"))  # freed at the start of the bow's transfer
+    assert rounds[4:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
+    assert not ep.in_hand

@@ -67,7 +67,9 @@ class TurnOnRadio(Strategy):
                 if ep.holds("toggled_on", radio):
                     return
             if cycle == 0:
-                log.info(f"{radio}: the switch did not toggle with this grasp; putting it back on {table} to pick it up again")
+                log.info(
+                    f"{radio}: the switch did not toggle with this grasp; putting it back on {table} to pick it up again"
+                )
                 ep.plan_and_execute([atom("ontop", radio, table)])
                 if ep.holding(radio):
                     log.warning(f"{radio}: still in the hand after the put-down; giving up")
@@ -91,10 +93,10 @@ class TurnOnRadio(Strategy):
 
 class AssembleGiftBaskets(Strategy):
     """Every basket gets one item of each kind. Baskets stand on the floor, items on a table; each transfer is a pick
-    at the table, a base move to the basket with the item in hand, and a place into the basket. Baskets are done
-    nearest to the table first; within a kind, the items nearest the table's edge are tried first (the reachable
-    ones), ``attempts`` of them per basket. An item still in the hand after a failed place is put down where the
-    robot stands so the hand is free for the next one."""
+    at the table (two poses at most), a base move to the basket with the item in hand, and a place into the basket.
+    Baskets are done nearest to the table first; within a kind, the items still on the table nearest its edge are
+    tried first (the reachable ones), ``attempts`` of them per basket. An item still in the hand after a failed
+    place is put down where the robot stands, and a hand still full at the next transfer is emptied first."""
 
     task = "assembling_gift_baskets"
     instruction = "put one candle, one cheese, one cookie and one bow into each wicker basket"
@@ -122,7 +124,7 @@ class AssembleGiftBaskets(Strategy):
         placed = set()
         for basket in baskets:
             for kind, items in items_by_kind.items():
-                candidates = [i for i in items if i not in placed and ep.holds("ontop", i, table)]
+                candidates = [i for i in items if i not in placed and ep.on_support(i, table)]
                 candidates.sort(key=lambda i: ep.edge_gap(i, table))  # nearest the table's edge first
                 for item in candidates[: self.attempts]:
                     if self.transfer(ep, item, basket, table):
@@ -130,14 +132,19 @@ class AssembleGiftBaskets(Strategy):
                         break
 
     def transfer(self, ep, item: str, basket: str, table: str) -> bool:
-        try:
-            ep.stand_for(item)
-        except Unreachable as e:
-            log.info(f"{item}: {e}")
+        if not self.free_hand(ep, table):
             return False
-        ep.plan_and_execute([atom("holding", item)])
-        if not ep.holding(item):
-            log.info(f"{item}: not in the hand after the pick round")
+        for attempt in range(2):  # a pick that fails (no plan, the item hidden from this pose) gets one more pose
+            try:
+                ep.stand_for(item)
+            except Unreachable as e:
+                log.info(f"{item}: {e}")
+                return False
+            ep.plan_and_execute([atom("holding", item)])
+            if ep.holding(item):
+                break
+            log.info(f"{item}: not in the hand after pick round {attempt + 1}")
+        else:
             return False
         try:
             ep.stand_for(basket)  # carrying the item
@@ -152,6 +159,29 @@ class AssembleGiftBaskets(Strategy):
             log.info(f"{item}: not inside {basket}; putting it down")
             ep.plan_and_execute([atom("ontop", item, ep.floor)], floor=True)
         return False
+
+    @staticmethod
+    def free_hand(ep, table: str) -> bool:
+        """Put down whatever the hand still holds (a place that failed left it there) before the next pick: on the
+        plane where the robot stands, else from a fresh pose at the table. False when the hand stays full."""
+        held = [name for name in ep.held_names()]
+        if not held:
+            return True
+        (name,) = held[:1]
+        log.info(f"{name} is still in the hand; putting it down before the next pick")
+        ep.plan_and_execute([atom("ontop", name, ep.floor)], floor=True)
+        if not ep.holding(name):
+            return True
+        try:
+            ep.stand_for(table)
+        except Unreachable as e:
+            log.warning(f"{name}: {e}; the hand stays full")
+            return False
+        ep.plan_and_execute([atom("ontop", name, table)])
+        if ep.holding(name):
+            log.warning(f"{name}: still in the hand after two put-downs; the hand stays full")
+            return False
+        return True
 
 
 STRATEGIES = {cls.task: cls for cls in (TurnOnRadio, AssembleGiftBaskets)}

@@ -119,25 +119,29 @@ class Episode:
         """Whether a hand holds the object (the robot's own knowledge: its grasp assist, else the plans' record)."""
         return self.sim.tracked_label(bddl) in self.sim.hands()
 
+    def held_names(self) -> list[str]:
+        """BDDL names of the task objects in the hands (the robot's own knowledge)."""
+        return [self.sim.bddl_names[label] for label in self.sim.hands() if label in self.sim.bddl_names]
+
     def position(self, bddl: str) -> np.ndarray:
         return self.sim.scene_object(bddl).aabb_center.cpu().numpy()
 
     def distance(self, a: str, b: str) -> float:
         return float(np.linalg.norm(self.position(a)[:2] - self.position(b)[:2]))
 
-    def support_of(self, bddl: str) -> str:
-        """The BDDL name of the table the object rests on: the task's ontop predicate, else the table whose
-        footprint holds the object's centre with its top just under the object (the predicate misses a radio on a
-        glass table), else the task's floor."""
-        tables = [n for n in self.sim.task_scope() if n.split(".n.")[0] == "table"]
-        for name in tables:
-            if self.sim.holds("ontop", bddl, name):
-                return name
-        lo_obj = float(self.sim.scene_object(bddl).aabb[0][2])
+    def on_support(self, bddl: str, support: str) -> bool:
+        """Whether the object stands on the support, by geometry: its centre inside the support's footprint and
+        its bottom within 15 cm above the top (the task's ontop predicate misreports objects on the glass table,
+        and reports items that fell to the floor as still on it)."""
+        lo, hi = [v.cpu().numpy() for v in self.sim.scene_object(support).aabb]
         c = self.position(bddl)
-        for name in tables:
-            lo, hi = [v.cpu().numpy() for v in self.sim.scene_object(name).aabb]
-            if lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1] and -0.02 <= lo_obj - hi[2] <= 0.10:
+        bottom = float(self.sim.scene_object(bddl).aabb[0][2])
+        return bool(lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1] and -0.02 <= bottom - hi[2] <= 0.15)
+
+    def support_of(self, bddl: str) -> str:
+        """The BDDL name of the table the object stands on (``on_support``), else the task's floor."""
+        for name in self.sim.task_scope():
+            if name.split(".n.")[0] == "table" and self.on_support(bddl, name):
                 return name
         return self.floor
 
