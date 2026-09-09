@@ -279,6 +279,22 @@ the item in the gripper (OmniGibson moves a grasp-assisted object with the robot
 holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). Baskets nearest the table come
 first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
 
+Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
+`runs/bench_radio_pass2`, `runs/bench_radio`; the same strategy scored 0.7, 0.7 and 0.6 in three passes, so read
+the number as about 0.65 with the press as the source of variance):
+
+| task | pass | mean q_score | successes | median env steps (of the timeout) | failure causes |
+|---|---|---|---|---|---|
+| turning_on_radio | 1 | 0.7 | 7/10 | 690 / 3224 | 2x no standing pose within 0.9 m, 1x press: no plan |
+| turning_on_radio | 2 | 0.7 | 7/10 | 784 / 3224 | 1x no standing pose within 1.0 m, 2x press: no plan (one after a planner CUDA fault) |
+| turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
+
+What fails is not the pick (26 of 30 instances ended with the radio in the hand) but the press with the grasp the
+pick chose: the right arm has a plan when the switch ends up about 0.59 m ahead of the base facing right and none
+when it is 6 cm further (a replayed request fails 3 of 3 times at 0.65 m, plans 3 of 3 at 0.59 m). The left hold
+pose and the press-pose sampling are where the next gain is. The planners had 0 CUDA faults in pass 3 (42 requests)
+against 4 in the ~60 requests before the collision caches were sized (DEPLOYMENT item 11).
+
 ```bash
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name turning_on_radio \
     --instances 0 1 2 3 4 5 6 7 8 9 --knowledge oracle --grasping-mode sticky --host localhost --port 8765 \

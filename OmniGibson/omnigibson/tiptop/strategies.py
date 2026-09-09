@@ -67,7 +67,7 @@ class TurnOnRadio(Strategy):
                 if ep.holds("toggled_on", radio):
                     return
             if cycle == 0:
-                log.info(f"{radio}: no press plan with this grasp; putting it back on {table} to pick it up again")
+                log.info(f"{radio}: the switch did not toggle with this grasp; putting it back on {table} to pick it up again")
                 ep.plan_and_execute([atom("ontop", radio, table)])
                 if ep.holding(radio):
                     log.warning(f"{radio}: still in the hand after the put-down; giving up")

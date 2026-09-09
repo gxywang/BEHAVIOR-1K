@@ -126,11 +126,20 @@ class Episode:
         return float(np.linalg.norm(self.position(a)[:2] - self.position(b)[:2]))
 
     def support_of(self, bddl: str) -> str:
-        """The BDDL name of the table or floor the object rests on at the moment (the task's ontop predicate)."""
-        for name in self.sim.task_scope():
-            if name.split(".n.")[0] in ("table", "floor") and self.sim.holds("ontop", bddl, name):
+        """The BDDL name of the table the object rests on: the task's ontop predicate, else the table whose
+        footprint holds the object's centre with its top just under the object (the predicate misses a radio on a
+        glass table), else the task's floor."""
+        tables = [n for n in self.sim.task_scope() if n.split(".n.")[0] == "table"]
+        for name in tables:
+            if self.sim.holds("ontop", bddl, name):
                 return name
-        raise ValueError(f"{bddl} rests on no table or floor of the task")
+        lo_obj = float(self.sim.scene_object(bddl).aabb[0][2])
+        c = self.position(bddl)
+        for name in tables:
+            lo, hi = [v.cpu().numpy() for v in self.sim.scene_object(name).aabb]
+            if lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1] and -0.02 <= lo_obj - hi[2] <= 0.10:
+                return name
+        return self.floor
 
     def edge_gap(self, item: str, support: str) -> float:
         """How far the item's centre is from the nearest edge of the support's footprint (small: reachable)."""
