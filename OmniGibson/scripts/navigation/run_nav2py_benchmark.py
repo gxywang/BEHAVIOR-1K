@@ -144,6 +144,15 @@ def parse_args(argv=None):
         default=None,
         help="Seconds to keep the viewer open. If omitted with --keep-open-on-complete, wait for Enter.",
     )
+    parser.add_argument(
+        "--viewer-camera-mode",
+        choices=("none", "follow"),
+        default="none",
+        help="Viewer camera behavior for non-headless visualization.",
+    )
+    parser.add_argument("--viewer-camera-distance", type=float, default=3.0)
+    parser.add_argument("--viewer-camera-height", type=float, default=2.0)
+    parser.add_argument("--viewer-camera-target-height", type=float, default=0.7)
     return parser.parse_args(argv)
 
 
@@ -681,6 +690,28 @@ def place_robot(robot, episode):
     zero_robot_velocities(robot)
 
 
+def update_viewer_camera(robot, args):
+    if args.viewer_camera_mode != "follow" or gm.HEADLESS:
+        return
+
+    position, orientation = robot.get_position_orientation()
+    yaw = float(T.quat2euler(orientation)[2].item())
+    offset = th.tensor(
+        [
+            -math.cos(yaw) * args.viewer_camera_distance,
+            -math.sin(yaw) * args.viewer_camera_distance,
+            args.viewer_camera_height,
+        ],
+        dtype=th.float32,
+    )
+    camera_position = position + offset
+    target_position = position + th.tensor([0.0, 0.0, args.viewer_camera_target_height], dtype=th.float32)
+    camera_orientation = T.vec2quat(target_position - camera_position)
+    if camera_orientation.dim() > 1:
+        camera_orientation = camera_orientation[0]
+    og.sim.viewer_camera.set_position_orientation(position=camera_position, orientation=camera_orientation)
+
+
 def apply_deadband(value, deadband):
     value = float(value)
     return 0.0 if abs(value) < deadband else value
@@ -713,11 +744,14 @@ def xy_distance(position, goal):
 def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, command_limits, nav2py_api, args):
     env.reset(get_obs=False)
     place_robot(robot, episode)
+    update_viewer_camera(robot, args)
 
     for _ in range(args.settle_steps):
         env.step({robot.name: controller_no_op_action(robot)})
+        update_viewer_camera(robot, args)
 
     zero_robot_velocities(robot)
+    update_viewer_camera(robot, args)
 
     costmap, costmap_is_profile_inflated = select_costmap(costmap_bundle, args.costmap_source)
     navigator = make_navigator(
@@ -769,6 +803,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
             commanded_steps += 1
 
         env.step({robot.name: action_from_nav2py_command(robot, executed_command)})
+        update_viewer_camera(robot, args)
         if args.visual_step_sleep > 0.0:
             time.sleep(args.visual_step_sleep)
         position, _ = robot.get_position_orientation()
@@ -911,6 +946,9 @@ def main(args=None, shutdown=True):
         "planner_cost_penalty",
         "visual_step_sleep",
         "keep_open_seconds",
+        "viewer_camera_distance",
+        "viewer_camera_height",
+        "viewer_camera_target_height",
     ):
         value = getattr(args, arg_name)
         if value is not None and value < 0.0:
@@ -937,7 +975,8 @@ def main(args=None, shutdown=True):
     command_limits = resolve_command_limits(robot_cfg, args)
     results = []
     try:
-        for (scene_model, scene_instance, _), scene_episodes in group_episodes_by_scene(episodes).items():
+        scene_groups = list(group_episodes_by_scene(episodes).items())
+        for scene_index, ((scene_model, scene_instance, _), scene_episodes) in enumerate(scene_groups):
             print(f"\nRunning template: {scene_instance} ({len(scene_episodes)} episodes)")
             cfg = build_env_config(
                 scene_model=scene_model,
@@ -989,7 +1028,8 @@ def main(args=None, shutdown=True):
                         f"reason={result['nav2py_reason']}"
                     )
 
-            og.clear()
+            if not (args.keep_open_on_complete and scene_index == len(scene_groups) - 1):
+                og.clear()
 
         output = write_results(
             args.output,
