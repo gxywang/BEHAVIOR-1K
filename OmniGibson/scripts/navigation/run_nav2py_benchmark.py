@@ -690,6 +690,20 @@ def place_robot(robot, episode):
     zero_robot_velocities(robot)
 
 
+def look_at_orientation(camera_position, target_position):
+    direction = target_position - camera_position
+    direction = direction / th.norm(direction)
+    up = th.tensor([0.0, 0.0, 1.0], dtype=th.float32, device=direction.device)
+    up = up - th.dot(up, direction) * direction
+    if th.norm(up) < 1e-6:
+        up = th.tensor([0.0, 1.0, 0.0], dtype=th.float32, device=direction.device)
+        up = up - th.dot(up, direction) * direction
+    up = up / th.norm(up)
+
+    camera_orientation = T.vec2quat(direction, up)
+    return camera_orientation[0] if camera_orientation.dim() > 1 else camera_orientation
+
+
 def update_viewer_camera(robot, args):
     if args.viewer_camera_mode != "follow" or gm.HEADLESS:
         return
@@ -706,9 +720,7 @@ def update_viewer_camera(robot, args):
     )
     camera_position = position + offset
     target_position = position + th.tensor([0.0, 0.0, args.viewer_camera_target_height], dtype=th.float32)
-    camera_orientation = T.vec2quat(target_position - camera_position)
-    if camera_orientation.dim() > 1:
-        camera_orientation = camera_orientation[0]
+    camera_orientation = look_at_orientation(camera_position, target_position)
     og.sim.viewer_camera.set_position_orientation(position=camera_position, orientation=camera_orientation)
 
 
