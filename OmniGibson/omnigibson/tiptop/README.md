@@ -528,6 +528,21 @@ for one task and is kept here, with what it did, in case a task needs it later.
 - Planner variance: the same capture can fail once with "Motion planning failed for 32/74 satisfying particles"
   and succeed next time (grasp sampling differs per call). Retry before debugging.
 - Teleports (`--place`, `--stand-for`, `--torso`) are scaffolding the rules forbid during evaluation.
+- **What the challenge evaluator gives a policy, against what this pipeline consumes (audited 2026-09-09).** Per
+  step a policy receives RGB from the head and the two wrist cameras (224x224 under the default
+  `DefaultWrapper`; metric depth and full resolution only under `RGBDFullResWrapper`, `eval.py --env-wrapper`),
+  the proprioception vector of `eval/r1pro.yaml` (base velocity, arm, end-effector, gripper and trunk joints;
+  no grasp flag), the camera poses relative to the base, and `task_id`, an integer index; no instruction text,
+  no object names, poses or states, no BDDL goal, no segmentation. The planner itself reads none of the
+  simulator: its goal predicates (`on`, `near`, `holding`, `pressed`) and its plans come from the request. What
+  reads the simulator is the harness around it: with `--knowledge oracle` the request carries instance masks,
+  button poses and a press stop signal from the object states; with either source the goal atoms come from the
+  loaded task's ground goal and the object labels from its object scope; and between rounds the benchmark
+  decides from the task's own predicate evaluator (`Episode.holds`: did the item land inside, is the switch on),
+  from object boxes (which table, where to stand, which item is nearest the edge) and from the robot's
+  grasp-assist record (what the hand holds, by object). None of that is in the evaluation feed. The planner needs
+  metric depth, so the wrapper the organisers evaluate with matters; the between-round decisions need a
+  perception of their own before the pipeline can run as a policy.
 - Pressing needs an empty hand (`Push` requires `HandEmpty`), so "hold the radio and press its button" is two
   plans for two arms (`--press-port`), not one. The held object is wherever the grasp left it: nothing yet turns
   the button toward a camera or the free hand, and the right arm's model locks the left arm at its ready pose, so
