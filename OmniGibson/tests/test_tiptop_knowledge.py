@@ -10,6 +10,7 @@ from omnigibson.tiptop.knowledge import (
     OracleKnowledge,
     make_knowledge,
 )
+from omnigibson.tiptop.bench import Episode
 from omnigibson.tiptop.protocol import attach_knowledge, build_request
 
 
@@ -166,10 +167,12 @@ def test_make_knowledge_rejects_unknown_sources():
 # ---------------------------------------------------------------- strategies
 
 
-class _Episode:
-    """A scripted episode: which rounds succeed is decided up front, and everything a strategy asks is recorded."""
+class _Episode(Episode):
+    """A scripted episode: which rounds succeed is decided up front, and everything a strategy asks is recorded.
+    The retry policy (``pick``, ``achieve``, ``put_down``) is the real one; the simulator's answers are scripted."""
 
-    def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=()):
+    def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=(), rounds=2):
+        self.rounds = rounds  # no Episode.__init__: there is no simulator behind this one
         self.outcomes = list(outcomes)  # per round, in order: a set of BDDL predicates that hold afterwards
         self.arms = set(arms)
         self.unreachable = set(unreachable)
@@ -258,20 +261,36 @@ def test_turn_on_radio_holds_the_radio_while_pressing():
         TurnOnRadio(goal).run(_Episode([]))  # one arm only
 
 
-def test_turn_on_radio_puts_the_radio_down_and_repicks_when_the_press_has_no_plan():
+def test_turn_on_radio_presses_again_once_and_never_puts_the_radio_down():
     from omnigibson.tiptop.strategies import TurnOnRadio
 
     goal = [{"predicate": "toggled_on", "args": ["radio_receiver.n.01_1"]}]
-    # pick, two failed presses, put down, pick again, press works
+    ep = _Episode([{"held"}, set(), {"toggled"}], arms=("left", "right"))  # the first press misses
+    TurnOnRadio(goal).run(ep)
+    assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding", "toggled_on", "toggled_on"]
+    # two misses end the strategy: no put-down and re-pick (README, "Kept out of the pipeline")
     ep = _Episode([{"held"}, set(), set(), {"placed"}, {"held"}, {"toggled"}], arms=("left", "right"))
     TurnOnRadio(goal).run(ep)
-    rounds = [c[1:] for c in ep.calls if c[0] == "round"]
-    assert [r[0] for r in rounds] == ["holding", "toggled_on", "toggled_on", "ontop", "holding", "toggled_on"]
-    assert rounds[3][1] == ("radio_receiver.n.01_1", "table.n.02_1") and rounds[3][2] == "left"
-    # the second cycle is the last: two more failed presses end it
-    ep = _Episode([{"held"}, set(), set(), {"placed"}, {"held"}, set(), set()], arms=("left", "right"))
+    assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding", "toggled_on", "toggled_on"]
+    assert ep.holding("radio_receiver.n.01_1")
+
+
+def test_episode_rounds_are_the_one_retry_policy():
+    from omnigibson.tiptop.strategies import TurnOnRadio, atom
+
+    goal = [{"predicate": "toggled_on", "args": ["radio_receiver.n.01_1"]}]
+    ep = _Episode([{"held"}, set(), set(), {"toggled"}], arms=("left", "right"), rounds=3)
     TurnOnRadio(goal).run(ep)
-    assert len([c for c in ep.calls if c[0] == "round"]) == 7
+    assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding", "toggled_on", "toggled_on", "toggled_on"]
+    ep = _Episode([set(), {"held"}, {"toggled"}], arms=("left", "right"), rounds=1)  # one pose, then no press
+    TurnOnRadio(goal).run(ep)
+    assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding"]
+    # a put-down is done when the hand is empty, wherever the object landed; rounds that run out return False
+    ep = _Episode([{"held"}, {"placed"}])
+    assert ep.pick("candle.n.01_1") and ep.put_down("candle.n.01_1", "table.n.02_1")
+    assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding", "ontop"]
+    assert not ep.achieve([atom("toggled_on", "radio_receiver.n.01_1")], arm="right")
+    assert len([c for c in ep.calls if c[0] == "round"]) == 4
 
 
 def test_assemble_gift_baskets_carries_items_and_tries_the_reachable_ones_first():
@@ -318,11 +337,13 @@ def test_assemble_gift_baskets_puts_a_stuck_item_down():
 
     goal = [{"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]}]
     positions = {"table.n.02_1": (0, 0), "wicker_basket.n.01_1": (2, 0), "candle.n.01_1": (0.1, 0)}
-    ep = _Episode([{"held"}, set(), {"placed"}], on_table=["candle.n.01_1"], positions=positions)
+    # the place gets the episode's two rounds, then the item is put down where the robot stands
+    ep = _Episode([{"held"}, set(), set(), {"placed"}], on_table=["candle.n.01_1"], positions=positions)
     AssembleGiftBaskets(goal, attempts=1).run(ep)
     rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
     assert rounds == [
         ("holding", ("candle.n.01_1",)),
+        ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")),
         ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")),
         ("ontop", ("candle.n.01_1", "floor.n.01_1")),
     ]
@@ -334,7 +355,9 @@ def test_bench_summary_means_the_q_scores():
 
     from omnigibson.tiptop.bench import write_summary
 
-    args = SimpleNamespace(task_name="turning_on_radio", mode="public_test", knowledge="oracle", grasping_mode="sticky")
+    args = SimpleNamespace(
+        task_name="turning_on_radio", mode="public_test", knowledge="oracle", grasping_mode="sticky", rounds=2
+    )
     results = [
         {
             "instance_id": 301,
@@ -420,21 +443,19 @@ def test_assemble_gift_baskets_frees_a_full_hand_before_the_next_pick():
         "candle.n.01_1": (0.1, 0),
         "bow.n.01_1": (0.2, 0),
     }
-    # the candle's place fails and so does the first put-down: the next transfer starts by putting it down
+    # the candle's place fails (two rounds) and so does the put-down (two rounds): the next transfer starts by
+    # putting it down
     ep = _Episode(
-        [{"held"}, set(), set(), {"placed"}, {"held"}, {"placed"}],
+        [{"held"}, set(), set(), set(), set(), {"placed"}, {"held"}, {"placed"}],
         on_table=["candle.n.01_1", "bow.n.01_1"],
         positions=positions,
     )
     AssembleGiftBaskets(goal, attempts=1).run(ep)
     rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
-    assert rounds[:3] == [
-        ("holding", ("candle.n.01_1",)),
-        ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")),
-        ("ontop", ("candle.n.01_1", "floor.n.01_1")),
-    ]
-    assert rounds[3] == ("ontop", ("candle.n.01_1", "floor.n.01_1"))  # freed at the start of the bow's transfer
-    assert rounds[4:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
+    inside, floor = ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")), ("ontop", ("candle.n.01_1", "floor.n.01_1"))
+    assert rounds[:5] == [("holding", ("candle.n.01_1",)), inside, inside, floor, floor]
+    assert rounds[5] == floor  # freed at the start of the bow's transfer
+    assert rounds[6:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
     assert not ep.in_hand
 
 
@@ -451,9 +472,10 @@ def test_assemble_gift_baskets_releases_an_item_no_plan_can_put_down():
         "candle.n.01_1": (0.1, 0),
         "bow.n.01_1": (0.2, 0),
     }
-    # the candle's place fails, the put-down fails, and at the bow's transfer both put-downs fail too: release
+    # the candle's place fails, the put-down fails, and at the bow's transfer both put-downs fail too (two rounds
+    # each): release
     ep = _Episode(
-        [{"held"}, set(), set(), set(), set(), {"held"}, {"placed"}],
+        [{"held"}] + [set()] * 8 + [{"held"}, {"placed"}],
         on_table=["candle.n.01_1", "bow.n.01_1"],
         positions=positions,
     )

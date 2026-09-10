@@ -884,8 +884,10 @@ class R1ProSim(TiptopSim):
         something up. The joints the new embodiment locks (torso, the other arm) must already be where it expects
         them within ``tol`` (a loaded wrist settles up to ~0.035 rad short of its target under a held object; the
         new planner only uses these values for the other arm's own collision spheres); fingers are the gripper
-        state and are not checked. The arm that planned so far keeps
-        its last gripper command (a held object stays held) and its joints are held at their current values.
+        state and are not checked. The arm that planned so far keeps its last gripper command (a held object stays
+        held) and its joints are held at their current values; the adopted arm resumes the command it was left
+        with (until 2026-09-09 it inherited the other arm's, so a left hand holding the radio was commanded open
+        by the next left plan and dropped it).
         The capture no longer swings an arm out of the camera's view (the held object should be seen), and the
         Rerun mirror keeps reporting the first embodiment's joints."""
         arm = embodiment["arm"]
@@ -905,7 +907,7 @@ class R1ProSim(TiptopSim):
             )
         if self.mirror_arm_idx is None:
             self.mirror_arm_idx, self.mirror_gripper_idx = self.arm_idx, self.gripper_idx
-        self.other_arm, self.other_gripper = self.arm, self.last_gripper
+        self.other_arm, self.other_gripper, self.last_gripper = self.arm, self.last_gripper, self.other_gripper
         self.arm = arm
         self.planned_joints = list(embodiment["joint_names"])
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])

@@ -193,9 +193,13 @@ def parse_plan(plan: dict) -> dict:
         else:
             raise ValueError(f"step {i}: unknown step type {kind!r}")
     q_init = plan.get("q_init")
+    gripper_init = plan.get("gripper_init")  # the gripper state the plan assumes at q_init (schema 1.1.0)
+    if gripper_init not in (None, "open", "closed"):
+        raise ValueError(f"gripper_init must be 'open' or 'closed', got {gripper_init!r}")
     return {
         "version": version,
         "q_init": None if q_init is None else np.asarray(q_init, dtype=np.float32),
+        "gripper_init": gripper_init,
         "steps": steps,
     }
 
@@ -205,7 +209,8 @@ def plan_summary(plan: dict) -> str:
     n_wp = sum(len(s["positions"]) for s in plan["steps"] if s["type"] == "trajectory")
     duration = sum(len(s["positions"]) * s["dt"] for s in plan["steps"] if s["type"] == "trajectory")
     grippers = [s["action"] for s in plan["steps"] if s["type"] == "gripper"]
-    return f"{n_traj} trajectories / {n_wp} waypoints / {duration:.1f}s planned, gripper events {grippers}"
+    start = f", gripper {plan['gripper_init']} at the start" if plan.get("gripper_init") else ""
+    return f"{n_traj} trajectories / {n_wp} waypoints / {duration:.1f}s planned, gripper events {grippers}{start}"
 
 
 def load_plan_json(path) -> dict:

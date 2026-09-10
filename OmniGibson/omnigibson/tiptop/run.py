@@ -482,6 +482,7 @@ def live_round(
                 "version": response["plan"]["version"],
                 "embodiment": response.get("embodiment") or client.metadata.get("embodiment"),
                 "q_init": response["plan"]["q_init"].tolist(),
+                "gripper_init": response["plan"].get("gripper_init"),
                 "steps": [
                     dict(
                         s,

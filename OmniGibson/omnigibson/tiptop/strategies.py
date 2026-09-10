@@ -1,8 +1,10 @@
-"""How a challenge task is broken into planning rounds: where to stand, what to ask the planner for, what to do
-when a round fails. A strategy runs against an ``Episode`` (bench.py): ``stand_for`` moves the base (a teleport
-today), ``plan_and_execute`` does one capture / plan / execute round, and the simulator answers the questions the
-pipeline cannot yet answer for itself (is the item in the hand, did it land inside; privileged). Nothing here
-knows how the planner is told about the scene (knowledge.py) or how it plans.
+"""How a challenge task is broken into planning rounds: where to stand and what to ask the planner for. A strategy
+runs against an ``Episode`` (bench.py): ``stand_for`` moves the base (a teleport today); ``pick``, ``achieve`` and
+``put_down`` run the capture / plan / execute rounds under the one retry policy every task gets (``--rounds``);
+and the simulator answers the questions the pipeline cannot yet answer for itself (is the item in the hand, did
+it land inside; privileged). A strategy orders the goals and decides what to skip; recovery only one task would
+need is not written here (README, "Kept out of the pipeline"). Nothing here knows how the planner is told about
+the scene (knowledge.py) or how it plans.
 """
 
 import logging
@@ -47,9 +49,7 @@ class TurnOnRadio(Strategy):
     """Pick the radio up with the left hand (the grasp presents the switch) and press the switch with the right.
     The radio must be held: pressed where it stands, a free-standing radio slides away on the table before the
     toggle registers (20 cm across the glass table, 2026-09-09), so this strategy needs the right-arm planner
-    (``--press-port``) and refuses to run without it. A failed pick is retried once from a fresh base pose. When
-    the press finds no plan twice (the grasp left the switch where the right hand cannot reach it), the radio is
-    put back on its table and picked up again, once."""
+    (``--press-port``) and refuses to run without it. The pick and the press each get the episode's rounds."""
 
     task = "turning_on_radio"
     instruction = "pick up the radio and press its button"
@@ -60,42 +60,13 @@ class TurnOnRadio(Strategy):
             raise ValueError(
                 "turning_on_radio needs the right-arm planner (--press-port): the radio is held while pressed"
             )
-        table = ep.support_of(radio)
-        for cycle in range(2):
-            if not self.pick(ep, radio):
-                return
-            for _ in range(2):
-                ep.plan_and_execute([atom("toggled_on", radio)], arm="right")
-                if ep.holds("toggled_on", radio):
-                    return
-            if cycle == 0:
-                log.info(
-                    f"{radio}: the switch did not toggle with this grasp; putting it back on {table} to pick it up again"
-                )
-                ep.plan_and_execute([atom("ontop", radio, table)])
-                if ep.holding(radio):
-                    log.warning(f"{radio}: still in the hand after the put-down; giving up")
-                    return
-
-    @staticmethod
-    def pick(ep, radio: str) -> bool:
-        """The radio in the left hand after at most two pick rounds from different base poses."""
-        for _ in range(2):
-            try:
-                ep.stand_for(radio)
-            except Unreachable as e:
-                log.warning(f"{radio}: {e}; giving up")
-                return False
-            ep.plan_and_execute([atom("holding", radio)])
-            if ep.holding(radio):
-                return True
-        log.warning(f"{radio}: not in the hand after two pick rounds; giving up")
-        return False
+        if ep.pick(radio):
+            ep.achieve([atom("toggled_on", radio)], arm="right")
 
 
 class AssembleGiftBaskets(Strategy):
     """Every basket gets one item of each kind. Baskets stand on the floor, items on a table; each transfer is a pick
-    at the table (two poses at most), a base move to the basket with the item in hand, and a place into the basket.
+    at the table, a base move to the basket with the item in hand, and a place into the basket.
     Baskets are done nearest to the table first; within a kind, the items still on the table nearest its edge are
     tried first (the reachable ones), ``attempts`` of them per basket. An item still in the hand after a failed
     place is put down where the robot stands, and a hand still full at the next transfer is emptied first."""
@@ -132,30 +103,19 @@ class AssembleGiftBaskets(Strategy):
     def transfer(self, ep, item: str, basket: str, table: str) -> bool:
         if not self.free_hand(ep, table):
             return False
-        for attempt in range(2):  # a pick that fails (no plan, the item hidden from this pose) gets one more pose
-            try:
-                ep.stand_for(item)
-            except Unreachable as e:
-                log.info(f"{item}: {e}")
-                return False
-            ep.plan_and_execute([atom("holding", item)])
-            if ep.holding(item):
-                break
-            log.info(f"{item}: not in the hand after pick round {attempt + 1}")
-        else:
+        if not ep.pick(item):
             return False
         try:
             ep.stand_for(basket)  # carrying the item
         except Unreachable as e:
             log.info(f"{basket}: {e}; putting {item} back down")
-            ep.plan_and_execute([atom("ontop", item, table)])
+            ep.put_down(item, table)
             return False
-        ep.plan_and_execute([atom("inside", item, basket)], floor=True)
-        if ep.holds("inside", item, basket):
+        if ep.achieve([atom("inside", item, basket)], floor=True):
             return True
         if ep.holding(item):  # free the hand: put it down on the floor plane where the robot stands
             log.info(f"{item}: not inside {basket}; putting it down")
-            ep.plan_and_execute([atom("ontop", item, ep.floor)], floor=True)
+            ep.put_down(item, ep.floor, floor=True)
         return False
 
     @staticmethod
@@ -168,12 +128,11 @@ class AssembleGiftBaskets(Strategy):
             return True
         name = held[0]
         log.info(f"{name} is still in the hand; putting it down before the next pick")
-        ep.plan_and_execute([atom("ontop", name, ep.floor)], floor=True)
-        if not ep.holding(name):
+        if ep.put_down(name, ep.floor, floor=True):
             return True
         try:
             ep.stand_for(table)
-            ep.plan_and_execute([atom("ontop", name, table)])
+            ep.put_down(name, table)
         except Unreachable as e:
             log.warning(f"{name}: {e}")
         if ep.holding(name):

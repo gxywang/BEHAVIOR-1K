@@ -127,10 +127,25 @@ class PlanExecutor:
         if action == "close":
             self.close_eef = self.sim.eef_pose_base(self.sim.arm)
 
+    def start_gripper(self, state: str) -> bool:
+        """Put the fingers in the state the plan assumes at its start ("open": the hand is empty; "closed": on the
+        object the plan starts holding) when the last gripper command differs; returns whether they moved. A hand
+        that closed on nothing in an earlier plan would otherwise approach its next grasp with closed fingers."""
+        wanted = self.sim.OPEN if state == "open" else self.sim.CLOSE
+        if wanted == self.gripper:
+            return False
+        log.info(
+            f"gripper {state} before the plan (the last command left it {'closed' if state == 'open' else 'open'})"
+        )
+        self.set_gripper("open" if state == "open" else "close")
+        return True
+
     def execute(self, plan: dict) -> dict:
         """Execute a parsed plan; returns tracking statistics."""
         t0 = time.time()
-        stats = {"trajectories": [], "gripper_events": [], "start_error_rad": None}
+        stats = {"trajectories": [], "gripper_events": [], "start_error_rad": None, "gripper_moved_first": False}
+        if plan.get("gripper_init") is not None:
+            stats["gripper_moved_first"] = self.start_gripper(plan["gripper_init"])
         if plan.get("q_init") is not None:
             stats["start_error_rad"] = self.home_to(plan["q_init"])
         q_last = self.sim.q_arm()

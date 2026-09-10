@@ -20,10 +20,11 @@ object within reach (1.1 m at most); *no plan* = the planner found no satisfying
 = the goal object had no pixels in the capture; *ran, not inside* = the place executed but the predicate stayed
 false (the item landed outside the rim or fell); *released* = the last-resort open of a hand no plan could empty.
 
-- **turning_on_radio**, four passes of the same strategy (pick with the left hand, press with the right while
-  holding): mean q_score **0.7 / 0.7 / 0.6 / 0.7**, 27 of 40 instances. Pass 4 is the reference: recorded with the
-  current code, so each video ends on the flip with the button's marker turned green; the tails of passes 1-3 are a
-  frozen copy of their last frame, which predates the marker's colour change.
+- **turning_on_radio**, five passes (pick with the left hand, press with the right while holding): mean q_score
+  **0.7 / 0.7 / 0.6 / 0.7 / 0.7**, 34 of 50 instances. Pass 5 is the reference: the current code (the one retry
+  policy without the put-down and re-pick, the press face inscribed in the button's radius, the plan's gripper
+  start state), each video ending on the flip with the button's marker turned green. Pass 4's videos end the same
+  way; the tails of passes 1-3 are a frozen copy of their last frame, which predates the marker's colour change.
   - pass 1 (`runs/bench_radio_pass1`, 7/10): 302, 303 no base pose within 0.9 m (the search now widens to 1.1 m);
     309 press: no plan x2 after the pick.
   - pass 2 (`runs/bench_radio_pass2`, 7/10): 302 press: no plan x2 (two picks); 303 no base pose; 309 press: no
@@ -34,8 +35,13 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
   - pass 4 (`runs/bench_radio_pass4`, 7/10, current code): 302 press: no plan x4 after three picks and a put-down;
     308 press: no plan x4 after one pick and a put-down; 309 the press ran twice without toggling, then the re-pick's
     press had no plan x2.
+  - pass 5 (`runs/bench_radio_pass5`, 7/10, current code, `--rounds 2`, no re-pick): 302 press: no plan x2 (the
+    switch 0.57 m ahead, tilted 7 deg down; the first pick closed on nothing and the hand was opened before the
+    second); 303 press: no plan x2 (0.63 m ahead); 309 press: no plan x2 (0.61 m ahead). Every press that planned
+    toggled the switch (7 of 7; pass 4 had two executed presses that missed by 2 mm), and the median instance took
+    722 env steps against 839 in pass 4.
   - What fails is the right hand's press plan, which depends on the grasp the left hand chose (a switch left
-    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (35 of 40 instances ended with the radio in hand).
+    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (45 of 50 instances ended with the radio in hand).
 - **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
   - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
     from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
@@ -334,19 +340,19 @@ round without the simulator (does a planner failure reproduce?):
 ./b1k/bin/python -m omnigibson.tiptop.replay runs/bench_radio_pass3/turning_on_radio_301_0/r02_right_toggled_on --port 8766 --repeats 3
 ```
 
-The task strategies (`strategies.py`) decide the rounds: `turning_on_radio` picks the radio up with the left
-hand and presses the switch with the right (the second planner on `--press-port` is required: a held radio
-cannot slide away under the press, a free-standing one did, 20 cm across the glass table, without toggling); a
-failed pick is retried from a pose at least 15 cm away, and when the press finds no plan twice (the grasp left
-the switch out of the right hand's reach) the radio goes back on the table and is picked up again, once;
-`assembling_gift_baskets` does 16 transfers, each a pick at the table, a teleport to the basket with
+The task strategies (`strategies.py`) order the rounds; the retry is the episode's and the same for every task
+(`--rounds`, default 2: a goal gets two planning rounds, a pick two base poses at least 15 cm apart, a put-down is
+done when the hand is empty; nothing else recovers, see "Kept out of the pipeline"). `turning_on_radio` picks the
+radio up with the left hand and presses the switch with the right (the second planner on `--press-port` is
+required: a held radio cannot slide away under the press, a free-standing one did, 20 cm across the glass table,
+without toggling); `assembling_gift_baskets` does 16 transfers, each a pick at the table, a teleport to the basket with
 the item in the gripper (OmniGibson moves a grasp-assisted object with the robot) and a place round that starts
 holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). Baskets nearest the table come
 first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
 
 Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
-`runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`; the same strategy scored 0.7, 0.7, 0.6 and
-0.7 in four passes, so read the number as about 0.68 with the press as the source of variance):
+`runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`, `runs/bench_radio_pass5`; 0.7, 0.7, 0.6,
+0.7 and 0.7 in five passes, so read the number as about 0.68 with the press plan as the source of variance):
 
 | task | pass | mean q_score | successes | median env steps (of the timeout) | failure causes |
 |---|---|---|---|---|---|
@@ -354,6 +360,7 @@ Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported bas
 | turning_on_radio | 2 | 0.7 | 7/10 | 784 / 3224 | 1x no standing pose within 1.0 m, 2x press: no plan (one after a planner CUDA fault) |
 | turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
 | turning_on_radio | 4 | 0.7 | 7/10 | 747 / 3224 | 2x press: no plan x4 even after a put-down and re-pick, 1x press executed twice without toggling then no plan for the re-pick; videos end on the flip (marker green) |
+| turning_on_radio | 5 | 0.7 | 7/10 | 751 / 3224 | 3x press: no plan x2 (the switch 0.57-0.63 m ahead); no executed press missed; the one retry policy, no put-down and re-pick |
 | assembling_gift_baskets | 1 (2 instances, stopped) | 0.31 | 0/2 | 11200 / 39090 | a failed put-down left the item in the hand and blocked every later pick; items knocked to the floor were re-picked |
 | assembling_gift_baskets | 2 | 0.6375 | 2/10 (16/16 twice; 15, 14, 13, 11, 11, 3, 3, 0 of 16) | 13600 / 39090 | 3 instances lost to one item no put-down plan could set down after a failed place (the hand stayed full); 45 stand attempts found no pose even at 1.1 m (a basket in a corner) |
 | assembling_gift_baskets | 3 | 0.875 | 2/10 (16/16 twice; 15, 15, 15, 15, 14, 13, 11, 10 of 16) | 16000 / 39090 | the last-resort release ended the stuck-item loops (4 releases, 27 failed of 374 rounds); what remains is one or two items per instance: bows no base pose reaches (3 instances), a basket in a corner (1), places with no satisfying plan (2) |
@@ -369,8 +376,10 @@ even at 1.1 m, a basket standing in a room corner, and places whose plan has no 
 What fails is not the pick (26 of 30 instances ended with the radio in the hand) but the press with the grasp the
 pick chose: the right arm has a plan when the switch ends up about 0.59 m ahead of the base facing right and none
 when it is 6 cm further (a replayed request fails 3 of 3 times at 0.65 m, plans 3 of 3 at 0.59 m). The left hold
-pose and the press-pose sampling are where the next gain is. The planners had 0 CUDA faults in pass 3 (42 requests)
-against 4 in the ~60 requests before the collision caches were sized (DEPLOYMENT item 11).
+pose and the press-pose sampling are where the next gain is. Pass 5 (the press face inscribed in the button's
+radius) confirms it: every press that planned toggled the switch, and the three failures had no press plan at
+0.57-0.63 m. The planners had 0 CUDA faults in pass 3 (42 requests) and pass 5 against 4 in the ~60 requests
+before the collision caches were sized (DEPLOYMENT item 11).
 
 ```bash
 OMNIGIBSON_HEADLESS=1 ./b1k/bin/python -m omnigibson.tiptop.bench --task-name turning_on_radio \
@@ -458,6 +467,37 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   camera frame (a basket cut by the border reconstructs 8 cm too long and the item is released beside it -- seen
   2026-09-04). `--stand-for` and the benchmark's strategies use it.
 
+## Kept out of the pipeline
+
+Nothing task-specific is written into the pipeline or a strategy: a strategy orders a task's goals and skips what
+it cannot do, and every goal of every task gets the same retry (`--rounds`). What follows was tried or proposed
+for one task and is kept here, with what it did, in case a task needs it later.
+
+- **Put the radio down and pick it up again (turning_on_radio passes 3-4; removed 2026-09-09).** When the press
+  found no plan twice, the strategy planned `ontop(radio, table)`, a fresh pick, and two more presses. It rescued
+  one instance in 20 (pass 4, 303: the third grasp pressed the switch) at the price of a put-down, a pick and two
+  press rounds per use, and the put-down itself misbehaved: the carried hull has no underside, so the planner
+  lowered the radio into the table (308 ended on its back at the table's far edge), and in 3 of the 7 put-down
+  rounds the fingers were already fully open before the plan's open event (the arm-switch bug fixed the same day,
+  see History). To bring it back as a pipeline feature: a generic "re-grasp when the goal has no plan with this
+  grasp" step in `Episode`, for every task, not a radio rule. The strategy's old form is in git (`ab3655ff2`).
+- **A present point in the right hand's workspace (proposed, not applied).** `experimental.present_point`
+  (`tiptop_sim_r1pro_right.yml`, `[0, -0.15, 1.2]`) is where a grasp should leave the switch facing. Every
+  first-pick grasp in passes 1-4 presented it the same way: facing the robot's right (normal within 12 deg of -y)
+  at 0.51-0.69 m ahead of the base. The presses with no plan were the ones at 0.62 m and beyond, the ones that
+  planned at 0.60 m and nearer, so the reach edge is the distance the left arm's lift leaves the radio at, which
+  the present point does not set (the left embodiment's plan-end pose, `q_home`, does). The rounds that faced the
+  switch up or toward the torso were the removed cycle's re-picks.
+- **Back off from the actual press pose (proposed, not applied).** When the switch flips early the executor stops
+  the push and runs the planned back-off from where the plan is, not the arm; the jump is at most the press depth
+  (4.5 cm) and it happens on success only.
+- **A put-down height from the object's known extent (proposed, not applied).** The carried hull is the pick-time
+  view, without an underside, so a place sets the object's seen part on the surface and its unseen part through
+  it. A generic fix belongs in the planner's carry model (`tiptop/in_hand.py`: extend the hull down to the support
+  plane the object rested on when it was picked); it would serve every place round, the baskets' included.
+- **A pass with assisted grasping (not run).** The challenge's default `grasping_mode` is `assisted`; the passes
+  used `sticky` (allowed). Same code, one flag.
+
 ## Known limits
 
 - **Finding the radio's switch without oracle information does not work yet (2026-09-08).** The `turning_on_radio`
@@ -535,3 +575,12 @@ a scripted episode, and the benchmark's summary.
   lifecycles; ``bddl_category`` replaces four name parsers; the base-pose search and footprint thresholds are named
   constants; ``R1ProSim`` takes ``overview_view`` / ``look_arm`` as arguments; ``--restand``, ``predicate_holds``
   and the planner's ``goal_hints`` are gone; ``obs.h5`` holds the whole request and ``replay.py`` re-plans a round.
+- 2026-09-09 (no task-specific recovery): the radio's put-down and re-pick cycle left the strategies; `Episode.pick`
+  / `achieve` / `put_down` are the one retry policy (`--rounds`), the same for both tasks. Two generic fixes from
+  the pass 4 dig: the planner's press face is the square inscribed in the button's radius (a corner of the old face
+  was 35 mm off a 22 mm switch), and a plan carries `gripper_init`, so a hand that closed on nothing is opened
+  before its next grasp; and the arm switch now hands each arm back its own gripper command (a left hand holding
+  the radio was commanded open by the next left plan: in 3 of 7 put-down rounds the radio was out of the fingers
+  before the plan's open event). turning_on_radio pass 5 with this code: 0.7 (7/10); every planned press toggled
+  the switch, the three failures had no press plan at the reach edge (0.57-0.63 m); median 722 env steps per
+  instance against 839 in pass 4.

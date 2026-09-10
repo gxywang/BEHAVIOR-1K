@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from omnigibson.tiptop.protocol import bddl_category
-from omnigibson.tiptop.strategies import STRATEGIES, Unreachable
+from omnigibson.tiptop.strategies import STRATEGIES, Unreachable, atom
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -101,10 +101,12 @@ class Episode:
     what to do next); and the simulator answers what the pipeline cannot perceive yet (``holds``, ``on_support``,
     ``support_of``, positions and distances): privileged, used in every benchmark whatever ``--knowledge`` says, and
     the result's ``bench.knowledge`` only describes what the planner was told. ``holding`` / ``held_names`` are the
-    robot's own grasp record, not privileged."""
+    robot's own grasp record, not privileged. ``pick``, ``achieve`` and ``put_down`` run the rounds under the one
+    retry policy every task gets (``--rounds``); there is no other recovery, in here or in a strategy."""
 
     def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path):
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
+        self.rounds = args.rounds
         self.records = []  # one per round, in order
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
         self.floor = sim.floor_name()
@@ -171,6 +173,44 @@ class Episode:
         log.info(f"round {i} {atom_text(atoms)} [{arm}]: {record.get('error') or 'executed'} ({record['seconds']}s)")
         return record
 
+    # ---------------------------------------------------------------- the retry policy, the same for every task
+    def satisfied(self, atoms: list[dict]) -> bool:
+        """Whether every atom holds: ``holding`` by the robot's own grasp record, the rest by the simulator."""
+        return all(
+            self.holding(a["args"][0]) if a["predicate"] == "holding" else self.holds(a["predicate"], *a["args"])
+            for a in atoms
+        )
+
+    def achieve(self, atoms: list[dict], arm: str = "left", floor: bool = False, done=None) -> bool:
+        """Up to ``--rounds`` planning rounds for ``atoms`` with the planner of ``arm``, stopping as soon as
+        ``done()`` (default: ``satisfied``); the retry every goal of every task gets, and the only one."""
+        done = (lambda: self.satisfied(atoms)) if done is None else done
+        for _ in range(self.rounds):
+            self.plan_and_execute(atoms, arm=arm, floor=floor)
+            if done():
+                return True
+        return False
+
+    def pick(self, bddl: str) -> bool:
+        """The object in the planned hand after up to ``--rounds`` pick rounds, each from a fresh base pose (a pick
+        that fails, no plan or the object hidden, is retried from somewhere else). False when no pose reaches it."""
+        for _ in range(self.rounds):
+            try:
+                self.stand_for(bddl)
+            except Unreachable as e:
+                log.warning(f"{bddl}: {e}")
+                return False
+            self.plan_and_execute([atom("holding", bddl)])
+            if self.holding(bddl):
+                return True
+        log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
+        return False
+
+    def put_down(self, bddl: str, support: str, floor: bool = False) -> bool:
+        """Put the held object on ``support``; done when the hand is empty, wherever the object landed (the point
+        is a free hand)."""
+        return self.achieve([atom("ontop", bddl, support)], floor=floor, done=lambda: not self.holding(bddl))
+
     # ---------------------------------------------------------------- what the simulator knows (privileged)
     def holds(self, predicate: str, *bddl_names: str) -> bool:
         return self.sim.holds(predicate, *bddl_names)
@@ -236,6 +276,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--max-steps", type=int, default=None, help="episode timeout in env steps (default: the challenge's)"
     )
     p.add_argument("--attempts-per-item", type=int, default=2, help="items of a kind tried per basket")
+    p.add_argument(
+        "--rounds",
+        type=int,
+        default=2,
+        help="planning rounds a goal gets before the strategy moves on (a pick's rounds each start from a fresh "
+        "base pose): the one retry policy, the same for every task",
+    )
     p.add_argument(
         "--summarize",
         action="store_true",
@@ -380,6 +427,7 @@ def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> d
         "mode": args.mode,
         "knowledge": args.knowledge,
         "grasping_mode": args.grasping_mode,
+        "rounds": args.rounds,
         "max_steps": max_steps,
         "instances": len(results),
         "mean_q_score": float(np.mean(scores)) if scores else None,
