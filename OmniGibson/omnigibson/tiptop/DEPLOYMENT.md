@@ -167,6 +167,14 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
     -m omnigibson.tiptop.bench ...`; give the box real swap (16 GB) before a long run; watch `rss_gb` in the
     per-transfer log lines for growth.
 
+20. **The planner dies at warm-up with MKL pivot errors on a loaded box.** `Intel oneMKL ERROR: Parameter 6 was
+    incorrect on entry to SLASWP` then `RuntimeError: Pivots given to lu_solve must all be greater or equal to 1`
+    inside cuRobo's `MotionGenConfig.load_from_robot_config` (STOMP covariance), seconds after "Setting up motion
+    planning". Seen only when the machine is heavily loaded by other users (load average 250 on 2026-09-08, 950 on
+    2026-09-10, five launches in a row failed). The launcher now pins `MKL_NUM_THREADS=1` and `OMP_NUM_THREADS=4`
+    (override by exporting them); with that both planners came up on the first attempt at load 950. One
+    observation so far: if it recurs, relaunch the planners one at a time when the load is lower.
+
 ## R1Pro specifics
 
 - Planner config: `TIPTOP_CONFIG=tiptop/config/tiptop_sim_r1pro.yml`; use `TIPTOP_PARTICLES=256 TIPTOP_MAX_PLANNING_TIME=40`
@@ -182,7 +190,7 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
   plan with `INVALID_START_STATE_SELF_COLLISION` before any motion is tried.
 - VRAM on the laptop during an Rs_int episode: about 9.5 GB total with both services idle (Isaac + scene ~5 GB).
 - Never attach `seg_instance` to a robot-mounted camera in this Isaac build (segfault after ~35 steps); the bridge
-  captures through an external shadow camera. Keep the robot camera rgb-only.
+  captures through external shadow cameras (one per optics: head, wrist). Keep the robot cameras rgb-only.
 
 ## Files
 

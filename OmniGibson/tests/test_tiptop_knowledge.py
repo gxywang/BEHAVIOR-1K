@@ -53,10 +53,12 @@ def test_attach_knowledge_sets_only_what_is_known():
 
 
 class _Sim:
-    """The bits of a simulator the knowledge sources read: tracked objects, goal translation, masks, buttons, hands."""
+    """The bits of a simulator the knowledge sources read: tracked objects, goal translation, masks (per view),
+    buttons, hands."""
 
-    def __init__(self, masks, held=None, arm="left"):
-        self.masks = masks  # label -> (H, W) bool
+    def __init__(self, masks, held=None, arm="left", views=None):
+        self.masks = masks  # label -> (H, W) bool, the primary view
+        self.views = views or {}  # view name -> {label -> (H, W) bool}, the further views
         self.objects = {label: object() for label in masks}
         self.held_objects = held or {}
         self.arm = arm
@@ -78,8 +80,14 @@ class _Sim:
         labels = sorted({name(f"{label.rpartition('_')[0]}.n.01_{label.rpartition('_')[2]}") for label in self.masks})
         return labels, out
 
-    def oracle_masks(self, request, extras, labels):
-        return np.stack([self.masks[label] for label in labels])
+    def object_meshes(self, labels):
+        return {}
+
+    def oracle_masks(self, request, extras, labels, meshes=None):
+        name = request.get("name") or request.get("view_name", "primary")
+        masks = self.views[name] if name in self.views else self.masks
+        empty = np.zeros(request["depth"].shape, bool)
+        return np.stack([masks.get(label, empty) for label in labels])
 
     def button_hints(self, atoms, category_level=False):
         self.button_calls.append(list(atoms))
@@ -120,6 +128,27 @@ def test_oracle_knowledge_sends_instance_masks_and_every_button_of_the_task():
     # a goal object with no pixels is an error the caller can act on
     with pytest.raises(GoalNotVisible):
         source.describe([{"predicate": "holding", "args": ["candle.n.01_1"]}], _request(), {})
+
+
+def test_oracle_masks_come_from_every_view_and_a_goal_object_may_hide_from_the_primary_view():
+    from omnigibson.tiptop.protocol import add_view
+
+    goal = [{"predicate": "holding", "args": ["candle.n.01_1"]}]
+    sim = _Sim(_masks(radio_1=20, candle_1=0), views={"left_wrist": {"candle_1": np.ones((4, 6), bool)}})
+    source = make_knowledge("oracle", sim, goal)
+    req = _request()
+    req["view_name"] = "head"
+    add_view(req, "left_wrist", np.zeros((4, 6, 3), np.uint8), np.ones((4, 6), np.float32), np.eye(3), np.eye(4))
+    known = source.describe(goal, req, {"views": {"left_wrist": {}}})
+    assert known.labels == ["candle_1", "radio_1"]  # the candle is in the wrist view only
+    assert known.masks.shape == (2, 6, 8) and not known.masks[0].any() and known.masks[1].sum() == 20
+    assert list(known.view_masks) == ["left_wrist"] and known.view_masks["left_wrist"].shape == (2, 4, 6)
+    assert known.summary()["view_mask_pixels"] == {"left_wrist": {"candle_1": 24, "radio_1": 0}}
+    known.attach(req)
+    assert req["gt_masks"].shape == (2, 6, 8) and req["views"][0]["gt_masks"].shape == (2, 4, 6)
+    blind = make_knowledge("oracle", _Sim(_masks(radio_1=20, candle_1=0), views={"left_wrist": {}}), goal)
+    with pytest.raises(GoalNotVisible, match="left_wrist"):  # hidden in every view
+        blind.describe(goal, req, {"views": {"left_wrist": {}}})
 
 
 def test_knowledge_reports_the_hands_at_its_own_label_level():

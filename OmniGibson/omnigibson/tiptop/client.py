@@ -86,6 +86,8 @@ class TiptopClient:
             log.warning("server metadata has no robot_type (older tiptop); cannot verify the embodiment")
         if "gt_masks" in request and not self.metadata.get("gt_detections_supported", False):
             log.warning("server does not advertise gt_detections_supported; gt_* keys will be ignored")
+        if request.get("views") and not self.metadata.get("views_supported", False):
+            log.warning("server does not advertise views_supported; the further views will be ignored")
 
     def plan(self, request: dict, timeout_s: float = 900.0) -> dict:
         """Send one request and return the server response with a parsed plan under response['plan'].

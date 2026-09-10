@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from omnigibson.tiptop.protocol import attach_knowledge, canonical_object_name
+from omnigibson.tiptop.protocol import attach_knowledge, canonical_object_name, capture_views
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ FLOOR_WORKSPACE = [[0.05, -0.80, -0.05], [1.30, 0.80, 1.60]]
 
 
 class GoalNotVisible(ValueError):
-    """A goal object has no pixels in the capture: the frame the planner would work from does not show it."""
+    """A goal object has no pixels in any view of the capture: the planner would not see it."""
 
 
 @dataclass
@@ -40,7 +40,8 @@ class SceneKnowledge:
 
     labels: list
     atoms: list
-    masks: np.ndarray | None = None  # (N, H, W) bool aligned with labels; None: the planner detects
+    masks: np.ndarray | None = None  # (N, H, W) bool aligned with labels, the primary view; None: the planner detects
+    view_masks: dict = field(default_factory=dict)  # view name -> (N, H_v, W_v) bool, the further views
     buttons: dict = field(default_factory=dict)  # label -> {position, normal, radius}
     held_labels: list = field(default_factory=list)  # in a hand the plan does not move
     in_hand: list = field(default_factory=list)  # in the planned hand: the plan starts holding them
@@ -56,16 +57,21 @@ class SceneKnowledge:
             held=self.held_labels,
             in_hand=self.in_hand,
             workspace=self.workspace,
+            view_masks=self.view_masks,
         )
 
     def summary(self) -> dict:
-        """What went into the request, for capture.json and the log (masks by pixel count)."""
+        """What went into the request, for capture.json and the log (masks by pixel count, per view)."""
         return {
             "labels": list(self.labels),
             "atoms": list(self.atoms),
             "mask_pixels": {label: int(m.sum()) for label, m in zip(self.labels, self.masks)}
             if self.masks is not None
             else None,
+            "view_mask_pixels": {
+                name: {label: int(m.sum()) for label, m in zip(self.labels, masks)}
+                for name, masks in self.view_masks.items()
+            },
             "buttons": dict(self.buttons),
             "held_labels": list(self.held_labels),
             "in_hand": list(self.in_hand),
@@ -174,21 +180,30 @@ class OracleKnowledge(KnowledgeSource):
 
     def describe(self, atoms, request, extras, floor=False) -> SceneKnowledge:
         labels, tiptop_atoms = self.translate(atoms)
-        masks = self.sim.oracle_masks(request, extras, labels)
-        counts = {label: int(m.sum()) for label, m in zip(labels, masks)}
-        visible = [label for label in labels if counts[label]]
-        hidden = [label for label in labels if not counts[label]]
+        views = capture_views(request, extras)
+        meshes = self.sim.object_meshes(labels)  # one mesh per label for every view's masks
+        masks = {
+            name: self.sim.oracle_masks(view, view_extras, labels, meshes=meshes) for name, view, view_extras in views
+        }
+        counts = {
+            name: {label: int(m.sum()) for label, m in zip(labels, view_masks)} for name, view_masks in masks.items()
+        }
+        visible = [label for label in labels if any(counts[name][label] for name in counts)]
+        hidden = [label for label in labels if label not in visible]
         needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a in hidden})
         if needed:
-            raise GoalNotVisible(f"goal objects {needed} are not visible in the capture (empty masks)")
-        log.info(
-            f"oracle masks: pixels per label { {label: counts[label] for label in visible} }; out of view: {hidden or 'none'}"
-        )
+            raise GoalNotVisible(f"goal objects {needed} are not visible in any view {list(counts)} (empty masks)")
+        for name in counts:
+            log.info(f"oracle masks in {name}: pixels per label { {label: counts[name][label] for label in visible} }")
+        log.info(f"out of every view: {hidden or 'none'}")
+        keep = [labels.index(label) for label in visible]
+        primary = views[0][0]
         held, in_hand = self.hands()
         return SceneKnowledge(
             labels=visible,
             atoms=tiptop_atoms,
-            masks=masks[[labels.index(label) for label in visible]],
+            masks=masks[primary][keep],
+            view_masks={name: view_masks[keep] for name, view_masks in masks.items() if name != primary},
             buttons=self.sim.button_hints(self.goal, category_level=False),
             held_labels=held,
             in_hand=in_hand,

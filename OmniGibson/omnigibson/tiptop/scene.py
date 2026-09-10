@@ -24,11 +24,14 @@ import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
 from omnigibson.tiptop.gt_masks import masks_from_geometry
+from omnigibson.tiptop.kinematics import look_at_quat_xyzw as _look_at_quat_xyzw
 from omnigibson.tiptop.protocol import (
     DROID_CAMERA_KWARGS,
     DROID_Q_INIT,
+    add_view,
     build_request,
     canonical_object_name,
+    capture_views,
     depth_to_points,
     points_to_pixels,
     rerun_name,
@@ -77,18 +80,20 @@ OBJECT_PRESETS = {
 }
 
 
+def decimated(vertices, faces, target_faces: int) -> tuple[np.ndarray, np.ndarray]:
+    """The mesh reduced to about ``target_faces`` triangles (open3d's quadric decimation)."""
+    import open3d as o3d
+
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(vertices, dtype=np.float64)),
+        o3d.utility.Vector3iVector(np.asarray(faces, dtype=np.int32)),
+    ).simplify_quadric_decimation(target_number_of_triangles=int(target_faces))
+    return np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+
+
 def look_at_quat_xyzw(eye, target, up=(0.0, 0.0, 1.0)) -> list[float]:
-    """Orientation (x, y, z, w) of a USD/OpenGL camera at ``eye`` looking at ``target`` (camera -z axis = view dir)."""
-    eye, target, up = np.asarray(eye, float), np.asarray(target, float), np.asarray(up, float)
-    forward = target - eye
-    forward /= np.linalg.norm(forward)
-    right = np.cross(forward, up)
-    if np.linalg.norm(right) < 1e-6:  # looking straight along `up`: pick any horizontal axis as the image x axis
-        right = np.cross(forward, np.array([1.0, 0.0, 0.0]))
-    right /= np.linalg.norm(right)
-    cam_up = np.cross(right, forward)
-    rot = np.stack([right, cam_up, -forward], axis=1)
-    return T.mat2quat(th.tensor(rot, dtype=th.float32)).tolist()
+    """``kinematics.look_at_quat_xyzw`` as a list (sensor configs and tensors take it as is)."""
+    return _look_at_quat_xyzw(eye, target, up).tolist()
 
 
 def overview_cam_config(eye=(0.0, 0.0, 3.0), target=(1.0, 0.0, 0.0)) -> dict:
@@ -252,6 +257,7 @@ class TiptopSim:
     def _init_state(self) -> None:
         """Per-episode state shared by every embodiment (R1ProSim builds its own scene and calls this too)."""
         self.state_stream = None  # client.SimStateStream once attached; fed from step()
+        self._link_meshes = {}  # (link prim path, max faces) -> its mesh in the link frame (link_trimesh_world)
         self.arm = self.robot.default_arm  # the arm the plans move (R1ProSim: the planner embodiment's arm)
         self.held_objects = {}  # tracked label -> arm, for objects a plan picked up (they move with that gripper)
         self.teleports = 0  # base teleports so far (the navigation stand-in; the benchmark reports the count)
@@ -502,53 +508,104 @@ class TiptopSim:
         vertices = (np.asarray(tm.vertices, dtype=np.float64) - pos.cpu().numpy()) @ rot
         faces = np.asarray(tm.faces, dtype=np.int64)
         if len(faces) > STREAM_MAX_FACES:
-            import open3d as o3d
-
-            mesh = o3d.geometry.TriangleMesh(
-                o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(faces)
-            ).simplify_quadric_decimation(target_number_of_triangles=STREAM_MAX_FACES)
-            vertices, faces = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+            vertices, faces = decimated(vertices, faces, STREAM_MAX_FACES)
         return vertices.astype(np.float32), faces.astype(np.int32)
 
     # ---------------------------------------------------------------- observation
-    def _capture_obs(self) -> tuple[dict, dict]:
+    primary_view = "cam"  # the capture camera's view name (R1ProSim: the --camera choice)
+    extra_views = ()  # further views captured with it and fused by the planner (R1ProSim: the wrist cameras)
+
+    def view_sensor(self, name: str):
+        """The sensor a view is rendered through (its intrinsics and pose describe the view)."""
+        return self.cam
+
+    def _capture_obs(self, name: str) -> tuple[dict, dict]:
         """One rendered frame with rgb, depth_linear and seg_instance from the capture camera."""
         for _ in range(3):
             og.sim.render()
         return self.cam.get_obs()
 
-    def capture(self, task: str) -> tuple[dict, dict]:
-        """Render one frame and assemble a TiPToP request from the observation alone (rgb, z-depth, intrinsics,
-        the OpenCV camera pose in the robot base frame, the planned joints), plus ``extras`` for the H5 file, the
-        validation and the knowledge sources (``knowledge.py`` attaches labels, masks and buttons afterwards): the
-        camera pose in the world frame, the instance segmentation when it was rendered, every tracked object's pose.
-        """
-        obs, info = self._capture_obs()
+    def robot_self_mask(self, name: str, depth, intrinsics, cam_pos_world, cam_quat_cv_world) -> np.ndarray | None:
+        """The robot's own pixels in a view, from its link meshes; None when this simulator's cameras never see it."""
+        return None
+
+    def view_frame(self, name: str) -> tuple[dict, dict]:
+        """One view of the capture: what the wire carries for it (rgb, z-depth, intrinsics, the OpenCV camera pose in
+        the robot base frame, the robot's own pixels as ``robot_mask``, None when there are none) and what the
+        knowledge sources, the validation and the files need (the camera pose in the world frame, the instance
+        segmentation when it was rendered). The robot's pixels are zeroed in the depth."""
+        obs, info = self._capture_obs(name)
+        sensor = self.view_sensor(name)
         rgb = obs["rgb"][..., :3].cpu().numpy().astype(np.uint8)
         depth = obs["depth_linear"].cpu().numpy().astype(np.float32)
         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
         depth[depth < 0] = 0.0
         seg = obs["seg_instance"].cpu().numpy() if "seg_instance" in obs else None
         id_to_name = {int(k): str(v) for k, v in info["seg_instance"].items()} if seg is not None else {}
-        intrinsics = self.cam.intrinsic_matrix.cpu().numpy().astype(np.float32)
-        robot_mask = np.zeros(depth.shape, dtype=bool)  # self-filter: the robot's own body seen by its camera
-        for label in self.mask_labels_as_invalid if seg is not None else ():
-            ids = [i for i, n in id_to_name.items() if n == label]
-            if ids:
-                masked = np.isin(seg, ids)
-                depth[masked] = 0.0
-                robot_mask |= masked
-                log.info(f"masked {int(masked.sum())} pixels of {label!r} out of the depth")
-
-        cam_pos, cam_quat = self.cam.get_position_orientation()  # world, USD camera axes
+        intrinsics = sensor.intrinsic_matrix.cpu().numpy().astype(np.float32)
+        cam_pos, cam_quat = sensor.get_position_orientation()  # world, USD camera axes
         cam_quat_cv = T.quat_multiply(cam_quat, th.tensor([1.0, 0.0, 0.0, 0.0]))  # 180 deg about camera x -> OpenCV
         cam_pos_b, cam_quat_b = self.to_base(cam_pos, cam_quat_cv)
         world_from_cam = T.pose2mat((cam_pos_b, cam_quat_b)).cpu().numpy().astype(np.float32)
-
-        request = build_request(rgb, depth, intrinsics, world_from_cam, task, self.q_arm())
+        robot_mask = np.zeros(depth.shape, dtype=bool)  # self-filter: the robot's own body seen by its camera
+        if seg is not None:
+            for label in self.mask_labels_as_invalid:
+                ids = [i for i, n in id_to_name.items() if n == label]
+                if ids:
+                    robot_mask |= np.isin(seg, ids)
+        else:
+            own = self.robot_self_mask(name, depth, intrinsics, cam_pos, cam_quat_cv)
+            if own is not None:
+                robot_mask |= own
         if robot_mask.any():
-            request["robot_mask"] = robot_mask  # the server keeps SAM2 off these pixels (occluding gripper)
-        self.last_capture_rgb = rgb
+            depth[robot_mask] = 0.0
+            log.info(f"{name}: masked {int(robot_mask.sum())} pixels of the robot out of the depth")
+        view = {
+            "rgb": rgb,
+            "depth": depth,
+            "intrinsics": intrinsics,
+            "world_from_cam": world_from_cam,
+            "robot_mask": robot_mask if robot_mask.any() else None,
+        }
+        view_extras = {
+            "cam_pos_base": cam_pos_b.cpu().numpy().tolist(),
+            "cam_quat_wxyz_ros": T.convert_quat(cam_quat_b, to="wxyz").cpu().numpy().tolist(),
+            "cam_pos_world": cam_pos.cpu().numpy().tolist(),
+            "cam_quat_xyzw_world_usd": cam_quat.cpu().numpy().tolist(),
+            "cam_quat_xyzw_world_cv": cam_quat_cv.cpu().numpy().tolist(),
+            "seg_instance": seg,
+            "id_to_name": id_to_name,
+        }
+        return view, view_extras
+
+    def capture(self, task: str) -> tuple[dict, dict]:
+        """Render every view (the primary, then ``extra_views``) and assemble a TiPToP request from the observation
+        alone (per view rgb, z-depth, intrinsics, the OpenCV camera pose in the robot base frame; the planned
+        joints), plus ``extras`` for the H5 file, the validation and the knowledge sources (``knowledge.py`` attaches
+        labels, masks and buttons afterwards): the camera poses in the world frame, the instance segmentation when
+        it was rendered (the primary's at the top level, the others under ``views``), every tracked object's pose.
+        """
+        view, extras = self.view_frame(self.primary_view)
+        request = build_request(
+            view["rgb"], view["depth"], view["intrinsics"], view["world_from_cam"], task, self.q_arm()
+        )
+        request["view_name"] = self.primary_view
+        if view["robot_mask"] is not None:
+            request["robot_mask"] = view["robot_mask"]  # the server keeps SAM2 off these pixels (occluding gripper)
+        self.last_capture_rgb = view["rgb"]
+        extras["views"] = {}
+        for name in self.extra_views:
+            view, view_extras = self.view_frame(name)
+            add_view(
+                request,
+                name,
+                view["rgb"],
+                view["depth"],
+                view["intrinsics"],
+                view["world_from_cam"],
+                robot_mask=view["robot_mask"],
+            )
+            extras["views"][name] = view_extras
 
         object_poses_base = {}
         self.capture_object_aabb_min_z = {name: float(obj.aabb[0][2]) for name, obj in self.objects.items()}
@@ -569,39 +626,43 @@ class TiptopSim:
                 "aabb_center": aabb_center_b.tolist(),
                 "aabb_corners": corners_b,  # for the frame-coverage check in validate_capture
             }
-        extras = {
-            "cam_pos_base": cam_pos_b.cpu().numpy().tolist(),
-            "cam_quat_wxyz_ros": T.convert_quat(cam_quat_b, to="wxyz").cpu().numpy().tolist(),
-            "cam_pos_world": cam_pos.cpu().numpy().tolist(),
-            "cam_quat_xyzw_world_usd": cam_quat.cpu().numpy().tolist(),
-            "cam_quat_xyzw_world_cv": cam_quat_cv.cpu().numpy().tolist(),
-            "base_pos_world": self.base_pose()[0].cpu().numpy().tolist(),
-            "base_quat_xyzw_world": self.base_pose()[1].cpu().numpy().tolist(),
-            "seg_instance": seg,
-            "id_to_name": id_to_name,
-            "object_poses_base": object_poses_base,
-            "object_poses_world": self.object_poses_world(),
-            "q_fingers": self.q_fingers().tolist(),
-            "sim_dt": self.dt,
-        }
+        extras.update(
+            {
+                "base_pos_world": self.base_pose()[0].cpu().numpy().tolist(),
+                "base_quat_xyzw_world": self.base_pose()[1].cpu().numpy().tolist(),
+                "object_poses_base": object_poses_base,
+                "object_poses_world": self.object_poses_world(),
+                "q_fingers": self.q_fingers().tolist(),
+                "sim_dt": self.dt,
+            }
+        )
         return request, extras
 
-    def oracle_masks(self, request: dict, extras: dict, labels: list[str]) -> np.ndarray:
-        """(N, H, W) bool masks of tracked objects for the frame ``capture`` returned (privileged: simulator truth).
-        Isaac's instance segmentation when it was rendered, else from the objects' meshes and the depth image
-        (``geometry_masks``). A label out of view gets an all-False row."""
-        seg = extras["seg_instance"]
+    def object_meshes(self, labels: list[str]) -> dict:
+        """{label: trimesh} of tracked objects at their current poses, world frame: the masks of every view of one
+        capture come from the same meshes (privileged)."""
+        missing = [label for label in labels if label not in self.objects]
+        if missing:
+            raise ValueError(f"no tracked object for labels {missing} (tracked: {sorted(self.objects)})")
+        return {label: self.object_trimesh_world(label) for label in labels}
+
+    def oracle_masks(self, view: dict, view_extras: dict, labels: list[str], meshes: dict | None = None) -> np.ndarray:
+        """(N, H, W) bool masks of tracked objects for one view of a capture (the request itself with the capture's
+        extras, or an entry of ``views`` with ``extras["views"][name]``; privileged: simulator truth). Isaac's
+        instance segmentation when it was rendered, else from the objects' meshes (``meshes``, else built here) and
+        the depth image (``geometry_masks``). A label out of view gets an all-False row."""
+        seg = view_extras["seg_instance"]
         if seg is not None:
-            id_to_name = extras["id_to_name"]
+            id_to_name = view_extras["id_to_name"]
             masks = []
             for label in labels:  # tracked objects may carry a different simulator name (task objects)
                 sim_name = self.objects[label].name if label in self.objects else label
                 ids = [i for i, n in id_to_name.items() if n == sim_name]
-                masks.append(np.isin(seg, ids) if ids else np.zeros(request["depth"].shape, dtype=bool))
+                masks.append(np.isin(seg, ids) if ids else np.zeros(view["depth"].shape, dtype=bool))
             return np.stack(masks)
-        cam_pos = th.tensor(extras["cam_pos_world"], dtype=th.float32)
-        cam_quat_cv = th.tensor(extras["cam_quat_xyzw_world_cv"], dtype=th.float32)
-        return self.geometry_masks(request["depth"], request["intrinsics"], cam_pos, cam_quat_cv, labels)
+        cam_pos = th.tensor(view_extras["cam_pos_world"], dtype=th.float32)
+        cam_quat_cv = th.tensor(view_extras["cam_quat_xyzw_world_cv"], dtype=th.float32)
+        return self.geometry_masks(view["depth"], view["intrinsics"], cam_pos, cam_quat_cv, labels, meshes=meshes)
 
     def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
         """The request labels and TiPToP atoms for goal atoms over tracked object names (spawned presets: the
@@ -617,24 +678,41 @@ class TiptopSim:
         """The tracked label of an object named in a goal atom (the name itself for spawned presets)."""
         return name
 
-    @staticmethod
-    def trimesh_world(obj) -> trimesh.Trimesh:
-        """Every visual mesh of every link of ``obj`` as one trimesh in the WORLD frame (current pose).
-
-        Links without visual meshes contribute their collision meshes. Poses come from the Fabric hierarchy, so the
-        result is current after teleports / set_position_orientation without a physics step.
-        """
-        parts = []
-        for link in obj.links.values():
-            # meta-link volumes (particleapplier, slicer, fluidsource, ...) sit in visual_meshes with purpose "guide":
-            # never rendered, so they must not claim depth pixels; collision meshes are all "guide" and stay unfiltered
+    def link_trimesh_world(self, link, max_faces: int | None = None) -> trimesh.Trimesh | None:
+        """Every visual mesh of one link as one trimesh in the WORLD frame (current pose); None for a link without
+        meshes. Links without visual meshes contribute their collision meshes. A link is rigid, so its mesh is read
+        from USD once, kept in the link's own frame (decimated to ``max_faces`` when asked: the robot's links are
+        only a self-mask), and placed by the link's current pose; poses come from the Fabric hierarchy, so the
+        result is current after teleports / set_position_orientation without a physics step."""
+        key = (link.prim_path, max_faces)
+        if key not in self._link_meshes:
+            # meta-link volumes (particleapplier, slicer, fluidsource, ...) sit in visual_meshes with purpose
+            # "guide": never rendered, so they must not claim depth pixels; collision meshes are all "guide" and
+            # stay unfiltered
             geoms = {k: g for k, g in link.visual_meshes.items() if g.purpose != "guide"} or link.collision_meshes
-            for geom in geoms.values():
-                parts.append(
-                    mesh_prim_to_trimesh_mesh(
-                        geom.prim, include_normals=False, include_texcoord=False, world_frame=True
-                    )
-                )
+            parts = [
+                mesh_prim_to_trimesh_mesh(geom.prim, include_normals=False, include_texcoord=False, world_frame=True)
+                for geom in geoms.values()
+            ]
+            local = None
+            if parts:
+                world = trimesh.util.concatenate(parts)
+                pos, quat = link.get_position_orientation()
+                local = world.copy()
+                local.apply_transform(np.linalg.inv(T.pose2mat((pos, quat)).cpu().numpy().astype(np.float64)))
+                if max_faces is not None and len(local.faces) > max_faces:
+                    local = trimesh.Trimesh(*decimated(local.vertices, local.faces, max_faces), process=False)
+            self._link_meshes[key] = local
+        local = self._link_meshes[key]
+        if local is None:
+            return None
+        world = local.copy()
+        world.apply_transform(T.pose2mat(link.get_position_orientation()).cpu().numpy().astype(np.float64))
+        return world
+
+    def trimesh_world(self, obj) -> trimesh.Trimesh:
+        """Every visual mesh of every link of ``obj`` as one trimesh in the WORLD frame (``link_trimesh_world``)."""
+        parts = [mesh for link in obj.links.values() if (mesh := self.link_trimesh_world(link)) is not None]
         if not parts:
             raise ValueError(f"object {obj.name!r} has no visual or collision meshes")
         return trimesh.util.concatenate(parts)
@@ -643,20 +721,18 @@ class TiptopSim:
         return self.trimesh_world(self.objects[name])
 
     def geometry_masks(
-        self, depth, intrinsics, cam_pos_world, cam_quat_cv_world, labels, tol: float | None = None
+        self, depth, intrinsics, cam_pos_world, cam_quat_cv_world, labels, tol: float | None = None, meshes=None
     ) -> np.ndarray:
         """(N, H, W) bool oracle masks for ``labels`` from the rendered depth and the objects' meshes.
 
-        Computed in the WORLD frame: the meshes come from ``object_trimesh_world`` and the camera pose is the world
-        pose of the OpenCV camera frame (same 180 deg-about-x conversion as the base-frame ``world_from_cam`` of the
-        request, minus the base transform), so no vertex transform into the base frame is needed. ``tol`` defaults to
-        ``self.gt_mask_tol`` (see ``masks_from_geometry`` for the contact-halo trade-off).
+        Computed in the WORLD frame: the meshes come from ``object_meshes`` (or ``meshes``, the same built once for
+        every view of a capture) and the camera pose is the world pose of the OpenCV camera frame (same 180
+        deg-about-x conversion as the base-frame ``world_from_cam`` of the request, minus the base transform), so
+        no vertex transform into the base frame is needed. ``tol`` defaults to ``self.gt_mask_tol`` (see
+        ``masks_from_geometry`` for the contact-halo trade-off).
         """
-        missing = [label for label in labels if label not in self.objects]
-        if missing:
-            raise ValueError(f"no tracked object for labels {missing} (tracked: {sorted(self.objects)})")
+        meshes = self.object_meshes(labels) if meshes is None else meshes
         world_from_cam_w = T.pose2mat((cam_pos_world, cam_quat_cv_world)).cpu().numpy().astype(np.float64)
-        meshes = {label: self.object_trimesh_world(label) for label in labels}
         masks = masks_from_geometry(
             depth, intrinsics, world_from_cam_w, meshes, tol=self.gt_mask_tol if tol is None else tol
         )
@@ -720,11 +796,15 @@ class TiptopSim:
         # fully framed in the next round, 0.72, worked). Runs with or without segmentation.
         coverage = self.frame_coverage(request, extras)
         report["frame_coverage"] = coverage
+        views = capture_views(request, extras)
+        report["view_coverage"] = {name: self.frame_coverage(view, extras) for name, view, _ in views[1:]}
         # Only the goal's own objects matter: every capture of a crowded table clips something at the edge, and a
-        # warning per clipped bystander would drown the one that actually breaks the plan.
+        # warning per clipped bystander would drown the one that actually breaks the plan. An object another view
+        # frames whole is not clipped.
         goal_args = {a for atom in request.get("gt_atoms") or [] for a in atom.get("args", [])}
         clipped, seen = [], set()
         for name, c in sorted(coverage.items(), key=lambda kv: kv[1]):
+            c = max([c, *(vc.get(name, 0.0) for vc in report["view_coverage"].values())])
             # with no atoms to filter by, report every clipped object rather than staying silent
             if not (self.FRAME_COVERAGE_MIN > c > 0.0):
                 continue

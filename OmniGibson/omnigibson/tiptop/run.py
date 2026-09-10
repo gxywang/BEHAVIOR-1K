@@ -87,7 +87,18 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="drop a preset object onto furniture",
     )
     r1.add_argument("--scene-objects", default="", help="comma-separated names of existing scene objects to manipulate")
-    r1.add_argument("--camera", default="head", choices=["head", "wrist"])
+    r1.add_argument(
+        "--camera", default="head", choices=["head", "left_wrist", "right_wrist"], help="the primary capture camera"
+    )
+    r1.add_argument(
+        "--views",
+        nargs="*",
+        default=["left_wrist", "right_wrist"],
+        choices=["head", "left_wrist", "right_wrist"],
+        metavar="VIEW",
+        help="further cameras captured with the primary one, fused by the planner into one scene ('--views' alone: "
+        "the primary camera only)",
+    )
     r1.add_argument(
         "--activity",
         default=None,
@@ -224,6 +235,7 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         spawn_presets=[sp[0] for sp in spawns],
         grasping_mode=args.grasping_mode,
         camera=args.camera,
+        views=args.views,
         head_aperture_mm=HEAD_APERTURE_MM if args.head_aperture is None else args.head_aperture,
         not_load_object_categories=[c for c in args.not_load.split(",") if c],
         activity=args.activity,
@@ -232,7 +244,13 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         segmentation=args.seg_instance,  # the annotator is opt-in; oracle masks come from geometry
         max_steps=max_steps,
     )
-    sim = R1ProSim(cfg, camera=args.camera, overview_view=args.overview, look_arm=None if args.no_look else LOOK_ARM)
+    sim = R1ProSim(
+        cfg,
+        camera=args.camera,
+        views=args.views,
+        overview_view=args.overview,
+        look_arm=None if args.no_look else LOOK_ARM,
+    )
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects
@@ -322,7 +340,7 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bo
     import imageio
 
     from omnigibson.tiptop.knowledge import GoalNotVisible
-    from omnigibson.tiptop.protocol import save_observation_h5
+    from omnigibson.tiptop.protocol import capture_views, save_observation_h5
 
     request, extras = sim.capture(args.task)
     try:
@@ -335,24 +353,36 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bo
     for problem in report["problems"]:
         log.warning(f"capture validation: {problem}")
     save_observation_h5(out_dir / "obs.h5", request, extras["cam_pos_base"], extras["cam_quat_wxyz_ros"])
-    imageio.imwrite(out_dir / "rgb.png", request["rgb"])
-    depth_vis = np.clip(request["depth"] / 2.0, 0, 1)
-    imageio.imwrite(out_dir / "depth.png", (depth_vis * 255).astype(np.uint8))
-    if known.masks is not None:
-        seg_vis = np.zeros_like(request["rgb"])
-        colors = [(255, 80, 80), (80, 200, 255), (120, 255, 120), (255, 220, 80)]
-        for i, mask in enumerate(known.masks):
-            seg_vis[mask.astype(bool)] = colors[i % len(colors)]
-        imageio.imwrite(out_dir / "gt_masks.png", seg_vis)
+    colors = [(255, 80, 80), (80, 200, 255), (120, 255, 120), (255, 220, 80)]
+    for name, view, _ in capture_views(request, extras):
+        suffix = "" if view is request else f"_{name}"
+        imageio.imwrite(out_dir / f"rgb{suffix}.png", view["rgb"])
+        imageio.imwrite(out_dir / f"depth{suffix}.png", (np.clip(view["depth"] / 2.0, 0, 1) * 255).astype(np.uint8))
+        masks = known.masks if view is request else known.view_masks.get(name)
+        if masks is not None:
+            seg_vis = np.zeros_like(view["rgb"])
+            for i, mask in enumerate(masks):
+                seg_vis[mask.astype(bool)] = colors[i % len(colors)]
+            imageio.imwrite(out_dir / f"gt_masks{suffix}.png", seg_vis)
     meta = {
         "task": args.task,
         "goal_atoms": known.atoms,
         "knowledge": {**knowledge.report(), **known.summary()},
         "intrinsics": request["intrinsics"].tolist(),
         "world_from_cam": request["world_from_cam"].tolist(),
+        "views": [
+            {"name": name, "intrinsics": view["intrinsics"].tolist(), "world_from_cam": view["world_from_cam"].tolist()}
+            for name, view, _ in capture_views(request, extras)
+        ],
         "q_init": request["q_init"].tolist(),
         "validation": report,
-        "extras": {k: v for k, v in extras.items() if k not in ("seg_instance",)},
+        "extras": {
+            k: v
+            if k != "views"
+            else {n: {kk: vv for kk, vv in ve.items() if kk != "seg_instance"} for n, ve in v.items()}
+            for k, v in extras.items()
+            if k not in ("seg_instance",)
+        },
     }
     with open(out_dir / "capture.json", "w") as f:
         json.dump(meta, f, indent=2)

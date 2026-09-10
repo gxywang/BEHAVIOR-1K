@@ -11,6 +11,10 @@
 set -e
 export PATH="$HOME/.pixi/bin:$PATH"
 unset LD_LIBRARY_PATH  # the pixi env ships its own CUDA libraries; host CUDA on the path breaks it
+# cuRobo's warm-up runs a CPU LU factorisation through MKL; on a loaded shared box MKL's threaded pivoting returns
+# garbage ("Pivots given to lu_solve must all be greater or equal to 1") and the server dies at start-up. One MKL
+# thread is safe and costs nothing here (planning is on the GPU); a few OpenMP threads are plenty for the rest.
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 # Shared multi-GPU boxes: TIPTOP_GPU=<index|uuid> pins this service to one card. Unset (laptop) = unchanged.
 if [ -n "${TIPTOP_GPU:-}" ]; then export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$TIPTOP_GPU"; fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

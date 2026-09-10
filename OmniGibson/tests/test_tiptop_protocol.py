@@ -142,6 +142,65 @@ def test_saved_observation_is_the_whole_request(tmp_path):
     assert again["gt_labels"] == onboard["gt_labels"] and "gt_masks" not in again and "gt_buttons" not in again
 
 
+def test_views_ride_along_validated_and_survive_the_h5(tmp_path):
+    from omnigibson.tiptop.protocol import add_view, attach_knowledge, request_from_observation
+
+    req = _request()
+    req["view_name"] = "head"
+    left = add_view(
+        req,
+        "left_wrist",
+        np.zeros((8, 10, 3), np.uint8),
+        np.ones((8, 10), np.float32),
+        np.eye(3),
+        np.eye(4),
+        robot_mask=np.eye(8, 10, dtype=bool),
+    )
+    add_view(req, "right_wrist", np.zeros((6, 6, 3), np.uint8), np.ones((6, 6), np.float32), np.eye(3), np.eye(4))
+    assert [v["name"] for v in req["views"]] == ["left_wrist", "right_wrist"] and left["robot_mask"].sum() == 8
+    with pytest.raises(ValueError, match="already"):
+        add_view(req, "head", req["rgb"], req["depth"], req["intrinsics"], req["world_from_cam"])
+    with pytest.raises(ValueError, match="robot_mask"):
+        add_view(req, "x", req["rgb"], req["depth"], req["intrinsics"], req["world_from_cam"], robot_mask=np.eye(3))
+    view_masks = {"left_wrist": np.zeros((2, 8, 10), bool), "right_wrist": np.ones((2, 6, 6), bool)}
+    with pytest.raises(ValueError, match="not a view"):
+        attach_knowledge(req, ["mug", "bowl"], [], view_masks={"nose": np.zeros((2, 6, 6), bool)})
+    with pytest.raises(ValueError, match="right_wrist"):
+        attach_knowledge(req, ["mug", "bowl"], [], view_masks={"right_wrist": np.zeros((2, 8, 10), bool)})
+    attach_knowledge(req, ["mug", "bowl"], req["gt_atoms"], masks=req["gt_masks"], view_masks=view_masks)
+    assert req["views"][1]["gt_masks"].dtype == np.uint8 and req["views"][1]["gt_masks"].sum() == 72
+    back = unpackb(packb(req))
+    assert (
+        np.array_equal(back["views"][0]["robot_mask"], left["robot_mask"]) and back["views"][1]["name"] == "right_wrist"
+    )
+    save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
+    obs = load_observation_h5(tmp_path / "obs.h5")
+    assert obs["view_name"] == "head" and [v["name"] for v in obs["views"]] == ["left_wrist", "right_wrist"]
+    assert obs["views"][0]["robot_mask"].dtype == bool and "robot_mask" not in obs["views"][1]
+    again = request_from_observation(obs)
+    assert set(again) == set(req) and again["view_name"] == "head"
+    for mine, theirs in zip(req["views"], again["views"]):
+        assert set(mine) == set(theirs)
+        for key in mine:
+            assert np.array_equal(np.asarray(mine[key]), np.asarray(theirs[key])), key
+
+
+def test_compose_views_gives_three_side_tiles_an_equal_share_of_the_height():
+    import numpy as np
+
+    from omnigibson.tiptop.executor import compose_views
+
+    head = np.full((720, 720, 3), 10, np.uint8)
+    overview = np.full((360, 640, 3), 200, np.uint8)
+    left, right = np.full((480, 480, 3), 90, np.uint8), np.full((480, 480, 3), 50, np.uint8)
+    frame = compose_views({"head_cam": head, "overview": overview, "left_wrist_cam": left, "right_wrist_cam": right})
+    assert frame.shape == (720, 1280, 3)
+    assert frame[100, 1000].tolist() == [200, 200, 200]  # overview at the top, 240 px tall
+    assert frame[360, 1000].tolist() == [90, 90, 90]  # left wrist 240x240 in the middle
+    assert frame[600, 1000].tolist() == [50, 50, 50]  # right wrist at the bottom
+    assert frame[600, 800].tolist() == [0, 0, 0]  # padding beside the centred wrist tile
+
+
 def test_depth_to_points_pinhole():
     depth = np.full((4, 6), 2.0, dtype=np.float32)
     K = np.array([[10.0, 0, 3], [0, 10.0, 2], [0, 0, 1]])

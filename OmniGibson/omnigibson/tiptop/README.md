@@ -92,30 +92,41 @@ Modules in this directory: `protocol.py` (wire and file formats, no OmniGibson i
 client and the Rerun mirror), `scene.py` (the simulator: stepping, capture, episode accounting), `r1pro.py` (the
 R1Pro in a BEHAVIOR scene: posture, cameras, task scope, base-pose search), `knowledge.py` (what the client tells
 the planner beyond the image: an oracle source and an onboard source), `executor.py` (plan execution, video),
-`strategies.py` (how a task is split into rounds), `bench.py` (the challenge-style benchmark), `replay.py` (re-plan
-a saved round), `run.py` (the CLI).
+`kinematics.py` (arm IK for the wrist cameras' look poses), `strategies.py` (how a task is split into rounds),
+`bench.py` (the challenge-style benchmark), `replay.py` (re-plan a saved round), `run.py` (the CLI).
 
 ## One round, step by step
 
 1. **Stand.** The base is teleported once per episode (`--stand-for`, `--near`, `--robot-pose`); the planner never
    moves it. `--stand-for [ITEM,...,]TARGET` (one name for a one-object task) searches a pose from which every named object is ahead, on the
    left, within the arm's reach and inside the head camera's view (see "R1Pro specifics").
-2. **Capture** (`R1ProSim.capture`). The left arm swings out of the head camera's view (`LOOK_ARM`), an external
-   "shadow" camera with the head camera's intrinsics is moved onto its pose and renders rgb + `depth_linear` until two
-   consecutive frames agree (the renderer accumulates over time after a teleport), then the arm returns to the ready
-   posture, which becomes the plan's `q_init`. `validate_capture` warns when a goal object is cut by the image
-   border (its hull would run past the real object -- the silent failure mode of the pipeline).
+2. **Capture** (`R1ProSim.capture`). Each free arm points its wrist camera at the look target (`wrist_look`: the
+   objects the base pose was chosen for, or the held object; Lula IK on that arm from above and to its side,
+   `kinematics.py`), which also takes it out of the head camera's frame; an arm that holds something stays where it
+   is. External "shadow" cameras with the head's and the wrists' intrinsics are moved onto the robot cameras' poses
+   and render rgb + `depth_linear` until two consecutive frames agree (the renderer accumulates over time after a
+   teleport), one view per camera (`--views`, default both wrists beside the head); in each view the robot's own
+   pixels are masked from its link meshes (`robot_self_mask`) and zeroed in the depth. Then the arms return to the
+   ready posture, which becomes the plan's `q_init`. `validate_capture` warns when a goal object is cut by the image
+   border in every view that sees it (its hull would run past the real object -- the silent failure mode of the
+   pipeline).
 3. **Request** (`protocol.build_request`, msgpack with numpy arrays, one websocket connection per request):
-   `rgb, depth, intrinsics, world_from_cam` (OpenCV camera in the robot base frame), `task, q_init`, plus what the
-   knowledge source knows (`knowledge.py`, `protocol.attach_knowledge`; see "What the planner is told"):
-   `gt_labels, gt_atoms` always, `gt_masks` from the oracle source, `gt_buttons` from the oracle source (true poses)
-   or the onboard source (detections carried from earlier rounds), `held_labels` / `in_hand` for what the hands
-   hold, `workspace_bounds` when the round works at the floor.
-4. **Plan** (`tiptop-server`, `_run_pipeline`). Masks → point cloud in the base frame → M2T2 grasps (associated to
-   objects by contact point) → table plane by RANSAC + one convex hull per object → cuTAMP samples pick/place
-   skeletons over 256 particles, cuRobo refines the motions → `{q_init, steps: [trajectory{positions, dt} |
-   gripper{open|close}]}`. The response also carries `objects: {label: {position, movable, grasps}}`, what
-   perception made of the frame, and `save_dir`, the run directory with the planner's own logs and images.
+   `rgb, depth, intrinsics, world_from_cam` (OpenCV camera in the robot base frame) for the primary view
+   (`view_name`), `views` for the others (`protocol.add_view`: each with its own `rgb, depth, intrinsics,
+   world_from_cam, robot_mask, gt_masks` at its own resolution), `task, q_init`, plus what the knowledge source
+   knows (`knowledge.py`, `protocol.attach_knowledge`; see "What the planner is told"): `gt_labels, gt_atoms`
+   always, `gt_masks` per view from the oracle source, `gt_buttons` from the oracle source (true poses) or the
+   onboard source (detections carried from earlier rounds), `held_labels` / `in_hand` for what the hands hold,
+   `workspace_bounds` when the round works at the floor.
+4. **Plan** (`tiptop-server`, `_run_pipeline`). Per view: masks → point cloud in the base frame. Per scene: the
+   views' detections are associated into objects (`tiptop/perception/association.py`: by label with ground-truth
+   masks, otherwise by projecting one view's masked points into the other and scoring the overlap with its masks)
+   and each object's points from every view are merged → M2T2 grasps on the merged cloud (associated to objects
+   by contact point) → table plane by RANSAC + one convex hull per object from its merged points → cuTAMP samples
+   pick/place skeletons over 256 particles, cuRobo refines the motions → `{q_init, gripper_init, steps:
+   [trajectory{positions, dt} | gripper{open|close}]}`. The response also carries `objects: {label: {position,
+   movable, grasps}}`, what perception made of the views, and `save_dir`, the run directory with the planner's own
+   logs and images (the extra views under `views/<name>/`).
 5. **Execute** (`executor.PlanExecutor`). Trajectories are resampled from the plan's `dt` to the env step (1/30 s)
    and tracked with absolute joint targets; gripper events hold the arm for `--gripper-hold-steps`; grasps are
    `sticky` for the demos (physical grasps of thin objects slip). Tracking lag and gripper state go to the result.
@@ -245,18 +256,20 @@ choice, `--knowledge`, made in `knowledge.py` and nowhere else; the rest of the 
 got. Every run records the source in its results, and the oracle one logs a PRIVILEGED warning at start.
 
 - **`oracle`** (the default, for development): the simulator's truth. Labels per instance (`candle_4`), `gt_masks`
-  from geometry (`gt_masks.py`: depth pixels within 8 mm of an object's mesh; or Isaac's annotator with
+  per view from geometry (`gt_masks.py`: depth pixels within 8 mm of an object's mesh; or Isaac's annotator with
   `--seg-instance`, where it works: Rs_int, not the house scenes) and the true pose of every toggle button the task
   presses (`gt_buttons`, sent in every round so the pick round can choose a grasp that presents it). Objects out of
-  view are dropped from the request; a goal object out of view is an error (`GoalNotVisible`). The server skips
-  detection and SAM2 and runs everything else unchanged. The challenge forbids all of this at evaluation time.
+  every view are dropped from the request; a goal object out of every view is an error (`GoalNotVisible`). The
+  server skips detection and SAM2 and runs everything else unchanged. The challenge forbids all of this at
+  evaluation time.
 - **`onboard`** (competition style): what an agent knows. Category names (`candle`), the goal atoms, the gripper
   state (`held_labels`, `in_hand`), and for a toggle button its label (`<object>_button`) so the detector looks
   for it; a button detected in an earlier round is carried through a grasp by the arm's kinematics and sent as a
   prior (`ButtonTracker`). Grounding DINO (prompts per category in `tiptop_sim_r1pro.yml`, e.g. "round cookie")
-  finds boxes in the head-camera image, SAM2 segments them; `robot_mask`, the robot's own pixels, keeps SAM2 off
-  an occluding gripper (only available with `--seg-instance`). Instances are numbered by box size, largest first,
-  so a category-level goal acts on the largest (closest) instance.
+  finds boxes in every view's image, SAM2 segments them; `robot_mask`, the robot's own pixels (from its link
+  meshes, or Isaac's annotator with `--seg-instance`), keeps SAM2 off an occluding gripper. The views' detections
+  are associated into objects by 3D reprojection overlap and instances are numbered by size, largest first, so a
+  category-level goal acts on the largest (closest) instance.
 - **Gemini** (`perception.detector: gemini`, tiptop's upstream default): Gemini detects the objects and translates
   the task; needs `GOOGLE_API_KEY`; atoms sent with the request take precedence.
 
@@ -291,8 +304,9 @@ otherwise attach it. The round is scored by the task's own `toggled_on`.
 Two hands (`--press-port`): with `--sequential` and a goal like `holding(radio);toggled_on(radio)`, the first round
 picks and holds with the left arm on the usual planner, then `adopt_embodiment` switches to planning the right arm
 (`r1pro_right`, a second `tiptop-server` on that port; nothing moves, the left gripper keeps its close command and
-the left joints are held where they are) and the press round captures in place, with the held object in the head
-camera's view, and presses with the closed right gripper (its press point is the midpoint of the fingertips). The
+the left joints are held where they are) and the press round captures with the held object in the head camera's
+view and the right wrist camera posed at it (the left arm stays), and presses with the closed right gripper (its
+press point is the midpoint of the fingertips). The
 Rerun mirror keeps reporting the left
 embodiment's joints. `--overview front` puts the third-person camera ahead and to the right of the robot, looking
 back at both hands (the default stands over the left shoulder, where the pressing hand is hidden by the torso);
@@ -406,7 +420,9 @@ A whole challenge task on its test instances is `python -m omnigibson.tiptop.ben
 Flags shared by all: `--embodiment franka|r1pro`, `--activity NAME` (+ `--activity-instance`, `--rooms`), scene
 set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene-objects`; the base
 `--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
-`--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|wrist`, `--head-aperture`, `--seg-instance`;
+`--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|left_wrist|right_wrist` (the primary view),
+`--views VIEW ...` (the further views, default both wrists; `--views` alone: the primary only), `--head-aperture`,
+`--seg-instance`;
 what the planner is told `--knowledge oracle|onboard`; the goal `--goal "pred(a,b);..."` (BDDL names with
 `--activity`), `--task`; execution
 `--grasping-mode physical|assisted|sticky`, `--gripper-hold-steps`, `--finger-max-effort`, `--settle-steps`,
@@ -454,10 +470,20 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (or `--torso` for the torso entries) and checks the simulator holds it (0.03 rad); it runs before the base pose
   is chosen because the head camera's reach (`camera_floor_distance`: where the bottom image edge meets a support)
   follows from it. The base gets the evaluator's 250 kg mass; without it the leaning posture tips the robot over.
-- **Cameras.** Head (`zed_link`, 720x720, 40 mm aperture = 99° HFOV as in the challenge) for the capture, left wrist
-  (`left_realsense_link`, 480x480) and an external overview camera for the mirror. Instance segmentation attached to
-  a robot-mounted camera leaks GPU memory and segfaults after ~35 steps in this Isaac build, so the robot cameras
-  render rgb only and an external shadow camera is moved onto the head camera's pose for the capture frame.
+- **Cameras.** Head (`zed_link`, 720x720, 40 mm aperture = 99° HFOV as in the challenge), left and right wrist
+  (`left_realsense_link`, `right_realsense_link`, 480x480, 20.995 mm = 63° HFOV) are the capture views (`--camera`
+  the primary, `--views` the others), plus an external overview camera for the mirror. Instance segmentation
+  attached to a robot-mounted camera leaks GPU memory and segfaults after ~35 steps in this Isaac build, so the
+  robot cameras render rgb only and external shadow cameras, one per optics, are moved onto the robot cameras'
+  poses for the capture frames.
+- **Look poses** (`wrist_look`, `kinematics.py`). For a capture each free arm whose wrist camera is a view is
+  posed by Lula IK (shipped with Isaac Sim; the arm's seven joints, everything else fixed where it is, from the
+  robot's URDF) so that its camera sits `LOOK_OFFSET` from its own shoulder (0.2 m ahead, 0.3 m to the arm's
+  side, 5 cm down: within reach for any target and outside the head camera's frame) looking at the look target;
+  both arms move in one 60-step settle and return in another, so a capture
+  costs what the old swing-out did. An arm more than 0.03 rad short of its pose after settling is logged as
+  blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm swings out of
+  view as before (`LOOK_ARM`); `--no-look` disables all of it.
 - **Base pose** (`best_base_pose`): candidates on rings 0.25-0.9 m around the named objects' centroid, facing it,
   yaw ±60° in 15° steps; rejected when an object is behind (< 0.15 m ahead), well to the right (> 0.3 m), beyond
   reach (0.9 m), nearer than the camera's reach for its own support height, hidden behind the container, outside
@@ -508,10 +534,10 @@ for one task and is kept here, with what it did, in case a task needs it later.
   the switch when its panel is in view; and when no button is seen before the pick the planner presents the object's
   far side. But the radio hangs upright from a handle grasp and the two grasp families differ by a half turn, so the
   speaker face can be turned toward either arm, never up toward the head camera: in the hand it is edge-on
-  (face cosine to the camera 0.04), the panel is a sliver, and the context test fails. The fix would be a look
-  from the right wrist camera before the press (the face points at the right arm anyway), a precomputed right-arm
-  look pose, a second shadow camera with the wrist optics, and a table fallback for close-up views. The demo therefore
-  uses the oracle button pose (`button_hints` -> `gt_buttons`); `--knowledge onboard` remains an experiment.
+  (face cosine to the camera 0.04), the panel is a sliver, and the context test fails. Since 2026-09-10 the press
+  round also captures the right wrist camera posed at the held radio (see "Look poses"); whether the detector
+  finds the switch in that view has not been measured yet. The demo therefore uses the oracle button pose
+  (`button_hints` -> `gt_buttons`); `--knowledge onboard` remains an experiment.
 - The base moves by teleport (`place_robot`), between rounds only: a carry is a pick round, a teleport with the
   object in the gripper (OmniGibson moves a grasp-assisted object with the robot) and a place round that starts
   holding it (`in_hand`). Nothing plans the base's path. While a hand holds something the capture keeps the arm
@@ -599,3 +625,12 @@ a scripted episode, and the benchmark's summary.
   before the plan's open event). turning_on_radio pass 5 with this code: 0.7 (7/10); every planned press toggled
   the switch, the three failures had no press plan at the reach edge (0.57-0.63 m); median 722 env steps per
   instance against 839 in pass 4.
+- 2026-09-10 (several views per capture): the head camera and both wrist cameras are captured together and fused by
+  the planner (`views` on the wire, `tiptop/views.py`, `tiptop/perception/association.py`; hulls, the support plane
+  and M2T2 grasps from the merged cloud). Each free arm poses its wrist camera by Lula IK beside its own shoulder,
+  looking at what the base pose was chosen for or at the held object (`kinematics.py`, `wrist_look`), out of the
+  head camera's frame; the robot's own pixels come out of every view from its link meshes. Verified: a three-view
+  capture of the radio (head 7131, left wrist 9359, right wrist 7965 radio pixels; all three views in the hull),
+  the pick of instance 301 with three views (the same fused request replays into a plan), and the press round's
+  failure at 0.69 m replaying identically with and without the wrist views (reach, not the fuller hull). The
+  planner launcher pins MKL to one thread (DEPLOYMENT item 20).

@@ -17,15 +17,22 @@ simulator knows and the robot could not (object poses, button poses, masks, a sw
 
 import logging
 import math
+import re
 from pathlib import Path
 
 import numpy as np
 import torch as th
 import yaml
+from bddl.condition_evaluation import HEAD
 
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
+from omnigibson.objects.usd_object import USDObject
+from omnigibson.tasks.behavior_task import BehaviorTask
+from omnigibson.tiptop.gt_masks import masks_from_geometry
+from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
+from omnigibson.tiptop.protocol import bddl_category, face_normal_local, points_to_pixels
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,
     OBJECT_PRESETS,
@@ -34,23 +41,34 @@ from omnigibson.tiptop.scene import (
     look_at_quat_xyzw,
     overview_cam_config,
 )
-from omnigibson.tiptop.protocol import bddl_category, face_normal_local
-from bddl.condition_evaluation import HEAD
-from omnigibson.objects.usd_object import USDObject
-from omnigibson.tasks.behavior_task import BehaviorTask
 
 log = logging.getLogger(__name__)
 
 ROBOT_NAME = "robot_r1"
 ROBOT_TYPE = "r1pro_left"
-CAMERA_LINKS = {"head": "zed_link", "wrist": "left_realsense_link"}
-SHADOW_CAM = CAMERA_NAME  # the external capture sensor, moved onto the robot camera's pose per capture (_capture_obs)
+CAMERA_LINKS = {"head": "zed_link", "left_wrist": "left_realsense_link", "right_wrist": "right_realsense_link"}
+VIEW_OPTICS = {"head": "head", "left_wrist": "wrist", "right_wrist": "wrist"}  # which shadow camera renders a view
+DEFAULT_VIEWS = ("left_wrist", "right_wrist")  # captured with the head camera and fused by the planner
+# The external capture sensors, one per optics: moved onto the robot camera's pose per view (_capture_obs). The
+# robot's own cameras render rgb only (video, mirror); depth and segmentation come from these.
+SHADOW_CAMS = {"head": CAMERA_NAME, "wrist": "tiptop_wrist_cam"}
+SHADOW_CAM = SHADOW_CAMS["head"]
 # Capture posture: the ready posture with the left shoulder abducted so the arm swings out to the robot's left, out of
 # the head camera's view. In the ready posture the gripper sits in front of the table objects and hides most of them
 # (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
 # 0 robot pixels, no contact. Applied on top of q_home, joint name -> value.
 LOOK_ARM = {"left_arm_joint2": 2.0}
 LOOK_SETTLE_STEPS = 60
+LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
+DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
+SELF_MASK_FACES = (
+    2000  # a robot link's mesh is decimated to this for the self-mask (it only marks the robot's own pixels)
+)
+LOOK_OFFSET = (
+    0.2,
+    0.3,
+    -0.05,
+)  # a wrist camera looks at the target from here: ahead, aside and up from its arm's shoulder (m)
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
@@ -143,6 +161,7 @@ def make_r1pro_env_config(
     spawn_presets=(),
     grasping_mode: str = "sticky",
     camera: str = "head",
+    views=DEFAULT_VIEWS,
     head_resolution: int = 720,
     wrist_resolution: int = 480,
     head_aperture_mm: float = HEAD_APERTURE_MM,
@@ -162,10 +181,12 @@ def make_r1pro_env_config(
     timeout (env steps), the challenge's 1.5x mean human demonstration length in a benchmark; effectively none
     otherwise.
 
-    Cameras: the robot camera TiPToP uses renders rgb only (video); an external "shadow" VisionSensor with the same
-    intrinsics provides rgb + depth_linear + seg_instance for the capture frame after being moved onto the robot
-    camera's pose. Instance segmentation attached to a robot-mounted camera leaks GPU memory every step in this
-    Isaac Sim build and segfaults the synthetic-data graph after ~35 steps; an external camera does not.
+    Cameras: the robot cameras render rgb only (video); an external "shadow" VisionSensor per optics (head:
+    ``head_resolution`` / ``head_aperture_mm``; wrist: ``wrist_resolution`` / ``WRIST_APERTURE_MM``) provides rgb +
+    depth_linear + seg_instance for a capture view after being moved onto the robot camera's pose; ``camera`` is
+    the primary view, ``views`` the further ones (``CAMERA_LINKS``). Instance segmentation attached to a
+    robot-mounted camera leaks GPU memory every step in this Isaac Sim build and segfaults the synthetic-data
+    graph after ~35 steps; an external camera does not.
     """
     jc = {
         "name": "JointController",
@@ -181,23 +202,29 @@ def make_r1pro_env_config(
         "command_input_limits": None,
         "command_output_limits": None,
     }
-    res = head_resolution if camera == "head" else wrist_resolution
-    aperture = head_aperture_mm if camera == "head" else WRIST_APERTURE_MM
-    shadow_cam = {
-        "sensor_type": "VisionSensor",
-        "name": SHADOW_CAM,
-        "relative_prim_path": f"/{SHADOW_CAM}",
-        "modalities": ["rgb", "depth_linear"] + (["seg_instance"] if segmentation else []),
-        "sensor_kwargs": {
-            "image_width": res,
-            "image_height": res,
-            "focal_length": 17.0,
-            "horizontal_aperture": aperture,
-        },
-        "position": [0.0, 0.0, 1.5],
-        "orientation": [0.0, 0.0, 0.0, 1.0],
-        "include_in_obs": False,
-    }
+    unknown = [v for v in (camera, *views) if v not in CAMERA_LINKS]
+    if unknown:
+        raise ValueError(f"unknown camera views {unknown} (known: {sorted(CAMERA_LINKS)})")
+    optics = {"head": (head_resolution, head_aperture_mm), "wrist": (wrist_resolution, WRIST_APERTURE_MM)}
+    shadow_cams = [
+        {
+            "sensor_type": "VisionSensor",
+            "name": SHADOW_CAMS[kind],
+            "relative_prim_path": f"/{SHADOW_CAMS[kind]}",
+            "modalities": ["rgb", "depth_linear"] + (["seg_instance"] if segmentation else []),
+            "sensor_kwargs": {
+                "image_width": optics[kind][0],
+                "image_height": optics[kind][0],
+                "focal_length": 17.0,
+                "horizontal_aperture": optics[kind][1],
+            },
+            "position": [0.0, 0.0, 1.5],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "include_in_obs": False,
+        }
+        for kind in ("head", "wrist")
+        if kind in {VIEW_OPTICS[v] for v in (camera, *views)}
+    ]
     scene = {
         "type": "InteractiveTraversableScene",
         "scene_model": scene_model,
@@ -232,7 +259,7 @@ def make_r1pro_env_config(
             "action_frequency": 30,
             "rendering_frequency": 30,
             "physics_frequency": 120,
-            "external_sensors": [shadow_cam, overview_cam_config()],  # the overview is aimed by place_robot
+            "external_sensors": [*shadow_cams, overview_cam_config()],  # the overview is aimed by place_robot
         },
         "scene": scene,
         "robots": [
@@ -242,8 +269,8 @@ def make_r1pro_env_config(
                 "obs_modalities": [
                     "rgb",
                     "proprio",
-                ],  # rgb for the video + mirror; capture frames come from the shadow camera
-                "include_sensor_names": sorted({CAMERA_LINKS[camera], CAMERA_LINKS["wrist"]}),
+                ],  # rgb for the video + mirror; capture frames come from the shadow cameras
+                "include_sensor_names": sorted(set(CAMERA_LINKS.values())),
                 "action_normalize": False,
                 "self_collisions": True,
                 "grasping_mode": grasping_mode,
@@ -303,12 +330,23 @@ class R1ProSim(TiptopSim):
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)
 
-    def __init__(self, config: dict, camera: str = "head", overview_view: str = "shoulder", look_arm=LOOK_ARM):
-        """``overview_view``: where ``place_robot`` puts the overview camera (``OVERVIEW_OFFSETS``); ``look_arm``:
-        joint overrides on top of q_home for the capture, None to capture in the ready posture."""
+    def __init__(
+        self,
+        config: dict,
+        camera: str = "head",
+        views=DEFAULT_VIEWS,
+        overview_view: str = "shoulder",
+        look_arm=LOOK_ARM,
+    ):
+        """``camera``: the primary view; ``views``: the further views of every capture (``CAMERA_LINKS``; the
+        environment must have been configured with the same, ``make_r1pro_env_config``); ``overview_view``: where
+        ``place_robot`` puts the overview camera (``OVERVIEW_OFFSETS``); ``look_arm``: joint overrides on top of
+        q_home for the capture, None to capture in the ready posture."""
         self.config = config
         self.overview_view = overview_view
         self.look_arm = look_arm
+        self.primary_view = camera
+        self.extra_views = tuple(v for v in views if v != camera)
         self.env = og.Environment(configs=config)
         self.robot = self.env.robots[0]
         self.arm = "left"
@@ -323,11 +361,27 @@ class R1ProSim(TiptopSim):
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
         self.gripper_idx = self.robot.gripper_control_idx[self.arm]
         self.dt = og.sim.get_sim_step_dt()
-        self.cam_name = f"{self.robot.name}:{CAMERA_LINKS[camera]}:Camera:0"
-        self.robot_cam = self.robot.sensors[self.cam_name]
-        self.wrist_cam_name = f"{self.robot.name}:{CAMERA_LINKS['wrist']}:Camera:0"
+        self.robot_cam_names = {name: f"{self.robot.name}:{link}:Camera:0" for name, link in CAMERA_LINKS.items()}
+        self.robot_cams = {name: self.robot.sensors[sensor] for name, sensor in self.robot_cam_names.items()}
+        self.cam_name = self.robot_cam_names[camera]
+        self.robot_cam = self.robot_cams[camera]  # the primary view's camera: the base-pose search frames with it
         self.STREAM_CAMERA = f"{camera}_cam"  # the capture camera's image in the Rerun mirror
-        self.cam = self.env.external_sensors[SHADOW_CAM]  # capture camera; moved onto robot_cam's pose per frame
+        self.shadows = {
+            kind: self.env.external_sensors[name]
+            for kind, name in SHADOW_CAMS.items()
+            if name in self.env.external_sensors
+        }
+        self.cam = self.shadows[VIEW_OPTICS[camera]]  # capture camera; moved onto robot_cam's pose per frame
+        # the wrist cameras' constant poses in their links, for the look poses (wrist_look), and the URDF's joints
+        self.camera_in_link = {}
+        for arm in ("left", "right"):
+            link = self.robot.links[CAMERA_LINKS[f"{arm}_wrist"]]
+            self.camera_in_link[arm] = link_from_camera(
+                *[v.cpu().numpy() for v in link.get_position_orientation()],
+                *[v.cpu().numpy() for v in self.robot_cams[f"{arm}_wrist"].get_position_orientation()],
+            )
+        self.urdf_joints = set(re.findall(r'<joint name="([^"]+)"', Path(self.robot.urdf_path).read_text()))
+        self.look_target = None  # base-frame point the wrist cameras look at in a capture (place_robot_for sets it)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -806,7 +860,10 @@ class R1ProSim(TiptopSim):
             f"standing for {' + '.join(names)}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
             f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m"
         )
-        return self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
+        pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
+        centre = th.stack([o.aabb_center for o in objects]).mean(dim=0)  # what the wrist cameras look at
+        self.look_target = self.to_base(centre, th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
+        return pose
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
@@ -815,6 +872,7 @@ class R1ProSim(TiptopSim):
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
         self.teleports += 1
+        self.look_target = None  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
         # back at the chest, where both hands and what they hold are in view ("front", the two-hands demo)
@@ -888,8 +946,8 @@ class R1ProSim(TiptopSim):
         held) and its joints are held at their current values; the adopted arm resumes the command it was left
         with (until 2026-09-09 it inherited the other arm's, so a left hand holding the radio was commanded open
         by the next left plan and dropped it).
-        The capture no longer swings an arm out of the camera's view (the held object should be seen), and the
-        Rerun mirror keeps reporting the first embodiment's joints."""
+        A capture still poses the free arm for its wrist camera (the held arm never moves), and the Rerun mirror
+        keeps reporting the first embodiment's joints."""
         arm = embodiment["arm"]
         if arm == self.arm:
             return
@@ -914,7 +972,6 @@ class R1ProSim(TiptopSim):
         self.gripper_idx = self.robot.gripper_control_idx[arm]
         self.posture = {j: float(q[self.joint_index[j]]) for j in locked if "finger" not in j}  # hold, do not move
         self.q_home = [float(v) for v in embodiment["q_home"]]
-        self.look_arm = None
         log.info(
             f"planning the {arm} arm from here on ({embodiment['robot_type']}: {len(self.planned_joints)} joints); "
             f"the {self.other_arm} arm holds its posture with gripper command {self.other_gripper:+.0f}; "
@@ -948,27 +1005,105 @@ class R1ProSim(TiptopSim):
         return float(ahead[0])
 
     # ---------------------------------------------------------------- observation
+    def wrist_look(self, arm: str, target) -> np.ndarray | None:
+        """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
+        (``kinematics.look_pose``), every other joint where it is; None when no configuration does."""
+        joints = list(self.robot.arm_joint_names[arm])
+        q = self.robot.get_joint_positions()
+        fixed = {
+            name: float(q[i]) for name, i in self.joint_index.items() if name in self.urdf_joints and name not in joints
+        }
+        ik = ArmIK(self.robot.urdf_path, joints, fixed, frame=CAMERA_LINKS[f"{arm}_wrist"])
+        shoulder, _ = self.to_base(*self.robot.links[self.robot.arm_link_names[arm][0]].get_position_orientation())
+        eye, cam_quat = look_pose(target, shoulder.cpu().numpy(), side=1 if arm == "left" else -1, offset=LOOK_OFFSET)
+        pos, quat = link_pose_for_camera(eye, cam_quat, self.camera_in_link[arm])
+        return ik.solve(pos, quat, seed=[float(q[self.joint_index[j]]) for j in joints])
+
     def capture(self, task: str) -> tuple[dict, dict]:
-        """Look with the arm out of the head camera's view, then return to the ready posture the plan starts from.
-        A hand that holds something stays where it is: the held object is what the next plan is about and must be
-        seen, and the gripper keeps its command (the swing used to open it and drop the object)."""
-        if self.look_arm is None or self.arm in (self.hands() or {}).values():
+        """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
+        (``wrist_look``; the target is a held object when there is one, else what the base pose was chosen for),
+        which also takes the arm out of the head camera's frame. An arm that holds something stays where it is:
+        the held object is what the next plan is about and must be seen, and the gripper keeps its command. The
+        planned arm swings out of view (``look_arm``) when no look configuration exists; with ``look_arm`` None
+        nothing moves. The plan starts from the ready posture the arms return to."""
+        if self.look_arm is None:
             return super().capture(task)
+        hands = self.hands()
+        held_arms = set(hands.values())
+        if held_arms:
+            target = self.eef_pose_base(sorted(held_arms)[0])[:3, 3]
+        else:
+            target = np.asarray(DEFAULT_LOOK_TARGET if self.look_target is None else self.look_target, dtype=np.float64)
         ready = list(self.q_home)
-        unknown = set(self.look_arm) - set(self.planned_joints)
-        assert not unknown, f"look posture names joints the planner does not move: {unknown}"
-        look = [float(self.look_arm.get(j, v)) for j, v in zip(self.planned_joints, ready)]
+        look = list(ready)  # the planned joints during the capture
+        posture = dict(self.posture)  # the other arm's joints during the capture
+        moved = {}  # arm -> {joint: value}
+        for arm in ("left", "right"):
+            if arm in held_arms or (arm != self.arm and f"{arm}_wrist" not in (self.primary_view, *self.extra_views)):
+                continue
+            joints = list(self.robot.arm_joint_names[arm])
+            q = self.wrist_look(arm, target)
+            if q is not None:
+                moved[arm] = {j: float(v) for j, v in zip(joints, q)}
+            elif arm == self.arm and any(j in self.look_arm for j in joints):
+                log.warning(
+                    f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; swinging it out of view"
+                )
+                moved[arm] = {j: float(self.look_arm[j]) for j in joints if j in self.look_arm}
+            else:
+                log.warning(
+                    f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; it stays where it is"
+                )
+            if arm == self.arm:
+                look = [moved.get(arm, {}).get(j, v) for j, v in zip(self.planned_joints, ready)]
+            else:
+                posture.update(moved.get(arm, {}))
+        if not moved:
+            return super().capture(task)
+        original = self.posture
+        self.posture = posture
         self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=look)
+        now = self.robot.get_joint_positions()
+        for arm, targets in moved.items():
+            lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
+            if lag > LOOK_TOL:
+                log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
         request, extras = super().capture(task)
+        self._log_wrist_framing(request, moved)
+        self.posture = original
         self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=ready)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
-        if lag > 0.03:
+        if lag > LOOK_TOL:
             raise RuntimeError(f"arm did not return to the ready posture after the capture (max error {lag:.3f} rad)")
+        now = self.robot.get_joint_positions()
+        for arm in moved:
+            if arm != self.arm:
+                back = max(abs(float(now[self.joint_index[j]]) - original[j]) for j in self.robot.arm_joint_names[arm])
+                if back > LOOK_TOL:
+                    log.warning(f"{arm} arm is {back:.3f} rad from its locked posture after the capture")
         request["q_init"] = np.asarray(q_ready, dtype=np.float32)  # the plan starts here, not at the look posture
-        extras["q_look"] = [float(v) for v in look]
-        log.info(f"captured in the look posture; plan starts from the ready posture (max error {lag:.4f} rad)")
+        extras["q_look"] = moved
+        log.info(
+            f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
+        )
         return request, extras
+
+    def _log_wrist_framing(self, request: dict, arms) -> None:
+        """Where the posed wrist cameras stand in the primary view's frame (an arm inside it hides the workspace)."""
+        h, w = request["depth"].shape
+        for arm in arms:
+            pos_b, _ = self.to_base(*self.robot_cams[f"{arm}_wrist"].get_position_orientation())
+            px, z = points_to_pixels([pos_b.cpu().numpy()], request["intrinsics"], request["world_from_cam"])
+            (u, v), inside = px[0], bool(z[0] > 0 and 0 <= px[0][0] < w and 0 <= px[0][1] < h)
+            log.info(
+                f"{arm} wrist camera at base {np.round(pos_b.cpu().numpy(), 2).tolist()}: "
+                + (
+                    f"inside the {self.primary_view} frame at pixel ({u:.0f}, {v:.0f})"
+                    if inside
+                    else f"outside the {self.primary_view} frame"
+                )
+            )
 
     # ---------------------------------------------------------------- stepping
     def action(self, q_arm, gripper: float) -> dict:
@@ -985,31 +1120,57 @@ class R1ProSim(TiptopSim):
         # base: HolonomicBaseJointController in position mode takes deltas, zeros hold the base still
         return {self.robot.name: a}
 
-    def _capture_obs(self) -> tuple[dict, dict]:
-        """Move the shadow camera onto the robot camera and render one rgb + depth (+ segmentation) frame."""
-        pos, quat = self.robot_cam.get_position_orientation()
-        self.cam.set_position_orientation(position=pos, orientation=quat)
+    def view_sensor(self, name: str):
+        return self.shadows[VIEW_OPTICS[name]]
+
+    def _capture_obs(self, name: str) -> tuple[dict, dict]:
+        """Move the view's shadow camera onto its robot camera and render one rgb + depth (+ segmentation) frame."""
+        robot_cam, shadow = self.robot_cams[name], self.view_sensor(name)
+        pos, quat = robot_cam.get_position_orientation()
+        shadow.set_position_orientation(position=pos, orientation=quat)
         # The renderer accumulates frames over time: after the camera jumps (base teleport, look posture) the first
         # frames are a ghost of the previous view, so render until two consecutive frames agree.
         previous = None
         for i in range(CAPTURE_MAX_RENDERS):
             og.sim.render()
             og.sim.render()
-            rgb = self.cam.get_obs()[0]["rgb"][..., :3].to(th.float32)
+            rgb = shadow.get_obs()[0]["rgb"][..., :3].to(th.float32)
             if previous is not None and float((rgb - previous).abs().mean()) < CAPTURE_CONVERGED_DIFF:
-                log.info(f"capture converged after {2 * (i + 1)} renders")
+                log.info(f"{name}: capture converged after {2 * (i + 1)} renders")
                 break
             previous = rgb
         else:
-            log.warning(f"capture did not converge after {2 * CAPTURE_MAX_RENDERS} renders; using the last frame")
-        k_robot, k_shadow = _intrinsics(self.robot_cam), _intrinsics(self.cam)
+            log.warning(
+                f"{name}: capture did not converge after {2 * CAPTURE_MAX_RENDERS} renders; using the last frame"
+            )
+        k_robot, k_shadow = _intrinsics(robot_cam), _intrinsics(shadow)
         if not np.allclose(k_robot, k_shadow, atol=0.5):
-            raise RuntimeError(f"shadow camera intrinsics {k_shadow.tolist()} != robot camera {k_robot.tolist()}")
-        p2, q2 = self.cam.get_position_orientation()
+            raise RuntimeError(
+                f"{name}: shadow camera intrinsics {k_shadow.tolist()} != robot camera {k_robot.tolist()}"
+            )
+        p2, q2 = shadow.get_position_orientation()
         assert th.allclose(p2, pos, atol=1e-4) and th.allclose(q2.abs(), quat.abs(), atol=1e-4), (
             "shadow camera did not move"
         )
-        return self.cam.get_obs()
+        return shadow.get_obs()
+
+    def robot_self_mask(self, name: str, depth, intrinsics, cam_pos_world, cam_quat_cv_world) -> np.ndarray:
+        """The robot's own pixels in a view from its link meshes: the viewing arm's links, gripper and fingers for
+        a wrist view (the camera looks along its own gripper), both arms' for the head view."""
+        arms = ["left", "right"] if name == "head" else [name.split("_")[0]]
+        meshes = {}
+        for arm in arms:
+            for link_name in (
+                *self.robot.arm_link_names[arm],
+                *self.robot.gripper_link_names[arm],
+                *self.robot.finger_link_names[arm],
+            ):
+                mesh = self.link_trimesh_world(self.robot.links[link_name], max_faces=SELF_MASK_FACES)
+                if mesh is not None:
+                    meshes[link_name] = mesh
+        world_from_cam_w = T.pose2mat((cam_pos_world, cam_quat_cv_world)).cpu().numpy().astype(np.float64)
+        masks = masks_from_geometry(depth, intrinsics, world_from_cam_w, meshes, tol=self.gt_mask_tol)
+        return np.any(np.stack(list(masks.values())), axis=0) if masks else np.zeros(depth.shape, dtype=bool)
 
     def camera_rgb(self) -> np.ndarray | None:
         return self._robot_rgb(self.cam_name)
@@ -1020,9 +1181,10 @@ class R1ProSim(TiptopSim):
         return self.last_obs[self.robot.name][sensor_name]["rgb"][..., :3].cpu().numpy().astype(np.uint8)
 
     def video_views(self) -> dict:
-        """The capture camera, the overview and the left wrist camera (video and Rerun mirror)."""
+        """The capture camera, the overview and the other robot cameras (video and Rerun mirror)."""
         views = super().video_views()
-        wrist = self._robot_rgb(self.wrist_cam_name)
-        if wrist is not None and self.wrist_cam_name != self.cam_name:
-            views["wrist_cam"] = wrist
+        for name, sensor in self.robot_cam_names.items():
+            rgb = self._robot_rgb(sensor) if name != self.primary_view else None
+            if rgb is not None:
+                views[f"{name}_cam"] = rgb
         return views

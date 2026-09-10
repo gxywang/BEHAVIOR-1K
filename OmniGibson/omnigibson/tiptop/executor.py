@@ -12,21 +12,19 @@ log = logging.getLogger(__name__)
 
 def compose_views(views: dict, column_width: int = 560, caption: str | None = None) -> np.ndarray:
     """One video frame from the simulator's views ({name: (H, W, 3) uint8}, the capture camera first): the first
-    view full size on the left, the others scaled to ``column_width`` and stacked down the right, each labelled;
-    ``caption`` goes in the top-left corner."""
+    view full size on the left, the others scaled to ``column_width`` and stacked down the right, each labelled and
+    each given at most an equal share of the main image's height; ``caption`` goes in the top-left corner."""
     from PIL import Image, ImageDraw, ImageFont
 
     names = list(views)
     main = Image.fromarray(np.ascontiguousarray(views[names[0]][..., :3]))
-    tiles, left = [], main.height
+    tiles = []
+    share = main.height / max(len(names) - 1, 1)
     for name in names[1:]:
         img = Image.fromarray(np.ascontiguousarray(views[name][..., :3]))
-        scale = min(column_width / img.width, left / img.height)
-        if scale <= 0:
-            break
+        scale = min(column_width / img.width, share / img.height)
         img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.BILINEAR)
         tiles.append((name, img))
-        left -= img.height
     canvas = Image.new("RGB", (main.width + (column_width if tiles else 0), main.height))
     canvas.paste(main, (0, 0))
     draw = ImageDraw.Draw(canvas)

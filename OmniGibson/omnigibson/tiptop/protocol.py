@@ -60,8 +60,28 @@ def unpackb(data: bytes):
 # --------------------------------------------------------------------------------------------------------------------
 # Request / response
 # --------------------------------------------------------------------------------------------------------------------
+def _frame(rgb, depth, intrinsics, world_from_cam) -> tuple:
+    """The validated arrays of one view (the conventions of ``build_request``)."""
+    rgb = np.asarray(rgb)
+    depth = np.asarray(depth, dtype=np.float32)
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+        raise ValueError(f"rgb must be (H, W, 3) uint8, got {rgb.shape} {rgb.dtype}")
+    if depth.shape != rgb.shape[:2]:
+        raise ValueError(f"depth {depth.shape} does not match rgb {rgb.shape[:2]}")
+    if not np.all(np.isfinite(depth)) or depth.min() < 0:
+        raise ValueError("depth must be finite and non-negative (use 0 for invalid pixels)")
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    world_from_cam = np.asarray(world_from_cam, dtype=np.float32)
+    if intrinsics.shape != (3, 3) or world_from_cam.shape != (4, 4):
+        raise ValueError("intrinsics must be (3, 3) and world_from_cam (4, 4)")
+    if not np.allclose(world_from_cam[3], [0, 0, 0, 1], atol=1e-6):
+        raise ValueError("world_from_cam is not a homogeneous transform")
+    return rgb, depth, intrinsics, world_from_cam
+
+
 def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt: dict | None = None) -> dict:
-    """Validate and assemble one planning request: the observation alone.
+    """Validate and assemble one planning request: the observation alone (its primary view; ``add_view`` adds
+    further views of the same instant).
 
     Args:
         rgb: (H, W, 3) uint8 RGB image.
@@ -74,21 +94,8 @@ def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt:
         gt: optional {labels, masks, atoms}, forwarded to ``attach_knowledge`` (kept for the offline H5 path and
             older callers; the client normally attaches what it knows afterwards, see ``knowledge.py``).
     """
-    rgb = np.asarray(rgb)
-    depth = np.asarray(depth, dtype=np.float32)
-    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
-        raise ValueError(f"rgb must be (H, W, 3) uint8, got {rgb.shape} {rgb.dtype}")
-    if depth.shape != rgb.shape[:2]:
-        raise ValueError(f"depth {depth.shape} does not match rgb {rgb.shape[:2]}")
-    if not np.all(np.isfinite(depth)) or depth.min() < 0:
-        raise ValueError("depth must be finite and non-negative (use 0 for invalid pixels)")
-    intrinsics = np.asarray(intrinsics, dtype=np.float32)
-    world_from_cam = np.asarray(world_from_cam, dtype=np.float32)
+    rgb, depth, intrinsics, world_from_cam = _frame(rgb, depth, intrinsics, world_from_cam)
     q_init = np.asarray(q_init, dtype=np.float32).reshape(-1)
-    if intrinsics.shape != (3, 3) or world_from_cam.shape != (4, 4):
-        raise ValueError("intrinsics must be (3, 3) and world_from_cam (4, 4)")
-    if not np.allclose(world_from_cam[3], [0, 0, 0, 1], atol=1e-6):
-        raise ValueError("world_from_cam is not a homogeneous transform")
     if not task:
         raise ValueError("task must be a non-empty string")
     request = {
@@ -104,8 +111,45 @@ def build_request(rgb, depth, intrinsics, world_from_cam, task: str, q_init, gt:
     return request
 
 
+def add_view(request: dict, name: str, rgb, depth, intrinsics, world_from_cam, robot_mask=None) -> dict:
+    """Append a further view of the same instant to a request (``views``): the conventions of the request's own
+    image (its primary view, named by ``view_name``), at the view's own resolution. ``robot_mask`` (H, W) bool
+    marks the robot's own pixels in that view. Returns the view dict (per-view masks are attached by
+    ``attach_knowledge``)."""
+    rgb, depth, intrinsics, world_from_cam = _frame(rgb, depth, intrinsics, world_from_cam)
+    name = str(name)
+    taken = {request.get("view_name", "primary"), *(view["name"] for view in request.get("views", []))}
+    if not name or name in taken:
+        raise ValueError(f"view name {name!r} is empty or already in the request ({sorted(taken)})")
+    view = {"name": name, "rgb": rgb, "depth": depth, "intrinsics": intrinsics, "world_from_cam": world_from_cam}
+    if robot_mask is not None:
+        robot_mask = np.asarray(robot_mask, dtype=bool)
+        if robot_mask.shape != rgb.shape[:2]:
+            raise ValueError(f"view {name!r}: robot_mask {robot_mask.shape} does not match rgb {rgb.shape[:2]}")
+        view["robot_mask"] = robot_mask
+    request.setdefault("views", []).append(view)
+    return view
+
+
+def capture_views(request: dict, extras: dict) -> list[tuple[str, dict, dict]]:
+    """Every view of a capture as (name, view dict, view extras), the primary first: the request itself with the
+    capture's extras, then each of ``request["views"]`` with ``extras["views"][name]``."""
+    primary = str(request.get("view_name", "primary"))
+    return [(primary, request, extras)] + [
+        (view["name"], view, extras["views"][view["name"]]) for view in request.get("views", [])
+    ]
+
+
 def attach_knowledge(
-    request: dict, labels, atoms, masks=None, buttons: dict | None = None, held=(), in_hand=(), workspace=None
+    request: dict,
+    labels,
+    atoms,
+    masks=None,
+    buttons: dict | None = None,
+    held=(),
+    in_hand=(),
+    workspace=None,
+    view_masks: dict | None = None,
 ) -> dict:
     """Add what the client knows about the scene to a request built by ``build_request`` (validated, in place).
 
@@ -113,7 +157,10 @@ def attach_knowledge(
         gt_labels: the object names the planner works with; with masks one per mask, else what the detector is
             asked for (category names, and ``<object>_button`` for a toggle button to find on that object).
         gt_atoms: the goal, [{"predicate", "args"}] over those names.
-        gt_masks: optional (N, H, W) bool instance masks aligned with ``labels``; the server then skips its detector.
+        gt_masks: optional (N, H, W) bool instance masks aligned with ``labels``; the server then skips its
+            detector. An all-False row is a label this image does not show; a label the goal names must have
+            pixels in at least one view of the request. ``view_masks`` ({view name: (N, H_v, W_v)}) are the same
+            for the further views (``add_view``), aligned with the same ``labels``.
         gt_buttons: optional {label: {position, normal, radius}} poses of toggle buttons in the base frame (given
             outright by an oracle, or carried from an earlier detection).
         held_labels: objects in a hand the plan does not move: obstacles the planner must not try to pick up.
@@ -131,6 +178,15 @@ def attach_knowledge(
         if masks.shape != (len(labels), *request["rgb"].shape[:2]):
             raise ValueError(f"masks must be ({len(labels)}, H, W), got {masks.shape}")
         request["gt_masks"] = masks
+    if view_masks:
+        views = {view["name"]: view for view in request.get("views", [])}
+        for name, view_mask in view_masks.items():
+            if name not in views:
+                raise ValueError(f"view_masks name {name!r} is not a view of the request ({sorted(views)})")
+            view_mask = np.asarray(view_mask).astype(np.uint8)
+            if view_mask.shape != (len(labels), *views[name]["rgb"].shape[:2]):
+                raise ValueError(f"view {name!r}: masks must be ({len(labels)}, H, W), got {view_mask.shape}")
+            views[name]["gt_masks"] = view_mask
     if buttons:
         for label, button in buttons.items():
             if len(button["position"]) != 3 or len(button["normal"]) != 3 or float(button["radius"]) <= 0:
@@ -255,6 +311,17 @@ def save_observation_h5(path, request: dict, cam_pos_base, cam_quat_wxyz_ros, ex
                 f.create_dataset(key, data=json.dumps(request[key]))
         if "robot_mask" in request:
             f.create_dataset("robot_mask", data=request["robot_mask"].astype(np.uint8), compression="gzip")
+        if "view_name" in request:
+            f.attrs["view_name"] = str(request["view_name"])
+        for view in request.get("views", []):  # further views of the instant: one group each, the same layout
+            g = f.create_group(f"views/{view['name']}")
+            g.create_dataset("rgb", data=view["rgb"])
+            g.create_dataset("depth", data=view["depth"][..., None].astype(np.float32))
+            g.create_dataset("intrinsic_matrix", data=view["intrinsics"].astype(np.float32))
+            g.create_dataset("world_from_cam", data=view["world_from_cam"].astype(np.float32))
+            for key in ("robot_mask", "gt_masks"):
+                if key in view:
+                    g.create_dataset(key, data=view[key].astype(np.uint8), compression="gzip")
         for key, value in (extra or {}).items():
             f.attrs[key] = json.dumps(value) if isinstance(value, (dict, list)) else value
 
@@ -294,6 +361,26 @@ def load_observation_h5(path) -> dict:
                 obs[key] = _json_dataset(f[key])
         if "robot_mask" in f:
             obs["robot_mask"] = f["robot_mask"][:].astype(bool)
+        if "view_name" in f.attrs:
+            obs["view_name"] = str(f.attrs["view_name"])
+        if "views" in f:
+            obs["views"] = []
+            for name in f["views"]:
+                g = f["views"][name]
+                depth_v = g["depth"][:]
+                depth_v = depth_v[..., 0] if depth_v.ndim == 3 else depth_v
+                view = {
+                    "name": str(name),
+                    "rgb": g["rgb"][:].astype(np.uint8),
+                    "depth": np.nan_to_num(depth_v.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0),
+                    "intrinsics": g["intrinsic_matrix"][:].astype(np.float32),
+                    "world_from_cam": g["world_from_cam"][:].astype(np.float32),
+                }
+                if "robot_mask" in g:
+                    view["robot_mask"] = g["robot_mask"][:].astype(bool)
+                if "gt_masks" in g:
+                    view["gt_masks"] = g["gt_masks"][:]
+                obs["views"].append(view)
     return obs
 
 
@@ -307,6 +394,18 @@ def request_from_observation(obs: dict) -> dict:
     file has, validated the way ``attach_knowledge`` validates a live request. Replaying a round is
     ``client.plan(request_from_observation(load_observation_h5(round_dir / "obs.h5")))``."""
     request = {key: obs[key] for key in ("rgb", "depth", "intrinsics", "world_from_cam", "task", "q_init")}
+    if "view_name" in obs:
+        request["view_name"] = obs["view_name"]
+    for view in obs.get("views", []):
+        add_view(
+            request,
+            view["name"],
+            view["rgb"],
+            view["depth"],
+            view["intrinsics"],
+            view["world_from_cam"],
+            robot_mask=view.get("robot_mask"),
+        )
     if "gt_labels" in obs:
         attach_knowledge(
             request,
@@ -317,6 +416,7 @@ def request_from_observation(obs: dict) -> dict:
             held=obs.get("held_labels", ()),
             in_hand=obs.get("in_hand", ()),
             workspace=obs.get("workspace_bounds"),
+            view_masks={view["name"]: view["gt_masks"] for view in obs.get("views", []) if "gt_masks" in view},
         )
     return request
 
