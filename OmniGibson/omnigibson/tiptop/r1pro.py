@@ -66,8 +66,8 @@ SELF_MASK_FACES = (
 )
 # Where a wrist camera looks at the target from: (ahead, aside on the arm's side, up) from its arm's shoulder (m), the
 # first the arm can reach (Lula IK on the R1Pro URDF, 2026-09-10: the first alone reaches every test target in the
-# upright posture but one in six for the right arm with the torso leaning; the four together reach all but one)
-LOOK_OFFSETS = ((0.2, 0.3, -0.05), (0.15, 0.3, -0.15), (0.1, 0.25, -0.25), (0.0, 0.3, -0.1))
+# upright posture; with the torso leaning the second takes most, and the four together reach nine targets in ten)
+LOOK_OFFSETS = ((0.2, 0.3, -0.05), (0.1, 0.25, -0.1), (0.0, 0.25, -0.1), (0.1, 0.15, -0.3))
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
@@ -381,6 +381,7 @@ class R1ProSim(TiptopSim):
             )
         self.urdf_joints = set(re.findall(r'<joint name="([^"]+)"', Path(self.robot.urdf_path).read_text()))
         self.look_target = None  # base-frame point the wrist cameras look at in a capture (place_robot_for sets it)
+        self.look_names = ()  # the objects it was chosen for: one of them in a hand is looked at there instead
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -862,6 +863,7 @@ class R1ProSim(TiptopSim):
         pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
         centre = th.stack([o.aabb_center for o in objects]).mean(dim=0)  # what the wrist cameras look at
         self.look_target = self.to_base(centre, th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
+        self.look_names = tuple(names)
         return pose
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
@@ -871,7 +873,7 @@ class R1ProSim(TiptopSim):
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
         self.teleports += 1
-        self.look_target = None  # a base-frame target from the previous pose means nothing here
+        self.look_target, self.look_names = None, ()  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
         # back at the chest, where both hands and what they hold are in view ("front", the two-hands demo)
@@ -1025,8 +1027,9 @@ class R1ProSim(TiptopSim):
 
     def capture(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
-        (``wrist_look``; the target is a held object when there is one, else what the base pose was chosen for),
-        which also takes the arm out of the head camera's frame. An arm that holds something stays where it is:
+        (``wrist_look``: what the base pose was chosen for, at the hand that holds it once it has been picked up;
+        a held object otherwise, when nothing was stood for), which also takes the arm out of the head camera's
+        frame. An arm that holds something stays where it is:
         the held object is what the next plan is about and must be seen, and the gripper keeps its command. The
         planned arm swings out of view (``look_arm``) when no look configuration exists; with ``look_arm`` None
         nothing moves. The plan starts from the ready posture the arms return to."""
@@ -1034,8 +1037,9 @@ class R1ProSim(TiptopSim):
             return super().capture(task)
         hands = self.hands()
         held_arms = set(hands.values())
-        if held_arms:
-            target = self.eef_pose_base(sorted(held_arms)[0])[:3, 3]
+        holding_arms = sorted(hands[self.tracked_label(n)] for n in self.look_names if self.tracked_label(n) in hands)
+        if holding_arms or (held_arms and self.look_target is None):
+            target = self.eef_pose_base((holding_arms or sorted(held_arms))[0])[:3, 3]
         else:
             target = np.asarray(DEFAULT_LOOK_TARGET if self.look_target is None else self.look_target, dtype=np.float64)
         ready = list(self.q_home)

@@ -490,8 +490,9 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 - **Look poses** (`wrist_look`, `kinematics.py`). For a capture each free arm whose wrist camera is a view is
   posed by Lula IK (shipped with Isaac Sim; the arm's seven joints, everything else fixed where it is, from the
   robot's URDF) so that its camera sits at the first of `LOOK_OFFSETS` from its own shoulder the arm can reach
-  (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then lower and closer; within reach for most targets in either
-  torso posture and outside the head camera's frame) looking at the look target;
+  (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then closer to the shoulder; nine targets in ten in either
+  torso posture, and outside the head camera's frame) looking at the look target: the objects the base pose was
+  chosen for, or the hand that holds one of them once it is picked up;
   both arms move in one 60-step settle and return in another, so a capture
   costs what the old swing-out did. An arm more than 0.03 rad short of its pose after settling is logged as
   blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm swings out of
