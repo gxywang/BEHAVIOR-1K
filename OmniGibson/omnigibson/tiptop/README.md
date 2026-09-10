@@ -20,11 +20,12 @@ object within reach (1.1 m at most); *no plan* = the planner found no satisfying
 = the goal object had no pixels in the capture; *ran, not inside* = the place executed but the predicate stayed
 false (the item landed outside the rim or fell); *released* = the last-resort open of a hand no plan could empty.
 
-- **turning_on_radio**, five passes (pick with the left hand, press with the right while holding): mean q_score
-  **0.7 / 0.7 / 0.6 / 0.7 / 0.7**, 34 of 50 instances. Pass 5 is the reference: the current code (the one retry
-  policy without the put-down and re-pick, the press face inscribed in the button's radius, the plan's gripper
-  start state), each video ending on the flip with the button's marker turned green. Pass 4's videos end the same
-  way; the tails of passes 1-3 are a frozen copy of their last frame, which predates the marker's colour change.
+- **turning_on_radio**, six passes (pick with the left hand, press with the right while holding): mean q_score
+  **0.7 / 0.7 / 0.6 / 0.7 / 0.7 / 0.9**, 43 of 60 instances. Pass 6 is the reference: the current code (three
+  camera views per capture fused by the planner, the wrist cameras posed by IK, presenting grasps ranked by how
+  near the switch ends up to the free hand, on top of pass 5's one retry policy, inscribed press face and gripper
+  start state), each video ending on the flip with the button's marker turned green. Passes 4-5 end the same way;
+  the tails of passes 1-3 are a frozen copy of their last frame, which predates the marker's colour change.
   - pass 1 (`runs/bench_radio_pass1`, 7/10): 302, 303 no base pose within 0.9 m (the search now widens to 1.1 m);
     309 press: no plan x2 after the pick.
   - pass 2 (`runs/bench_radio_pass2`, 7/10): 302 press: no plan x2 (two picks); 303 no base pose; 309 press: no
@@ -40,8 +41,15 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     second); 303 press: no plan x2 (0.63 m ahead); 309 press: no plan x2 (0.61 m ahead). Every press that planned
     toggled the switch (7 of 7; pass 4 had two executed presses that missed by 2 mm), and the median instance took
     722 env steps against 839 in pass 4.
+  - pass 6 (`runs/bench_radio_pass6`, 9/10, current code, three views): 309 press: no plan x2 (the switch 0.65 m
+    ahead; only 3 of 216 grasps presented it, the nearest leaving it 74-77 cm from the present point). The other
+    nine instances' switches landed 0.49-0.60 m ahead and every press planned and toggled at the first try except
+    303 and 304 (second press). 302 and 303, which had failed in four and three of the earlier passes, succeeded
+    with one teleport each. Wall time 11-27 min per instance under a load average of 1000 (other users' jobs).
   - What fails is the right hand's press plan, which depends on the grasp the left hand chose (a switch left
-    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (45 of 50 instances ended with the radio in hand).
+    0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (55 of 60 instances ended with the radio in hand).
+    Ranking the presenting grasps by where they leave the switch (pass 6) moved it from 0.54-0.69 m to 0.49-0.60 m
+    ahead on nine instances.
 - **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
   - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
     from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
@@ -365,8 +373,10 @@ holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). B
 first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
 
 Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
-`runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`, `runs/bench_radio_pass5`; 0.7, 0.7, 0.6,
-0.7 and 0.7 in five passes, so read the number as about 0.68 with the press plan as the source of variance):
+`runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`, `runs/bench_radio_pass5`,
+`runs/bench_radio_pass6`; 0.7, 0.7, 0.6, 0.7 and 0.7 in the five single-view passes, so read those as about 0.68
+with the press plan as the source of variance; pass 6, the first with three views and the nearness ranking of
+presenting grasps, scored 0.9 once):
 
 | task | pass | mean q_score | successes | median env steps (of the timeout) | failure causes |
 |---|---|---|---|---|---|
@@ -375,6 +385,7 @@ Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported bas
 | turning_on_radio | 3 | 0.6 | 6/10 | 861 / 3224 | 2x press: no plan even after a re-pick, 1x pick from 0.95 m never grasped, 1x press executed without toggling then re-pick planning failed |
 | turning_on_radio | 4 | 0.7 | 7/10 | 747 / 3224 | 2x press: no plan x4 even after a put-down and re-pick, 1x press executed twice without toggling then no plan for the re-pick; videos end on the flip (marker green) |
 | turning_on_radio | 5 | 0.7 | 7/10 | 751 / 3224 | 3x press: no plan x2 (the switch 0.57-0.63 m ahead); no executed press missed; the one retry policy, no put-down and re-pick |
+| turning_on_radio | 6 | 0.9 | 9/10 | 805 / 3224 | 1x press: no plan x2 (the switch 0.65 m ahead); three views per capture, presenting grasps ranked by the switch's distance to the free hand |
 | assembling_gift_baskets | 1 (2 instances, stopped) | 0.31 | 0/2 | 11200 / 39090 | a failed put-down left the item in the hand and blocked every later pick; items knocked to the floor were re-picked |
 | assembling_gift_baskets | 2 | 0.6375 | 2/10 (16/16 twice; 15, 14, 13, 11, 11, 3, 3, 0 of 16) | 13600 / 39090 | 3 instances lost to one item no put-down plan could set down after a failed place (the hand stayed full); 45 stand attempts found no pose even at 1.1 m (a basket in a corner) |
 | assembling_gift_baskets | 3 | 0.875 | 2/10 (16/16 twice; 15, 15, 15, 15, 14, 13, 11, 10 of 16) | 16000 / 39090 | the last-resort release ended the stuck-item loops (4 releases, 27 failed of 374 rounds); what remains is one or two items per instance: bows no base pose reaches (3 instances), a basket in a corner (1), places with no satisfying plan (2) |
@@ -478,8 +489,9 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   poses for the capture frames.
 - **Look poses** (`wrist_look`, `kinematics.py`). For a capture each free arm whose wrist camera is a view is
   posed by Lula IK (shipped with Isaac Sim; the arm's seven joints, everything else fixed where it is, from the
-  robot's URDF) so that its camera sits `LOOK_OFFSET` from its own shoulder (0.2 m ahead, 0.3 m to the arm's
-  side, 5 cm down: within reach for any target and outside the head camera's frame) looking at the look target;
+  robot's URDF) so that its camera sits at the first of `LOOK_OFFSETS` from its own shoulder the arm can reach
+  (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then lower and closer; within reach for most targets in either
+  torso posture and outside the head camera's frame) looking at the look target;
   both arms move in one 60-step settle and return in another, so a capture
   costs what the old swing-out did. An arm more than 0.03 rad short of its pose after settling is logged as
   blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm swings out of
@@ -633,4 +645,8 @@ a scripted episode, and the benchmark's summary.
   capture of the radio (head 7131, left wrist 9359, right wrist 7965 radio pixels; all three views in the hull),
   the pick of instance 301 with three views (the same fused request replays into a plan), and the press round's
   failure at 0.69 m replaying identically with and without the wrist views (reach, not the fuller hull). The
-  planner launcher pins MKL to one thread (DEPLOYMENT item 20).
+  planner launcher pins MKL to one thread (DEPLOYMENT item 20). Then, with the fused cloud offering twice the
+  grasps, the pick left the radio's switch 0.68-0.69 m ahead twice on instance 301 (beyond the right arm's reach);
+  the presenting filter now keeps the facing grasps that leave the button nearest the present point, and
+  turning_on_radio pass 6 scored 0.9 (9/10; the switch 0.49-0.60 m ahead on nine instances, 0.65 m on the one that
+  failed), against 0.6-0.7 in the five single-view passes.

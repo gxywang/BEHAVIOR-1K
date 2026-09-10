@@ -64,11 +64,10 @@ DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras loo
 SELF_MASK_FACES = (
     2000  # a robot link's mesh is decimated to this for the self-mask (it only marks the robot's own pixels)
 )
-LOOK_OFFSET = (
-    0.2,
-    0.3,
-    -0.05,
-)  # a wrist camera looks at the target from here: ahead, aside and up from its arm's shoulder (m)
+# Where a wrist camera looks at the target from: (ahead, aside on the arm's side, up) from its arm's shoulder (m), the
+# first the arm can reach (Lula IK on the R1Pro URDF, 2026-09-10: the first alone reaches every test target in the
+# upright posture but one in six for the right arm with the torso leaning; the four together reach all but one)
+LOOK_OFFSETS = ((0.2, 0.3, -0.05), (0.15, 0.3, -0.15), (0.1, 0.25, -0.25), (0.0, 0.3, -0.1))
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
@@ -1007,7 +1006,8 @@ class R1ProSim(TiptopSim):
     # ---------------------------------------------------------------- observation
     def wrist_look(self, arm: str, target) -> np.ndarray | None:
         """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
-        (``kinematics.look_pose``), every other joint where it is; None when no configuration does."""
+        (``kinematics.look_pose``, the first of ``LOOK_OFFSETS`` the arm reaches), every other joint where it is;
+        None when no configuration does."""
         joints = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         fixed = {
@@ -1015,9 +1015,13 @@ class R1ProSim(TiptopSim):
         }
         ik = ArmIK(self.robot.urdf_path, joints, fixed, frame=CAMERA_LINKS[f"{arm}_wrist"])
         shoulder, _ = self.to_base(*self.robot.links[self.robot.arm_link_names[arm][0]].get_position_orientation())
-        eye, cam_quat = look_pose(target, shoulder.cpu().numpy(), side=1 if arm == "left" else -1, offset=LOOK_OFFSET)
-        pos, quat = link_pose_for_camera(eye, cam_quat, self.camera_in_link[arm])
-        return ik.solve(pos, quat, seed=[float(q[self.joint_index[j]]) for j in joints])
+        seed = [float(q[self.joint_index[j]]) for j in joints]
+        for offset in LOOK_OFFSETS:
+            eye, cam_quat = look_pose(target, shoulder.cpu().numpy(), side=1 if arm == "left" else -1, offset=offset)
+            solution = ik.solve(*link_pose_for_camera(eye, cam_quat, self.camera_in_link[arm]), seed=seed)
+            if solution is not None:
+                return solution
+        return None
 
     def capture(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
