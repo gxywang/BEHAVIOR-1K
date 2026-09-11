@@ -79,6 +79,16 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     (the Workspace bullet, Known limits, `cutamp-04-held-object-collisions.patch`) fixed for pass 5; on the fixed
     planner the same saved rounds plan 14/14 picks, 18/18 carries and 12/12 pass 3 controls. Pass 3 used physical
     grasps and one round per goal, so pass 5 against pass 3 compares more than the views.
+  - pass 5 (`runs/bench_baskets_pass5`, three views, near edge 0.35 m, cuTAMP patch 04, sticky grasps,
+    `--rounds 2`): mean **0.881**, 302 complete. 301 15/16 bow_4 no base pose x4; 303 12/16 candle_1 no base pose
+    x3, no plan x1; 304 15/16 bow_1 no base pose; 305 10/16 basket_4 in the room corner (no base pose x5), bows 3
+    and 4 no base pose; 306 15/16 bow_1 not visible x2; 307 14/16 bow_4 no base pose x3; 308 15/16 bow_1 no base
+    pose x3; 309 14/16 cookie_2 no plan x1; 310 15/16 bow_4. Rounds: picks 203 executed, 2 failed; places 144
+    executed, 6 failed (2 no satisfying particles, 4 goal in no view); put-downs 5 executed, 0 failed (pass 4: 30,
+    36 and 100 failed). Eight of the eleven items lost outside 305 are bows at the far table edge with no base
+    pose within 1.1 m: the base-pose search is now the main loss, not the planner. 43-157 min per instance at load
+    100-440. The capture ramps still used the straight swing (143 of 722 above the cap, see Look poses); the
+    two-leg swing landed after this pass started.
   - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
     reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
     about 16k of the 39k allowed env steps per instance.
