@@ -65,6 +65,20 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     (no base pose x5), bow_3 and candle_2 no base pose, no plan x3; 306 15/16 candle_2 no plan x4 and not visible
     x2, one released; 307 15/16 bow_4 no base pose x2; 308 15/16 bow_1 no base pose x3, one released; 309 15/16
     cheese_2 ran, not inside.
+  - pass 4 (`runs/bench_baskets_pass4`, the head and both wrist views fused, sticky grasps, `--rounds 2`): mean
+    **0.775**, no instance complete. 301 13/16 bow_4 no base pose x4, bow_2 x2; 302 13/16 basket_4's candle_3,
+    cheese_3 and bow_4; 303 15/16 bow_1; 304 13/16 bows 4, 1, 2; 305 10/16 basket_4 in the room corner (no base
+    pose x6), bow_3 no base pose x4; 306 11/16 twelve picks with no plan; 307 11/16; 308 12/16 bow_1 no base pose
+    x3; 309 13/16 bows 4, 1, 2; 310 13/16 cheese_1, bows 4 and 3. The picks held (204 executed, 30 failed: 22
+    motion planning, 4 goal in no view, 2 arm short of the ready posture after the capture, 2 other); the places
+    fell to 125 executed and 36 failed (17 no satisfying particles, 16 motion planning, 3 other) from 141 and 6 in
+    pass 3, and the put-down after a failed place planned 6 times in 106 against 7 in 19, so a failed place cost
+    the rest of the instance's time: 31 min to 3.0 h per instance (pass 3: 27-33 min), 14.7-19.5k env steps.
+    Replaying 30 failed rounds through a third planner: all three views 0/30, the head view alone 16/30, head and
+    right wrist 10/30; 40 pass 3 rounds through the new code 39/40 -- the views, not the code path. Three causes
+    (the Workspace bullet, Known limits, `cutamp-04-held-object-collisions.patch`) fixed for pass 5; on the fixed
+    planner the same saved rounds plan 14/14 picks, 18/18 carries and 12/12 pass 3 controls. Pass 3 used physical
+    grasps and one round per goal, so pass 5 against pass 3 compares more than the views.
   - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
     reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
     about 16k of the 39k allowed env steps per instance.
@@ -506,8 +520,9 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (-0.05 m, when the target stands on it) to 1.6 m. The near edge is past the base (its front collision spheres
   reach x 0.25) and the leaning torso. It matters with the wrist views: the head camera never sees a support
   nearer than 0.40 m, but a wrist camera sees the floor from 0.14 m and the top of the base at table height, and
-  a support cuboid that runs under the robot puts its start posture in collision -- every pick of pass 4 failed
-  that way ("Motion planning failed for 32/N satisfying particles", cuRobo `INVALID_START_STATE_WORLD_COLLISION`;
+  a support cuboid that runs under the robot puts its start posture in collision -- the 30 failed rounds of pass 4
+  that were replayed all failed with the three views (0 of 30; 16 of 30 with the head view alone), this being one
+  of three causes ("Motion planning failed for 32/N satisfying particles", cuRobo `INVALID_START_STATE_WORLD_COLLISION`;
   replaying the saved rounds with the near edge at 0.35 m planned them, 2026-09-10).
 - **Base pose** (`best_base_pose`): candidates on rings 0.25-0.9 m around the named objects' centroid, facing it,
   yaw ±60° in 15° steps; rejected when an object is behind (< 0.15 m ahead), well to the right (> 0.3 m), beyond
