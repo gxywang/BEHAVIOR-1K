@@ -1,0 +1,10 @@
+# Task description for the generic runner (strategies.py). Everything a task needs to say about itself lives
+# here, as data: the instruction the planner is given, which sub-plan handles its goal atoms, and the choices
+# that were tuned on it. The goal atoms themselves come from the task's BDDL definition at run time.
+task: assembling_gift_baskets
+instruction: put one candle, one cheese, one cookie and one bow into each wicker basket
+plan: transfer  # every inside/ontop goal atom is a pick at the item, a carry to its container, a place
+order:
+  containers: nearest_first  # containers by distance from the items' support, nearest first
+  items: nearest_edge_first  # within a kind, items nearest the edge of their support first (the reachable ones)
+attempts_per_kind: 2  # items of one kind tried per container before moving on

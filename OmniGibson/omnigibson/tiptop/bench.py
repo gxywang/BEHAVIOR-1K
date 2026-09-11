@@ -4,7 +4,7 @@ Same task instances (the public test split, indices 0-9 for reported results), s
 the mean human demonstration length, in env steps), same metrics (``TaskMetric``: 1 on success, else the newly
 satisfied fraction of the best goal option; ``AgentMetric``: base and end-effector displacement), the same result
 JSON per rollout as ``omnigibson.eval.eval``. What differs, and is written into every result: the robot is driven
-in-process by a task strategy (strategies.py) that teleports the base instead of navigating, and the planner may
+in-process by a task runner (strategies.py) that teleports the base instead of navigating, and the planner may
 be told what the simulator knows (``--knowledge oracle``: masks and button poses). Both are stand-ins for parts of
 the pipeline that do not exist yet, so a number from this benchmark is an upper bound for the manipulation part,
 not a challenge score.
@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from omnigibson.tiptop.protocol import bddl_category
-from omnigibson.tiptop.strategies import STRATEGIES, Unreachable, atom
+from omnigibson.tiptop.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -43,6 +43,7 @@ log = logging.getLogger("omnigibson.tiptop")
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
 UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
+FLOOR_LEVEL = 0.15  # m: a target whose bottom is lower than this stands on the floor (the workspace reaches down)
 
 
 def short_atom(atom: str) -> str:
@@ -97,12 +98,14 @@ def verdict_caption(reason: str, success: bool, goal: dict) -> str:
 
 class Episode:
     """One task instance as a strategy sees it. The base moves by teleport (``stand_for``); the planner of an arm
-    plans one round at a time (``plan_and_execute``, which never raises on a failed round: the strategy decides
-    what to do next); and the simulator answers what the pipeline cannot perceive yet (``holds``, ``on_support``,
-    ``support_of``, positions and distances): privileged, used in every benchmark whatever ``--knowledge`` says, and
-    the result's ``bench.knowledge`` only describes what the planner was told. ``holding`` / ``held_names`` are the
-    robot's own grasp record, not privileged. ``pick``, ``achieve`` and ``put_down`` run the rounds under the one
-    retry policy every task gets (``--rounds``); there is no other recovery, in here or in a strategy."""
+    plans one round at a time (``plan_and_execute``, which never raises on a failed round: the runner decides what
+    to do next); and judges each round without asking the simulator whether it worked: ``holding`` is the robot's
+    own hand record (a plan closed the hand and the fingers stopped on something), a placement is a geometric test
+    on where the knowledge source localizes the objects (``placed``: the item's box over the target's), a press
+    counts once its planned stroke ran. Positions, distances and supports (``on_support``, ``support_of``,
+    ``edge_gap``) come from the same localization, which the oracle source reads from the simulator and the onboard
+    source from the planner's reports. ``pick``, ``achieve`` and ``put_down`` run the rounds under the one retry
+    policy every task gets (``--rounds``); there is no other recovery, in here or in a task description."""
 
     def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path):
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
@@ -174,20 +177,33 @@ class Episode:
         return record
 
     # ---------------------------------------------------------------- the retry policy, the same for every task
-    def satisfied(self, atoms: list[dict]) -> bool:
-        """Whether every atom holds: ``holding`` by the robot's own grasp record, the rest by the simulator."""
-        return all(
-            self.holding(a["args"][0]) if a["predicate"] == "holding" else self.holds(a["predicate"], *a["args"])
-            for a in atoms
-        )
+    def satisfied(self, atoms: list[dict], record: dict | None = None) -> bool:
+        """Whether every atom holds, judged from the robot's own readings and localization: ``holding`` by the hand
+        record, a placement by ``placed``, and a press (or any other atom) by its round having run without error:
+        the switch's state is the simulator's to know, so a press is open loop."""
+        ran = record is not None and not record.get("error")
+        for a in atoms:
+            predicate, args = a["predicate"], a["args"]
+            if predicate == "holding":
+                ok = self.holding(args[0])
+            elif predicate in PLACE_PREDICATES and len(args) == 2:
+                ok = self.placed(args[0], args[1])
+            else:
+                ok = ran
+            if not ok:
+                return False
+        return True
 
-    def achieve(self, atoms: list[dict], arm: str = "left", floor: bool = False, done=None) -> bool:
+    def achieve(self, atoms: list[dict], arm: str = "left", floor: bool | None = None, done=None) -> bool:
         """Up to ``--rounds`` planning rounds for ``atoms`` with the planner of ``arm``, stopping as soon as
-        ``done()`` (default: ``satisfied``); the retry every goal of every task gets, and the only one."""
-        done = (lambda: self.satisfied(atoms)) if done is None else done
+        ``done()`` (default: ``satisfied``); the retry every goal of every task gets, and the only one. ``floor``
+        (the planner's workspace reaches the floor) is read off the target when not given: a container or support
+        that stands on the floor."""
+        if floor is None:
+            floor = any(self.near_floor(a["args"][1]) for a in atoms if len(a["args"]) == 2)
         for _ in range(self.rounds):
-            self.plan_and_execute(atoms, arm=arm, floor=floor)
-            if done():
+            record = self.plan_and_execute(atoms, arm=arm, floor=floor)
+            if done() if done is not None else self.satisfied(atoms, record):
                 return True
         return False
 
@@ -206,57 +222,96 @@ class Episode:
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
         return False
 
-    def put_down(self, bddl: str, support: str, floor: bool = False) -> bool:
+    def put_down(self, bddl: str, support: str, floor: bool | None = None) -> bool:
         """Put the held object on ``support``; done when the hand is empty, wherever the object landed (the point
         is a free hand)."""
         return self.achieve([atom("ontop", bddl, support)], floor=floor, done=lambda: not self.holding(bddl))
 
-    # ---------------------------------------------------------------- what the simulator knows (privileged)
-    def holds(self, predicate: str, *bddl_names: str) -> bool:
-        return self.sim.holds(predicate, *bddl_names)
-
+    # ---------------------------------------------------------------- the robot's own record
     def holding(self, bddl: str) -> bool:
-        """Whether a hand holds the object (the robot's own knowledge: its grasp assist, else the plans' record)."""
+        """Whether a hand holds the object, by the robot's own record (a plan closed the hand on it and the
+        fingers stopped on something; see ``run.note_hands``)."""
         return self.sim.tracked_label(bddl) in self.sim.hands()
 
     def held_names(self) -> list[str]:
-        """BDDL names of the task objects in the hands (the robot's own knowledge)."""
+        """BDDL names of the task objects in the hands (the robot's own record)."""
         return [self.sim.bddl_names[label] for label in self.sim.hands() if label in self.sim.bddl_names]
 
     def release(self, steps: int = 45) -> None:
         """Open the planned hand where it is and let whatever it holds fall (the last resort when no put-down
-        plan exists); the hand is then held open for ``steps`` env steps so the object clears it."""
+        plan exists); the hand is then held open for ``steps`` env steps so the object clears it, and the record
+        of that hand is cleared."""
         self.sim.video_caption = f"release [{self.sim.arm} arm]"
         self.sim.hold(steps, self.sim.OPEN)
+        for label, arm in list(self.sim.hands().items()):
+            if arm == self.sim.arm:
+                self.sim.held_objects.pop(label, None)
         self.records.append({"release": True, "step": self.sim.n_steps, "hands": dict(self.sim.hands())})
 
+    # ---------------------------------------------------------------- localization (the knowledge source's)
+    def boxes(self, *bddl_names: str) -> dict:
+        """name -> {center, lo, hi} (world frame) from the knowledge source; the floor has no box."""
+        return self.knowledge.localize(*[n for n in bddl_names if n != self.floor])
+
     def position(self, bddl: str) -> np.ndarray:
-        return self.sim.scene_object(bddl).aabb_center.cpu().numpy()
+        return self.boxes(bddl)[bddl]["center"]
 
     def distance(self, a: str, b: str) -> float:
-        return float(np.linalg.norm(self.position(a)[:2] - self.position(b)[:2]))
+        boxes = self.boxes(a, b)
+        return float(np.linalg.norm(boxes[a]["center"][:2] - boxes[b]["center"][:2]))
 
     def on_support(self, bddl: str, support: str) -> bool:
         """Whether the object stands on the support, by geometry: its centre inside the support's footprint and
-        its bottom within 15 cm above the top (the task's ontop predicate misreports objects on the glass table,
-        and reports items that fell to the floor as still on it)."""
-        lo, hi = [v.cpu().numpy() for v in self.sim.scene_object(support).aabb]
-        c = self.position(bddl)
-        bottom = float(self.sim.scene_object(bddl).aabb[0][2])
-        return bool(lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1] and -0.02 <= bottom - hi[2] <= 0.15)
+        its bottom within 15 cm above the top."""
+        if support == self.floor:
+            return True
+        boxes = self.boxes(bddl, support)
+        return placed_over(boxes[bddl], boxes[support], from_bottom=False)
+
+    def placed(self, item: str, target: str) -> bool:
+        """Whether the item ended on or in the target, by geometry: its centre inside the target's footprint and
+        its bottom anywhere from 2 cm under the target's bottom (inside a container) to 15 cm above its top (on a
+        surface). Onto the floor: the hand let go of it."""
+        if target == self.floor:
+            return not self.holding(item)
+        boxes = self.boxes(item, target)
+        return placed_over(boxes[item], boxes[target], from_bottom=True)
 
     def support_of(self, bddl: str) -> str:
-        """The BDDL name of the table the object stands on (``on_support``), else the task's floor."""
-        for name in self.sim.task_scope():
-            if bddl_category(name) == "table" and self.on_support(bddl, name):
-                return name
-        return self.floor
+        """The BDDL name of the task object the item stands on (the highest one whose footprint holds it, any
+        category), else the task's floor."""
+        names = [n for n in self.sim.task_scope() if n not in (bddl, self.floor) and bddl_category(n) != "agent"]
+        boxes = self.boxes(bddl, *names)
+        under = [n for n in names if placed_over(boxes[bddl], boxes[n], from_bottom=False)]
+        if not under:
+            return self.floor
+        return max(under, key=lambda n: float(boxes[n]["hi"][2]))
+
+    def near_floor(self, name: str) -> bool:
+        """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor."""
+        if name == self.floor:
+            return True
+        return float(self.boxes(name)[name]["lo"][2]) < FLOOR_LEVEL
 
     def edge_gap(self, item: str, support: str) -> float:
         """How far the item's centre is from the nearest edge of the support's footprint (small: reachable)."""
-        lo, hi = [v.cpu().numpy() for v in self.sim.scene_object(support).aabb]
-        c = self.position(item)
+        if support == self.floor:
+            return 0.0
+        boxes = self.boxes(item, support)
+        lo, hi, c = boxes[support]["lo"], boxes[support]["hi"], boxes[item]["center"]
         return float(min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1]))
+
+
+def placed_over(item: dict, target: dict, from_bottom: bool) -> bool:
+    """Geometric "on" (``from_bottom`` False: the item's bottom within -2 cm .. +15 cm of the target's top) or
+    "on or in" (True: from 2 cm under the target's bottom to 15 cm over its top), with the item's centre inside
+    the target's footprint. Boxes are {center, lo, hi}."""
+    c, bottom = item["center"], float(item["lo"][2])
+    lo, hi = target["lo"], target["hi"]
+    if not (lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1]):
+        return False
+    low = float(lo[2]) - 0.02 if from_bottom else float(hi[2]) - 0.02
+    return low <= bottom <= float(hi[2]) + 0.15
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -275,7 +330,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--max-steps", type=int, default=None, help="episode timeout in env steps (default: the challenge's)"
     )
-    p.add_argument("--attempts-per-item", type=int, default=2, help="items of a kind tried per basket")
+    p.add_argument(
+        "--attempts-per-item", type=int, default=None, help="items of a kind tried per container (default: the task's)"
+    )
     p.add_argument(
         "--rounds",
         type=int,
@@ -290,7 +347,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
     if args.task_name not in STRATEGIES:
-        p.error(f"no strategy for task {args.task_name!r}; known: {sorted(STRATEGIES)}")
+        p.error(f"no task description for {args.task_name!r}; known: {sorted(STRATEGIES)}")
     # what run.py's helpers read: the challenge robot, the activity to load, the instruction the planner is given
     args.embodiment = "r1pro"
     args.activity = args.task_name
@@ -334,7 +391,7 @@ def main(argv=None) -> None:
         sim = build_r1pro_sim(args, metadata["embodiment"], max_steps=max_steps)
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
-        strategy = strategy_for(args.task_name, task_goal_atoms(sim), **strategy_kwargs(args))
+        strategy = strategy_for(args.task_name, task_goal_atoms(sim), attempts=args.attempts_per_item)
         for index, instance_id in zip(args.instances, instance_ids):
             t0 = time.time()
             name = f"{args.task_name}_{instance_id}_0"
@@ -413,10 +470,6 @@ def main(argv=None) -> None:
         if og.app is not None:
             og.shutdown()
     sys.exit(exit_code)
-
-
-def strategy_kwargs(args) -> dict:
-    return {"attempts": args.attempts_per_item} if args.task_name == "assembling_gift_baskets" else {}
 
 
 def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> dict:

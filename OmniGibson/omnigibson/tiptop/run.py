@@ -566,10 +566,10 @@ def do_execute(
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
-    # the plan pushes a little past the surface; a source that knows when the switch flips ends the push there
+    # the press runs its planned stroke: nothing tells the executor when the switch flips (that would be the
+    # simulator's answer, which a policy does not get); the switch state is logged afterwards for the record only
     press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
-    press_done = knowledge.press_done(press_targets) if press_targets and knowledge is not None else None
-    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps, press_done=press_done)
+    executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps)
     block = press_targets and args.grasping_mode != "physical"  # the press closes the gripper; it must not grasp
     with sim.recording(out_dir / f"{tag}.mp4") if record and not args.no_video else nullcontext():
         if block:
@@ -612,22 +612,34 @@ def do_execute(
 
 
 def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
-    """Update what the hands hold after a plan: from the robot's grasp assist when it has one (sticky / assisted
-    grasping), else from the plan's own goals (a holding goal took the object, a placement let it go). A newly
-    taken object is reported to the knowledge source (a button on it moves with the gripper from now on)."""
+    """Update the robot's own record of what its hands hold after a plan, from the plan and the fingers: a plan for
+    ``holding(x)`` that closed the hand with the fingers stopping on something (``grasp_sensed``) put x in the
+    hand; a plan that placed x, or a hand no longer sensed closed on anything, took it out. The simulator's grasp
+    assist is only compared with this record in the log. A newly taken object is reported to the knowledge source
+    (a button on it moves with the gripper from now on)."""
     before = dict(sim.held_objects)
-    if sim.grasped_labels() is None:  # physical grasping: the plan's goals are the only record
-        for atom in atoms:
-            if atom["predicate"] == "holding" and executor.close_eef is not None:
-                sim.held_objects[sim.tracked_label(atom["args"][0])] = sim.arm
-            elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
-                sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
-    after = sim.hands()  # the grasp assist's record where the robot has one
+    for atom in atoms:
+        if atom["predicate"] == "holding" and executor.close_eef is not None:
+            label = sim.tracked_label(atom["args"][0])
+            if sim.grasp_sensed(sim.arm):
+                sim.held_objects[label] = sim.arm
+            else:
+                log.info(f"{label}: the hand closed but the fingers met nothing ({sim.finger_width(sim.arm):.3f} m)")
+        elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
+            sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
+    for label, holder in list(sim.held_objects.items()):  # a hand that no longer holds anything
+        if holder == sim.arm and not sim.grasp_sensed(sim.arm):
+            log.info(
+                f"{label}: no longer sensed in the {holder} hand ({sim.finger_width(sim.arm):.3f} m between the fingers)"
+            )
+            sim.held_objects.pop(label)
+    after = sim.hands()
     for label, holder in after.items():
         if label not in before and knowledge is not None and executor.close_eef is not None:
             knowledge.picked(label, holder, executor.close_eef)
     if after != before:
         log.info(f"hands now hold {after or 'nothing'}")
+    sim.check_hands()
 
 
 def main(argv=None):

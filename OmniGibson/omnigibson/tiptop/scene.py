@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 TABLE_HEIGHT = 0.75  # world z of the table top; the robot base sits on it, so base-frame z = 0 there
 FINGER_OPEN = 0.04
+FINGER_CONTACT = 0.006  # m between the fingers when closed: more than this and they stopped on an object
 CAMERA_NAME = "tiptop_cam"
 OVERVIEW_CAM = "overview_cam"  # third-person rgb camera for the Rerun mirror, aimed at the workspace
 OVERVIEW_SIZE = (640, 360)
@@ -306,6 +307,12 @@ class TiptopSim:
             th.as_tensor(pos, dtype=th.float32), th.as_tensor(quat, dtype=th.float32), base_pos, base_quat
         )
 
+    def base_to_world(self, pos_b) -> np.ndarray:
+        """A base-frame point in the world frame (the inverse of ``to_base`` for positions)."""
+        base_pos, base_quat = self.base_pose()
+        rot = T.quat2mat(base_quat).cpu().numpy().astype(np.float64)
+        return rot @ np.asarray(pos_b, dtype=np.float64) + base_pos.cpu().numpy().astype(np.float64)
+
     def object_poses_world(self) -> dict:
         return {name: [p.tolist() for p in obj.get_position_orientation()] for name, obj in self.objects.items()}
 
@@ -395,12 +402,40 @@ class TiptopSim:
         return [[x0, y0, self.FLOOR_Z if floor else z0], [x1, y1, z1]]
 
     def hands(self) -> dict:
-        """{tracked label: arm} of what the hands hold now: the grasp assist's own record when the robot has one
-        (sticky / assisted grasping; ``held_objects`` is brought up to date), else the bookkeeping from the plans."""
-        grasped = self.grasped_labels()
-        if grasped is not None:
-            self.held_objects = grasped
+        """{tracked label: arm} of what the hands hold now, by the robot's own record: a plan that closed a hand on
+        an object with the fingers stopping on something (``grasp_sensed``) put it there, a plan that let go or a
+        release took it out (``run.note_hands``). Never the simulator's grasp assist: that record is compared with
+        this one in the log (``check_hands``) and steers nothing."""
         return dict(self.held_objects)
+
+    def check_hands(self) -> None:
+        """Log where the robot's own record and the simulator's grasp assist disagree (diagnostics only)."""
+        grasped = self.grasped_labels()
+        if grasped is not None and grasped != self.held_objects:
+            log.warning(
+                f"hand record {self.held_objects or 'empty'} differs from the grasp assist's {grasped or 'empty'}"
+            )
+
+    def finger_width(self, arm: str | None = None) -> float:
+        """How far apart the fingers of ``arm`` (default: the planned arm) are, in metres: the sum of the finger
+        joint positions (each 0 closed .. FINGER_OPEN open)."""
+        order = list(self.robot.joints.keys())
+        names = self.robot.finger_joint_names[arm or self.robot.default_arm]
+        q = self.robot.get_joint_positions()
+        return float(sum(float(q[order.index(j)]) for j in names))
+
+    def gripper_command(self, arm: str | None = None) -> float:
+        """The last gripper command sent to ``arm`` (OPEN or CLOSE): the planned arm's, or the other arm's kept
+        command on a two-armed robot."""
+        planned = getattr(self, "arm", None)
+        if arm is None or arm == planned or planned is None:
+            return self.last_gripper
+        return getattr(self, "other_gripper", self.OPEN)
+
+    def grasp_sensed(self, arm: str | None = None) -> bool:
+        """Whether the hand of ``arm`` is closed on something, from the robot's own readings: the gripper was
+        commanded closed and the fingers stopped more than ``FINGER_CONTACT`` apart (closed on nothing they meet)."""
+        return self.gripper_command(arm) < 0 and self.finger_width(arm) > FINGER_CONTACT
 
     def grasped_labels(self) -> dict | None:
         """{tracked label: arm} of the tracked objects the robot's grasp assist holds right now (sticky or assisted

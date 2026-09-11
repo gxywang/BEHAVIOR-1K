@@ -1,0 +1,6 @@
+# Task description for the generic runner (strategies.py); see assembling_gift_baskets.yaml for the fields.
+task: turning_on_radio
+instruction: pick up the radio and press its button
+plan: press  # every toggled_on goal atom is a press of the object's button
+press: hold  # pick the object up with one hand and press with the other: a free-standing radio slides away on the
+             # table before the toggle registers (20 cm across the glass table, 2026-09-09)

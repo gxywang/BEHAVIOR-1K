@@ -7,16 +7,15 @@ its object, and a button seen in an earlier round is carried through a grasp by 
 (``ButtonTracker``). ``OracleKnowledge`` reads the simulator instead: per-instance labels, masks from the objects'
 geometry (or Isaac's instance segmentation), and the true pose of every toggle button the task presses. That is
 privileged information the challenge forbids at evaluation time; it exists so planning and execution can be
-developed and measured without a detector. It lives in this module and in ``R1ProSim``'s ``oracle_masks`` /
-``button_hints`` / ``toggled``; the benchmark's ``Episode`` (bench.py) reads the simulator too, for the decisions a
-strategy makes between rounds, and says so in its own docstring. A run that uses this source says so (``report``).
-Both sources produce
-the same ``SceneKnowledge``; the rest of the pipeline never asks which one it got. The one thing a source tells the
-executor is ``press_done``: the oracle knows the instant a switch flips, the onboard source has no such signal.
+developed and measured without a detector. The oracle gives exactly two kinds of thing, perception (masks, button
+poses) and localization (``localize``: where the task objects are, as boxes); it never says whether a round worked.
+Whether a pick or a place succeeded is judged by the episode from the robot's own readings and from localization
+(bench.py, ``Episode.satisfied``), and a press runs its planned stroke with no signal from the switch. A run that
+uses the oracle says so (``report``). Both sources produce the same ``SceneKnowledge``; the rest of the pipeline
+never asks which one it got.
 """
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,6 +23,8 @@ import numpy as np
 from omnigibson.tiptop.protocol import attach_knowledge, canonical_object_name, capture_views
 
 log = logging.getLogger(__name__)
+
+SEEN_HALF_EXTENT = 0.10  # m: the box the onboard source draws around a perceived position it has no extent for
 
 
 class GoalNotVisible(ValueError):
@@ -158,10 +159,11 @@ class KnowledgeSource:
     def picked(self, tracked: str, arm: str, eef: np.ndarray) -> None:
         """A plan just closed ``arm`` (eef pose ``eef``, base frame) on the tracked object; what moves with it now."""
 
-    def press_done(self, bddl_targets: list[str]) -> Callable[[], bool] | None:
-        """A signal that the press of these switches has landed, for the executor to end the push on; None when the
-        source has no such signal and the push runs to its planned depth."""
-        return None
+    def localize(self, *bddl_names: str) -> dict:
+        """Where the named task objects are, world frame: name -> {"center": (3,), "lo": (3,), "hi": (3,)} (an
+        axis-aligned box). The episode's geometric checks (is the item over the basket, which support is it on,
+        how far is the container) run on this and on nothing else."""
+        raise NotImplementedError
 
     def report(self) -> dict:
         return {"source": self.name, "privileged": self.privileged}
@@ -206,8 +208,13 @@ class OracleKnowledge(KnowledgeSource):
             workspace=self.sim.workspace(floor),
         )
 
-    def press_done(self, bddl_targets):
-        return lambda: all(self.sim.toggled(name) for name in bddl_targets)
+    def localize(self, *bddl_names):
+        out = {}
+        for name in bddl_names:
+            obj = self.sim.scene_object(name)
+            lo, hi = [v.cpu().numpy().astype(np.float64) for v in obj.aabb]
+            out[name] = {"center": obj.aabb_center.cpu().numpy().astype(np.float64), "lo": lo, "hi": hi}
+        return out
 
 
 class OnboardKnowledge(KnowledgeSource):
@@ -221,6 +228,19 @@ class OnboardKnowledge(KnowledgeSource):
     def __init__(self, sim, goal):
         super().__init__(sim, goal)
         self.buttons = ButtonTracker()
+        self.seen = {}  # label -> world position of the object the planner last reported (a point, no extent yet)
+
+    def localize(self, *bddl_names):
+        """The planner's last reported position of each object, as a box of ``SEEN_HALF_EXTENT`` around it (the
+        response carries positions, not hulls, so the extent is nominal); an object never reported is unknown."""
+        out = {}
+        for name in bddl_names:
+            label = self.label(self.sim.tracked_label(name))
+            if label not in self.seen:
+                raise KeyError(f"{name} ({label}) has not been perceived yet; nothing to localize it from")
+            c = np.asarray(self.seen[label], dtype=np.float64)
+            out[name] = {"center": c, "lo": c - SEEN_HALF_EXTENT, "hi": c + SEEN_HALF_EXTENT}
+        return out
 
     def describe(self, atoms, request, extras, floor=False) -> SceneKnowledge:
         labels, tiptop_atoms = self.translate(atoms)
@@ -242,6 +262,10 @@ class OnboardKnowledge(KnowledgeSource):
         )
 
     def learned(self, response: dict) -> None:
+        for label, info in (response.get("objects") or {}).items():
+            if isinstance(info, dict) and info.get("position") is not None:
+                pos_b = np.asarray(info["position"], dtype=np.float64)
+                self.seen[label] = self.sim.base_to_world(pos_b)
         if response.get("buttons"):  # an object in hand moves with its gripper: remember the pose relative to it
             held = {self.label(l): (arm, self.sim.eef_pose_base(arm)) for l, arm in self.sim.hands().items()}
             self.buttons.update(response["buttons"], held)
