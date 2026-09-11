@@ -611,27 +611,48 @@ def do_execute(
     return result
 
 
+HOLD_RADIUS = 0.15  # m: an object localized within this distance of the hand after a pick is in it
+
+
+def in_hand_by_localization(sim, knowledge, bddl: str, arm: str) -> bool | None:
+    """Whether the object is at the hand of ``arm``, by where the knowledge source localizes it: its box centre
+    within ``HOLD_RADIUS`` of the hand. None when the source cannot localize it (never perceived)."""
+    try:
+        box = knowledge.localize(bddl)[bddl]
+    except (KeyError, NotImplementedError):
+        return None
+    hand = sim.base_to_world(sim.eef_pose_base(arm)[:3, 3])
+    return bool(np.linalg.norm(np.asarray(box["center"], dtype=np.float64) - hand) < HOLD_RADIUS)
+
+
 def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
-    """Update the robot's own record of what its hands hold after a plan, from the plan and the fingers: a plan for
-    ``holding(x)`` that closed the hand with the fingers stopping on something (``grasp_sensed``) put x in the
-    hand; a plan that placed x, or a hand no longer sensed closed on anything, took it out. The simulator's grasp
-    assist is only compared with this record in the log. A newly taken object is reported to the knowledge source
-    (a button on it moves with the gripper from now on)."""
+    """Update the robot's own record of what its hands hold after a plan. A plan for ``holding(x)`` that closed
+    the hand put x in it when x is now localized at the hand (``in_hand_by_localization``), or, when the source
+    cannot localize it, when the fingers stopped on something (``grasp_sensed``; with sticky grasping the fingers
+    close through the attached object, so that reading is the fallback, not the rule). A plan that placed x, or
+    an object no longer at the hand, leaves the record. The simulator's grasp assist is only compared with the
+    record in the log. A newly taken object is reported to the knowledge source (a button on it moves with the
+    gripper from now on)."""
     before = dict(sim.held_objects)
     for atom in atoms:
         if atom["predicate"] == "holding" and executor.close_eef is not None:
-            label = sim.tracked_label(atom["args"][0])
-            if sim.grasp_sensed(sim.arm):
+            bddl, label = atom["args"][0], sim.tracked_label(atom["args"][0])
+            at_hand = in_hand_by_localization(sim, knowledge, bddl, sim.arm) if knowledge is not None else None
+            held = sim.grasp_sensed(sim.arm) if at_hand is None else at_hand
+            if held:
                 sim.held_objects[label] = sim.arm
             else:
-                log.info(f"{label}: the hand closed but the fingers met nothing ({sim.finger_width(sim.arm):.3f} m)")
+                how = "is not at the hand" if at_hand is not None else "fingers met nothing"
+                log.info(
+                    f"{label}: the hand closed but the object {how} ({sim.finger_width(sim.arm):.3f} m between the fingers)"
+                )
         elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
             sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
-    for label, holder in list(sim.held_objects.items()):  # a hand that no longer holds anything
-        if holder == sim.arm and not sim.grasp_sensed(sim.arm):
-            log.info(
-                f"{label}: no longer sensed in the {holder} hand ({sim.finger_width(sim.arm):.3f} m between the fingers)"
-            )
+    for label, holder in list(sim.held_objects.items()):  # an object that left the hand (fell, was released)
+        bddl = sim.bddl_names.get(label, label) if hasattr(sim, "bddl_names") else label
+        at_hand = in_hand_by_localization(sim, knowledge, bddl, holder) if knowledge is not None else None
+        if at_hand is False or (at_hand is None and holder == sim.arm and not sim.grasp_sensed(sim.arm)):
+            log.info(f"{label}: no longer at the {holder} hand")
             sim.held_objects.pop(label)
     after = sim.hands()
     for label, holder in after.items():

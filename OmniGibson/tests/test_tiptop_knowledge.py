@@ -601,3 +601,88 @@ def test_what_failed_names_the_unsatisfied_atoms_the_unreachable_objects_and_the
         "released an item x1",
     ]
     assert what_failed({"success": True, "bench": {}}) == ""
+
+
+def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as_fallback():
+    """After a pick the object counts as held when the knowledge source localizes it within HOLD_RADIUS of the
+    hand; with sticky grasping the fingers close through the object, so their width is only the fallback when
+    nothing can localize it. A placement or an object that left the hand clears the record."""
+    from omnigibson.tiptop.run import HOLD_RADIUS, note_hands
+
+    class Sim:
+        arm = "left"
+
+        def __init__(self):
+            self.held_objects = {}
+            self.bddl_names = {"candle_1": "candle.n.01_1"}
+            self.finger = 0.0
+            self.hand = np.array([1.0, 0.0, 0.8])
+            self.warnings = []
+
+        def tracked_label(self, name):
+            return name.replace(".n.01_", "_")
+
+        def eef_pose_base(self, arm):
+            m = np.eye(4)
+            m[:3, 3] = self.hand
+            return m
+
+        def base_to_world(self, p):
+            return np.asarray(p, float)
+
+        def grasp_sensed(self, arm):
+            return self.finger > 0.006
+
+        def finger_width(self, arm):
+            return self.finger
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def check_hands(self):
+            pass
+
+    class Knowledge:
+        def __init__(self, center):
+            self.center, self.picked_calls = center, []
+
+        def localize(self, *names):
+            if self.center is None:
+                raise KeyError(names[0])
+            c = np.asarray(self.center, float)
+            return {n: {"center": c, "lo": c - 0.03, "hi": c + 0.03} for n in names}
+
+        def picked(self, label, arm, eef):
+            self.picked_calls.append(label)
+
+    class Executor:
+        close_eef = np.eye(4)
+
+    pick = [{"predicate": "holding", "args": ["candle.n.01_1"]}]
+    place = [{"predicate": "inside", "args": ["candle.n.01_1", "basket.n.01_1"]}]
+    # localized at the hand: held, whatever the fingers say (sticky grasping closes them through the object)
+    sim, know = Sim(), Knowledge([1.02, 0.0, 0.78])
+    note_hands(sim, pick, Executor(), know)
+    assert sim.hands() == {"candle_1": "left"} and know.picked_calls == ["candle_1"]
+    # a placement clears it
+    note_hands(sim, place, Executor(), know)
+    assert sim.hands() == {}
+    # localized far from the hand: not held, even with the fingers on something
+    sim, know = Sim(), Knowledge([1.0 + HOLD_RADIUS + 0.05, 0.0, 0.78])
+    sim.finger = 0.03
+    note_hands(sim, pick, Executor(), know)
+    assert sim.hands() == {}
+    # nothing can localize it: the fingers decide
+    sim, know = Sim(), Knowledge(None)
+    sim.finger = 0.03
+    note_hands(sim, pick, Executor(), know)
+    assert sim.hands() == {"candle_1": "left"}
+    sim.finger = 0.0
+    note_hands(sim, [], Executor(), know)  # a later plan: the fingers are empty now
+    assert sim.hands() == {}
+    # an object that drifted away from the hand leaves the record
+    sim, know = Sim(), Knowledge([1.0, 0.0, 0.8])
+    note_hands(sim, pick, Executor(), know)
+    know.center = [3.0, 0.0, 0.1]
+    note_hands(sim, [], Executor(), know)
+    assert sim.hands() == {}
