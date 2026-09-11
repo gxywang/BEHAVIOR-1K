@@ -683,9 +683,9 @@ for one task and is kept here, with what it did, in case a task needs it later.
   reads the simulator is the harness around it: with `--knowledge oracle` the request carries instance masks,
   button poses and a press stop signal from the object states; with either source the goal atoms come from the
   loaded task's ground goal and the object labels from its object scope; and between rounds the benchmark
-  decides from the task's own predicate evaluator (`Episode.holds`: did the item land inside, is the switch on),
-  from object boxes (which table, where to stand, which item is nearest the edge) and from the robot's
-  grasp-assist record (what the hand holds, by object). None of that is in the evaluation feed. The planner needs
+  decides from object boxes (which table, where to stand, which item is nearest the edge, whether the item's box
+  ended inside the container's) and from its own hand record (localization at the hand, the fingers as fallback;
+  until 2026-09-11 it asked the task's predicate evaluator and the grasp-assist record instead). None of that is in the evaluation feed. The planner needs
   metric depth, so the wrapper the organisers evaluate with matters; the between-round decisions need a
   perception of their own before the pipeline can run as a policy.
 - Pressing needs an empty hand (`Push` requires `HandEmpty`), so "hold the radio and press its button" is two
@@ -695,6 +695,22 @@ for one task and is kept here, with what it did, in case a task needs it later.
 - Perception's table used to be whatever plane most objects' contact points touched; on the radio (its underside
   hidden, 8 cm above the glass) that was a tilted plane through its own face, which cut its hull to the top slab.
   The planner now takes only near-horizontal planes and allows contact points up to 10 cm above the table.
+- **Gaps found by reading the other 98 challenge tasks (2026-09-11).** A second review of the 16 tasks rated most
+  doable checked the ratings against this code and found five runner gaps, none task-specific and none fixed yet:
+  a goal that says `(not (toggled_on x))` reaches `task_goal_atoms` as a predicate called `not` and the press
+  runner ignores it (`turning_out_all_lights_before_sleep`, `setting_the_fire`); `Runner.run_transfers` takes the
+  support of the first goal item and never tries items resting elsewhere (`organizing_art_supplies`: four items
+  from the desk into a tote, then the tote from the floor onto the desk); a press that holds leaves the object in
+  the hand, so a goal that also places the object ends with it held (`installing_a_modem`, fax machine, scanner);
+  `placed_over` accepts an item whose bottom is up to 15 cm above the container's top, so an item resting on a
+  half-open lid counts as inside (`composting_waste`); and `SUPPORT_CATEGORIES` is tables and floors only, so a
+  desk, counter or carrel named as a support is a hull object and the placement aims at its hull top
+  (`installing_a_fax_machine`: the partition tops of a cubicle). Also noted: the fingers open to `FINGER_OPEN`
+  4 cm each where the URDF allows 5 cm, and cans, glasses and onions of 7 to 8.3 cm sit at that 8 cm limit;
+  nothing has been lifted out of a deep container (a basket's hull is solid to the planner); passes 4 and 5 used
+  sticky grasps where the challenge grasps physically. The full ranking of the 100 tasks is on the architecture
+  page, section 10: after the check, three tasks are the shape we already run (`putting_away_toys`,
+  `dispose_of_batteries`, `clean_up_broken_glass`).
 
 ## Tests
 
