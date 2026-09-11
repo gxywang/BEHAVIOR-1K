@@ -626,6 +626,24 @@ def test_step_counts_and_scores_only_while_the_episode_is_open():
     assert TiptopSim.frame_caption(sim) == "round 1\nstep 2/10"
 
 
+def test_via_configuration_moves_the_elbow_first_out_and_last_back():
+    from omnigibson.tiptop.protocol import via_configuration
+
+    arm = ["a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+    names = ["torso", *arm, "other"]
+    now = {j: 0.0 for j in names}
+    goal = {"torso": 0.5, "other": 2.0, **{j: 1.0 for j in arm}}
+    out = via_configuration(names, now, goal, {"left": arm}, elbow=3, elbow_first=True)
+    assert out["a4"] == 1.0 and all(out[j] == 0.0 for j in arm if j != "a4")
+    assert out["torso"] == 0.5 and out["other"] == 2.0  # joints of no arm go straight to the goal
+    back = via_configuration(names, now, goal, {"left": arm}, elbow=3, elbow_first=False)
+    assert back["a4"] == 0.0 and all(back[j] == 1.0 for j in arm if j != "a4")
+    # an arm whose joints are not being ramped is ignored
+    assert via_configuration(names, now, goal, {"right": ["r1", "r2", "r3", "r4"]}, 3, True) == {
+        j: goal[j] for j in names
+    }
+
+
 def test_joint_ramp_bounds_every_step_and_ends_on_the_goal():
     from omnigibson.tiptop.protocol import joint_ramp
 

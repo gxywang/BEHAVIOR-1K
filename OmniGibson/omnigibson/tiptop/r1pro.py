@@ -32,7 +32,7 @@ from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
 from omnigibson.tiptop.gt_masks import masks_from_geometry
 from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
-from omnigibson.tiptop.protocol import bddl_category, face_normal_local, joint_ramp, points_to_pixels
+from omnigibson.tiptop.protocol import bddl_category, face_normal_local, joint_ramp, points_to_pixels, via_configuration
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,
     OBJECT_PRESETS,
@@ -63,6 +63,21 @@ LOOK_SETTLE_STEPS = 60
 # target per control step: a step change of the targets makes the position controller slam the arms, which shakes
 # the whole robot and can shift the objects the capture is about to look at. Well under the arm joints' 7 rad/s.
 CAPTURE_MAX_JOINT_VEL = 0.6
+RAMP_BLOCK_TOL = 0.1  # rad: a ramped joint this far from its target is not following the ramp (blocked); logged
+# A wrist camera's look configuration must keep these links of its arm (name suffixes) out of the base's box, inflated
+# by BASE_CLEARANCE: Lula IK knows no collisions, and with the torso leaning the first offset put the right hand on the
+# base top, where it stayed for the whole capture (2026-09-11, assembling_gift_baskets: finger and wrist-camera links
+# in contact with base_link, the joints slipping round it at their velocity limit).
+HAND_LINKS = (
+    "arm_link4",
+    "arm_link6",
+    "realsense_link",
+    "gripper_link",
+    "gripper_finger_link1",
+    "gripper_finger_link2",
+)
+BASE_CLEARANCE = 0.10  # m
+ELBOW = 3  # index of the elbow in an arm's joint list: folded before a capture swing, straightened after it
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
@@ -393,6 +408,7 @@ class R1ProSim(TiptopSim):
         self.urdf_joints = set(re.findall(r'<joint name="([^"]+)"', Path(self.robot.urdf_path).read_text()))
         self.look_target = None  # base-frame point the wrist cameras look at in a capture (place_robot_for sets it)
         self.look_names = ()  # the objects it was chosen for: one of them in a hand is looked at there instead
+        self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -1032,9 +1048,57 @@ class R1ProSim(TiptopSim):
         for offset in LOOK_OFFSETS:
             eye, cam_quat = look_pose(target, shoulder.cpu().numpy(), side=1 if arm == "left" else -1, offset=offset)
             solution = ik.solve(*link_pose_for_camera(eye, cam_quat, self.camera_in_link[arm]), seed=seed)
-            if solution is not None:
-                return solution
+            if solution is None:
+                continue
+            inside = self.links_in_base_box(arm, ik, solution)
+            if inside:
+                log.info(
+                    f"{arm} arm: look offset {offset} puts {inside} within {BASE_CLEARANCE} m of the base; skipped"
+                )
+                continue
+            return solution
         return None
+
+    def base_box(self) -> np.ndarray:
+        """(min, max) corners of base_link's collision bounding box in the base frame, inflated by nothing."""
+        if self._base_box is None:
+            lo, hi = self.robot.links["base_link"].aabb
+            unit = th.tensor([0.0, 0.0, 0.0, 1.0])
+            corners = [
+                self.to_base(th.tensor([float(x), float(y), float(z)]), unit)[0].cpu().numpy()
+                for x in (lo[0], hi[0])
+                for y in (lo[1], hi[1])
+                for z in (lo[2], hi[2])
+            ]
+            pts = np.asarray(corners, dtype=np.float64)
+            self._base_box = np.stack([pts.min(axis=0), pts.max(axis=0)])
+            log.info(f"base box (base frame): {np.round(self._base_box, 2).tolist()}")
+        return self._base_box
+
+    def links_in_base_box(self, arm: str, ik: ArmIK, q) -> list[str]:
+        """The arm's hand links (``HAND_LINKS``) whose frame origin at arm joints ``q`` lies inside the base's box
+        inflated by ``BASE_CLEARANCE``."""
+        lo, hi = self.base_box()
+        inside = []
+        for suffix in HAND_LINKS:
+            pos, _ = ik.fk(q, f"{arm}_{suffix}")
+            if np.all(pos > lo - BASE_CLEARANCE) and np.all(pos < hi + BASE_CLEARANCE):
+                inside.append(f"{arm}_{suffix}")
+        return inside
+
+    def ramp_arms(self, q_arm, posture: dict, arms, gripper: float, settle_steps: int, elbow_first: bool) -> None:
+        """``ramp_to`` the targets through a via configuration: for each arm in ``arms`` the elbow alone has moved
+        (``elbow_first``, a swing out: the hand rises before it travels) or every joint but the elbow has (a swing
+        back: the hand travels folded and straightens last). Both legs ramp at the capture speed; the via is not
+        held."""
+        q = self.robot.get_joint_positions()
+        names = list(self.planned_joints) + list(posture)
+        now = {j: float(q[self.joint_index[j]]) for j in names}
+        goal = dict(zip(names, [float(v) for v in q_arm] + [float(posture[j]) for j in posture]))
+        via = via_configuration(names, now, goal, {a: self.robot.arm_joint_names[a] for a in arms}, ELBOW, elbow_first)
+        if any(abs(via[j] - now[j]) > 1e-3 for j in names):
+            self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0)
+        self.ramp_to(q_arm, posture, gripper, settle_steps)
 
     def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int) -> int:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
@@ -1048,18 +1112,32 @@ class R1ProSim(TiptopSim):
         path = joint_ramp(start, goal, CAPTURE_MAX_JOINT_VEL * self.dt)
         k = len(self.planned_joints)
         idx = [self.joint_index[j] for j in names]
-        last, fastest = np.asarray(start), 0.0
-        for q in path:
+        ramped = np.array(["finger" not in j for j in names])  # the gripper command drives the fingers, not the ramp
+        last, fastest, culprit, blocked = np.asarray(start), 0.0, "", None
+        for i, q in enumerate(path):
             self.posture = {j: float(v) for j, v in zip(posture, q[k:])}
             self.step(q[:k], gripper)
             measured = self.robot.get_joint_positions()[idx].cpu().numpy().astype(np.float64)
-            fastest = max(fastest, float(np.abs(measured - last).max()) / self.dt)
+            speed = np.abs(measured - last) / self.dt
+            if speed.max() > fastest:
+                j = int(speed.argmax())
+                fastest = float(speed[j])
+                culprit = f" ({names[j]} at step {i + 1}: {last[j]:+.3f} -> {measured[j]:+.3f} rad, target {q[j]:+.3f})"
+            lag = np.where(ramped, np.abs(measured - q), 0.0)
+            if blocked is None and lag.max() > RAMP_BLOCK_TOL:
+                j = int(lag.argmax())
+                blocked = (names[j], i + 1, float(lag[j]))
             last = measured
+        if blocked is not None:
+            log.warning(
+                f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
+                f"behind its target): the arm is pushing against something"
+            )
         self.posture = {j: float(v) for j, v in posture.items()}
         self.hold(settle_steps, gripper, q_arm=[float(v) for v in q_arm])
         log.info(
             f"joints ramped over {len(path)} steps at up to {CAPTURE_MAX_JOINT_VEL} rad/s commanded, "
-            f"{fastest:.2f} rad/s measured, then {settle_steps} settle steps"
+            f"{fastest:.2f} rad/s measured{culprit}, then {settle_steps} settle steps"
         )
         return len(path)
 
@@ -1107,7 +1185,7 @@ class R1ProSim(TiptopSim):
         if not moved:
             return super().capture(task)
         original = self.posture
-        self.ramp_to(look, posture, self.last_gripper, LOOK_SETTLE_STEPS)
+        self.ramp_arms(look, posture, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=True)
         now = self.robot.get_joint_positions()
         for arm, targets in moved.items():
             lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
@@ -1115,7 +1193,7 @@ class R1ProSim(TiptopSim):
                 log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
         request, extras = super().capture(task)
         self._log_wrist_framing(request, moved)
-        self.ramp_to(ready, original, self.last_gripper, LOOK_SETTLE_STEPS)
+        self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:

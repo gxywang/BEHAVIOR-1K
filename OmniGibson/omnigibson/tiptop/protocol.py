@@ -522,6 +522,22 @@ def face_normal_local(vertices, point) -> np.ndarray:
     return normal
 
 
+def via_configuration(names, now, goal, arms: dict, elbow: int, elbow_first: bool) -> dict:
+    """The configuration a two-leg arm swing passes through: ``goal`` for every joint in ``names`` except, for each
+    arm in ``arms`` (arm -> its joint names in order), the joints that wait at ``now``: all but the elbow (index
+    ``elbow`` in the arm's list) when ``elbow_first`` (a swing out: the hand rises before it travels), the elbow
+    alone otherwise (a swing back: the hand travels folded and straightens last). ``now`` and ``goal`` map joint
+    name -> value."""
+    via = {j: float(goal[j]) for j in names}
+    for joints in arms.values():
+        joints = list(joints)
+        for j in joints:
+            waits = (j != joints[elbow]) if elbow_first else (j == joints[elbow])
+            if waits and j in via:
+                via[j] = float(now[j])
+    return via
+
+
 def joint_ramp(start, goal, max_step: float) -> np.ndarray:
     """Joint targets from ``start`` to ``goal`` (dof,) in equal steps of at most ``max_step`` per joint, the last one
     ``goal`` itself: (n, dof), n >= 1. A target that jumps makes a position controller slam the joints; commanding

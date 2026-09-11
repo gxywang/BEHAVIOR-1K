@@ -508,13 +508,22 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then closer to the shoulder; nine targets in ten in either
   torso posture, and outside the head camera's frame) looking at the look target: the objects the base pose was
   chosen for, or the hand that holds one of them once it is picked up;
-  both arms move together and return together. The joint targets are ramped, never stepped: every joint moves at
-  no more than `CAPTURE_MAX_JOINT_VEL` (0.6 rad/s, one interpolated target per control step, `ramp_to`), then the
-  arms settle for 60 steps; a stepped target made the position controller slam the arms, which shook the robot and
-  could shift the objects the capture was about to look at (2026-09-11). The log line "joints ramped over N steps
-  ... measured" reports the fastest joint seen. An arm more than 0.03 rad short of its pose after settling is
-  logged as blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm
-  swings out of view as before (`LOOK_ARM`, ramped too); `--no-look` disables all of it.
+  a configuration that puts a hand link (`HAND_LINKS`) within `BASE_CLEARANCE` (0.10 m) of the base's box is
+  skipped, since Lula IK knows no collisions. Both arms move together and return together. The joint targets are
+  ramped, never stepped: every joint moves at no more than `CAPTURE_MAX_JOINT_VEL` (0.6 rad/s, one interpolated
+  target per control step, `ramp_to`), then the arms settle for 60 steps; a stepped target made the position
+  controller slam the arms, which shook the robot and could shift the objects the capture was about to look at
+  (2026-09-11). Each swing has two legs (`ramp_arms`, `protocol.via_configuration`): out, the elbow folds first
+  and the rest of the arm follows; back, the elbow straightens last. With the torso leaning the right arm hangs
+  over the base, and a straight joint-space swing dragged its hand across the base top: the joints stopped
+  following the ramp, wound up and slipped round the base at their velocity limit (7.4 rad/s measured against
+  0.6 commanded, in 53 of 218 pass 5 ramps, every one with the right arm swinging); with the two legs the same
+  capture measured 0.60 rad/s on every ramp and the hand grazed the base for two steps (2026-09-11, replayed in
+  simulation from the bench's first capture of assembling_gift_baskets 301). The log line "joints ramped over N
+  steps ... measured" names the fastest joint, its step and target; a ramped joint more than `RAMP_BLOCK_TOL`
+  (0.1 rad) from its target is logged as pushing against something. An arm more than 0.03 rad short of its pose
+  after settling is logged as blocked and captured anyway; a held arm never moves; when no configuration exists
+  the planned arm swings out of view as before (`LOOK_ARM`, ramped too); `--no-look` disables all of it.
 - **Workspace** (`WORKSPACE_NEAR`, `TiptopSim.workspace`). Every request carries the box the planner crops each
   view to: x from 0.35 m ahead of the base frame to 1.3 m, |y| ≤ 0.8 m, z from the tabletop (0.25 m) or the floor
   (-0.05 m, when the target stands on it) to 1.6 m. The near edge is past the base (its front collision spheres
