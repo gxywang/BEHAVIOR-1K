@@ -569,6 +569,15 @@ for one task and is kept here, with what it did, in case a task needs it later.
   `/health` before each request (DEPLOYMENT item 11). Reachability: some instances put an object where no base
   pose within 0.9 m is free (a radio at the far side of the table with a sofa behind it); the benchmark widens
   the search to 1.1 m once (the torso leans) and then skips the object.
+- **Complete hulls used to fail every carry and the picks of piled objects (fixed 2026-09-10).** cuTAMP checked the
+  robot's collision spheres against the object in its gripper at the placement, and cuRobo planned the retract
+  after a place with the released object back as an obstacle around the fingers, and the retract after a pick
+  with the attached object touching its neighbours. All of it passed only while hulls were the head camera's
+  partial views; with the wrist cameras completing them every carry failed (`robot_to_movables 0/256`,
+  `INVALID_START_STATE_WORLD_COLLISION`) and so did picks of bows lying against each other. The held object is now
+  exempt up to its placement, and every retract ignores the object just released and retries with the attached
+  object's spheres detached when its start state is in collision
+  (`tiptop/install/patches/cutamp-04-held-object-collisions.patch`).
 - Placement goes onto the top face of the container's convex hull with a 1 cm surface shrink, which is less than a
   wicker rim: an item can be set down on the rim (2026-09-05, from a stretched 0.8 m reach) and topple the basket.
 - Flat objects (cheese slabs, bows) get few M2T2 grasps; the planner succeeds on them from close, orthogonal

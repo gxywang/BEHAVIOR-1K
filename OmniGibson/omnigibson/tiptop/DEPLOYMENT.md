@@ -98,7 +98,11 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    order on top of the pinned cuTAMP release: `01-world-cfg-alias` (a `get_world_cfg` list-aliasing fix that
    otherwise crashes every plan skeleton tried after the first motion-planning attempt with `KeyError: 'table'`),
    `02-press-button` (the `Push` operator: hover, press, back off along a button's normal), `03-initial-holding`
-   (a plan may start with an object in the gripper: `in_hand` requests). A cuTAMP checkout made without the script
+   (a plan may start with an object in the gripper: `in_hand` requests), `04-held-object-collisions` (the object in
+   the gripper is not collision-checked against the robot holding it; every retract ignores the object a place just
+   released around the fingers and, when its start state is in collision because the attached object touches what
+   it lay against, is planned again with the object's spheres detached, as cuTAMP's place branch already did;
+   needed once the wrist cameras complete the hulls). A cuTAMP checkout made without the script
    needs `git apply` of the same patches in that order; the clone on shenlong-gpu-01 carries 01 and 02 as local
    commits and 03 as its working tree, so `git diff` there regenerates 03. Upstreaming them to tiptop-robot/cuTAMP
    is the real fix.
