@@ -89,6 +89,16 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     pose within 1.1 m: the base-pose search is now the main loss, not the planner. 43-157 min per instance at load
     100-440. The capture ramps still used the straight swing (143 of 722 above the cap, see Look poses); the
     two-leg swing landed after this pass started.
+  - gate test (`runs/bench_baskets_gates1`, instance 301 only, 2026-09-11 15:48-16:41): the first run where the
+    policy judges its own rounds (see "How a round is judged" under Benchmark) and captures with the head camera
+    at three torso yaws instead of the wrist cameras (`--views head_left head_right`): **0.8125** (13/16) in 50
+    min. The hand record agreed with the simulator's grasp assist in all 32 hand events; two picks were judged
+    misses and retried, rightly. Lost: candle_3 and bow_4 no base pose (x3, x4), swiss_cheese_3 picked twice
+    without ending in the hand. Two planning failures, one "no objects with sufficient point cloud data" from a
+    stance where the three head views saw little of the item. Pass 5 had 0.9375 on this instance with the wrist
+    views and the simulator's verdicts. A first run of the finger-width hand gate the same afternoon called every
+    candle and bow pick a miss (the fingers close through an attached object under sticky grasping) and was
+    stopped after 36 rounds; the localization gate replaced it.
   - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
     reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
     about 16k of the 39k allowed env steps per instance.
@@ -372,9 +382,12 @@ number from this benchmark bounds the manipulation part of the pipeline; it is n
 
 **How a round is judged (2026-09-11).** The policy never asks the simulator whether a round worked; a policy at
 evaluation could not. `Episode.satisfied` (bench.py) judges from the robot's own readings and from localization:
-a pick counts when the plan closed the hand and the fingers stopped more than `FINGER_CONTACT` (6 mm) apart
-(`TiptopSim.grasp_sensed`; `run.note_hands` keeps the hand record, and the simulator's grasp assist is only
-compared with it in the log); a placement counts when the item's box sits over the target's, by geometry on
+a pick counts when the plan closed the hand and the knowledge source then localizes the object within
+`HOLD_RADIUS` (15 cm) of the hand (`run.note_hands` keeps the hand record; the fingers stopping more than
+`FINGER_CONTACT` (6 mm) apart, `TiptopSim.grasp_sensed`, decides only when nothing can localize the object, since
+sticky grasping closes the fingers through the attached object: 0-4 mm on candles and bows, 2026-09-11; the
+simulator's grasp assist is only compared with the record in the log); a placement counts when the item's box
+sits over the target's, by geometry on
 where the knowledge source localizes the two (`placed`: centre inside the target's footprint, bottom from 2 cm
 under the target's bottom to 15 cm over its top); a press counts once its planned stroke ran (open loop: the
 executor gets no signal from the switch, and the oracle source no longer offers one). Localization is the
