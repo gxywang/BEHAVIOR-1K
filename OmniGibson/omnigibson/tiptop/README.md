@@ -370,6 +370,32 @@ under `<out>/json/`, plus `summary.json` with the mean q_score. Two things are s
 instead of navigating, and with `--knowledge oracle` the planner is told the simulator's masks and button poses. A
 number from this benchmark bounds the manipulation part of the pipeline; it is not a challenge score.
 
+**How a round is judged (2026-09-11).** The policy never asks the simulator whether a round worked; a policy at
+evaluation could not. `Episode.satisfied` (bench.py) judges from the robot's own readings and from localization:
+a pick counts when the plan closed the hand and the fingers stopped more than `FINGER_CONTACT` (6 mm) apart
+(`TiptopSim.grasp_sensed`; `run.note_hands` keeps the hand record, and the simulator's grasp assist is only
+compared with it in the log); a placement counts when the item's box sits over the target's, by geometry on
+where the knowledge source localizes the two (`placed`: centre inside the target's footprint, bottom from 2 cm
+under the target's bottom to 15 cm over its top); a press counts once its planned stroke ran (open loop: the
+executor gets no signal from the switch, and the oracle source no longer offers one). Localization is the
+knowledge source's: the oracle reads object boxes from the simulator, the onboard source keeps the positions the
+planner reported (`KnowledgeSource.localize`). So the oracle gives perception (masks, button poses) and
+localization (boxes), nothing else. The instance is still scored by the task's own predicates at the end, which
+is the challenge's metric and not the policy's business. Ordering (containers nearest the items' support,
+items nearest its edge), the support an item stands on (any task object under it, not only tables) and whether
+a target stands on the floor (the workspace reaches down) are all read off the same localization.
+
+**Task descriptions.** A task says what it needs in `tasks/<task>.yaml` (strategies.py, `TaskSpec`): the
+instruction the planner is given, the sub-plan (`transfer` for inside/ontop atoms: pick, carry, place;
+`press` for toggled_on atoms, `hold` to pick the object first) and the ordering choices tuned on it. One generic
+`Runner` executes any description; the goal atoms come from the task's BDDL definition (the TiPToP paper had a
+language model write goals from an instruction; we read them from the task, and at evaluation the task id says
+which definition applies). Nothing tuned on a task lives in code.
+
+**Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
+and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
+already exercised.
+
 Outputs per instance: `videos/<task>_<instance>_0.mp4` is the whole episode in one video, every env step from the
 first teleport to the end (the capture camera left, the overview and the wrist camera right), each frame stamped
 with what the robot is doing (`teleport: stand for ...`, `round N: holding(...) [left arm]`, `release`) and the
@@ -457,7 +483,8 @@ Flags shared by all: `--embodiment franka|r1pro`, `--activity NAME` (+ `--activi
 set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene-objects`; the base
 `--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
 `--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|left_wrist|right_wrist` (the primary view),
-`--views VIEW ...` (the further views, default both wrists; `--views` alone: the primary only), `--head-aperture`,
+`--views VIEW ...` (the further views, default both wrists; `head_left` / `head_right`: the head camera with the
+torso turned +-29°, see "Look poses"; `--views` alone: the primary only), `--head-aperture`,
 `--seg-instance`;
 what the planner is told `--knowledge oracle|onboard`; the goal `--goal "pred(a,b);..."` (BDDL names with
 `--activity`), `--task`; execution
@@ -534,6 +561,17 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (0.1 rad) from its target is logged as pushing against something. An arm more than 0.03 rad short of its pose
   after settling is logged as blocked and captured anyway; a held arm never moves; when no configuration exists
   the planned arm swings out of view as before (`LOOK_ARM`, ramped too); `--no-look` disables all of it.
+  **Turned head views** (`--views head_left head_right`, `HEAD_YAW_VIEWS`) are the alternative to swinging the
+  wrist cameras: after the primary and the wrist views, the torso's yaw joint (`torso_joint4`, planned, so it is
+  ramped through `q_arm` with the arms as they are) is ramped to +0.5 rad, the head view rendered, then to
+  -0.5 rad and rendered again, then back to 0, each ramp at the capture speed with 30 settle steps
+  (`_capture_views`, `yawed_joints`). 0.5 rad is about 29°, so the three head views span roughly 150° with the
+  99° head camera; the base does not turn, so each view's camera pose (read from the simulator as it is rendered)
+  is right in the base frame as it is, and the oracle masks come from that pose per view. The joint's axis is
+  `torso_link4`'s z, which leans with the torso: in the challenge posture it is 23° off the base's z, so the
+  turned camera also rolls a little and rises 3 mm (measured 2026-09-11, assembling_gift_baskets 0: the camera
+  moved 3.6 cm sideways, 28.6° about an axis through x = -0.14 m of the base frame). The torso must be back
+  within 0.03 rad before the request's `q_init` is read; the plan starts from the ready posture as before.
 - **Workspace** (`WORKSPACE_NEAR`, `TiptopSim.workspace`). Every request carries the box the planner crops each
   view to: x from 0.35 m ahead of the base frame to 1.3 m, |y| ≤ 0.8 m, z from the tabletop (0.25 m) or the floor
   (-0.05 m, when the target stands on it) to 1.6 m. The near edge is past the base (its front collision spheres

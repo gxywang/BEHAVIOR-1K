@@ -32,7 +32,14 @@ from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
 from omnigibson.tiptop.gt_masks import masks_from_geometry
 from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
-from omnigibson.tiptop.protocol import bddl_category, face_normal_local, joint_ramp, points_to_pixels, via_configuration
+from omnigibson.tiptop.protocol import (
+    add_view,
+    bddl_category,
+    face_normal_local,
+    joint_ramp,
+    points_to_pixels,
+    via_configuration,
+)
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,
     OBJECT_PRESETS,
@@ -46,9 +53,32 @@ log = logging.getLogger(__name__)
 
 ROBOT_NAME = "robot_r1"
 ROBOT_TYPE = "r1pro_left"
-CAMERA_LINKS = {"head": "zed_link", "left_wrist": "left_realsense_link", "right_wrist": "right_realsense_link"}
-VIEW_OPTICS = {"head": "head", "left_wrist": "wrist", "right_wrist": "wrist"}  # which shadow camera renders a view
+# Capture views: name -> the robot camera's link. "head_left" / "head_right" are the head camera again, with the
+# torso turned to +-HEAD_VIEW_YAW (HEAD_YAW_VIEWS): an alternative to swinging the wrist cameras.
+CAMERA_LINKS = {
+    "head": "zed_link",
+    "left_wrist": "left_realsense_link",
+    "right_wrist": "right_realsense_link",
+    "head_left": "zed_link",
+    "head_right": "zed_link",
+}
+VIEW_OPTICS = {  # which shadow camera renders a view
+    "head": "head",
+    "left_wrist": "wrist",
+    "right_wrist": "wrist",
+    "head_left": "head",
+    "head_right": "head",
+}
 DEFAULT_VIEWS = ("left_wrist", "right_wrist")  # captured with the head camera and fused by the planner
+# The head camera turned on the torso's yaw joint (zed_link sits on torso_link4; torso_joint4 rotates about that
+# link's z, limits +-3.05 rad): about 29 degrees, so three head views span roughly 150 degrees with the 99 degree
+# head camera; the torso, not the base, turns, and the arms come along. In the leaning challenge posture the joint's
+# axis is 23 degrees off the base's z (measured 2026-09-11), which the view's camera pose, read from the simulator
+# as it is rendered, carries as it is.
+HEAD_VIEW_YAW = 0.5  # rad
+HEAD_YAW_JOINT = "torso_joint4"
+HEAD_YAW_VIEWS = {"head_left": HEAD_VIEW_YAW, "head_right": -HEAD_VIEW_YAW}  # view name -> torso yaw it is taken at
+HEAD_YAW_SETTLE_STEPS = 30  # after a yaw ramp: only the torso moved (the arms settle for LOOK_SETTLE_STEPS)
 # The external capture sensors, one per optics: moved onto the robot camera's pose per view (_capture_obs). The
 # robot's own cameras render rgb only (video, mirror); depth and segmentation come from these.
 SHADOW_CAMS = {"head": CAMERA_NAME, "wrist": "tiptop_wrist_cam"}
@@ -228,6 +258,8 @@ def make_r1pro_env_config(
     unknown = [v for v in (camera, *views) if v not in CAMERA_LINKS]
     if unknown:
         raise ValueError(f"unknown camera views {unknown} (known: {sorted(CAMERA_LINKS)})")
+    if camera in HEAD_YAW_VIEWS:
+        raise ValueError(f"{camera!r} is the head camera turned; the primary view is taken at torso yaw 0 ('head')")
     optics = {"head": (head_resolution, head_aperture_mm), "wrist": (wrist_resolution, WRIST_APERTURE_MM)}
     shadow_cams = [
         {
@@ -347,6 +379,20 @@ def _intrinsics(sensor, tries: int = 10) -> np.ndarray:
     return sensor.intrinsic_matrix.cpu().numpy()
 
 
+def yawed_joints(planned_joints, q_arm, yaw: float, joint: str = HEAD_YAW_JOINT) -> list[float]:
+    """``q_arm`` (the planned joints' targets, in ``planned_joints`` order) with ``joint`` set to ``yaw``: the torso
+    turned for a head view, every other joint where it is. The joint must be planned (``r1pro_left`` plans the
+    torso); a locked joint's value lives in the posture instead."""
+    planned_joints = list(planned_joints)
+    if joint not in planned_joints:
+        raise ValueError(f"{joint} is not a planned joint ({planned_joints}); a turned head view needs it")
+    if len(q_arm) != len(planned_joints):
+        raise ValueError(f"{len(q_arm)} joint targets for {len(planned_joints)} planned joints")
+    q = [float(v) for v in q_arm]
+    q[planned_joints.index(joint)] = float(yaw)
+    return q
+
+
 class R1ProSim(TiptopSim):
     """R1Pro in a BEHAVIOR scene; the TiptopSim interface (capture / step / q_arm / objects) for the left arm."""
 
@@ -367,6 +413,8 @@ class R1ProSim(TiptopSim):
         environment must have been configured with the same, ``make_r1pro_env_config``); ``overview_view``: where
         ``place_robot`` puts the overview camera (``OVERVIEW_OFFSETS``); ``look_arm``: joint overrides on top of
         q_home for the capture, None to capture in the ready posture."""
+        if camera in HEAD_YAW_VIEWS:
+            raise ValueError(f"{camera!r} is the head camera turned; the primary view is taken at torso yaw 0 ('head')")
         self.config = config
         self.overview_view = overview_view
         self.look_arm = look_arm
@@ -386,8 +434,9 @@ class R1ProSim(TiptopSim):
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
         self.gripper_idx = self.robot.gripper_control_idx[self.arm]
         self.dt = og.sim.get_sim_step_dt()
-        self.robot_cam_names = {name: f"{self.robot.name}:{link}:Camera:0" for name, link in CAMERA_LINKS.items()}
-        self.robot_cams = {name: self.robot.sensors[sensor] for name, sensor in self.robot_cam_names.items()}
+        sensor_names = {name: f"{self.robot.name}:{link}:Camera:0" for name, link in CAMERA_LINKS.items()}
+        self.robot_cam_names = {n: s for n, s in sensor_names.items() if n not in HEAD_YAW_VIEWS}  # one per camera
+        self.robot_cams = {name: self.robot.sensors[sensor] for name, sensor in sensor_names.items()}  # per view
         self.cam_name = self.robot_cam_names[camera]
         self.robot_cam = self.robot_cams[camera]  # the primary view's camera: the base-pose search frames with it
         self.STREAM_CAMERA = f"{camera}_cam"  # the capture camera's image in the Rerun mirror
@@ -1148,9 +1197,11 @@ class R1ProSim(TiptopSim):
         frame. An arm that holds something stays where it is:
         the held object is what the next plan is about and must be seen, and the gripper keeps its command. The
         planned arm swings out of view (``look_arm``) when no look configuration exists; with ``look_arm`` None
-        nothing moves. The plan starts from the ready posture the arms return to."""
+        nothing moves. The head views of ``HEAD_YAW_VIEWS`` come last, the torso turned to their yaw with the arms
+        as they are (``_capture_views``). The plan starts from the ready posture the arms return to."""
+        ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
         if self.look_arm is None:
-            return super().capture(task)
+            return self._capture_views(task, ready)
         hands = self.hands()
         held_arms = set(hands.values())
         holding_arms = sorted(hands[self.tracked_label(n)] for n in self.look_names if self.tracked_label(n) in hands)
@@ -1158,7 +1209,6 @@ class R1ProSim(TiptopSim):
             target = self.eef_pose_base((holding_arms or sorted(held_arms))[0])[:3, 3]
         else:
             target = np.asarray(DEFAULT_LOOK_TARGET if self.look_target is None else self.look_target, dtype=np.float64)
-        ready = list(self.q_home)
         look = list(ready)  # the planned joints during the capture
         posture = dict(self.posture)  # the other arm's joints during the capture
         moved = {}  # arm -> {joint: value}
@@ -1183,7 +1233,7 @@ class R1ProSim(TiptopSim):
             else:
                 posture.update(moved.get(arm, {}))
         if not moved:
-            return super().capture(task)
+            return self._capture_views(task, ready)
         original = self.posture
         self.ramp_arms(look, posture, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=True)
         now = self.robot.get_joint_positions()
@@ -1191,7 +1241,7 @@ class R1ProSim(TiptopSim):
             lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
             if lag > LOOK_TOL:
                 log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
-        request, extras = super().capture(task)
+        request, extras = self._capture_views(task, look)
         self._log_wrist_framing(request, moved)
         self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
         q_ready = self.q_arm()
@@ -1208,6 +1258,53 @@ class R1ProSim(TiptopSim):
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
+        )
+        return request, extras
+
+    def _capture_views(self, task: str, q_arm) -> tuple[dict, dict]:
+        """``TiptopSim.capture`` for the primary view and the wrist views, where the joints stand now (``q_arm``: the
+        planned joints' targets, at torso yaw 0), then each head view of ``HEAD_YAW_VIEWS`` among ``extra_views``
+        with the torso ramped to its yaw (``ramp_to``; the other planned joints and the locked posture stay, so the
+        arms come along), and the torso ramped back. The base frame does not turn with the torso, so a view's
+        camera pose, read from the simulator as it is rendered, is right as it is."""
+        head_views = [v for v in self.extra_views if v in HEAD_YAW_VIEWS]
+        extra_views = self.extra_views
+        self.extra_views = tuple(v for v in extra_views if v not in HEAD_YAW_VIEWS)
+        try:
+            request, extras = super().capture(task)
+        finally:
+            self.extra_views = extra_views
+        if not head_views:
+            return request, extras
+        q_arm = [float(v) for v in q_arm]
+        for name in head_views:
+            yaw = HEAD_YAW_VIEWS[name]
+            self.ramp_to(
+                yawed_joints(self.planned_joints, q_arm, yaw), self.posture, self.last_gripper, HEAD_YAW_SETTLE_STEPS
+            )
+            view, view_extras = self.view_frame(name)
+            add_view(
+                request,
+                name,
+                view["rgb"],
+                view["depth"],
+                view["intrinsics"],
+                view["world_from_cam"],
+                robot_mask=view["robot_mask"],
+            )
+            extras["views"][name] = view_extras
+            log.info(
+                f"head view {name}: torso yaw {math.degrees(yaw):.0f} deg, camera at base "
+                f"{np.round(view_extras['cam_pos_base'], 2).tolist()}"
+            )
+        self.ramp_to(q_arm, self.posture, self.last_gripper, HEAD_YAW_SETTLE_STEPS)
+        i = self.planned_joints.index(HEAD_YAW_JOINT)
+        back = abs(float(self.q_arm()[i]) - q_arm[i])
+        if back > LOOK_TOL:
+            raise RuntimeError(f"torso yaw did not return after the head views (off by {back:.3f} rad)")
+        request["q_init"] = self.q_arm()  # the plan starts here, not at a turned head view
+        log.info(
+            f"head views {head_views} taken; torso yaw back at {math.degrees(q_arm[i]):.0f} deg (error {back:.4f} rad)"
         )
         return request, extras
 
@@ -1279,7 +1376,7 @@ class R1ProSim(TiptopSim):
     def robot_self_mask(self, name: str, depth, intrinsics, cam_pos_world, cam_quat_cv_world) -> np.ndarray:
         """The robot's own pixels in a view from its link meshes: the viewing arm's links, gripper and fingers for
         a wrist view (the camera looks along its own gripper), both arms' for the head view."""
-        arms = ["left", "right"] if name == "head" else [name.split("_")[0]]
+        arms = ["left", "right"] if VIEW_OPTICS[name] == "head" else [name.split("_")[0]]
         meshes = {}
         for arm in arms:
             for link_name in (

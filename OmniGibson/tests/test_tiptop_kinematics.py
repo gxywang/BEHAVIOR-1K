@@ -14,9 +14,11 @@ from omnigibson.tiptop.kinematics import (
     matrix_pose,
     pose_matrix,
 )
+from omnigibson.tiptop.r1pro import HEAD_YAW_JOINT, HEAD_YAW_VIEWS, yawed_joints
 
 URDF = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro/urdf/r1pro.urdf"
 LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 8)]
+TORSO = [f"torso_joint{i}" for i in range(1, 5)]  # planned before the arm in r1pro_left
 Q_HOME = [-1.6312, 0.2636, -1.812, -1.4576, -0.0508, -0.3727, -1.3193]  # r1pro_left's ready posture
 FIXED = {f"torso_joint{i}": v for i, v in zip(range(1, 5), [1.025, -1.45, -0.47, 0.0])}
 FIXED.update({f"right_arm_joint{i}": 0.0 for i in range(1, 8)})
@@ -80,3 +82,19 @@ def test_lula_solves_a_look_pose_for_the_left_wrist_camera():
     assert np.linalg.norm(pos_after - (pos + [0.05, 0.0, 0.05])) < 0.01
     assert np.allclose(pose_matrix(pos_after, quat_after)[:3, :3], pose_matrix(pos, quat)[:3, :3], atol=0.15)
     assert ik.solve([3.0, 0.0, 0.0], quat, seed=Q_HOME) is None  # out of reach
+
+
+def test_yawed_joints_turns_the_torso_yaw_and_nothing_else():
+    """A head view turns torso_joint4 (a planned joint) to the view's yaw; the rest of the capture posture stays."""
+    q = [1.2, -1.7, -0.9, 0.0, *Q_HOME]
+    i = (TORSO + LEFT_ARM).index(HEAD_YAW_JOINT)
+    for name, yaw in HEAD_YAW_VIEWS.items():
+        turned = yawed_joints(TORSO + LEFT_ARM, q, yaw)
+        assert turned[i] == yaw, name
+        assert turned[:i] == q[:i] and turned[i + 1 :] == q[i + 1 :]
+    assert q[i] == 0.0  # the input is left alone
+    assert HEAD_YAW_VIEWS["head_left"] == -HEAD_YAW_VIEWS["head_right"] > 0  # left is a positive yaw about z
+    with pytest.raises(ValueError):  # an embodiment that locks the torso cannot turn it through q_arm
+        yawed_joints(LEFT_ARM, Q_HOME, 0.5)
+    with pytest.raises(ValueError):
+        yawed_joints(TORSO + LEFT_ARM, Q_HOME, 0.5)
