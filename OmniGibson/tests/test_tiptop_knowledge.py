@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from omnigibson.tiptop.knowledge import (
-    FLOOR_WORKSPACE,
     GoalNotVisible,
     OnboardKnowledge,
     OracleKnowledge,
@@ -38,12 +37,12 @@ def test_attach_knowledge_sets_only_what_is_known():
         buttons={"radio_1_button": {"position": [1, 0, 0.5], "normal": [0, 1, 0], "radius": 0.02}},
         held=["radio_1"],
         in_hand=["candle_1"],
-        workspace=FLOOR_WORKSPACE,
+        workspace=[[0.35, -0.8, -0.05], [1.3, 0.8, 1.6]],
     )
     assert req["gt_masks"].dtype == np.uint8 and req["gt_masks"].sum() == 4
     assert req["gt_buttons"]["radio_1_button"]["radius"] == 0.02
     assert req["held_labels"] == ["radio_1"] and req["in_hand"] == ["candle_1"]
-    assert req["workspace_bounds"] == FLOOR_WORKSPACE
+    assert req["workspace_bounds"] == [[0.35, -0.8, -0.05], [1.3, 0.8, 1.6]]
     with pytest.raises(ValueError):
         attach_knowledge(req, ["a", "b"], [], masks=masks)  # one mask for two labels
     with pytest.raises(ValueError):
@@ -99,6 +98,9 @@ class _Sim:
     def hands(self):
         return dict(self.held_objects)
 
+    def workspace(self, floor=False):
+        return [[0.35, -0.8, -0.05 if floor else 0.25], [1.3, 0.8, 1.6]]
+
 
 def _masks(**pixels):
     out = {}
@@ -121,7 +123,7 @@ def test_oracle_knowledge_sends_instance_masks_and_every_button_of_the_task():
     assert known.labels == ["radio_1"]  # the candle is out of view and dropped
     assert known.masks.shape == (1, 6, 8) and known.atoms == [{"predicate": "holding", "args": ["radio_1"]}]
     assert "radio_1_button" in known.buttons and sim.button_calls == [goal]  # the whole task's buttons, every round
-    assert known.in_hand == [] and known.held_labels == [] and known.workspace is None
+    assert known.in_hand == [] and known.held_labels == [] and known.workspace == sim.workspace()
     req = _request()
     known.attach(req)
     assert req["gt_masks"].shape == (1, 6, 8) and "in_hand" not in req
@@ -157,7 +159,7 @@ def test_knowledge_reports_the_hands_at_its_own_label_level():
     oracle = OracleKnowledge(sim, goal)
     known = oracle.describe(goal, _request(), {}, floor=True)
     assert known.in_hand == ["candle_4"] and known.held_labels == ["radio_1"]
-    assert known.workspace == FLOOR_WORKSPACE
+    assert known.workspace == [[0.35, -0.8, -0.05], [1.3, 0.8, 1.6]]  # the embodiment's box, down to the floor
     onboard = OnboardKnowledge(sim, goal)
     known = onboard.describe(goal, _request(), {})
     assert known.in_hand == ["candle"] and known.held_labels == ["radio"]  # category level

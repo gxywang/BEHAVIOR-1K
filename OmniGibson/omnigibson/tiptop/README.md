@@ -125,7 +125,8 @@ the planner beyond the image: an oracle source and an onboard source), `executor
    knows (`knowledge.py`, `protocol.attach_knowledge`; see "What the planner is told"): `gt_labels, gt_atoms`
    always, `gt_masks` per view from the oracle source, `gt_buttons` from the oracle source (true poses) or the
    onboard source (detections carried from earlier rounds), `held_labels` / `in_hand` for what the hands hold,
-   `workspace_bounds` when the round works at the floor.
+   `workspace_bounds`: the embodiment's box (`TiptopSim.workspace`; see "Workspace" under "R1Pro specifics"),
+   reaching the floor when the round works there.
 4. **Plan** (`tiptop-server`, `_run_pipeline`). Per view: masks → point cloud in the base frame. Per scene: the
    views' detections are associated into objects (`tiptop/perception/association.py`: by label with ground-truth
    masks, otherwise by projecting one view's masked points into the other and scoring the overlap with its masks)
@@ -497,6 +498,14 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   costs what the old swing-out did. An arm more than 0.03 rad short of its pose after settling is logged as
   blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm swings out of
   view as before (`LOOK_ARM`); `--no-look` disables all of it.
+- **Workspace** (`WORKSPACE_NEAR`, `TiptopSim.workspace`). Every request carries the box the planner crops each
+  view to: x from 0.35 m ahead of the base frame to 1.3 m, |y| ≤ 0.8 m, z from the tabletop (0.25 m) or the floor
+  (-0.05 m, when the target stands on it) to 1.6 m. The near edge is past the base (its front collision spheres
+  reach x 0.25) and the leaning torso. It matters with the wrist views: the head camera never sees a support
+  nearer than 0.40 m, but a wrist camera sees the floor from 0.14 m and the top of the base at table height, and
+  a support cuboid that runs under the robot puts its start posture in collision -- every pick of pass 4 failed
+  that way ("Motion planning failed for 32/N satisfying particles", cuRobo `INVALID_START_STATE_WORLD_COLLISION`;
+  replaying the saved rounds with the near edge at 0.35 m planned them, 2026-09-10).
 - **Base pose** (`best_base_pose`): candidates on rings 0.25-0.9 m around the named objects' centroid, facing it,
   yaw ±60° in 15° steps; rejected when an object is behind (< 0.15 m ahead), well to the right (> 0.3 m), beyond
   reach (0.9 m), nearer than the camera's reach for its own support height, hidden behind the container, outside

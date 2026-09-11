@@ -61,6 +61,11 @@ LOOK_ARM = {"left_arm_joint2": 2.0}
 LOOK_SETTLE_STEPS = 60
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
+# The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
+# and the leaning torso, so the support plane the wrist cameras see beside the robot never runs under it. The head
+# camera alone never saw the table nearer than 0.40 m; the wrist cameras see the floor from 0.14 m and the base's top
+# at table height, and a support cuboid reaching there puts the robot's start posture in collision (pass 4).
+WORKSPACE_NEAR = 0.35
 SELF_MASK_FACES = (
     2000  # a robot link's mesh is decimated to this for the self-mask (it only marks the robot's own pixels)
 )
@@ -325,6 +330,8 @@ def _intrinsics(sensor, tries: int = 10) -> np.ndarray:
 
 class R1ProSim(TiptopSim):
     """R1Pro in a BEHAVIOR scene; the TiptopSim interface (capture / step / q_arm / objects) for the left arm."""
+
+    WORKSPACE = ((WORKSPACE_NEAR, -0.80, 0.25), (1.30, 0.80, 1.60))
 
     expect_table_z = None  # no synthetic table at base z = 0: validate_capture only checks the objects
     mask_labels_as_invalid = (ROBOT_NAME,)

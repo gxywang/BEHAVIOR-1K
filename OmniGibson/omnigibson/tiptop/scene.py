@@ -228,6 +228,11 @@ class TiptopSim:
     FRAME_COVERAGE_MIN = 0.5
     gt_mask_tol = 0.008  # geometry masks: surface distance (m) within which a depth pixel belongs to an object
     STREAM_CAMERA = "cam"  # name of the capture camera's image in the Rerun mirror
+    # The base-frame box the planner works in (its crop of every view): the tabletop ahead of the robot, as TiPToP's
+    # sim config has it; ``workspace`` lowers it to the floor for a container standing there. An embodiment moves the
+    # near edge past its own footprint (R1ProSim).
+    WORKSPACE = ((0.05, -0.80, 0.25), (1.30, 0.80, 1.60))
+    FLOOR_Z = -0.05
 
     def __init__(self, config: dict):
         self.config = config
@@ -382,6 +387,12 @@ class TiptopSim:
         self.episode_open = False
         self.stop_when_done = False
         return self.n_steps
+
+    def workspace(self, floor: bool = False) -> list:
+        """The box the planner works in for a request (base frame, [[x0, y0, z0], [x1, y1, z1]]): ``WORKSPACE``,
+        reaching the floor when the target stands on it."""
+        (x0, y0, z0), (x1, y1, z1) = self.WORKSPACE
+        return [[x0, y0, self.FLOOR_Z if floor else z0], [x1, y1, z1]]
 
     def hands(self) -> dict:
         """{tracked label: arm} of what the hands hold now: the grasp assist's own record when the robot has one

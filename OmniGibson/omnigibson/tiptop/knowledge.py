@@ -25,10 +25,6 @@ from omnigibson.tiptop.protocol import attach_knowledge, canonical_object_name, 
 
 log = logging.getLogger(__name__)
 
-# The planner works inside a base-frame box (its configured crop is the tabletop ahead of the robot, z from 0.25 m).
-# For a container standing on the floor the box must reach the floor; the client asks for this one then.
-FLOOR_WORKSPACE = [[0.05, -0.80, -0.05], [1.30, 0.80, 1.60]]
-
 
 class GoalNotVisible(ValueError):
     """A goal object has no pixels in any view of the capture: the planner would not see it."""
@@ -45,7 +41,7 @@ class SceneKnowledge:
     buttons: dict = field(default_factory=dict)  # label -> {position, normal, radius}
     held_labels: list = field(default_factory=list)  # in a hand the plan does not move
     in_hand: list = field(default_factory=list)  # in the planned hand: the plan starts holding them
-    workspace: list | None = None  # base-frame box for this request, None: the planner's default
+    workspace: list | None = None  # base-frame box for this request (the embodiment's, TiptopSim.workspace)
 
     def attach(self, request: dict) -> dict:
         return attach_knowledge(
@@ -207,7 +203,7 @@ class OracleKnowledge(KnowledgeSource):
             buttons=self.sim.button_hints(self.goal, category_level=False),
             held_labels=held,
             in_hand=in_hand,
-            workspace=FLOOR_WORKSPACE if floor else None,
+            workspace=self.sim.workspace(floor),
         )
 
     def press_done(self, bddl_targets):
@@ -242,7 +238,7 @@ class OnboardKnowledge(KnowledgeSource):
             buttons=tracked,
             held_labels=held,
             in_hand=in_hand,
-            workspace=FLOOR_WORKSPACE if floor else None,
+            workspace=self.sim.workspace(floor),
         )
 
     def learned(self, response: dict) -> None:
