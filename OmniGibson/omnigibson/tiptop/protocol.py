@@ -522,6 +522,16 @@ def face_normal_local(vertices, point) -> np.ndarray:
     return normal
 
 
+def joint_ramp(start, goal, max_step: float) -> np.ndarray:
+    """Joint targets from ``start`` to ``goal`` (dof,) in equal steps of at most ``max_step`` per joint, the last one
+    ``goal`` itself: (n, dof), n >= 1. A target that jumps makes a position controller slam the joints; commanding
+    this ramp one row per control step bounds every joint's speed to ``max_step`` per step."""
+    start, goal = np.asarray(start, dtype=np.float64), np.asarray(goal, dtype=np.float64)
+    n = max(1, int(np.ceil(np.abs(goal - start).max() / max_step))) if max_step > 0 else 1
+    t = np.arange(1, n + 1, dtype=np.float64)[:, None] / n
+    return (start + t * (goal - start)).astype(np.float32)
+
+
 def resample_trajectory(positions, dt: float, target_dt: float) -> np.ndarray:
     """Linearly resample an (N, dof) trajectory sampled every ``dt`` seconds onto ``target_dt``, keeping the end point."""
     positions = np.asarray(positions, dtype=np.float32)

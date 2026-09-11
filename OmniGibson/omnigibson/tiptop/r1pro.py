@@ -32,7 +32,7 @@ from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
 from omnigibson.tiptop.gt_masks import masks_from_geometry
 from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
-from omnigibson.tiptop.protocol import bddl_category, face_normal_local, points_to_pixels
+from omnigibson.tiptop.protocol import bddl_category, face_normal_local, joint_ramp, points_to_pixels
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,
     OBJECT_PRESETS,
@@ -59,6 +59,10 @@ SHADOW_CAM = SHADOW_CAMS["head"]
 # 0 robot pixels, no contact. Applied on top of q_home, joint name -> value.
 LOOK_ARM = {"left_arm_joint2": 2.0}
 LOOK_SETTLE_STEPS = 60
+# A capture posture is reached by ramping the joint targets at no more than this speed (rad/s), one interpolated
+# target per control step: a step change of the targets makes the position controller slam the arms, which shakes
+# the whole robot and can shift the objects the capture is about to look at. Well under the arm joints' 7 rad/s.
+CAPTURE_MAX_JOINT_VEL = 0.6
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
@@ -1032,6 +1036,33 @@ class R1ProSim(TiptopSim):
                 return solution
         return None
 
+    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int) -> int:
+        """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
+        than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
+        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``. Returns the
+        number of ramp steps."""
+        now = self.robot.get_joint_positions()
+        names = list(self.planned_joints) + list(posture)
+        start = [float(now[self.joint_index[j]]) for j in names]
+        goal = [float(v) for v in q_arm] + [float(posture[j]) for j in posture]
+        path = joint_ramp(start, goal, CAPTURE_MAX_JOINT_VEL * self.dt)
+        k = len(self.planned_joints)
+        idx = [self.joint_index[j] for j in names]
+        last, fastest = np.asarray(start), 0.0
+        for q in path:
+            self.posture = {j: float(v) for j, v in zip(posture, q[k:])}
+            self.step(q[:k], gripper)
+            measured = self.robot.get_joint_positions()[idx].cpu().numpy().astype(np.float64)
+            fastest = max(fastest, float(np.abs(measured - last).max()) / self.dt)
+            last = measured
+        self.posture = {j: float(v) for j, v in posture.items()}
+        self.hold(settle_steps, gripper, q_arm=[float(v) for v in q_arm])
+        log.info(
+            f"joints ramped over {len(path)} steps at up to {CAPTURE_MAX_JOINT_VEL} rad/s commanded, "
+            f"{fastest:.2f} rad/s measured, then {settle_steps} settle steps"
+        )
+        return len(path)
+
     def capture(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
         (``wrist_look``: what the base pose was chosen for, at the hand that holds it once it has been picked up;
@@ -1076,8 +1107,7 @@ class R1ProSim(TiptopSim):
         if not moved:
             return super().capture(task)
         original = self.posture
-        self.posture = posture
-        self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=look)
+        self.ramp_to(look, posture, self.last_gripper, LOOK_SETTLE_STEPS)
         now = self.robot.get_joint_positions()
         for arm, targets in moved.items():
             lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
@@ -1085,8 +1115,7 @@ class R1ProSim(TiptopSim):
                 log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
         request, extras = super().capture(task)
         self._log_wrist_framing(request, moved)
-        self.posture = original
-        self.hold(LOOK_SETTLE_STEPS, self.last_gripper, q_arm=ready)
+        self.ramp_to(ready, original, self.last_gripper, LOOK_SETTLE_STEPS)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:

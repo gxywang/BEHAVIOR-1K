@@ -624,3 +624,15 @@ def test_step_counts_and_scores_only_while_the_episode_is_open():
     TiptopSim.step(sim, [0.0, 0.0], 1.0)  # the tail: not counted, not scored, no EpisodeOver
     assert sim.n_steps == 2 and len(fed) == 2
     assert TiptopSim.frame_caption(sim) == "round 1\nstep 2/10"
+
+
+def test_joint_ramp_bounds_every_step_and_ends_on_the_goal():
+    from omnigibson.tiptop.protocol import joint_ramp
+
+    path = joint_ramp([0.0, 1.0, -0.5], [1.5, 1.0, -0.2], max_step=0.02)
+    assert path.shape == (75, 3) and path.dtype == np.float32
+    assert np.allclose(path[-1], [1.5, 1.0, -0.2])
+    steps = np.diff(np.vstack([[0.0, 1.0, -0.5], path]), axis=0)
+    assert np.abs(steps).max() <= 0.02 + 1e-6 and np.allclose(steps[:, 1], 0.0)
+    assert joint_ramp([0.3], [0.3], 0.02).shape == (1, 1)  # already there: one step, the goal itself
+    assert np.allclose(joint_ramp([0.0], [0.05], 0.1), [[0.05]])  # a small move is one step

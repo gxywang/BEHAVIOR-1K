@@ -494,10 +494,13 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then closer to the shoulder; nine targets in ten in either
   torso posture, and outside the head camera's frame) looking at the look target: the objects the base pose was
   chosen for, or the hand that holds one of them once it is picked up;
-  both arms move in one 60-step settle and return in another, so a capture
-  costs what the old swing-out did. An arm more than 0.03 rad short of its pose after settling is logged as
-  blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm swings out of
-  view as before (`LOOK_ARM`); `--no-look` disables all of it.
+  both arms move together and return together. The joint targets are ramped, never stepped: every joint moves at
+  no more than `CAPTURE_MAX_JOINT_VEL` (0.6 rad/s, one interpolated target per control step, `ramp_to`), then the
+  arms settle for 60 steps; a stepped target made the position controller slam the arms, which shook the robot and
+  could shift the objects the capture was about to look at (2026-09-11). The log line "joints ramped over N steps
+  ... measured" reports the fastest joint seen. An arm more than 0.03 rad short of its pose after settling is
+  logged as blocked and captured anyway; a held arm never moves; when no configuration exists the planned arm
+  swings out of view as before (`LOOK_ARM`, ramped too); `--no-look` disables all of it.
 - **Workspace** (`WORKSPACE_NEAR`, `TiptopSim.workspace`). Every request carries the box the planner crops each
   view to: x from 0.35 m ahead of the base frame to 1.3 m, |y| ≤ 0.8 m, z from the tabletop (0.25 m) or the floor
   (-0.05 m, when the target stands on it) to 1.6 m. The near edge is past the base (its front collision spheres
