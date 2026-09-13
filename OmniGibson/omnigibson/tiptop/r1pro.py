@@ -1377,8 +1377,11 @@ class R1ProSim(TiptopSim):
         joints = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         ik = self.arm_ik(arm)
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
         shoulder, _ = self.to_base(*self.robot.links[self.robot.arm_link_names[arm][0]].get_position_orientation())
         seed = [float(q[self.joint_index[j]]) for j in joints]
+        here = np.asarray(seed, dtype=np.float64)
+        candidates = []
         for offset in LOOK_OFFSETS:
             eye, cam_quat = look_pose(target, shoulder.cpu().numpy(), side=1 if arm == "left" else -1, offset=offset)
             solution = ik.solve(*link_pose_for_camera(eye, cam_quat, self.camera_in_link[arm]), seed=seed)
@@ -1390,10 +1393,6 @@ class R1ProSim(TiptopSim):
                     f"{arm} arm: look offset {offset} puts {inside} within {BASE_CLEARANCE} m of the base; skipped"
                 )
                 continue
-            blocked = self.links_in_scene(arm, ik, solution, aabbs)
-            if blocked:
-                log.info(f"{arm} arm: look offset {offset} puts {blocked}; skipped")
-                continue
             in_the_way = self.links_before_camera(arm, ik, solution, target)
             if in_the_way:
                 log.info(
@@ -1401,8 +1400,23 @@ class R1ProSim(TiptopSim):
                     "skipped (the head view would lose it to the self-mask)"
                 )
                 continue
-            return solution
-        return None
+            # How much of the arm passes within ARM_RADIUS of the furniture on the way there and back. Not a
+            # rejection: the arm is near the furniture it works at whatever it does, so the offsets are ranked
+            # and the roomiest is taken. The runs of 2026-09-13 show what the unranked choice costs -- the first
+            # offset that solved was taken, and the arm met a desk on the way to it.
+            touched, objects = self.path_contacts(arm, ik, here, solution, aabbs)
+            candidates.append((touched, len(candidates), offset, solution, objects))
+        if not candidates:
+            return None
+        touched, _, offset, solution, objects = min(candidates)
+        if touched:
+            log.info(
+                f"{arm} arm: look offset {offset} is the roomiest of {len(candidates)}, and still takes the arm "
+                f"within {ARM_RADIUS} m of {objects} at {touched} point(s) on the way"
+            )
+        elif len(candidates) > 1:
+            log.info(f"{arm} arm: look offset {offset} chosen, clear of the scene the whole way")
+        return solution
 
     def base_box(self) -> np.ndarray:
         """(min, max) corners of base_link's collision bounding box in the base frame, inflated by nothing."""
@@ -1520,6 +1534,45 @@ class R1ProSim(TiptopSim):
         if cached is None or cached[0] != stamp:
             self._scene_meshes[obj.name] = (stamp, self.trimesh_world(obj))
         return self._scene_meshes[obj.name][1]
+
+    def path_contacts(self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES) -> tuple:
+        """How much of the arm comes within ``ARM_RADIUS`` of the scene along the straight joint-space path from
+        ``q_from`` to ``q_to``: (number of arm sample points that do, the objects they belong to).
+
+        A count rather than a verdict, because there is no honest threshold: at the ready posture in front of a
+        desk the arm is already within 6 cm of it (measured 2026-09-13, scratchpad/arm_clearance.py), and a robot
+        working at a desk is *supposed* to be near it. Ranking candidate look poses by this number picks the one
+        with the most room without ever deciding that none of them is usable.
+
+        One mesh query per nearby object for the whole path: the meshes are cached (``scene_mesh``) but preparing
+        one for a query is not, so the arm's points for every sampled configuration go in together.
+        """
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        held = {self.objects[label] for label in self.hands() if label in self.objects}
+        points, boxes = [], []
+        for t in np.linspace(0.0, 1.0, max(2, samples)):
+            arm_points = self.arm_points(arm, ik, q_from + t * (q_to - q_from))
+            if not arm_points:
+                continue
+            points.append(sample_polyline(arm_points, ARM_SAMPLE_STEP))
+            boxes.append(arm_points)
+        if not points:
+            return 0, []
+        samples_all = np.concatenate(points)
+        touched, objects = 0, []
+        for obj, lo, hi in aabbs:
+            if obj in held or not any(polyline_hits_box(b, lo, hi, ARM_RADIUS) for b in boxes):
+                continue
+            try:
+                near = points_within_tol(self.scene_mesh(obj), samples_all, ARM_RADIUS)
+            except Exception:
+                continue  # no mesh to measure against; the box alone decides nothing (see arm_hits_scene)
+            if near.any():
+                touched += int(near.sum())
+                objects.append(obj.name)
+        return touched, objects
 
     def path_hits_scene(self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES) -> list[str]:
         """Scene objects the arm reaches into anywhere along the straight joint-space path from ``q_from`` to
