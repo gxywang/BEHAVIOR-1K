@@ -561,6 +561,11 @@ Reading the options is cheap where it matters: the demand is complete after the 
 every container), and the read is capped at `GOAL_OPTIONS_READ` for goals with many (assembling_gift_baskets
 has 331,776, putting_away_toys 256, the two disposal tasks 1).
 
+**Reading a run.** `scripts/read_run.py runs/<dir> [log]` prints the score per instance, what was left
+unsatisfied, and the counts the pipeline writes about its own trouble: rounds executed and lost, blocked capture
+swings, an arm on the head camera's line of sight, views dropped for holding nothing but the robot, stances that
+framed nothing whole, and where each object a capture could not see actually was. No simulator, no GPU.
+
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
 already exercised. What the first runs of `dispose_of_batteries` and `putting_away_toys` cost (2026-09-12) says
