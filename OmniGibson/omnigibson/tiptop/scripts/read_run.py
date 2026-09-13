@@ -28,6 +28,8 @@ if summary:
         gap = summary["mean_q_score"] - float(known["mean"])
         verdict = "BETTER than" if gap > 1e-9 else ("WORSE than" if gap < -1e-9 else "level with")
         same = int(known.get("instance_count", -1)) == int(summary["instances"])
+        if known.get("stale"):
+            print(f"    NOTE: that baseline is marked stale -- {known['note'][:150]}")
         print(
             f"  {verdict} the best on record ({float(known['mean']):.4f}, {known['run']}, "
             f"instances {known['instances'] or '-'})"

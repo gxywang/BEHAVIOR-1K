@@ -14,15 +14,16 @@
     "run": "pass 6",
     "instances": "301-310",
     "date": "2026-09-11",
-    "note": "ten instances; the button pose is oracle",
-    "instance_count": 10
+    "note": "STALE, do not compare against it: pass 6 ran on 2026-09-10 06:59 and the capture speed cap (CAPTURE_MAX_JOINT_VEL, commit 6cf430432) landed 2026-09-11 00:27, so this number was measured with observation swings that slammed the arms at the joints' full speed. Re-measure before using it.",
+    "instance_count": 10,
+    "stale": true
   },
   "assembling_gift_baskets": {
     "mean": 0.881,
     "run": "runs/bench_baskets_pass6",
     "instances": "301-310",
     "date": "2026-09-11",
-    "note": "single instance best: 0.875 on 301 in the 2026-09-12 regression",
+    "note": "single instance best: 0.875 on 301 in the 2026-09-12 regression Check the date against commit 6cf430432 (the capture speed cap, 2026-09-11 00:27) before comparing: a pass that predates it was measured with uncapped observation swings.",
     "instance_count": 10
   },
   "dispose_of_batteries": {
