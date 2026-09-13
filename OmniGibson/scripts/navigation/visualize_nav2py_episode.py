@@ -2,13 +2,16 @@
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import omnigibson as og
+import omnigibson.lazy as lazy
 
 import run_nav2py_benchmark as runner
 from generate_nav_benchmark import build_env_config, load_robot_config, seed_everything
 from omnigibson.macros import gm
+from omnigibson.utils.ui_utils import KeyboardEventHandler
 
 
 DEFAULT_OUTPUT = "outputs/navigation/interactive_nav2py_result.json"
@@ -54,22 +57,44 @@ def command_text(command):
     return f"vx={velocity.vx:.3f} vy={velocity.vy:.3f} wz={velocity.wz:.3f}"
 
 
-def wait_for_control_step(step, now, state, command, executed_command):
-    del state, command
-    try:
-        input(
-            f"\nStep {step:04d}  t={now:.2f}s  command: {command_text(executed_command)}\n"
-            "Press Enter to send this command..."
-        )
-    except EOFError as exc:
-        raise RuntimeError("Interactive visualization requires a terminal that can receive Enter key presses.") from exc
+class VisualizationClosed(Exception):
+    pass
 
 
-def wait_until_ready():
-    try:
-        input("\nStart pose is loaded and settled. Press Enter to begin stepping navigation...")
-    except EOFError as exc:
-        raise RuntimeError("Interactive visualization requires a terminal that can receive Enter key presses.") from exc
+class VisualStepGate:
+    """Keeps Kit rendering while the user inspects the current navigation state."""
+
+    def __init__(self):
+        self.advance_requested = False
+        self.closed = False
+
+    def advance(self):
+        self.advance_requested = True
+
+    def close(self):
+        self.closed = True
+
+    def wait(self, message):
+        self.advance_requested = False
+        print(f"\n{message}\nClick the OmniGibson viewport, then press N for the next step. Press Esc to close.")
+        while not self.advance_requested and not self.closed:
+            og.sim.render()
+            time.sleep(0.01)
+        if self.closed:
+            raise VisualizationClosed
+
+    def wait_until_ready(self):
+        self.wait("Start pose is loaded and settled.")
+
+    def wait_for_control_step(self, step, now, state, command, executed_command):
+        del state, command
+        self.wait(f"Step {step:04d}  t={now:.2f}s  command: {command_text(executed_command)}")
+
+    def wait_until_closed(self):
+        print("\nRun complete. Inspect the viewer; press Esc in the viewport to close.")
+        while not self.closed:
+            og.sim.render()
+            time.sleep(0.01)
 
 
 def main(argv=None):
@@ -109,6 +134,11 @@ def main(argv=None):
 
     try:
         env = og.Environment(configs=cfg)
+        gate = VisualStepGate()
+        KeyboardEventHandler.add_keyboard_callback(lazy.carb.input.KeyboardInput.N, gate.advance)
+        KeyboardEventHandler.add_keyboard_callback(lazy.carb.input.KeyboardInput.ESCAPE, gate.close)
+        camera_mover = og.sim.enable_viewer_camera_teleoperation()
+        camera_mover.set_delta(0.5)
         robot = env.robots[0]
         if robot.model in ("r1", "r1pro"):
             og.sim.stop()
@@ -134,8 +164,8 @@ def main(argv=None):
             command_limits,
             nav2py_api,
             args,
-            after_reset=wait_until_ready,
-            before_control_step=wait_for_control_step,
+            after_reset=gate.wait_until_ready,
+            before_control_step=gate.wait_for_control_step,
         )
         output = runner.write_results(
             args.output,
@@ -151,7 +181,9 @@ def main(argv=None):
             f"final_distance={result['final_distance']:.3f}m state={result['nav2py_state']}"
         )
         print(f"Saved result to: {Path(output)}")
-        runner.keep_viewer_open(args.keep_open_seconds)
+        gate.wait_until_closed()
+    except VisualizationClosed:
+        print("\nVisualization closed.")
     finally:
         og.shutdown()
 
