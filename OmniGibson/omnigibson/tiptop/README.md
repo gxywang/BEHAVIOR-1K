@@ -112,6 +112,13 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     views and the simulator's verdicts. A first run of the finger-width hand gate the same afternoon called every
     candle and bow pick a miss (the fingers close through an attached object under sticky grasping) and was
     stopped after 36 rounds; the localization gate replaced it.
+  - regression after the 2026-09-12 changes (`runs/bench_baskets_regress1`, instance 301, the goal-driven runner,
+    the capture stopping on contact, the ahead-based stance test, wrist views, own verdicts): **0.875** (14/16),
+    34 teleports, 28,585 of 39,090 env steps. The two losses are the known bow problem: bow_4 found no base pose
+    twice, bow_3 was picked twice without ending in the hand. One round hit `Shrunk OBB`, one a hidden object,
+    and the retry covered both. On this instance pass 5 scored 0.9375 with the simulator's verdicts and the gate
+    test 0.8125 with head yaw views, so the changes cost nothing measurable here; the run was slower per round
+    (78-228 s) because a second benchmark shared the machine.
   - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
     reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
     about 16k of the 39k allowed env steps per instance.
