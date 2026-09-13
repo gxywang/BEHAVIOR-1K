@@ -202,12 +202,19 @@ def openable_joints(obj) -> list:
     return out
 
 
-def handle_point(link, axis, opening_sign: float) -> np.ndarray:
-    """A point to take hold of on a moving link: the middle of the face that leads when the joint opens.
+def handle_point(link, axis, opening_sign: float, grip: str = "face", inset: float = 0.015) -> np.ndarray:
+    """A point to take hold of on a moving link, and there is rarely anything built to take hold of.
 
-    Nothing in the dataset marks a handle, so this takes the link's own box and steps to the face furthest along
-    the direction the link travels -- the drawer front, the door's swinging edge -- which is where a handle is when
-    there is one and a reasonable place to push or pull when there is not.
+    Nothing in the BEHAVIOR assets marks a handle: `bottom_cabinet/slgzfc/misc/metadata.json`, the cabinet of
+    store_honey, has link_tags {link_1..4: ["openable"]} and nothing else, and its drawer fronts are flat panels.
+    So two grips are offered and the caller tries both:
+
+    ``face``   the middle of the face that leads when the joint opens -- the drawer front, the door's swinging
+               edge. Right when a handle protrudes there, and impossible on a flat panel, since a parallel jaw
+               has nothing to close on.
+    ``edge``   the middle of the leading face's TOP edge, ``inset`` below the top surface, which a parallel jaw
+               can pinch: it comes down over the panel and closes across its thickness. This is the one that can
+               work on a flat drawer front.
     """
     lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.aabb)
     centre = (lo + hi) / 2.0
@@ -217,4 +224,7 @@ def handle_point(link, axis, opening_sign: float) -> np.ndarray:
         return centre
     a = a / n * (1.0 if opening_sign >= 0 else -1.0)
     half = (hi - lo) / 2.0
-    return centre + a * float(np.abs(half @ a))
+    point = centre + a * float(np.abs(half @ a))
+    if grip == "edge":
+        point[2] = float(hi[2]) - float(inset)
+    return point

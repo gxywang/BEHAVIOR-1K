@@ -164,3 +164,20 @@ def test_a_degenerate_pull_direction_just_offers_what_the_hand_has():
     from omnigibson.tiptop.articulation import grasp_orientations
 
     assert len(grasp_orientations(np.eye(3), [0.0, 0.0, 0.0])) == 1
+
+
+def test_the_edge_grip_aims_at_the_top_of_the_panel_and_the_face_grip_at_its_middle():
+    """No BEHAVIOR asset marks a handle: store_honey's cabinet is four flat drawer fronts tagged only "openable".
+
+    A parallel jaw has nothing to close on at the middle of a flat face, but it can come down over the panel's top
+    edge and close across its thickness, so both are offered and the caller tries the edge first.
+    """
+    from omnigibson.tiptop.articulation import handle_point
+
+    drawer = _Link([0.0, -0.25, 0.50], [0.5, 0.25, 0.65])  # 15 cm tall front, opening along +x
+    face = handle_point(drawer, [1.0, 0.0, 0.0], opening_sign=+1.0, grip="face")
+    edge = handle_point(drawer, [1.0, 0.0, 0.0], opening_sign=+1.0, grip="edge")
+    assert face[0] == pytest.approx(0.5) and edge[0] == pytest.approx(0.5), "both on the leading face"
+    assert face[2] == pytest.approx(0.575), "the face grip aims at the middle of the panel"
+    assert edge[2] == pytest.approx(0.635), "the edge grip aims just below its top, where a jaw can pinch"
+    assert edge[2] < 0.65, "and inside the panel, not in the air above it"
