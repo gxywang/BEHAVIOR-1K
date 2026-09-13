@@ -94,7 +94,7 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "--views",
         nargs="*",
         default=["left_wrist", "right_wrist"],
-        choices=["head", "left_wrist", "right_wrist", "head_left", "head_right"],
+        choices=["head", "left_wrist", "right_wrist", "head_left", "head_right", "head_up", "head_down"],
         metavar="VIEW",
         help="further cameras captured with the primary one, fused by the planner into one scene ('--views' alone: "
         "the primary camera only)",

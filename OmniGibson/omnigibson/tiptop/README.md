@@ -523,7 +523,8 @@ set-up `--place OBJ:SUPPORT[:DX,DY]`, `--spawn PRESET:SUPPORT[:DX,DY]`, `--scene
 `--stand-for [ITEM,...,]TARGET` | `--near FURNITURE [--side] [--standoff]` | `--robot-pose X Y YAW`; the posture
 `--torso J1 J2 J3 J4`, `--no-look`; the capture `--camera head|left_wrist|right_wrist` (the primary view),
 `--views VIEW ...` (the further views, default both wrists; `head_left` / `head_right`: the head camera with the
-torso turned +-29°, see "Look poses"; `--views` alone: the primary only), `--head-aperture`,
+torso turned +-29°; `head_up` / `head_down`: the torso leaned +-17°, which moves the camera about 15 cm, see
+"Look poses"; `--views` alone: the primary only), `--head-aperture`,
 `--seg-instance`;
 what the planner is told `--knowledge oracle|onboard`; the goal `--goal "pred(a,b);..."` (BDDL names with
 `--activity`), `--task`; execution
@@ -608,11 +609,17 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (0.1 rad) from its target is logged as pushing against something. An arm more than 0.03 rad short of its pose
   after settling is logged as blocked and captured anyway; a held arm never moves; when no configuration exists
   the planned arm swings out of view as before (`LOOK_ARM`, ramped too); `--no-look` disables all of it.
-  **Turned head views** (`--views head_left head_right`, `HEAD_YAW_VIEWS`) are the alternative to swinging the
-  wrist cameras: after the primary and the wrist views, the torso's yaw joint (`torso_joint4`, planned, so it is
-  ramped through `q_arm` with the arms as they are) is ramped to +0.5 rad, the head view rendered, then to
-  -0.5 rad and rendered again, then back to 0, each ramp at the capture speed with 30 settle steps
-  (`_capture_views`, `yawed_joints`). 0.5 rad is about 29°, so the three head views span roughly 150° with the
+  **Moved head views** (`--views head_left head_right` or `--views head_up head_down`, `HEAD_VIEWS`) are the
+  alternative to swinging the wrist cameras, and need no room beside the robot: after the primary and the wrist
+  views, one planned torso joint is ramped off the capture posture, the head view is rendered, and the joint is
+  ramped back, each ramp at the capture speed with 30 settle steps (`_capture_views`, `turned_joints`). Two
+  joints are offered. **Yaw** (`head_left`, `head_right`, `torso_joint4` ±0.5 rad) rotates the link the camera
+  sits on, so it re-aims the camera from the same place: the camera is 9 cm off that axis and travels about 4 cm,
+  which is a wider field of view but hardly a second viewpoint. **Pitch** (`head_up`, `head_down`,
+  `torso_joint3` ±0.3 rad, added 2026-09-12) leans the 0.48 m mast the camera stands on, so the camera moves
+  about 15 cm as well as tilting: that is what shows the inside of a container or the top of a low object from
+  two angles. Neither has a benchmark pass yet; the yaw pair has one instance (0.8125, see Results).
+  0.5 rad is about 29°, so the three yaw views span roughly 150° with the
   99° head camera; the base does not turn, so each view's camera pose (read from the simulator as it is rendered)
   is right in the base frame as it is, and the oracle masks come from that pose per view. The joint's axis is
   `torso_link4`'s z, which leans with the torso: in the challenge posture it is 23° off the base's z, so the

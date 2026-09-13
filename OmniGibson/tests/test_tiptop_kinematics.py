@@ -14,7 +14,7 @@ from omnigibson.tiptop.kinematics import (
     matrix_pose,
     pose_matrix,
 )
-from omnigibson.tiptop.r1pro import HEAD_YAW_JOINT, HEAD_YAW_VIEWS, yawed_joints
+from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, turned_joints
 
 URDF = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro/urdf/r1pro.urdf"
 LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 8)]
@@ -84,17 +84,20 @@ def test_lula_solves_a_look_pose_for_the_left_wrist_camera():
     assert ik.solve([3.0, 0.0, 0.0], quat, seed=Q_HOME) is None  # out of reach
 
 
-def test_yawed_joints_turns_the_torso_yaw_and_nothing_else():
-    """A head view turns torso_joint4 (a planned joint) to the view's yaw; the rest of the capture posture stays."""
+def test_a_head_view_moves_one_torso_joint_and_nothing_else():
+    """A head view moves one planned torso joint off the capture posture: yaw re-aims the camera, pitch leans the
+    mast it sits on. Everything else in the posture stays."""
     q = [1.2, -1.7, -0.9, 0.0, *Q_HOME]
-    i = (TORSO + LEFT_ARM).index(HEAD_YAW_JOINT)
-    for name, yaw in HEAD_YAW_VIEWS.items():
-        turned = yawed_joints(TORSO + LEFT_ARM, q, yaw)
-        assert turned[i] == yaw, name
-        assert turned[:i] == q[:i] and turned[i + 1 :] == q[i + 1 :]
-    assert q[i] == 0.0  # the input is left alone
-    assert HEAD_YAW_VIEWS["head_left"] == -HEAD_YAW_VIEWS["head_right"] > 0  # left is a positive yaw about z
+    for name, (joint, delta) in HEAD_VIEWS.items():
+        i = (TORSO + LEFT_ARM).index(joint)
+        turned = turned_joints(TORSO + LEFT_ARM, q, joint, delta)
+        assert turned[i] == pytest.approx(q[i] + delta), name
+        assert turned[:i] == q[:i] and turned[i + 1 :] == q[i + 1 :], name
+    assert q == [1.2, -1.7, -0.9, 0.0, *Q_HOME]  # the input is left alone
+    assert HEAD_VIEWS["head_left"][1] == -HEAD_VIEWS["head_right"][1] > 0  # left is a positive yaw about z
+    assert HEAD_VIEWS["head_up"][1] == -HEAD_VIEWS["head_down"][1] > 0
+    assert HEAD_VIEWS["head_up"][0] != HEAD_VIEWS["head_left"][0]  # pitch and yaw are different joints
     with pytest.raises(ValueError):  # an embodiment that locks the torso cannot turn it through q_arm
-        yawed_joints(LEFT_ARM, Q_HOME, 0.5)
+        turned_joints(LEFT_ARM, Q_HOME, HEAD_YAW_JOINT, 0.5)
     with pytest.raises(ValueError):
-        yawed_joints(TORSO + LEFT_ARM, Q_HOME, 0.5)
+        turned_joints(TORSO + LEFT_ARM, Q_HOME, HEAD_YAW_JOINT, 0.5)
