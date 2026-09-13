@@ -345,7 +345,8 @@ def log_missing_objects(sim, request: dict, extras: dict, atoms: list[dict]) -> 
     names = {sim.tracked_label(a) for atom in atoms for a in atom["args"]}
     for label in sorted(names & set(poses)):
         point = np.asarray(poses[label]["aabb_center"], dtype=np.float64)
-        for name, view, _ in capture_views(request, extras):
+        sim_name = sim.objects[label].name if label in sim.objects else label
+        for name, view, view_extras in capture_views(request, extras):
             depth = np.asarray(view["depth"], dtype=np.float64)
             h, w = depth.shape
             px, z = points_to_pixels([point], view["intrinsics"], view["world_from_cam"])
@@ -357,6 +358,29 @@ def log_missing_objects(sim, request: dict, extras: dict, atoms: list[dict]) -> 
                 + ("inside the image" if inside else "OUTSIDE the image")
                 + f", depth there {seen}"
             )
+            # What the renderer itself says. The pose above and the picture can disagree: on 2026-09-13 a battery
+            # projected 0.48 m from the head camera onto a cabinet whose top was empty in the rgb, with the depth
+            # at that pixel reading 0.90 m. Isaac's instance segmentation settles which of the two is wrong --
+            # the object's own pixels are where it was really drawn, if it was drawn at all.
+            seg = (view_extras or {}).get("seg_instance")
+            id_to_name = (view_extras or {}).get("id_to_name") or {}
+            if seg is None:
+                continue
+            seg = np.asarray(seg)
+            ids = [i for i, n in id_to_name.items() if n == sim_name]
+            drawn = np.isin(seg, ids) if ids else np.zeros(seg.shape, dtype=bool)
+            here = id_to_name.get(int(seg[int(v), int(u)]), "?") if inside else "-"
+            if drawn.any():
+                ys, xs = np.nonzero(drawn)
+                log.warning(
+                    f"    the renderer drew {sim_name} at pixel ({xs.mean():.0f}, {ys.mean():.0f}) with "
+                    f"{int(drawn.sum())} pixels in this view; at the projected pixel it drew {here!r}"
+                )
+            else:
+                log.warning(
+                    f"    the renderer drew no pixels of {sim_name} in this view at all; at the projected pixel "
+                    f"it drew {here!r}"
+                )
 
 
 def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bool = False) -> tuple[dict, dict]:
