@@ -852,10 +852,13 @@ def run_episode(
     command_limits,
     nav2py_api,
     args,
+    after_env_reset=None,
     after_reset=None,
     before_control_step=None,
 ):
     env.reset(get_obs=False)
+    if after_env_reset is not None:
+        after_env_reset()
     place_robot(robot, episode)
     update_viewer_camera(robot, args)
 

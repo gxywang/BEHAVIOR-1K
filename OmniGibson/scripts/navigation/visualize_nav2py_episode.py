@@ -1,6 +1,7 @@
 """Interactively step through one saved navigation benchmark episode in the OmniGibson viewer."""
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -118,6 +119,59 @@ def add_goal_marker(env, episode):
     return marker, position
 
 
+def restore_tro_state(env, episode):
+    tro_path = Path(episode["tro_state_path"])
+    template_path = Path(episode["template_path"])
+    if not tro_path.is_file():
+        raise FileNotFoundError(f"TRO state file does not exist: {tro_path}")
+    if not template_path.is_file():
+        raise FileNotFoundError(f"Task template file does not exist: {template_path}")
+
+    with open(tro_path, "r", encoding="utf-8") as f:
+        tro_state = json.load(f)
+    with open(template_path, "r", encoding="utf-8") as f:
+        inst_to_name = json.load(f)["metadata"]["task"]["inst_to_name"]
+
+    restored = []
+    for bddl_name, state in tro_state.items():
+        if bddl_name == "robot_poses" or not isinstance(state, dict):
+            continue
+        root_link = state.get("root_link")
+        object_name = inst_to_name.get(bddl_name)
+        if root_link is None or object_name is None:
+            continue
+        obj = env.scene.object_registry("name", object_name)
+        if obj is None:
+            continue
+        obj.set_position_orientation(
+            position=th.tensor(root_link["pos"], dtype=th.float32),
+            orientation=th.tensor(root_link["ori"], dtype=th.float32),
+        )
+        obj.set_linear_velocity(th.zeros(3))
+        obj.set_angular_velocity(th.zeros(3))
+        if state.get("non_kin"):
+            obj.load_non_kin_state({"non_kin": state["non_kin"]})
+        restored.append(object_name)
+
+    target_bddl = episode["target_bddl_instance"]
+    target_state = tro_state.get(target_bddl, {})
+    target_position = target_state.get("root_link", {}).get("pos")
+    target_name = episode["target_object_name"]
+    target = env.scene.object_registry("name", target_name)
+    if target_position is None or target is None:
+        raise RuntimeError(f"Could not restore target {target_name} from TRO state {tro_path}")
+
+    actual_position, _ = target.get_position_orientation()
+    restore_error = runner.xy_distance(actual_position[:2], target_position[:2])
+    if restore_error > 0.02:
+        raise RuntimeError(f"Restored {target_name} differs from its TRO position by {restore_error:.3f} m")
+    goal_distance = runner.xy_distance(episode["goal_position"][:2], target_position[:2])
+    print(
+        f"Restored {len(restored)} TRO objects; {target_name} matches its TRO pose. "
+        f"Goal is {goal_distance:.3f} m from the target center."
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
     if gm.HEADLESS or gm.REMOTE_STREAMING:
@@ -181,6 +235,9 @@ def main(argv=None):
             goal_marker.set_position_orientation(position=goal_marker_position)
             gate.wait_until_ready()
 
+        def after_env_reset():
+            restore_tro_state(env, episode)
+
         result = runner.run_episode(
             env,
             robot,
@@ -191,6 +248,7 @@ def main(argv=None):
             command_limits,
             nav2py_api,
             args,
+            after_env_reset=after_env_reset,
             after_reset=after_reset,
             before_control_step=gate.wait_for_control_step,
         )
