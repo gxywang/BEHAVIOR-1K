@@ -7,14 +7,17 @@ from pathlib import Path
 
 import omnigibson as og
 import omnigibson.lazy as lazy
+import torch as th
 
 import run_nav2py_benchmark as runner
 from generate_nav_benchmark import build_env_config, load_robot_config, seed_everything
 from omnigibson.macros import gm
+from omnigibson.objects.primitive_object import PrimitiveObject
 from omnigibson.utils.ui_utils import KeyboardEventHandler
 
 
 DEFAULT_OUTPUT = "outputs/navigation/interactive_nav2py_result.json"
+GOAL_MARKER_HEIGHT = 0.06
 
 
 def option_was_supplied(option, argv):
@@ -99,6 +102,22 @@ class VisualStepGate:
             time.sleep(0.01)
 
 
+def add_goal_marker(env, episode):
+    marker = PrimitiveObject(
+        relative_prim_path="/interactive_nav_goal_marker",
+        name="interactive_nav_goal_marker",
+        primitive_type="Cylinder",
+        radius=0.15,
+        height=GOAL_MARKER_HEIGHT,
+        visual_only=True,
+        rgba=th.tensor([0.0, 0.7, 1.0, 0.85]),
+    )
+    env.scene.add_object(marker)
+    position = th.tensor(episode["goal_position"], dtype=th.float32)
+    position[2] = env.scene.get_floor_height(int(episode.get("floor", 0))) + GOAL_MARKER_HEIGHT / 2.0
+    return marker, position
+
+
 def main(argv=None):
     args = parse_args(argv)
     if gm.HEADLESS or gm.REMOTE_STREAMING:
@@ -142,6 +161,7 @@ def main(argv=None):
         camera_mover = og.sim.enable_viewer_camera_teleoperation()
         camera_mover.set_delta(0.5)
         robot = env.robots[0]
+        goal_marker, goal_marker_position = add_goal_marker(env, episode)
         if robot.model in ("r1", "r1pro"):
             og.sim.stop()
             robot.base_footprint_link.mass = 250.0
@@ -156,6 +176,11 @@ def main(argv=None):
 
         print(f"\nLoaded {episode['episode_id']}.")
         print(f"Success criterion: {runner.format_success_criterion(args, robot)}")
+
+        def after_reset():
+            goal_marker.set_position_orientation(position=goal_marker_position)
+            gate.wait_until_ready()
+
         result = runner.run_episode(
             env,
             robot,
@@ -166,7 +191,7 @@ def main(argv=None):
             command_limits,
             nav2py_api,
             args,
-            after_reset=gate.wait_until_ready,
+            after_reset=after_reset,
             before_control_step=gate.wait_for_control_step,
         )
         output = runner.write_results(
