@@ -143,9 +143,15 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     simulated one. A floor object seen once, from 0.5 m at a steep angle, gives a point cloud of its near face
     only, so the hull's centre sits toward the camera; on a 15 cm candle that is a rounding error, on a toy
     figure it is the whole object.
-  - The first attempt also ended 0.33 rad short of the planned grasp: reaching the floor asks `torso_joint2` to
-    swing a radian and the arm trailed its target the whole way. The executor now names the joint that fell
-    short.
+  - The first attempt also ended 0.33 rad short of the planned grasp, and once the executor started naming the
+    joint (`runs/bench_toys_head2`) the reason was plain: **the torso cannot hold what the planner asks for near
+    the floor.** A grasp of a toy 0.5 m ahead wants `torso_joint2` at +0.42 rad, 2.1 rad from the challenge
+    posture's -1.7, and the joint stops 0.80 rad short and stays there through three seconds of holding the
+    target. The pose is inside the URDF's limits (-2.79 to 2.53) but outside what the position controller holds
+    against gravity with the arm extended, and cuRobo plans against joint limits, not torque. Sometimes the same
+    stance draws a grasp the torso can hold and the pick works at the first try; that is the variance between the
+    two head-view runs. The fix belongs in the planner's robot description: measure the torso range the robot
+    actually holds under load and give the planner that, rather than the URDF's.
   - The living room stops the capture swings (a sofa, a coffee table and a room light around the toys), so the
     instance used up its allowance of blocked swings and stopped posing the wrist cameras -- and then could not
     see what it was carrying, because the free arm's wrist camera is what looks at the hand. Every place round of
