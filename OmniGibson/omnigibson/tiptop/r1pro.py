@@ -1142,6 +1142,40 @@ class R1ProSim(TiptopSim):
             )
         return best, rejected
 
+    def hidden_from_here(self, names, aabbs=None) -> dict:
+        """For each object named, the scene objects standing between the head camera (as it is now) and it.
+
+        The stance search asks whether an object is in frame; this asks whether anything is in the way, which is a
+        different question and the one `battery_3` fails in every run of `dispose_of_batteries` -- it sits on a
+        cabinet whose own top edge hides it at the grazing angle a 1.26 m camera has on a 1.02 m surface. The box
+        is the prefilter and the object's mesh decides, as in ``arm_hits_scene``. An object's own support does not
+        false-positive: the ray to a thing standing on a surface stays above that surface until it arrives.
+        """
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        eye = self.base_to_world(self.head_camera_in_base()[1][:3, 3])
+        held = {self.objects[label] for label in self.hands() if label in self.objects}
+        out = {}
+        for name in names:
+            obj = self.scene_object(name)
+            target = obj.aabb_center.cpu().numpy().astype(np.float64)
+            blockers = []
+            for other, lo, hi in aabbs:
+                if other is obj or other in held or other.category in FLOOR_COVERINGS:
+                    continue
+                if not segment_hits_box(eye, target, lo, hi):
+                    continue
+                try:
+                    mesh = self.scene_mesh(other)
+                except Exception:
+                    blockers.append(other.name)  # no mesh; the box is all there is to go on
+                    continue
+                ray = sample_polyline([eye, target], ARM_SAMPLE_STEP)[:-1]  # not the target itself
+                if bool(points_within_tol(mesh, ray, 0.0).any()):
+                    blockers.append(other.name)
+            if blockers:
+                out[name] = blockers
+        return out
+
     def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9, avoid=()) -> dict:
         """Stand where every item and the target (the last name) are in the left arm's reach ("navigation done").
 
@@ -1180,6 +1214,13 @@ class R1ProSim(TiptopSim):
             f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m"
         )
         pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
+        hidden = self.hidden_from_here(names)
+        if hidden:
+            log.warning(
+                "from this stance the head camera's line to "
+                + ", ".join(f"{name} passes through {blockers}" for name, blockers in hidden.items())
+                + " -- the capture will see nothing of it unless another view does"
+            )
         centre = th.stack([o.aabb_center for o in objects]).mean(dim=0)  # what the wrist cameras look at
         self.look_target = self.to_base(centre, th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
         self.look_names = tuple(names)
