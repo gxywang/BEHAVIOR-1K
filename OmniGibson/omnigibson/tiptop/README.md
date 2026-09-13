@@ -204,6 +204,25 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     still right about what it tests, and its unit tests hold against the robot's measured camera; it is simply not
     what was losing these rounds. `log_blocked_sight` now reports, on every capture, which arm links stand on that
     line, so the next run says how often it happens instead of leaving it at one comparison.
+  - **Do the poses agree with the picture? Yes, to a pixel (2026-09-13).** Two failed captures, annotated with the
+    pixel the object's pose projects to, looked as though the pose and the render disagreed by about 22 cm -- in
+    one, a battery is plainly drawn 130 px from the cross. Checking it against the saved observations of three
+    captures that *worked* (`obs.h5` carries the depth, the masks and the camera; `capture.json` the poses) settles
+    it the other way:
+
+    | round | object | pose projects to | the renderer drew it at | gap |
+    | --- | --- | --- | --- | --- |
+    | `302 r01` | `battery_2` | (209, 522) | (209, 522), 414 px | **0.7 px** |
+    | `302 r07` | `battery_1` | (286, 560) | (286, 565), 700 px | **4.5 px** |
+    | `302 r03` | `desk_1` | (220, 420) | (531, 520), 16140 px | 327 px |
+
+    The projection is exact for the objects that matter. (A large object's gap is not an error: the centre of a
+    desk's box and the centroid of the pixels it fills are different points, and when the robot stands at it the
+    box centre projects off the image entirely.) So the annotated image was misread -- the battery drawn 130 px
+    away is a different object -- and the empty masks are genuine invisibility, not a frame bug. Two kinds show up
+    in the numbers: something in front of the object (depth 0.33 m at the pixel where the object is 0.53 m away)
+    and the object in the robot's own hand, hidden by its fingers (0.39 m out in mid air with the floor 1.00 m
+    behind it, and once 0.03 m from the lens).
   - So `dispose_of_batteries` loses its rounds to three separate things, each measured rather than guessed: the
     object below the head frame (fixed by the projection test), the object hidden behind the robot's own arm
     (fixed by the line-of-sight test), and one case that still needs a look -- `battery_3` 0.36 m from the camera,
