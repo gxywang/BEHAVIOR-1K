@@ -44,6 +44,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=1800)
     parser.add_argument("--success-distance", type=float, default=0.1)
+    parser.add_argument(
+        "--success-criterion",
+        choices=("center-distance", "footprint-overlap"),
+        default="center-distance",
+        help=(
+            "center-distance succeeds when base-center XY distance is <= --success-distance. "
+            "footprint-overlap succeeds when the goal point lies inside the robot's final XY footprint."
+        ),
+    )
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
         "--costmap-source",
@@ -344,6 +353,14 @@ def robot_profile_diagnostics(profile):
         "max_reverse_velocity": float(profile.max_reverse_velocity),
         "max_lateral_velocity": float(profile.max_lateral_velocity),
         "max_angular_velocity": float(profile.max_angular_velocity),
+    }
+
+
+def robot_footprint_diagnostics(robot):
+    extent_xy = robot.reset_joint_pos_aabb_extent[:2]
+    return {
+        "extent_xy": to_float_list(extent_xy),
+        "bounding_radius": float(th.norm(extent_xy).item() / 2.0),
     }
 
 
@@ -756,6 +773,17 @@ def xy_distance(position, goal):
     return math.hypot(float(position[0]) - float(goal[0]), float(position[1]) - float(goal[1]))
 
 
+def point_inside_robot_footprint(robot, point):
+    position, orientation = robot.get_position_orientation()
+    yaw = float(T.quat2euler(orientation)[2].item())
+    dx = float(point[0]) - float(position[0])
+    dy = float(point[1]) - float(position[1])
+    local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+    local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+    half_extent = robot.reset_joint_pos_aabb_extent[:2] / 2.0
+    return abs(local_x) <= float(half_extent[0]) and abs(local_y) <= float(half_extent[1])
+
+
 def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, command_limits, nav2py_api, args):
     env.reset(get_obs=False)
     place_robot(robot, episode)
@@ -823,7 +851,12 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
             time.sleep(args.visual_step_sleep)
         position, _ = robot.get_position_orientation()
         final_distance = xy_distance(position[:2], goal[:2])
-        success = final_distance <= args.success_distance
+        goal_inside_footprint = point_inside_robot_footprint(robot, goal)
+        success = (
+            goal_inside_footprint
+            if args.success_criterion == "footprint-overlap"
+            else final_distance <= args.success_distance
+        )
         nav_status = navigator.status()
         map_diagnostic = point_cost_diagnostic(navigator.costmap, position[:2])
         if first_lethal_cell_event is None and map_diagnostic["cost"] is not None and map_diagnostic["cost"] >= 253:
@@ -866,8 +899,10 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "load_room_instances": episode["load_room_instances"],
         "floor": int(episode.get("floor", 0)),
         "success": success,
+        "success_criterion": args.success_criterion,
         "costmap_source": args.costmap_source,
         "robot_profile": robot_profile_diagnostics(profile),
+        "robot_footprint": robot_footprint_diagnostics(robot),
         "controller_command_limits": command_limits_diagnostics(command_limits),
         "costmap_diagnostics": costmap_diagnostics,
         "nav2py_state": status.state.value,
@@ -881,6 +916,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "final_position": to_float_list(position),
         "final_yaw": final_yaw,
         "final_distance": xy_distance(position[:2], goal[:2]),
+        "goal_inside_robot_footprint": point_inside_robot_footprint(robot, goal),
         "geodesic_distance": float(episode["geodesic_distance"]),
         "remaining_distance": status.remaining_distance,
         "progress": status.progress,
@@ -919,6 +955,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "seed": args.seed,
         "max_steps": args.max_steps,
         "success_distance": args.success_distance,
+        "success_criterion": args.success_criterion,
         "costmap_source": args.costmap_source,
         "dynamic_safety_disabled": args.disable_dynamic_safety,
         "trace_failures": args.trace_failures,
@@ -1034,6 +1071,7 @@ def main(args=None, shutdown=True):
                     f"  {result['episode_id']}: "
                     f"{'SUCCESS' if result['success'] else 'FAIL'} "
                     f"final_distance={result['final_distance']:.3f}m "
+                    f"criterion={result['success_criterion']} "
                     f"state={result['nav2py_state']}"
                 )
                 if not result["success"]:
@@ -1057,7 +1095,10 @@ def main(args=None, shutdown=True):
         )
         summary = summarize_results(results)
         print(f"\nSaved results to: {output}")
-        print(f"Success rate: {summary['successes']}/{summary['total']} ({summary['success_rate']:.1%})")
+        print(
+            f"Success rate: {summary['successes']}/{summary['total']} "
+            f"({summary['success_rate']:.1%}) using {args.success_criterion}"
+        )
         if shutdown and args.keep_open_on_complete:
             keep_viewer_open(args.keep_open_seconds)
     except Exception:
