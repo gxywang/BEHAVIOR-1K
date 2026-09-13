@@ -147,6 +147,13 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     on both, so the wider margin cost a battery by pushing the search past the poses that work. What the two runs
     do say is that the failure is a property of the stance, not of the object, and that the retry from another
     pose recovers it every time.
+  - run 10 (`runs/bench_batteries_10`, the same two instances, after the arm-collision fixes): **0.50 and 0.25,
+    mean 0.375** -- level with run 8's mean, with the two instances swapped (301 went 0.25 to 0.50, 302 went 0.50
+    to 0.25). Nine rounds executed against six, five lost to empty masks against seven, three to planning against
+    one. On two instances that is a wash, and the fixes should not be credited with a gain from it; what the run
+    does show is the machinery working -- look poses chosen by room ("the roomiest of 3", and once "clear of the
+    scene the whole way"), the four blocked motions each naming itself, and tracking under the new command leash
+    unchanged at a median of 0.008 rad. `battery_3` is still unplaced in both, as in every run of this task.
   - run 8 (`runs/bench_batteries_8`, instances 301 and 302, with the projection test for stances, the line-of-sight
     filter for look poses and the empty-view guard): **0.25 and 0.50, mean 0.375** against run 5's 0.25 on both.
     Seven rounds lost to empty masks where run 5 lost nine, six executed in both. Instance 302 placed two of its
