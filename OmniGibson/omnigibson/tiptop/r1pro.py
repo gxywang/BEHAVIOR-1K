@@ -1393,12 +1393,17 @@ class R1ProSim(TiptopSim):
 
     def present_held(self, arm: str, aabbs=None, ignore=()) -> np.ndarray | None:
         """Joints of ``arm`` that hold what it is carrying in front of the head camera (``PRESENT_POINT`` on its
-        own side, the first of ``PRESENT_OFFSETS`` it reaches, clear of the base and of the scene), the gripper
+        own side, the roomiest of the ``PRESENT_OFFSETS`` it reaches, clear of the base), the gripper
         keeping the orientation it grasped with so the object is not turned in the hand. ``ignore``: objects the
         round is about, which do not count as obstacles here -- the robot stands at the container it is going to
         place into, and the place motion enters it anyway with the planner's own collision geometry, so refusing
         every pose near it leaves nothing (putting_away_toys at a toy box, 2026-09-12). None when no
-        configuration does."""
+        configuration does.
+
+        Ranked by ``path_contacts`` for the same reason ``wrist_look`` is: with head views alone there is no wrist
+        camera to see a carried object with, so every carry round presents it -- and in runs/bench_toys_6, 28 of
+        the 29 presentations were stopped against something. Taking the first offset that reaches is what made
+        that the task's dominant collision."""
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         skip = {self.scene_object(n) for n in ignore}
         aabbs = [row for row in aabbs if row[0] not in skip]
@@ -1410,19 +1415,34 @@ class R1ProSim(TiptopSim):
         quat_xyzw = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
         side = 1.0 if arm == "left" else -1.0
         base = np.array([PRESENT_POINT[0], side * PRESENT_POINT[1], PRESENT_POINT[2]], dtype=np.float64)
+        here = np.asarray(seed, dtype=np.float64)
+        candidates = []
         for offset in PRESENT_OFFSETS:
             target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
             # the orientation is loose: what matters is that the object is in the picture, not how it is held
             solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.04, tolerance_rad=1.2)
             if solution is None:
                 continue
-            blocked = self.links_in_base_box(arm, ik, solution) + self.links_in_scene(arm, ik, solution, aabbs)
-            if blocked:
-                log.info(f"{arm} arm: presenting at {np.round(target, 2).tolist()} puts {blocked}; skipped")
+            inside = self.links_in_base_box(arm, ik, solution)
+            if inside:
+                log.info(f"{arm} arm: presenting at {np.round(target, 2).tolist()} puts {inside} at the base; skipped")
                 continue
-            log.info(f"{arm} arm: presenting what it holds at {np.round(target, 2).tolist()}")
-            return solution
-        return None
+            touched, objects = self.path_contacts(arm, ik, here, solution, aabbs)
+            candidates.append((touched, len(candidates), target, solution, objects))
+        if not candidates:
+            return None
+        touched, _, target, solution, objects = min(candidates)
+        if touched:
+            log.info(
+                f"{arm} arm: presenting what it holds at {np.round(target, 2).tolist()}, the roomiest of "
+                f"{len(candidates)}, still passing within {ARM_RADIUS} m of {objects} at {touched} point(s)"
+            )
+        else:
+            log.info(
+                f"{arm} arm: presenting what it holds at {np.round(target, 2).tolist()}, clear of the scene the "
+                f"whole way ({len(candidates)} reachable)"
+            )
+        return solution
 
     def wrist_look(self, arm: str, target, aabbs=None) -> np.ndarray | None:
         """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
