@@ -63,6 +63,24 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (55 of 60 instances ended with the radio in hand).
     Ranking the presenting grasps by where they leave the switch (pass 6) moved it from 0.54-0.69 m to 0.49-0.60 m
     ahead on nine instances.
+- **dispose_of_batteries** (three batteries into the floor bin; two on a desk in one cubicle, one on a cabinet in
+  another room; the goal's fourth atom, the bin on the floor, is true at the start and the runner drops it), the
+  first task run with the goal-driven runner (2026-09-12):
+  - run 1 (`runs/bench_batteries_1`, instance 301): **0.0**, no round run. Every capture swing in the cubicle was
+    blocked by the furniture; the arm could not return to the ready posture and the round was lost, and on the
+    way it swept a battery off the desk, after which the pick's workspace box (which then started above the
+    floor) had nothing in it. Three fixes came out of this: the ramp stops when a joint falls behind instead of
+    leaning on the obstacle, a capture that cannot get back plans from where the arm is, and the pick's workspace
+    follows the item.
+  - run 4 (`runs/bench_batteries_4`, instance 301): **0.25** (one of the three batteries picked from the desk,
+    carried to the other room and dropped in the bin; the fourth atom was already true so it earns nothing).
+    What failed: four rounds with the object not visible from the stance, one with no plan. The stance search was
+    at fault, not the capture: it compared the camera's bottom-edge distance with the radial distance to the
+    object instead of how far ahead it is, and the head camera sits 0.44 m ahead of the base, so a battery 0.48 m
+    ahead passed the test and fell out of the bottom of the frame. Fixed after this run.
+  - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
+    battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
+    search.
 - **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
   - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
     from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
