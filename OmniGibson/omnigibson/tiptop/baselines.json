@@ -49,5 +49,29 @@
     "date": "",
     "note": "task file written, never benchmarked",
     "instance_count": 0
+  },
+  "picking_up_trash": {
+    "mean": 1.0,
+    "run": "runs/bench_picking_up_trash_1",
+    "instances": "0",
+    "instance_count": 1,
+    "date": "2026-09-13",
+    "note": "Solved completely on the task's first ever run, 5 rounds, 1055 s. Three cans of soda off one floor into a trash can on another; the cans are 7-8.3 cm across against a jaw that opens to 8 cm, which was the reason for trying it. One instance only."
+  },
+  "re_shelving_library_books": {
+    "mean": 0.0,
+    "run": "runs/bench_re_shelving_library_books_1",
+    "instances": "0",
+    "instance_count": 1,
+    "date": "2026-09-13",
+    "note": "First run: 0.0, with 10 planning failures and 8 rounds lost to empty masks, one round executed and an item released. A bookcase is an opening entered from the SIDE, unlike every container the pipeline has placed into, and the shelf above the target slot is in the way of a top-down approach."
+  },
+  "store_honey": {
+    "mean": 0.0,
+    "run": "runs/bench_store_honey_1",
+    "instances": "0",
+    "instance_count": 1,
+    "date": "2026-09-13",
+    "note": "First run: 0.0, but the pick and the place both executed -- the jar finished ON the cabinet (bottom z 0.84, cabinet top 0.85). Nothing is wrong with the transfer; the cabinet has to be opened first. The cheapest end-to-end test of an open/close skill in the challenge set."
   }
 }
