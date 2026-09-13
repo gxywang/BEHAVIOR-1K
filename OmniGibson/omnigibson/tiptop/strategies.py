@@ -180,7 +180,11 @@ class Runner:
         self.tries.clear()  # one instance's attempts say nothing about the next
         presses = press_targets(self.goal)
         handled = (*PLACE_PREDICATES, "toggled_on", "holding")
-        other = {a["predicate"] for a in self.goal if a["predicate"] not in handled and a["args"][0] not in handled}
+        other = {
+            a["predicate"]
+            for a in self.goal
+            if a["predicate"] not in handled and (a["args"][:1] or [""])[0] not in handled
+        }
         if other:
             log.warning(f"{self.spec.task}: no sub-plan for goal atoms {sorted(other)}; they are left alone")
         if self.spec.plan in ("transfer", "auto") and self.demand.total():
