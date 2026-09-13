@@ -1274,7 +1274,10 @@ class R1ProSim(TiptopSim):
         ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
         if self.look_arm is None:
             return self._capture_views(task, ready)
-        if self.blocked_swings >= BLOCKED_SWINGS_MAX:  # this room stops the arms; stop trying and stop nudging things
+        # This room stops the arms: stop trying and stop nudging things over. Not while a hand holds something,
+        # though: the other arm's wrist camera is what sees the held object, and without it the place round has no
+        # view of what it is carrying and fails on empty masks (putting_away_toys, 2026-09-12).
+        if self.blocked_swings >= BLOCKED_SWINGS_MAX and not self.hands():
             return self._capture_views(task, ready)
         hands = self.hands()
         held_arms = set(hands.values())

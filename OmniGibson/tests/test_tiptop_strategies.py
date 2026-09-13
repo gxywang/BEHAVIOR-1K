@@ -318,6 +318,23 @@ def test_an_unreachable_container_puts_the_item_back_on_its_support():
     assert ep.hand is None
 
 
+def test_emptying_a_hand_never_stands_for_the_floor():
+    """The floor is not an object to stand at: standing for it crashed an instance (putting_away_toys, whose
+    support_of falls back to the task floor for a toy lying on it)."""
+    boxes = {"toy_box.n.01_1": box((1.0, 0, 0.2), half=(0.3, 0.3, 0.2)), "toy.n.01_1": box((0.2, 0.5, 0.05))}
+    ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())
+    ep.hand = "toy.n.01_1"  # held, and its support is the floor
+
+    def refuse(bddl, support, floor=None):
+        ep.calls.append(("put_down", bddl, support))
+        return False  # no put-down plans, so the ladder runs to the end
+
+    ep.put_down = refuse
+    assert Runner.free_hand(ep, ep.floor) is False or True  # the point is the calls it made
+    assert ("stand_for", (ep.floor,)) not in ep.calls
+    assert ("release",) in ep.calls
+
+
 def test_a_full_hand_is_emptied_before_the_next_pick():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set())

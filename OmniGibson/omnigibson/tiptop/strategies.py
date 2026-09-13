@@ -314,11 +314,12 @@ class Runner:
         log.info(f"{name} is still in the hand; putting it down before the next pick")
         if ep.put_down(name, ep.floor):
             return True
-        try:
-            ep.stand_for(support)
-            ep.put_down(name, support)
-        except Unreachable as e:
-            log.warning(f"{name}: {e}")
+        if support != ep.floor:  # there is nowhere to "stand for" the floor, and it has no box to stand by
+            try:
+                ep.stand_for(support)
+                ep.put_down(name, support)
+            except Unreachable as e:
+                log.warning(f"{name}: {e}")
         if ep.holding(name):
             log.warning(f"{name}: no put-down plan; releasing it where the robot stands")
             ep.release()
