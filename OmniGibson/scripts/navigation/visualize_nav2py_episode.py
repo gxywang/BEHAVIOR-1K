@@ -40,11 +40,13 @@ def parse_args(argv=None):
     if not option_was_supplied("--viewer-camera-mode", runner_argv):
         args.viewer_camera_mode = "follow"
     if not option_was_supplied("--viewer-camera-distance", runner_argv):
-        args.viewer_camera_distance = 4.5
+        args.viewer_camera_distance = 1.5
     if not option_was_supplied("--viewer-camera-height", runner_argv):
-        args.viewer_camera_height = 2.8
+        args.viewer_camera_height = 1.7
     if not option_was_supplied("--viewer-camera-target-height", runner_argv):
-        args.viewer_camera_target_height = 0.6
+        args.viewer_camera_target_height = 0.55
+    args.viewer_camera_lateral_offset = 1.1
+    args.viewer_camera_target_forward_offset = 0.7
     return args
 
 

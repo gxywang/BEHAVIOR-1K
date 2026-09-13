@@ -771,16 +771,25 @@ def update_viewer_camera(robot, args):
 
     position, orientation = robot.get_position_orientation()
     yaw = float(T.quat2euler(orientation)[2].item())
+    lateral_offset = getattr(args, "viewer_camera_lateral_offset", 0.0)
+    target_forward_offset = getattr(args, "viewer_camera_target_forward_offset", 0.0)
     offset = th.tensor(
         [
-            -math.cos(yaw) * args.viewer_camera_distance,
-            -math.sin(yaw) * args.viewer_camera_distance,
+            -math.cos(yaw) * args.viewer_camera_distance - math.sin(yaw) * lateral_offset,
+            -math.sin(yaw) * args.viewer_camera_distance + math.cos(yaw) * lateral_offset,
             args.viewer_camera_height,
         ],
         dtype=th.float32,
     )
     camera_position = position + offset
-    target_position = position + th.tensor([0.0, 0.0, args.viewer_camera_target_height], dtype=th.float32)
+    target_position = position + th.tensor(
+        [
+            math.cos(yaw) * target_forward_offset,
+            math.sin(yaw) * target_forward_offset,
+            args.viewer_camera_target_height,
+        ],
+        dtype=th.float32,
+    )
     camera_orientation = look_at_orientation(camera_position, target_position)
     og.sim.viewer_camera.set_position_orientation(position=camera_position, orientation=camera_orientation)
 
