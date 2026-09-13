@@ -584,8 +584,16 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   (0.2 m ahead, 0.3 m to the arm's side, 5 cm down, then closer to the shoulder; nine targets in ten in either
   torso posture, and outside the head camera's frame) looking at the look target: the objects the base pose was
   chosen for, or the hand that holds one of them once it is picked up;
-  a configuration that puts a hand link (`HAND_LINKS`) within `BASE_CLEARANCE` (0.10 m) of the base's box is
-  skipped, since Lula IK knows no collisions. Both arms move together and return together. The joint targets are
+  a configuration that puts a hand link (`HAND_LINKS`) within `BASE_CLEARANCE` (0.10 m) of the base's box, or
+  inside any scene object's box inflated by `SCENE_CLEARANCE` (0.03 m, `links_in_scene`), is skipped, since Lula
+  IK knows no collisions. The scene test was added on 2026-09-12: in the office cubicle of
+  `dispose_of_batteries` the look pose put the wrist against the desk, the joints stopped following the ramp,
+  the arm swept a battery off the desk on the way, and every round of the instance died with "arm did not return
+  to the ready posture" (`runs/bench_batteries_1`, q_score 0, no round run). The swing-out-of-view fallback for
+  the planned arm is tested the same way; when neither clears, the arms stay at the ready posture and the
+  capture takes whatever views they give. Object boxes are conservative (a desk's box includes the space under
+  it), so this refuses some configurations that would have been free; the head view carries the round when it
+  does. Both arms move together and return together. The joint targets are
   ramped, never stepped: every joint moves at no more than `CAPTURE_MAX_JOINT_VEL` (0.6 rad/s, one interpolated
   target per control step, `ramp_to`), then the arms settle for 60 steps; a stepped target made the position
   controller slam the arms, which shook the robot and could shift the objects the capture was about to look at
