@@ -766,7 +766,7 @@ def look_at_orientation(camera_position, target_position):
 
 
 def update_viewer_camera(robot, args):
-    if args.viewer_camera_mode != "follow" or gm.HEADLESS:
+    if args.viewer_camera_mode != "follow" or (gm.HEADLESS and not gm.REMOTE_STREAMING):
         return
 
     position, orientation = robot.get_position_orientation()

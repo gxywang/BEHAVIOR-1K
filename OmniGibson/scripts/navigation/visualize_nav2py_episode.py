@@ -173,10 +173,9 @@ def restore_tro_state(env, episode):
 
 def main(argv=None):
     args = parse_args(argv)
-    if gm.HEADLESS:
+    if gm.HEADLESS and not gm.REMOTE_STREAMING:
         raise RuntimeError(
-            "This script needs a viewer camera. Unset OMNIGIBSON_HEADLESS; "
-            "OMNIGIBSON_REMOTE_STREAMING=native is supported."
+            "This script needs either a desktop viewer or OMNIGIBSON_REMOTE_STREAMING=native."
         )
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
