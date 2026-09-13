@@ -41,6 +41,10 @@ from omnigibson.macros import gm
 DEFAULT_OUTPUT = "outputs/navigation/object_nav_benchmark.json"
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--demo-root", default="datasets/demonstrations", help="LeRobot demo dataset root.")
@@ -431,8 +435,9 @@ def generate_task_episodes(
     appdata_cache = Path(gm.APPDATA_PATH) / "global" / "cache" / "texturecache"
     appdata_cache.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nLoaded template: {args.scene_instance}")
-    print(f"Task: {task_name}")
+    log(f"\nLoaded template: {args.scene_instance}")
+    log(f"Task: {task_name}")
+    log(f"Demo rows available for task: {len(rows)}")
     env = og.Environment(configs=cfg)
     if env.robots[0].model in ("r1", "r1pro"):
         og.sim.stop()
@@ -512,14 +517,14 @@ def generate_task_episodes(
                 episode["tro_state_path"] = str(tro_path)
                 episode["robot_pose_key"] = robot_pose_key
                 episodes.append(episode)
-                print(
+                log(
                     f"  [{len(episodes):03d}] {episode['episode_id']}: "
                     f"{target_name} -> {episode['goal_position']} "
                     f"({episode['geodesic_distance']:.3f} m)"
                 )
 
     og.clear()
-    print(f"Generated {len(episodes)} episodes for {task_name}. Skipped: {skipped}")
+    log(f"Generated {len(episodes)} episodes for {task_name}. Skipped: {skipped}")
     return episodes
 
 
@@ -574,6 +579,13 @@ def main() -> None:
     templates = index_templates(args.task_instances_root, args.scene)
     tro_states = index_tro_states(args.task_instances_root, args.scene)
     tasks = sorted(set(rows["task_name"]) & set(templates))
+    log(f"Demo root: {args.demo_root}")
+    log(f"Task-instances root: {args.task_instances_root}")
+    log(f"Scene: {args.scene}")
+    log(f"Demo rows after task filter: {len(rows)}")
+    log(f"Template tasks found for scene: {len(templates)}")
+    log(f"TRO states found for scene: {len(tro_states)}")
+    log(f"Tasks selected: {tasks}")
     if args.task:
         missing = sorted(set(args.task) - set(tasks))
         if missing:
@@ -598,10 +610,12 @@ def main() -> None:
                 robot_cfg=robot_cfg,
                 args=args,
             )
+            if not episodes:
+                raise RuntimeError(f"No valid object-goal episodes were generated for {task_name}")
             tmp_path = task_path.with_suffix(".json.tmp")
             write_benchmark(tmp_path, args, robot_cfg, episodes)
             tmp_path.replace(task_path)
-            print(f"Wrote object-goal benchmark: {task_path}")
+            log(f"Wrote object-goal benchmark: {task_path}")
     finally:
         og.shutdown()
 
