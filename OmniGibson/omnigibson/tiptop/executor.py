@@ -15,8 +15,16 @@ LARGE_FINAL_ERROR = 0.05  # rad: a segment that ends this far from its target di
 # converge(). These stop that. The tolerance is five times the worst tracking error measured on healthy segments
 # (0.000-0.019 rad over runs/bench_batteries_8 and the putting_away_toys run of 2026-09-13), so normal dynamics
 # cannot trip it; the same numbers as the capture ramps use (RAMP_BLOCK_TOL / RAMP_BLOCK_STEPS).
-EXEC_BLOCK_TOL = 0.1  # rad behind its target
-EXEC_BLOCK_STEPS = 5  # consecutive steps behind before the segment is abandoned
+EXEC_BLOCK_TOL = 0.1  # rad behind its target: reported, and the leash below is set to the same distance
+EXEC_BLOCK_STEPS = 5  # consecutive steps behind before a segment says so in the log
+# With a position drive the torque is proportional to (command - measured), so keeping the command within
+# EXEC_LEASH of where the arm actually is bounds how hard the arm can lean on whatever it has met -- and bounds
+# the wind-up that otherwise lets a lagging joint catch up at several rad/s and fling what it is holding. It does
+# NOT give up on the segment, which matters: 43 segments in runs/ fall more than 0.1 rad behind and still finish
+# within 0.05 rad of their target, 18 of those rounds recovered, and 10 earned an atom that is in the instance's
+# final satisfied list -- including Place(candle_2, wicker_basket_1) at 0.96 rad of lag and 0.006 rad of final
+# error. Abandoning a segment on lag would have thrown those away (measured 2026-09-13 over the whole run corpus).
+EXEC_LEASH = 0.1
 CONVERGE_NO_PROGRESS = 1e-3  # rad: what counts as converge() having got closer, for the trace it records
 
 
@@ -84,6 +92,19 @@ class VideoRecorder:
         log.info(f"wrote video {self.path}")
 
 
+def leash(q_target, q_measured, limit: float = EXEC_LEASH) -> np.ndarray:
+    """``q_target`` brought within ``limit`` of ``q_measured``, joint by joint.
+
+    The command a position drive is given, never more than ``limit`` ahead of where the arm is: the drive's torque
+    is proportional to that difference, so this bounds how hard the arm pushes on anything it meets without
+    changing where the trajectory goes. A joint that is free is unaffected -- healthy tracking error on these runs
+    is 0.000-0.019 rad, far inside the leash.
+    """
+    q_t = np.asarray(q_target, dtype=np.float64)
+    q_m = np.asarray(q_measured, dtype=np.float64)
+    return (q_m + np.clip(q_t - q_m, -limit, limit)).astype(np.float32)
+
+
 class PlanExecutor:
     """Streams absolute joint targets to the sim at the env rate; gripper events hold the arm and toggle the fingers."""
 
@@ -109,7 +130,7 @@ class PlanExecutor:
         self.last_converge = {}  # what the last converge() did: steps, whether it was capped, the error trace
 
     def _step(self, q_arm) -> np.ndarray:
-        self.sim.step(q_arm, self.gripper)
+        self.sim.step(leash(q_arm, self.sim.q_arm()), self.gripper)
         self.n_steps += 1
         return self.sim.q_arm()
 
@@ -198,27 +219,24 @@ class PlanExecutor:
                 errs = []
                 stopped_early = False
                 blocked = 0  # consecutive steps the arm has been further than EXEC_BLOCK_TOL behind its target
-                gave_up = False
+                fell_behind = False
                 for q in traj:
                     errs.append(float(np.abs(self._step(q) - q).max()))
                     if stop is not None and stop():
                         stopped_early = True
                         break
                     blocked = blocked + 1 if errs[-1] > EXEC_BLOCK_TOL else 0
-                    if blocked >= EXEC_BLOCK_STEPS:
-                        # The arm is not following the plan: something is in its way that the planner did not know
-                        # about. Commanding the rest of the segment only pushes harder on it.
-                        gave_up = True
+                    if blocked == EXEC_BLOCK_STEPS:
+                        # Reported, not acted on: the arm is behind because something is in its way that the
+                        # planner did not know about, and the leash in _step is what keeps it from pushing. The
+                        # segment runs on because breaking free is often how the placement lands.
+                        fell_behind = True
                         log.warning(
                             f"[{i}] {step['label']}: the arm has been {errs[-1]:.2f} rad behind for "
-                            f"{EXEC_BLOCK_STEPS} steps at step {len(errs)} of {len(traj)}; it is pushing against "
-                            "something, so the rest of this segment is abandoned"
+                            f"{EXEC_BLOCK_STEPS} steps at step {len(errs)} of {len(traj)}; it is pushing "
+                            f"against something (the command is leashed to {EXEC_LEASH} rad, so it cannot lean harder)"
                         )
-                        break
-                if gave_up:
-                    final_err = self.converge(self.sim.q_arm(), max_steps=self.gripper_hold_steps)
-                    stats.setdefault("converges", []).append({"step": i, **self.last_converge})
-                elif stopped_early:
+                if stopped_early:
                     final_err = float(errs[-1])
                 else:
                     final_err = self.converge(traj[-1], stop=stop)
@@ -248,7 +266,7 @@ class PlanExecutor:
                         "max_tracking_error_rad": float(max(errs)),
                         "final_error_rad": final_err,
                         "stopped_early": stopped_early,
-                        "abandoned": gave_up,
+                        "fell_behind": fell_behind,
                     }
                 )
                 log.info(

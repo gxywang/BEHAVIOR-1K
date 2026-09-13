@@ -66,3 +66,28 @@ def test_converge_keeps_settling_a_joint_that_is_still_creeping():
     err = ex.converge(np.array([0.05], dtype=np.float32), tol=0.005, max_steps=500)
     assert err < 0.005
     assert ex.last_converge["capped"] is False
+
+
+# --------------------------------------------------------------- the command leash
+def test_the_leash_does_nothing_to_a_command_the_arm_is_following():
+    from omnigibson.tiptop.executor import leash
+
+    measured = np.array([0.0, 1.0, -0.5])
+    target = np.array([0.01, 1.02, -0.49])  # healthy tracking error is 0.000-0.019 rad
+    assert np.allclose(leash(target, measured), target, atol=1e-6)
+
+
+def test_the_leash_bounds_how_far_ahead_of_a_stuck_joint_the_command_can_run():
+    from omnigibson.tiptop.executor import EXEC_LEASH, leash
+
+    measured = np.array([0.0, 0.0])
+    target = np.array([2.0, -2.0])  # a segment that has run a long way past a jammed joint
+    out = leash(target, measured)
+    assert np.allclose(out, [EXEC_LEASH, -EXEC_LEASH])
+
+
+def test_a_leashed_command_still_reaches_its_target_when_the_arm_is_free():
+    sim = StubSim(speed=0.05)
+    ex = executor(sim)
+    err = ex.converge(np.array([1.0], dtype=np.float32), tol=0.01, max_steps=500)
+    assert err < 0.01, "the leash advances with the arm, so a free joint still arrives"
