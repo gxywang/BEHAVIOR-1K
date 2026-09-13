@@ -74,8 +74,11 @@ def wait_until_ready():
 
 def main(argv=None):
     args = parse_args(argv)
-    if gm.HEADLESS:
-        raise RuntimeError("This script needs a non-headless OmniGibson session. Unset OMNIGIBSON_HEADLESS first.")
+    if gm.HEADLESS or gm.REMOTE_STREAMING:
+        raise RuntimeError(
+            "This script needs a desktop OmniGibson session. Unset OMNIGIBSON_HEADLESS "
+            "and OMNIGIBSON_REMOTE_STREAMING first."
+        )
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
     if args.success_distance <= 0.0:
