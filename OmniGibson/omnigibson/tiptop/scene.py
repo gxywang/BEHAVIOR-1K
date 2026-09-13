@@ -642,6 +642,13 @@ class TiptopSim:
         extras["views"] = {}
         for name in self.extra_views:
             view, view_extras = self.view_frame(name)
+            if not np.any(view["depth"] > 0):
+                # Every pixel is the robot's own (the self-mask zeroes them) or has no return: the view carries no
+                # geometry at all and the planner can only waste time on it. Seen when a capture swing is blocked
+                # and the arm stays at the ready posture, where its wrist camera looks at the robot's own body --
+                # all 230400 pixels of a left wrist view masked (2026-09-13, dispose_of_batteries).
+                log.warning(f"{name}: nothing but the robot in this view (no valid depth); not sent")
+                continue
             add_view(
                 request,
                 name,

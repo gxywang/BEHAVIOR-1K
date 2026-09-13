@@ -127,6 +127,11 @@ SCENE_CLEARANCE = 0.03  # m: a look configuration keeps the hand links this far 
 BLOCKED_SWINGS_MAX = 2  # capture swings stopped against something before an instance gives up on look poses
 ELBOW = 3  # index of the elbow in an arm's joint list: folded before a capture swing, straightened after it
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
+# An arm link whose origin passes this close (m) to the head camera's line of sight to the look target is taken to
+# block it. About the half width of the gripper, which is the widest thing on the arm; the test is on link origins,
+# so a link is a point and this radius stands in for its mesh. The arm in front of the target does not merely darken
+# it: the self-mask zeroes the robot's own pixels, so the target comes back with no depth and an empty mask.
+LOOK_BLOCK_RADIUS = 0.08
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
 # and the leaning torso, so the support plane the wrist cameras see beside the robot never runs under it. The head
@@ -174,6 +179,13 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
+# best_base_pose projects the objects themselves into the head camera a candidate stance would have (see
+# frame_objects). The image border is taken FRAME_MARGIN_PX pixels in, so an object counted as framed has a little
+# room either side rather than touching the edge, and every pixel an object still falls outside costs
+# FRAMING_PENALTY_PX: 0.006 is FRAMING_PENALTY per radian divided by the head camera's focal length in pixels
+# (308 at 99 deg over 720), so a clipped object keeps about the weight the angle measure gave it.
+FRAME_MARGIN_PX = 12
+FRAMING_PENALTY_PX = 0.006
 # best_base_pose: the candidate grid around the objects' centroid and the score terms (lower is better)
 RING_START, RING_STEP = 0.25, 0.05  # m, rings out to the arm's reach
 RING_ANGLE_STEP = np.pi / 18  # 10 deg around the centroid
@@ -194,6 +206,70 @@ AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from th
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
+
+
+def blocks_ray(eye, target, point, radius: float) -> bool:
+    """Whether ``point`` sits within ``radius`` of the segment from ``eye`` to ``target`` (all in one frame).
+
+    A point beside the line, behind the eye or past the target does not block the view of the target.
+    """
+    eye = np.asarray(eye, dtype=np.float64).reshape(3)
+    ray = np.asarray(target, dtype=np.float64).reshape(3) - eye
+    length = float(np.linalg.norm(ray))
+    if length < 1e-6:
+        return False
+    rel = np.asarray(point, dtype=np.float64).reshape(3) - eye
+    along = float(rel @ (ray / length))
+    return 0.0 < along < length and float(np.linalg.norm(rel - along * ray / length)) < radius
+
+
+def box_corners(lo, hi) -> np.ndarray:
+    """The 8 corners of an axis-aligned box given as its low and high xyz, as (8, 3)."""
+    lo = np.asarray(lo, dtype=np.float64).reshape(3)
+    hi = np.asarray(hi, dtype=np.float64).reshape(3)
+    return np.array(
+        [[hi[0] if i & 1 else lo[0], hi[1] if i & 2 else lo[1], hi[2] if i & 4 else lo[2]] for i in range(8)],
+        dtype=np.float64,
+    )
+
+
+def frame_objects(
+    corners, intrinsics, base_from_cam, base_z, width, height, x, y, yaw, strict=True, margin_px=FRAME_MARGIN_PX
+):
+    """Project the objects into the head camera a stance at (``x``, ``y``, ``yaw``) would have.
+
+    The head camera is rigid with the base for a given torso posture, so its pose in the base frame
+    (``base_from_cam``, OpenCV axes, from ``R1ProSim.head_camera_in_base``) is the same wherever the robot stands:
+    putting each object's world box into the candidate's base frame and projecting through it is exactly the
+    picture the capture will take. ``corners``: one (8, 3) world box per object (``box_corners``). ``base_z``: the
+    world height of the base frame, so a world z becomes a base z.
+
+    Returns (reason to reject the stance or None, pixels an object's corners fall outside the image). A stance is
+    rejected when an object is behind the camera, or when an object small enough to fit inside the frame at that
+    distance is cut by its border -- the measured cause of a lost round is a battery projecting to row 791 of a
+    720-row head image (2026-09-12, dispose_of_batteries), and an item the planner has to grasp is worth nothing
+    half seen. An object too big to fit is only penalised by the pixels it falls outside: no stance frames a toy
+    box and the toy beside it whole, and a clipped container is worth more than no stance at all. ``strict=False``
+    turns every cut into a penalty: what ``best_base_pose`` falls back to when no stance frames the objects whole.
+    """
+    fwd = np.array([math.cos(yaw), math.sin(yaw)])
+    left = np.array([-math.sin(yaw), math.cos(yaw)])
+    here = np.array([x, y], dtype=np.float64)
+    outside = 0.0
+    for box in corners:
+        rel = np.asarray(box, dtype=np.float64)[:, :2] - here
+        pts = np.stack([rel @ fwd, rel @ left, np.asarray(box, dtype=np.float64)[:, 2] - base_z], axis=-1)
+        px, z = points_to_pixels(pts, intrinsics, base_from_cam)
+        if np.any(z <= 0):
+            return "behind the head camera", 0.0
+        lo, hi = px.min(axis=0), px.max(axis=0)
+        low = np.array([margin_px, margin_px], dtype=np.float64)
+        high = np.array([width - 1 - margin_px, height - 1 - margin_px], dtype=np.float64)
+        cut = float(np.sum(np.maximum(0.0, low - lo) + np.maximum(0.0, hi - high)))
+        if strict and cut > 0.0 and np.all(hi - lo <= high - low):  # it would fit in the frame; this stance cuts it
+            return "outside the head camera's frame", 0.0
+        outside += cut
+    return None, outside
 
 
 def embodiment_meta_path(robot_type: str = ROBOT_TYPE) -> Path:
@@ -848,7 +924,16 @@ class R1ProSim(TiptopSim):
         return 0.5 * math.hypot(ex, ey)
 
     def best_base_pose(
-        self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, support_z=None, avoid=()
+        self,
+        points_xy,
+        ignore=(),
+        reach: float = 0.9,
+        aabbs=None,
+        half_widths=None,
+        support_z=None,
+        avoid=(),
+        boxes=None,
+        frame_strict: bool = True,
     ) -> tuple[tuple | None, dict]:
         """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
         the left arm's reach.
@@ -859,11 +944,17 @@ class R1ProSim(TiptopSim):
         (``ignore``: objects that do not count; ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken
         here otherwise).
 
-        ``half_widths``: each point's xy radius, so the view test can keep the object's *edges* in frame and not just
-        its centre; None reproduces the point test for callers that pass bare positions. ``support_z``: the world
-        height each object stands at (one value, or one per point), so the head camera's reach for it can be
-        measured (``camera_floor_distance``); None skips that test. ``avoid``: (x, y) poses already tried; candidates
-        within ``AVOID_RADIUS`` of one are rejected, so a retry gets a different viewpoint.
+        ``boxes``: each object's world AABB as (low xyz, high xyz). Given them, whether a candidate frames an object
+        is decided by projecting the object into the head camera that candidate would have (``frame_objects``)
+        rather than by the angle measures below -- the same projection the masks use, so the test is exact. A
+        candidate that cuts an object the frame could hold whole is rejected; when no candidate frames them all,
+        the search runs again with ``frame_strict=False``, where a cut only costs score.
+
+        ``half_widths``, ``support_z``: the angle measures used when no boxes are passed. Each point's xy radius, so
+        the view test can keep the object's *edges* in frame and not just its centre (None reproduces the point
+        test), and the world height each object stands at (one value, or one per point) so the head camera's reach
+        for it can be measured (``camera_floor_distance``; None skips that test). ``avoid``: (x, y) poses already
+        tried; candidates within ``AVOID_RADIUS`` of one are rejected, so a retry gets a different viewpoint.
         Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
         """
         pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
@@ -876,6 +967,18 @@ class R1ProSim(TiptopSim):
             heights = [support_z] * len(pts) if np.isscalar(support_z) else list(support_z)
             min_dists = [self.camera_floor_distance(float(z)) + CAMERA_MIN_MARGIN for z in heights]
         half_fov = math.atan2(self.robot_cam.image_width / 2, float(_intrinsics(self.robot_cam)[0, 0]))
+        view = None
+        if boxes is not None:
+            k, base_from_cam, base_z = self.head_camera_in_base()
+            view = dict(
+                corners=[box_corners(lo, hi) for lo, hi in boxes],
+                intrinsics=k,
+                base_from_cam=base_from_cam,
+                base_z=base_z,
+                width=int(self.robot_cam.image_width),
+                height=int(self.robot_cam.image_height),
+                strict=frame_strict,
+            )
         t = len(pts) - 1  # the target (container) is last
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
@@ -902,7 +1005,7 @@ class R1ProSim(TiptopSim):
                     # which is what camera_floor_distance returns; the radial distance flattered a stance with the
                     # object off to one side, and a battery 0.48 m ahead of a base whose camera sits 0.44 m ahead
                     # of it came out of the capture with an empty mask (2026-09-12, dispose_of_batteries).
-                    if any(a < m for a, m in zip(ahead, min_dists)):
+                    if view is None and any(a < m for a, m in zip(ahead, min_dists)):
                         rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
                         continue
                     # a container nearer than an item and in line with it hides the item (empty mask): keep their
@@ -916,9 +1019,14 @@ class R1ProSim(TiptopSim):
                     ):
                         rejected["container hides the item"] = rejected.get("container hides the item", 0) + 1
                         continue
-                    if max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
+                    if view is None and max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
                         rejected["outside camera view"] = rejected.get("outside camera view", 0) + 1
                         continue
+                    if view is not None:
+                        why, off_frame = frame_objects(**view, x=x, y=y, yaw=yaw)
+                        if why:
+                            rejected[why] = rejected.get(why, 0) + 1
+                            continue
                     # Prefer poses that keep each object's *edges* in frame, not just its centre. A mask cut by the
                     # image border reconstructs into a hull that runs past the real object, and the planner then
                     # places into that phantom part: on 2026-09-04 a basket whose centre sat at 43 deg had its edge
@@ -934,7 +1042,7 @@ class R1ProSim(TiptopSim):
                         max(dist)
                         + SIDE_WEIGHT * max(0.0, SIDE_TARGET - min(side))
                         + YAW_WEIGHT * abs(yaw_offset)
-                        + FRAMING_PENALTY * clipped
+                        + (FRAMING_PENALTY_PX * off_frame if view is not None else FRAMING_PENALTY * clipped)
                     )
                     if best is None or score < best[0]:
                         key = (float(x), float(y))
@@ -945,6 +1053,21 @@ class R1ProSim(TiptopSim):
                             best = (score, x, y, yaw, dist, side)
                         else:
                             rejected[why] = rejected.get(why, 0) + 1
+        if best is None and boxes is not None and frame_strict:
+            log.info(
+                f"no stance frames every object whole ({dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:4])}); allowing a clipped one"
+            )
+            return self.best_base_pose(
+                points_xy,
+                ignore=ignore,
+                reach=reach,
+                aabbs=aabbs,
+                half_widths=half_widths,
+                support_z=support_z,
+                avoid=avoid,
+                boxes=boxes,
+                frame_strict=False,
+            )
         return best, rejected
 
     def place_robot_for(self, *names: str, ignore_names=(), reach: float = 0.9, avoid=()) -> dict:
@@ -971,6 +1094,7 @@ class R1ProSim(TiptopSim):
             half_widths=[self.xy_radius(n) for n in names],
             support_z=support_z,
             avoid=avoid,
+            boxes=[(o.aabb[0].cpu().numpy(), o.aabb[1].cpu().numpy()) for o in objects],
         )
         if best is None:
             raise RuntimeError(
@@ -1128,6 +1252,20 @@ class R1ProSim(TiptopSim):
         ahead, _ = self.to_base(th.tensor(hit, dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))
         return float(ahead[0])
 
+    def head_camera_in_base(self) -> tuple[np.ndarray, np.ndarray, float]:
+        """Head camera intrinsics, its OpenCV pose (4, 4) in the robot base frame, and the base frame's world z.
+
+        Built exactly as a captured view's ``world_from_cam`` is (scene.view_frame), which is also a base-frame
+        pose. The camera is rigid with the base for a given torso posture, so this holds for any base pose: it is
+        what lets ``best_base_pose`` project an object into a stance it has not taken yet.
+        """
+        k = _intrinsics(self.robot_cam).astype(np.float64)
+        pos, quat = self.robot_cam.get_position_orientation()
+        quat_cv = T.quat_multiply(quat, th.tensor([1.0, 0.0, 0.0, 0.0]))  # 180 deg about camera x -> OpenCV
+        pos_b, quat_b = self.to_base(pos, quat_cv)
+        base_from_cam = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float64)
+        return k, base_from_cam, float(self.base_pose()[0][2])
+
     # ---------------------------------------------------------------- observation
     def arm_ik(self, arm: str, frame: str | None = None) -> ArmIK:
         """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for
@@ -1196,6 +1334,13 @@ class R1ProSim(TiptopSim):
             if blocked:
                 log.info(f"{arm} arm: look offset {offset} puts {blocked}; skipped")
                 continue
+            in_the_way = self.links_before_camera(arm, ik, solution, target)
+            if in_the_way:
+                log.info(
+                    f"{arm} arm: look offset {offset} puts {in_the_way} between the head camera and the target; "
+                    "skipped (the head view would lose it to the self-mask)"
+                )
+                continue
             return solution
         return None
 
@@ -1235,6 +1380,26 @@ class R1ProSim(TiptopSim):
                 ):
                     hits.append(f"{arm}_{suffix} in {obj.name}")
                     break
+        return hits
+
+    def links_before_camera(self, arm: str, ik: ArmIK, q, target) -> list[str]:
+        """Links of ``arm`` at joints ``q`` that stand on the head camera's line of sight to ``target`` (base frame).
+
+        Measured cause of a lost round (2026-09-12, dispose_of_batteries): battery_1 projected *inside* the head
+        image both times the capture missed it, at 0.61 m and 0.64 m, and the depth at its pixel read 0.41 m and
+        then 0.01 m. A near-zero depth is the robot's own pixels, which the self-mask zeroes -- the arm was between
+        the head camera and the battery. Link origins against ``LOOK_BLOCK_RADIUS``; links Lula's description does
+        not carry are skipped rather than guessed at.
+        """
+        eye = self.head_camera_in_base()[1][:3, 3]
+        hits = []
+        for link in self.robot.arm_link_names[arm]:
+            try:
+                pos, _ = ik.fk(q, link)
+            except Exception:
+                continue
+            if blocks_ray(eye, target, pos, LOOK_BLOCK_RADIUS):
+                hits.append(link)
         return hits
 
     def links_in_base_box(self, arm: str, ik: ArmIK, q) -> list[str]:
@@ -1434,12 +1599,41 @@ class R1ProSim(TiptopSim):
         )
         return request, extras
 
+    def log_blocked_sight(self) -> list[str]:
+        """Say which of the robot's own arm links stand between the head camera and what this capture is about.
+
+        The self-mask zeroes the robot's own pixels, so an arm on that line does not darken the target, it deletes
+        it: the mask comes back empty and the round is lost. The look poses are already filtered for this
+        (``wrist_look``), but an arm that never moved -- no look configuration, or a swing that stopped against
+        something and went back to the ready posture -- is not, and that is the posture most captures end in.
+        Measured on 2026-09-13 (dispose_of_batteries, `scratchpad/stance_check.py`): the *same* stance, with the
+        battery at the same pixel 0.67 m away, gave an empty mask in one capture and 499 pixels in the next; the
+        stance was identical and the arms were not. An arm holding something is skipped, since what it holds is
+        usually the look target itself.
+        """
+        if self.look_target is None:
+            return []
+        q = self.robot.get_joint_positions()
+        held_arms = set(self.hands().values())
+        blocking = []
+        for arm in ("left", "right"):
+            if arm in held_arms:
+                continue
+            joints = list(self.robot.arm_joint_names[arm])
+            now = [float(q[self.joint_index[j]]) for j in joints]
+            hits = self.links_before_camera(arm, self.arm_ik(arm), now, self.look_target)
+            if hits:
+                log.warning(f"{arm} arm stands between the head camera and the look target: {hits}")
+            blocking += hits
+        return blocking
+
     def _capture_views(self, task: str, q_arm) -> tuple[dict, dict]:
         """``TiptopSim.capture`` for the primary view and the wrist views, where the joints stand now (``q_arm``: the
         planned joints' targets, at torso yaw 0), then each head view of ``HEAD_VIEWS`` among ``extra_views``
         with the torso ramped to its yaw (``ramp_to``; the other planned joints and the locked posture stay, so the
         arms come along), and the torso ramped back. The base frame does not turn with the torso, so a view's
         camera pose, read from the simulator as it is rendered, is right as it is."""
+        self.log_blocked_sight()
         head_views = [v for v in self.extra_views if v in HEAD_VIEWS]
         extra_views = self.extra_views
         self.extra_views = tuple(v for v in extra_views if v not in HEAD_VIEWS)

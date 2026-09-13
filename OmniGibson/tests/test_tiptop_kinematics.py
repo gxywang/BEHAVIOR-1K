@@ -101,3 +101,146 @@ def test_a_head_view_moves_one_torso_joint_and_nothing_else():
         turned_joints(LEFT_ARM, Q_HOME, HEAD_YAW_JOINT, 0.5)
     with pytest.raises(ValueError):
         turned_joints(TORSO + LEFT_ARM, Q_HOME, HEAD_YAW_JOINT, 0.5)
+
+
+# --------------------------------------------------------------- framing a stance's head view
+# A head camera roughly where the R1Pro's sits in its base frame -- 1.4 m up, 0.1 m ahead, pitched 30 deg down,
+# OpenCV axes (+x right, +y down, +z forward); the measured challenge posture puts it at 1.26 m, and the tests are
+# about the geometry, not that pose. 720x720 at 99 deg gives fx = 360 / tan(49.5 deg) = 308.
+HEAD_PITCH = np.radians(30.0)
+HEAD_K = np.array([[308.0, 0.0, 360.0], [0.0, 308.0, 360.0], [0.0, 0.0, 1.0]])
+
+
+def head_in_base(pitch: float = HEAD_PITCH) -> np.ndarray:
+    forward = np.array([np.cos(pitch), 0.0, -np.sin(pitch)])
+    right = np.array([0.0, -1.0, 0.0])
+    down = np.cross(forward, right)
+    m = np.eye(4)
+    m[:3, 0], m[:3, 1], m[:3, 2] = right, down, forward
+    m[:3, 3] = [0.1, 0.0, 1.4]
+    return m
+
+
+def framing(boxes, x=0.0, y=0.0, yaw=0.0, **kw):
+    from omnigibson.tiptop.r1pro import box_corners, frame_objects
+
+    return frame_objects(
+        [box_corners(lo, hi) for lo, hi in boxes], HEAD_K, head_in_base(), 0.0, 720, 720, x, y, yaw, **kw
+    )
+
+
+def cube(centre, half=0.03):
+    c = np.asarray(centre, dtype=float)
+    return (c - half, c + half)
+
+
+def test_box_corners_are_the_eight_corners_and_their_mean_is_the_centre():
+    from omnigibson.tiptop.r1pro import box_corners
+
+    corners = box_corners([0.0, 0.0, 0.0], [1.0, 2.0, 4.0])
+    assert corners.shape == (8, 3)
+    assert len({tuple(c) for c in corners}) == 8
+    assert np.allclose(corners.mean(axis=0), [0.5, 1.0, 2.0])
+
+
+def test_an_object_on_a_table_ahead_is_framed_whole():
+    why, outside = framing([cube([0.6, 0.0, 0.75])])
+    assert why is None and outside == 0.0
+
+
+def test_an_object_at_the_robots_feet_is_below_the_frame():
+    # what the diagnostic saw: a battery 0.2 m ahead of the base projects past the bottom of a 720-row image
+    why, _ = framing([cube([0.2, 0.0, 0.75])])
+    assert why == "outside the head camera's frame"
+
+
+def test_an_object_behind_the_robot_is_behind_the_camera():
+    why, _ = framing([cube([-0.6, 0.0, 0.75])])
+    assert why == "behind the head camera"
+
+
+def test_yaw_brings_an_object_to_the_side_into_frame():
+    aside = cube([0.4, 0.9, 0.75])  # 66 deg to the left of a robot facing +x: outside a 99 deg frame
+    assert framing([aside])[0] == "outside the head camera's frame"
+    assert framing([aside], yaw=np.radians(66.0))[0] is None
+
+
+def test_an_object_the_frame_could_hold_whole_is_rejected_when_a_stance_cuts_it():
+    table = (np.array([0.35, -0.45, 0.0]), np.array([0.95, 0.45, 0.5]))  # fits in frame, but not from here
+    assert framing([table])[0] == "outside the head camera's frame"
+    assert framing([table], x=-0.7)[0] is None  # the same object, the robot further back
+
+
+def test_an_object_too_big_for_the_frame_is_a_penalty_not_a_rejection():
+    wall = (np.array([0.3, -2.0, 0.0]), np.array([1.2, 2.0, 1.6]))  # nothing frames this whole
+    why, outside = framing([wall])
+    assert why is None and outside > 0.0
+
+
+def test_the_fallback_pass_takes_a_cut_object_as_a_penalty():
+    why, outside = framing([cube([0.2, 0.0, 0.75])], strict=False)
+    assert why is None and outside > 0.0
+
+
+def test_standing_further_back_frames_what_standing_close_cuts_off():
+    on_the_floor = cube([0.35, 0.0, 0.03])
+    assert framing([on_the_floor])[0] == "outside the head camera's frame"
+    assert framing([on_the_floor], x=-0.35)[0] is None  # the same object, the robot 0.35 m further back
+
+
+# --------------------------------------------------------------- the arm on the head camera's line of sight
+def blocking(point, eye=(0.1, 0.0, 1.4), target=(0.6, 0.0, 0.75), radius=0.08):
+    from omnigibson.tiptop.r1pro import blocks_ray
+
+    return blocks_ray(eye, target, point, radius)
+
+
+def test_a_link_on_the_line_between_the_camera_and_the_target_blocks_it():
+    assert blocking((0.35, 0.0, 1.075))  # halfway along the sight line
+
+
+def test_a_link_beside_the_line_does_not_block():
+    assert not blocking((0.35, 0.3, 1.075))
+
+
+def test_a_link_behind_the_camera_or_past_the_target_does_not_block():
+    assert not blocking((-0.2, 0.0, 1.6))
+    assert not blocking((0.9, 0.0, 0.55))
+
+
+def test_the_radius_is_what_decides_a_near_miss():
+    just_off = (0.35, 0.09, 1.075)
+    assert not blocking(just_off)
+    assert blocking(just_off, radius=0.12)
+
+
+# The head camera as it actually sits in the base frame at the challenge torso posture, read from a capture
+# (runs/bench_toys_head3, `--torso 1.2 -1.7 -0.9 0.0`): 0.44 m ahead of the base, 1.25 m up, pitched 43 deg down,
+# 720x720 with fx 306. The framing test is only as good as this pose, so one case is measured rather than made up.
+MEASURED_HEAD = np.array(
+    [
+        [0.0, -0.680984, 0.732298, 0.441770],
+        [-1.0, 0.000001, -0.000005, 0.000004],
+        [0.0, -0.732298, -0.680984, 1.248709],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+)
+MEASURED_K = np.array([[306.0, 0.0, 360.0], [0.0, 306.0, 360.0], [0.0, 0.0, 1.0]])
+
+
+def measured_framing(boxes, x=0.0, y=0.0, yaw=0.0, **kw):
+    from omnigibson.tiptop.r1pro import box_corners, frame_objects
+
+    return frame_objects(
+        [box_corners(lo, hi) for lo, hi in boxes], MEASURED_K, MEASURED_HEAD, 0.0, 720, 720, x, y, yaw, **kw
+    )
+
+
+def test_the_measured_head_camera_frames_a_battery_on_a_desk_but_not_one_at_the_robots_feet():
+    # the desk in dispose_of_batteries stands at z 0.78 and the head camera sees it from 0.42 m ahead
+    assert measured_framing([cube([0.75, 0.0, 0.80])])[0] is None
+    assert measured_framing([cube([0.30, 0.0, 0.80])])[0] == "outside the head camera's frame"
+
+
+def test_the_measured_head_camera_reaches_the_floor_close_in():
+    assert measured_framing([cube([0.55, 0.0, 0.04])])[0] is None  # a toy on the floor, within reach

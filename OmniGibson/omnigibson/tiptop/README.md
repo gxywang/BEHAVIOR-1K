@@ -161,21 +161,50 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     with 492 pixels; one that fails has it 0.72 m away and 71 pixels below the frame; another has it 0.36 m away
     at a pixel inside the image where the rendered depth reads 0.51 m, so the camera resolves past it. Standing
     too close is the common thread, and the fix is not a margin on `camera_floor_distance`, which models a
-    surface's frame edge rather than the object: **the stance search should project the object itself into the
-    candidate's camera and reject poses where it falls outside the image or nearer than the camera resolves.**
-    It already computes each candidate's camera pose, and `points_to_pixels` is the same projection the masks
-    use, so the test is exact rather than a proxy.
+    surface's frame edge rather than the object.
+  - **Fixed (2026-09-13): the stance search now projects the objects themselves.** `frame_objects` puts each
+    object's box into the base frame a candidate stance would have and projects it through
+    `head_camera_in_base()` -- the head camera's pose in the base frame, which is the same wherever the robot
+    stands for a given torso posture -- with the same `points_to_pixels` the masks use. A candidate that cuts an
+    object the frame could hold whole is rejected; an object too big to frame whole (a toy box the robot stands
+    at) only costs score, and if no candidate frames everything whole the search runs again with that rule
+    relaxed, so a task never loses a stance it used to have. This replaces two proxies: the bottom-edge distance
+    from `camera_floor_distance + CAMERA_MIN_MARGIN`, which modelled the support plane rather than the object,
+    and the +-45 deg cone, which was both tighter than the 99 deg camera horizontally and silent vertically.
   - The same diagnostic shows a **second, different cause** on the other batteries, and it is the robot itself:
     `battery_1` projects *inside* the head image both times it is missed, at 0.61 m and 0.64 m, and the depth at
     that pixel reads **0.41 m** and then **0.01 m**. A near-zero depth is the robot's own pixels, which the
     self-mask zeroes: the arm is between the head camera and the target. The look poses are already chosen to
-    keep the wrist cameras out of the head camera's frame (`_log_wrist_framing`), but nothing checks whether the
-    arm lies on the line from the head camera to what the capture is about. That test belongs next to the others
-    in `wrist_look`, and it is cheap: the arm's link positions are already computed there for the base and scene
-    clearance checks.
-  - So `dispose_of_batteries` loses its rounds to three separate things, each now measured rather than guessed:
-    the object below the head frame, the object hidden behind the robot's own arm, and one case where the camera
-    resolves past the object entirely (0.36 m away, rendered depth 0.51 m) that still needs a look.
+    keep the wrist cameras out of the head camera's frame (`_log_wrist_framing`), but nothing checked whether the
+    arm lies on the line from the head camera to what the capture is about. **Fixed (2026-09-13):**
+    `links_before_camera` measures every arm link's distance to the segment from the head camera to the look
+    target (`blocks_ray`, `LOOK_BLOCK_RADIUS` 0.08 m, about the gripper's half width) and `wrist_look` skips a
+    look offset that puts a link on that line, next to the base-box and scene-box tests it already ran.
+  - **What the stance comparison actually showed (2026-09-13, `scratchpad/stance_check.py`).** Standing for each
+    battery twice, once with the old angle tests and once with the projection test, and capturing at each stance:
+
+    | battery | old stance | head pixels | new stance | head pixels |
+    | --- | --- | --- | --- | --- |
+    | `battery_3` | (11.07, -9.76) yaw 75, 0.85 m | 1441 | (10.91, -9.80) yaw 65, 0.90 m | none |
+    | `battery_1` | (10.76, 4.95) yaw -155, 1.0 m | none | **the same pose** | 499 |
+    | `battery_2` | (8.88, 5.03) yaw -100, 0.5 m | 1235 | (8.72, 4.98) yaw -80, 0.45 m | none |
+
+    The middle row settles it: **the same stance, the battery at the same pixel (196, 354) 0.67 m away, gave an
+    empty mask in one capture and 499 pixels in the next.** Nothing about the viewpoint decides this, so framing
+    cannot be the main cause -- what differed between the two captures is where the arms were. The capture swing
+    is blocked in this room (a cubicle; the arm meets the desk), and a blocked swing goes back to the ready
+    posture, where the arm can sit on the line from the head camera to the object. The projection test above is
+    still right about what it tests, and its unit tests hold against the robot's measured camera; it is simply not
+    what was losing these rounds. `log_blocked_sight` now reports, on every capture, which arm links stand on that
+    line, so the next run says how often it happens instead of leaving it at one comparison.
+  - So `dispose_of_batteries` loses its rounds to three separate things, each measured rather than guessed: the
+    object below the head frame (fixed by the projection test), the object hidden behind the robot's own arm
+    (fixed by the line-of-sight test), and one case that still needs a look -- `battery_3` 0.36 m from the camera,
+    45.7 deg off its axis, projecting *inside* the image at pixel (44, 320) with the rendered depth there reading
+    0.51 m. A depth larger than the object's own distance means the ray passed through where the battery was
+    supposed to be and hit what was behind it, so the pose the diagnostic printed and the frame the camera
+    rendered disagree. One observation, no explanation yet; the framing rule above does not cover it, because at
+    that stance the battery is inside the frame.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
@@ -794,6 +823,12 @@ for one task and is kept here, with what it did, in case a task needs it later.
   used `sticky` (allowed). Same code, one flag.
 
 ## Known limits
+
+- **A view with nothing but the robot in it is no longer sent (2026-09-13).** When a capture swing is blocked the
+  arm stays at the ready posture, where its own wrist camera looks at the robot's body: one left wrist view came
+  back with all 230,400 of its pixels in the self-mask, so its depth was zero everywhere. `TiptopSim.capture` now
+  skips an extra view whose depth has no valid pixel at all. It is a real limit rather than a fix: the capture
+  still spends the render, and the round still has one view fewer to plan from.
 
 - **Finding the radio's switch without oracle information does not work yet (2026-09-08).** The `turning_on_radio`
   radio has two red controls: the power switch on its black round speaker panel, and a knob on its top edge. In the
