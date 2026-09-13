@@ -777,6 +777,10 @@ for one task and is kept here, with what it did, in case a task needs it later.
   wicker rim: an item can be set down on the rim (2026-09-05, from a stretched 0.8 m reach) and topple the basket.
 - Flat objects (cheese slabs, bows) get few M2T2 grasps; the planner succeeds on them from close, orthogonal
   viewpoints and fails from others.
+- A container seen almost edge-on gives a hull whose oriented box is thinner than the 1 cm the planner shrinks
+  it by, and the place fails with `Shrunk OBB for <name> has half extents <= 0` (a wicker basket in
+  `runs/bench_baskets_regress1`, round 30, half extents 1.7 cm / -0.2 cm / 0.9 cm). The retry from another
+  stance is the current answer; the planner could fall back to the unshrunk box instead.
 - Planner variance: the same capture can fail once with "Motion planning failed for 32/74 satisfying particles"
   and succeed next time (grasp sampling differs per call). Retry before debugging.
 - Teleports (`--place`, `--stand-for`, `--torso`) are scaffolding the rules forbid during evaluation.
