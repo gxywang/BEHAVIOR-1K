@@ -917,7 +917,10 @@ the head views shared `LOOK_TOL`'s 0.03 rad -- inside the settling distribution.
 run spread 0.0000-0.0282 rad and all three rounds lost to the check were "off by 0.030". It has its own number now
 (`HEAD_VIEW_RETURN_TOL`, 0.10), clear of settling and still far under the head view's own 0.3 rad delta.
 
-**What was proposed and refused.** Each finding was given to an agent told to refute it. Three of eight were
+**What was proposed and refused.** Each finding was given to an agent told to refute it: 20 checked, **9 confirmed
+and 11 refuted**. All four findings about the stance search were refuted -- the base is not standing badly (the
+footprint square, the workspace box and the score's preference for standing close were each checked and held up),
+so the trouble is in how the robot moves once it is there. Of the capture and executor findings, three were
 refuted on the code and were never implemented: that `ramp_to`'s block test fires on joints the ramp does not move
 (every ramp re-baselines on the measured positions), that a stopped ramp rests *in* the obstacle for the settle,
 and that each segment opens with a command jump (`start_gap` is a servo lag, not a jump). A fourth was refuted as
