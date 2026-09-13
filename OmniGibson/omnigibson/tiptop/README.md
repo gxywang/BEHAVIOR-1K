@@ -63,46 +63,6 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     0.65 m ahead: no plan 3/3; 0.59 m: plans 3/3), not the pick (55 of 60 instances ended with the radio in hand).
     Ranking the presenting grasps by where they leave the switch (pass 6) moved it from 0.54-0.69 m to 0.49-0.60 m
     ahead on nine instances.
-- **dispose_of_batteries** (three batteries into the floor bin; two on a desk in one cubicle, one on a cabinet in
-  another room; the goal's fourth atom, the bin on the floor, is true at the start and the runner drops it), the
-  first task run with the goal-driven runner (2026-09-12):
-  - run 1 (`runs/bench_batteries_1`, instance 301): **0.0**, no round run. Every capture swing in the cubicle was
-    blocked by the furniture; the arm could not return to the ready posture and the round was lost, and on the
-    way it swept a battery off the desk, after which the pick's workspace box (which then started above the
-    floor) had nothing in it. Three fixes came out of this: the ramp stops when a joint falls behind instead of
-    leaning on the obstacle, a capture that cannot get back plans from where the arm is, and the pick's workspace
-    follows the item.
-  - run 4 (`runs/bench_batteries_4`, instance 301): **0.25** (one of the three batteries picked from the desk,
-    carried to the other room and dropped in the bin; the fourth atom was already true so it earns nothing).
-    What failed: four rounds with the object not visible from the stance, one with no plan. The stance search was
-    at fault, not the capture: it compared the camera's bottom-edge distance with the radial distance to the
-    object instead of how far ahead it is, and the head camera sits 0.44 m ahead of the base, so a battery 0.48 m
-    ahead passed the test and fell out of the bottom of the frame. Fixed after this run.
-  - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
-    battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
-    search.
-- **putting_away_toys** (eight toy figures off two floors into either of two toy boxes, one on a floor and one
-  on a table; the goal's 256 ground options say any box takes any toy, and the runner fills the nearest),
-  2026-09-12, `runs/bench_toys_1`, instance 301: **0.0**, and the first task whose picks are all off the floor.
-  What it showed, in order:
-  - A floor pick can work: `toy_figure_5` was picked at the second stance. The two attempts on `toy_figure_7`
-    both executed and closed on nothing; the second tracked its plan exactly (final error 0.000 rad), so the
-    grasp pose itself was wrong, and the log says why: the object's perceived position was **2.1-3.5 cm** off the
-    simulated one. A floor object seen once, from 0.5 m at a steep angle, gives a point cloud of its near face
-    only, so the hull's centre sits toward the camera; on a 15 cm candle that is a rounding error, on a toy
-    figure it is the whole object.
-  - The first attempt also ended 0.33 rad short of the planned grasp: reaching the floor asks `torso_joint2` to
-    swing a radian and the arm trailed its target the whole way. The executor now names the joint that fell
-    short.
-  - The living room stops the capture swings (a sofa, a coffee table and a room light around the toys), so the
-    instance used up its allowance of blocked swings and stopped posing the wrist cameras -- and then could not
-    see what it was carrying, because the free arm's wrist camera is what looks at the hand. Every place round of
-    the held toy failed on empty masks. Fixed: the look poses stay while a hand holds something.
-  - It ended on a crash: emptying a hand stood for the item's support, which for a toy on the floor is the task
-    floor, and a floor is not an object to stand at. Fixed.
-  - Next: the same two instances with `--views head_up head_down` (the torso leans instead of an arm swinging, so
-    nothing moves near the furniture and the floor object is seen from two heights).
-
 - **assembling_gift_baskets** (four baskets on the floor, one candle, cheese, cookie and bow each, 16 transfers):
   - pass 1 (`runs/bench_baskets_pass1`, 2 instances, stopped): 301 9/16 (seven rounds with the item not visible
     from the capture pose, no plan x2, bow_2 no base pose); 302 1/16 (not visible x19, no plan x11: a failed
@@ -155,6 +115,45 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
   - What remains costs one or two items per instance: a bow at the far edge of the table that no base pose
     reaches, a basket standing in a room corner, and places with no satisfying plan; 27-33 min of wall time and
     about 16k of the 39k allowed env steps per instance.
+- **dispose_of_batteries** (three batteries into the floor bin; two on a desk in one cubicle, one on a cabinet in
+  another room; the goal's fourth atom, the bin on the floor, is true at the start and the runner drops it), the
+  first task run with the goal-driven runner (2026-09-12):
+  - run 1 (`runs/bench_batteries_1`, instance 301): **0.0**, no round run. Every capture swing in the cubicle was
+    blocked by the furniture; the arm could not return to the ready posture and the round was lost, and on the
+    way it swept a battery off the desk, after which the pick's workspace box (which then started above the
+    floor) had nothing in it. Three fixes came out of this: the ramp stops when a joint falls behind instead of
+    leaning on the obstacle, a capture that cannot get back plans from where the arm is, and the pick's workspace
+    follows the item.
+  - run 4 (`runs/bench_batteries_4`, instance 301): **0.25** (one of the three batteries picked from the desk,
+    carried to the other room and dropped in the bin; the fourth atom was already true so it earns nothing).
+    What failed: four rounds with the object not visible from the stance, one with no plan. The stance search was
+    at fault, not the capture: it compared the camera's bottom-edge distance with the radial distance to the
+    object instead of how far ahead it is, and the head camera sits 0.44 m ahead of the base, so a battery 0.48 m
+    ahead passed the test and fell out of the bottom of the frame. Fixed after this run.
+  - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
+    battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
+    search.
+- **putting_away_toys** (eight toy figures off two floors into either of two toy boxes, one on a floor and one
+  on a table; the goal's 256 ground options say any box takes any toy, and the runner fills the nearest),
+  2026-09-12, `runs/bench_toys_1`, instance 301: **0.0**, and the first task whose picks are all off the floor.
+  What it showed, in order:
+  - A floor pick can work: `toy_figure_5` was picked at the second stance. The two attempts on `toy_figure_7`
+    both executed and closed on nothing; the second tracked its plan exactly (final error 0.000 rad), so the
+    grasp pose itself was wrong, and the log says why: the object's perceived position was **2.1-3.5 cm** off the
+    simulated one. A floor object seen once, from 0.5 m at a steep angle, gives a point cloud of its near face
+    only, so the hull's centre sits toward the camera; on a 15 cm candle that is a rounding error, on a toy
+    figure it is the whole object.
+  - The first attempt also ended 0.33 rad short of the planned grasp: reaching the floor asks `torso_joint2` to
+    swing a radian and the arm trailed its target the whole way. The executor now names the joint that fell
+    short.
+  - The living room stops the capture swings (a sofa, a coffee table and a room light around the toys), so the
+    instance used up its allowance of blocked swings and stopped posing the wrist cameras -- and then could not
+    see what it was carrying, because the free arm's wrist camera is what looks at the hand. Every place round of
+    the held toy failed on empty masks. Fixed: the look poses stay while a hand holds something.
+  - It ended on a crash: emptying a hand stood for the item's support, which for a toy on the floor is the task
+    floor, and a floor is not an object to stand at. Fixed.
+  - Next: the same two instances with `--views head_up head_down` (the torso leans instead of an arm swinging, so
+    nothing moves near the furniture and the floor object is seen from two heights).
 
 ## Architecture
 
