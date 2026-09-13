@@ -27,11 +27,11 @@
   },
   "dispose_of_batteries": {
     "mean": 0.375,
-    "run": "runs/bench_batteries_8",
-    "instances": "0 1",
-    "instance_count": 2,
+    "run": "runs/bench_batteries_ten",
+    "instances": "0-9",
+    "instance_count": 10,
     "date": "2026-09-13",
-    "note": "The best of several runs, and NOT a number a change can be judged against: runs 10 and 12 are the same code on the same two instances and gave 0.375 (0.50/0.25) and 0.125 (0.00/0.25), with 9 and 3 rounds executed and 3 and 6 planning failures. Two instances of this task cannot resolve anything smaller than that spread; use more instances, or read the mechanism counts across several runs."
+    "note": "Ten instances, one solved completely (304). Per instance: 0.25, 0.50, 0.50, 1.00, 0.50, 0.25, 0.00, 0.25, 0.00, 0.50. This is the first number for this task worth comparing against -- two instances gave 0.375 and 0.125 on identical code. The composition has shifted: 30 rounds executed, 30 lost to PLANNING and 14 to empty masks, all 54 cuTAMP failures being 'motion planning failed for N/N satisfying particles'. battery_3 is unplaced in 8 of the 10."
   },
   "putting_away_toys": {
     "mean": 0.8125,

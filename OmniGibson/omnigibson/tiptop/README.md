@@ -147,6 +147,18 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     on both, so the wider margin cost a battery by pushing the search past the poses that work. What the two runs
     do say is that the failure is a property of the stance, not of the object, and that the retry from another
     pose recovers it every time.
+  - **ten instances** (`runs/bench_batteries_ten`, after everything of 2026-09-13): **mean 0.375**, and instance
+    304 solved completely -- the first instance of this task ever finished. Per instance 0.25, 0.50, 0.50, 1.00,
+    0.50, 0.25, 0.00, 0.25, 0.00, 0.50. Take this as the task's number and the two-instance runs below as
+    anecdotes; two instances gave 0.375 and 0.125 on identical code.
+
+    **What it costs its rounds has changed.** 30 rounds executed, **30 lost to planning** and 14 to empty masks,
+    where the pre-arm-work runs lost mostly to empty masks. Every one of the 54 cuTAMP failures is "Motion
+    planning failed for N/N satisfying particles": the planner finds states that satisfy the goal and cannot find
+    a motion to them. That is now this task's largest loss and it is on the planner's side of the wire, which
+    makes the confirmed finding about its world model the next thing to test -- a round carrying a battery from a
+    desk to a bin on the floor spans two heights, and the planner keeps one support plane and deletes what is
+    below it. `battery_3`, on a cabinet in another room, is unplaced in 8 of the 10.
   - run 10 (`runs/bench_batteries_10`, the same two instances, after the arm-collision fixes): **0.50 and 0.25,
     mean 0.375** -- level with run 8's mean, with the two instances swapped (301 went 0.25 to 0.50, 302 went 0.50
     to 0.25). Nine rounds executed against six, five lost to empty masks against seven, three to planning against
