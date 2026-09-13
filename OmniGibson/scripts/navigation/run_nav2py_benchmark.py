@@ -360,8 +360,28 @@ def robot_footprint_diagnostics(robot):
     extent_xy = robot.reset_joint_pos_aabb_extent[:2]
     return {
         "extent_xy": to_float_list(extent_xy),
+        "half_extent_xy": to_float_list(extent_xy / 2.0),
         "bounding_radius": float(th.norm(extent_xy).item() / 2.0),
     }
+
+
+def success_criterion_diagnostics(args, robot):
+    if args.success_criterion == "center-distance":
+        return {
+            "type": "center-distance",
+            "success_distance": float(args.success_distance),
+        }
+    return {
+        "type": "footprint-overlap",
+        **robot_footprint_diagnostics(robot),
+    }
+
+
+def format_success_criterion(args, robot):
+    if args.success_criterion == "center-distance":
+        return f"center-distance<={args.success_distance:.3f}m"
+    half_x, half_y = robot_footprint_diagnostics(robot)["half_extent_xy"]
+    return f"footprint-overlap half_extent=({half_x:.3f},{half_y:.3f})m"
 
 
 def _symmetric_limit(lower, upper, index):
@@ -535,6 +555,27 @@ def point_cost_diagnostic(costmap, point):
         "goal_rejected": cost >= 253,
         "free_neighbor_cells_r1": free_neighbors,
     }
+
+
+def benchmark_episode_metadata(episode):
+    keys = (
+        "demo_episode_index",
+        "demo_raw_episode_id",
+        "task_instance_id",
+        "annotation_path",
+        "navigation_skill_idx",
+        "navigation_skill_frame_duration",
+        "start_source",
+        "target_object_name",
+        "target_bddl_instance",
+        "target_object_position",
+        "goal_source",
+        "goal_projection_radius",
+        "goal_projection_angle",
+        "template_path",
+        "tro_state_path",
+    )
+    return {key: episode[key] for key in keys if key in episode}
 
 
 def command_diagnostic(command):
@@ -773,7 +814,7 @@ def xy_distance(position, goal):
     return math.hypot(float(position[0]) - float(goal[0]), float(position[1]) - float(goal[1]))
 
 
-def point_inside_robot_footprint(robot, point):
+def robot_footprint_overlap_diagnostic(robot, point):
     position, orientation = robot.get_position_orientation()
     yaw = float(T.quat2euler(orientation)[2].item())
     dx = float(point[0]) - float(position[0])
@@ -781,10 +822,30 @@ def point_inside_robot_footprint(robot, point):
     local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
     local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
     half_extent = robot.reset_joint_pos_aabb_extent[:2] / 2.0
-    return abs(local_x) <= float(half_extent[0]) and abs(local_y) <= float(half_extent[1])
+    margin_x = float(half_extent[0]) - abs(local_x)
+    margin_y = float(half_extent[1]) - abs(local_y)
+    return {
+        "inside": margin_x >= 0.0 and margin_y >= 0.0,
+        "goal_local_xy": [float(local_x), float(local_y)],
+        "half_extent_xy": to_float_list(half_extent),
+        "margin_xy": [margin_x, margin_y],
+        "overflow": max(-margin_x, -margin_y, 0.0),
+    }
 
 
-def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config, command_limits, nav2py_api, args):
+def run_episode(
+    env,
+    robot,
+    episode,
+    costmap_bundle,
+    profile,
+    navigation_config,
+    command_limits,
+    nav2py_api,
+    args,
+    after_reset=None,
+    before_control_step=None,
+):
     env.reset(get_obs=False)
     place_robot(robot, episode)
     update_viewer_camera(robot, args)
@@ -795,6 +856,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
 
     zero_robot_velocities(robot)
     update_viewer_camera(robot, args)
+    if after_reset is not None:
+        after_reset()
 
     costmap, costmap_is_profile_inflated = select_costmap(costmap_bundle, args.costmap_source)
     navigator = make_navigator(
@@ -845,15 +908,17 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         if executed_command is not None and not executed_command.is_stop:
             commanded_steps += 1
 
+        if before_control_step is not None:
+            before_control_step(step, now, state, command, executed_command)
         env.step({robot.name: action_from_nav2py_command(robot, executed_command)})
         update_viewer_camera(robot, args)
         if args.visual_step_sleep > 0.0:
             time.sleep(args.visual_step_sleep)
         position, _ = robot.get_position_orientation()
         final_distance = xy_distance(position[:2], goal[:2])
-        goal_inside_footprint = point_inside_robot_footprint(robot, goal)
+        footprint_overlap = robot_footprint_overlap_diagnostic(robot, goal)
         success = (
-            goal_inside_footprint
+            footprint_overlap["inside"]
             if args.success_criterion == "footprint-overlap"
             else final_distance <= args.success_distance
         )
@@ -891,6 +956,7 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
     status = navigator.status()
     position, orientation = robot.get_position_orientation()
     final_yaw = float(T.quat2euler(orientation)[2].item())
+    final_footprint_overlap = robot_footprint_overlap_diagnostic(robot, goal)
     result = {
         "episode_id": episode["episode_id"],
         "scene_model": episode["scene_model"],
@@ -898,8 +964,10 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "scene_instance": episode["scene_instance"],
         "load_room_instances": episode["load_room_instances"],
         "floor": int(episode.get("floor", 0)),
+        "benchmark_episode_metadata": benchmark_episode_metadata(episode),
         "success": success,
         "success_criterion": args.success_criterion,
+        "success_criterion_value": success_criterion_diagnostics(args, robot),
         "costmap_source": args.costmap_source,
         "robot_profile": robot_profile_diagnostics(profile),
         "robot_footprint": robot_footprint_diagnostics(robot),
@@ -916,7 +984,8 @@ def run_episode(env, robot, episode, costmap_bundle, profile, navigation_config,
         "final_position": to_float_list(position),
         "final_yaw": final_yaw,
         "final_distance": xy_distance(position[:2], goal[:2]),
-        "goal_inside_robot_footprint": point_inside_robot_footprint(robot, goal),
+        "goal_inside_robot_footprint": final_footprint_overlap["inside"],
+        "goal_robot_footprint_overlap": final_footprint_overlap,
         "geodesic_distance": float(episode["geodesic_distance"]),
         "remaining_distance": status.remaining_distance,
         "progress": status.progress,
@@ -956,6 +1025,9 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "max_steps": args.max_steps,
         "success_distance": args.success_distance,
         "success_criterion": args.success_criterion,
+        "success_criterion_value": (
+            results[0]["success_criterion_value"] if results else {"type": args.success_criterion}
+        ),
         "costmap_source": args.costmap_source,
         "dynamic_safety_disabled": args.disable_dynamic_safety,
         "trace_failures": args.trace_failures,
@@ -1071,7 +1143,7 @@ def main(args=None, shutdown=True):
                     f"  {result['episode_id']}: "
                     f"{'SUCCESS' if result['success'] else 'FAIL'} "
                     f"final_distance={result['final_distance']:.3f}m "
-                    f"criterion={result['success_criterion']} "
+                    f"criterion={format_success_criterion(args, robot)} "
                     f"state={result['nav2py_state']}"
                 )
                 if not result["success"]:
@@ -1097,7 +1169,7 @@ def main(args=None, shutdown=True):
         print(f"\nSaved results to: {output}")
         print(
             f"Success rate: {summary['successes']}/{summary['total']} "
-            f"({summary['success_rate']:.1%}) using {args.success_criterion}"
+            f"({summary['success_rate']:.1%}) using {format_success_criterion(args, robot)}"
         )
         if shutdown and args.keep_open_on_complete:
             keep_viewer_open(args.keep_open_seconds)

@@ -1,0 +1,157 @@
+"""Interactively step through one saved navigation benchmark episode in the OmniGibson viewer."""
+
+import argparse
+import sys
+from pathlib import Path
+
+import omnigibson as og
+
+import run_nav2py_benchmark as runner
+from generate_nav_benchmark import build_env_config, load_robot_config, seed_everything
+from omnigibson.macros import gm
+
+
+DEFAULT_OUTPUT = "outputs/navigation/interactive_nav2py_result.json"
+
+
+def option_was_supplied(option, argv):
+    return option in argv or any(value.startswith(f"{option}=") for value in argv)
+
+
+def parse_args(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(
+        description="Open one benchmark episode and wait for Enter before every nav2py control step."
+    )
+    parser.add_argument("--episode-id", required=True, help="The one full benchmark episode ID to visualize.")
+    interactive_args, runner_argv = parser.parse_known_args(argv)
+
+    if "--episode-ids" in runner_argv:
+        parser.error("Use --episode-id; this visualizer supports exactly one episode.")
+
+    args = runner.parse_args(runner_argv)
+    args.episode_ids = [interactive_args.episode_id]
+    args.keep_open_on_complete = True
+    if not option_was_supplied("--output", runner_argv):
+        args.output = DEFAULT_OUTPUT
+    if not option_was_supplied("--viewer-camera-mode", runner_argv):
+        args.viewer_camera_mode = "follow"
+    if not option_was_supplied("--viewer-camera-distance", runner_argv):
+        args.viewer_camera_distance = 4.5
+    if not option_was_supplied("--viewer-camera-height", runner_argv):
+        args.viewer_camera_height = 2.8
+    if not option_was_supplied("--viewer-camera-target-height", runner_argv):
+        args.viewer_camera_target_height = 0.6
+    return args
+
+
+def command_text(command):
+    if command is None:
+        return "none"
+    if command.is_stop:
+        return "stop"
+    velocity = command.velocity
+    return f"vx={velocity.vx:.3f} vy={velocity.vy:.3f} wz={velocity.wz:.3f}"
+
+
+def wait_for_control_step(step, now, state, command, executed_command):
+    del state, command
+    try:
+        input(
+            f"\nStep {step:04d}  t={now:.2f}s  command: {command_text(executed_command)}\n"
+            "Press Enter to send this command..."
+        )
+    except EOFError as exc:
+        raise RuntimeError("Interactive visualization requires a terminal that can receive Enter key presses.") from exc
+
+
+def wait_until_ready():
+    try:
+        input("\nStart pose is loaded and settled. Press Enter to begin stepping navigation...")
+    except EOFError as exc:
+        raise RuntimeError("Interactive visualization requires a terminal that can receive Enter key presses.") from exc
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if gm.HEADLESS:
+        raise RuntimeError("This script needs a non-headless OmniGibson session. Unset OMNIGIBSON_HEADLESS first.")
+    if args.max_steps < 1:
+        raise ValueError("--max-steps must be at least 1")
+    if args.success_distance <= 0.0:
+        raise ValueError("--success-distance must be positive")
+
+    args.safety_slowdown_scales = runner.parse_safety_slowdown_scales(args.safety_slowdown_scales)
+    seed_everything(args.seed)
+    runner.add_nav2py_to_path(args.nav2py_root)
+    nav2py_api = runner.load_nav2py()
+    navigation_config = runner.make_navigation_config(nav2py_api, args)
+    if navigation_config.controller.min_lookahead_distance > navigation_config.controller.max_lookahead_distance:
+        raise ValueError("--min-lookahead-distance must be less than or equal to --max-lookahead-distance")
+
+    _, episodes = runner.load_benchmark(args.benchmark)
+    episode = runner.filter_episodes(episodes, args.episode_ids)[0]
+    with gm.unlocked():
+        gm.USE_GPU_DYNAMICS = False
+        gm.ENABLE_TRANSITION_RULES = False
+
+    robot_cfg = load_robot_config(args.robot_config)
+    command_limits = runner.resolve_command_limits(robot_cfg, args)
+    cfg = build_env_config(
+        scene_model=episode["scene_model"],
+        robot_cfg=robot_cfg,
+        scene_instance=episode["scene_instance"],
+        load_room_instances=episode["load_room_instances"],
+    )
+
+    try:
+        env = og.Environment(configs=cfg)
+        robot = env.robots[0]
+        if robot.model in ("r1", "r1pro"):
+            og.sim.stop()
+            robot.base_footprint_link.mass = 250.0
+            og.sim.play()
+        profile = runner.make_robot_profile(
+            robot,
+            nav2py_api,
+            args,
+            clearance_is_in_costmap=args.costmap_source in {"og-eroded", "og-eroded-soft"},
+        )
+        costmap_bundle = runner.make_costmap_bundle(env.scene, int(episode.get("floor", 0)), robot, nav2py_api, args)
+
+        print(f"\nLoaded {episode['episode_id']}.")
+        print(f"Success criterion: {runner.format_success_criterion(args, robot)}")
+        result = runner.run_episode(
+            env,
+            robot,
+            episode,
+            costmap_bundle,
+            profile,
+            navigation_config,
+            command_limits,
+            nav2py_api,
+            args,
+            after_reset=wait_until_ready,
+            before_control_step=wait_for_control_step,
+        )
+        output = runner.write_results(
+            args.output,
+            args.benchmark,
+            args.nav2py_root,
+            navigation_config,
+            command_limits,
+            args,
+            [result],
+        )
+        print(
+            f"\n{'SUCCESS' if result['success'] else 'FAIL'}: {result['episode_id']} "
+            f"final_distance={result['final_distance']:.3f}m state={result['nav2py_state']}"
+        )
+        print(f"Saved result to: {Path(output)}")
+        runner.keep_viewer_open(args.keep_open_seconds)
+    finally:
+        og.shutdown()
+
+
+if __name__ == "__main__":
+    main()
