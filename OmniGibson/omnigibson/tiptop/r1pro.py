@@ -1416,12 +1416,13 @@ class R1ProSim(TiptopSim):
         side = 1.0 if arm == "left" else -1.0
         base = np.array([PRESENT_POINT[0], side * PRESENT_POINT[1], PRESENT_POINT[2]], dtype=np.float64)
         here = np.asarray(seed, dtype=np.float64)
-        candidates = []
+        candidates, unreachable = [], 0
         for offset in PRESENT_OFFSETS:
             target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
             # the orientation is loose: what matters is that the object is in the picture, not how it is held
             solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.04, tolerance_rad=1.2)
             if solution is None:
+                unreachable += 1
                 continue
             inside = self.links_in_base_box(arm, ik, solution)
             if inside:
@@ -1430,6 +1431,14 @@ class R1ProSim(TiptopSim):
             touched, objects = self.path_contacts(arm, ik, here, solution, aabbs)
             candidates.append((touched, len(candidates), target, solution, objects))
         if not candidates:
+            # Which of the two it is matters: an arm that cannot reach any present point from where it stands is a
+            # different problem from one whose every reach is refused. The seed is where the arm actually is, and
+            # the capture's own changes move that -- so say it.
+            log.warning(
+                f"{arm} arm: none of the {len(PRESENT_OFFSETS)} present points work from "
+                f"{np.round(here, 2).tolist()}: {unreachable} out of reach, "
+                f"{len(PRESENT_OFFSETS) - unreachable} refused at the base"
+            )
             return None
         touched, _, target, solution, objects = min(candidates)
         if touched:
