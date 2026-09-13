@@ -109,6 +109,7 @@ LOOK_SETTLE_STEPS = 60
 # the whole robot and can shift the objects the capture is about to look at. Well under the arm joints' 7 rad/s.
 CAPTURE_MAX_JOINT_VEL = 0.6
 RAMP_BLOCK_TOL = 0.1  # rad: a ramped joint this far from its target is not following the ramp (blocked); logged
+RAMP_BLOCK_STEPS = 5  # consecutive steps behind that tolerance before the ramp calls it blocked and stops
 # A wrist camera's look configuration must keep these links of its arm (name suffixes) out of the base's box, inflated
 # by BASE_CLEARANCE: Lula IK knows no collisions, and with the torso leaning the first offset put the right hand on the
 # base top, where it stayed for the whole capture (2026-09-11, assembling_gift_baskets: finger and wrist-camera links
@@ -1223,7 +1224,7 @@ class R1ProSim(TiptopSim):
         k = len(self.planned_joints)
         idx = [self.joint_index[j] for j in names]
         ramped = np.array(["finger" not in j for j in names])  # the gripper command drives the fingers, not the ramp
-        last, fastest, culprit, blocked = np.asarray(start), 0.0, "", None
+        last, fastest, culprit, blocked, behind = np.asarray(start), 0.0, "", None, 0
         for i, q in enumerate(path):
             self.posture = {j: float(v) for j, v in zip(posture, q[k:])}
             self.step(q[:k], gripper)
@@ -1235,14 +1236,18 @@ class R1ProSim(TiptopSim):
                 culprit = f" ({names[j]} at step {i + 1}: {last[j]:+.3f} -> {measured[j]:+.3f} rad, target {q[j]:+.3f})"
             lag = np.where(ramped, np.abs(measured - q), 0.0)
             last = measured
-            if lag.max() > RAMP_BLOCK_TOL:
+            # One step behind is a graze the arm slips past (the right arm over the base does it on most basket
+            # captures); RAMP_BLOCK_STEPS in a row is something the arm is not going to get past.
+            behind = behind + 1 if lag.max() > RAMP_BLOCK_TOL else 0
+            if behind >= RAMP_BLOCK_STEPS:
                 j = int(lag.argmax())
                 blocked = (names[j], i + 1, float(lag[j]))
                 break  # stop pushing: the rest of the path would only lean harder on whatever is in the way
         if blocked is not None:
             log.warning(
                 f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
-                f"behind its target): the arm is pushing against something, so the ramp stopped there"
+                f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
+                f"ramp stopped there"
             )
             held = self.robot.get_joint_positions()
             self.posture = {j: float(held[self.joint_index[j]]) for j in posture}
