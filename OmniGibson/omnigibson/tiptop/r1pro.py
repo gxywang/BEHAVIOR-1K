@@ -30,6 +30,15 @@ import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
 from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
+from omnigibson.tiptop.articulation import (
+    OPEN_FRACTION_SCORED,
+    follow_joint,
+    handle_point,
+    is_open,
+    openable_joints,
+    opening_travel,
+    pose_matrix,
+)
 from omnigibson.tiptop.gt_masks import masks_from_geometry, points_within_tol
 from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
 from omnigibson.tiptop.protocol import (
@@ -250,6 +259,12 @@ FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: w
 STANCE_CLEARANCE = 0.05
 CLEAR_WEIGHT = 4.0
 TRAVEL_SETTLE_STEPS = 20  # after folding or unfolding: one joint moved, so it settles quickly
+# Opening a container: how finely the joint's path is followed, and the holds around it. The steps matter more
+# than they look -- the hand is holding the link, so a coarse path drags it through poses its joint does not
+# allow and the grasp is what gives way.
+OPEN_PATH_STEPS = 10
+OPEN_SETTLE_STEPS = 15
+OPEN_GRASP_STEPS = 25  # closing on the handle before any pulling starts
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -1069,6 +1084,88 @@ class R1ProSim(TiptopSim):
         if moved > shift:
             return False, f"the base slid {moved * 100:.0f} cm from where it was put"
         return True, ""
+
+    def open_container(self, arm: str, name: str, fraction: float = OPEN_FRACTION_SCORED) -> dict:
+        """Take hold of a container's moving link and follow its joint, opening it by ``fraction`` of its range.
+
+        The one motion in the pipeline where the gripper has to follow a path rather than reach a pose: a drawer
+        slides, a door swings, and the link comes with the hand. The path comes from ``articulation.follow_joint``;
+        each of its poses is solved with the arm's own IK and ramped to at the capture speed, so the hand tracks
+        the curve instead of being commanded to its end. Returns what happened, for the round's record.
+
+        It reads the joint from the simulator (``openable_joints``), which is privileged in exactly the way the
+        oracle's button poses are: at evaluation the axis, the limits and the handle would come from perception,
+        and nothing else about the motion changes.
+        """
+        obj = self.scene_object(name)
+        joints = openable_joints(obj)
+        if not joints:
+            return {"opened": False, "why": f"{name} has no joint that opens"}
+        # the widest range first: on a bank of drawers any one satisfies the atom, and the widest is the easiest
+        joints.sort(key=lambda j: -(abs(j["upper"] - j["lower"])))
+        joint = joints[0]
+        travel = opening_travel(joint["kind"], joint["lower"], joint["upper"], joint["position"], fraction)
+        if abs(travel) < 1e-4:
+            return {"opened": is_open(joint["lower"], joint["upper"], joint["position"]), "why": "already open"}
+        link = obj.links.get(joint["link"])
+        if link is None:
+            return {"opened": False, "why": f"{name}.{joint['name']} has no link to take hold of"}
+        grip = self.eef_pose_base(arm)
+        handle_world = handle_point(link, joint["axis"], np.sign(travel) or 1.0)
+        handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
+        start = pose_matrix(
+            handle_base.cpu().numpy(), T.mat2quat(th.tensor(grip[:3, :3], dtype=th.float32)).cpu().numpy()
+        )
+        axis_base = self.to_base(th.tensor(joint["axis"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
+        origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
+        base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
+        path = follow_joint(
+            start,
+            joint["kind"],
+            axis_base.cpu().numpy() - base_pos,  # a direction, so the base translation comes back out
+            origin_base.cpu().numpy(),
+            travel,
+            steps=OPEN_PATH_STEPS,
+        )
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
+        joints_of = list(self.robot.arm_joint_names[arm])
+        q = self.robot.get_joint_positions()
+        seed = [float(q[self.joint_index[j]]) for j in joints_of]
+        reached, blocked = 0, ""
+        for i, pose in enumerate(path):
+            quat = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
+            solution = ik.solve(pose[:3, 3], quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+            if solution is None:
+                blocked = f"no inverse kinematics for step {i + 1} of {len(path)}"
+                break
+            targets = [float(v) for v in self.q_arm()]
+            for name_j, value in zip(joints_of, solution):
+                if name_j in self.planned_joints:
+                    targets[self.planned_joints.index(name_j)] = float(value)
+            stopped = self.ramp_to(
+                targets,
+                self.posture,
+                self.CLOSE if i else self.OPEN,
+                OPEN_SETTLE_STEPS,
+                note=f"open {name} step {i + 1}",
+            )
+            seed = [float(v) for v in solution]
+            reached = i + 1
+            if i == 0:
+                self.hold(OPEN_GRASP_STEPS, self.CLOSE)  # take hold of the handle before pulling on it
+            if stopped is not None:
+                blocked = f"{stopped[0]} stopped following at step {i + 1} of {len(path)}"
+                break
+        self.hold(OPEN_SETTLE_STEPS, self.OPEN)  # let go, whatever happened
+        after = openable_joints(obj)
+        now = next((j for j in after if j["name"] == joint["name"]), joint)
+        opened = is_open(now["lower"], now["upper"], now["position"])
+        log.info(
+            f"{name}.{joint['name']} ({joint['kind']}): asked for {travel:+.3f}, reached step {reached} of "
+            f"{len(path)}, joint now {now['position']:.3f} of [{now['lower']:.2f}, {now['upper']:.2f}] "
+            f"-- {'OPEN' if opened else 'still closed'}" + (f"; {blocked}" if blocked else "")
+        )
+        return {"opened": opened, "why": blocked, "joint": joint["name"], "position": now["position"]}
 
     def place_robot_near(self, support: str, side: str = "auto", standoff: float = 0.30, ignore_names=()) -> dict:
         """Put the robot next to a piece of furniture, facing it ("navigation done" stand-in).
