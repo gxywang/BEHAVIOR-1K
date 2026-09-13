@@ -165,6 +165,17 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     candidate's camera and reject poses where it falls outside the image or nearer than the camera resolves.**
     It already computes each candidate's camera pose, and `points_to_pixels` is the same projection the masks
     use, so the test is exact rather than a proxy.
+  - The same diagnostic shows a **second, different cause** on the other batteries, and it is the robot itself:
+    `battery_1` projects *inside* the head image both times it is missed, at 0.61 m and 0.64 m, and the depth at
+    that pixel reads **0.41 m** and then **0.01 m**. A near-zero depth is the robot's own pixels, which the
+    self-mask zeroes: the arm is between the head camera and the target. The look poses are already chosen to
+    keep the wrist cameras out of the head camera's frame (`_log_wrist_framing`), but nothing checks whether the
+    arm lies on the line from the head camera to what the capture is about. That test belongs next to the others
+    in `wrist_look`, and it is cheap: the arm's link positions are already computed there for the base and scene
+    clearance checks.
+  - So `dispose_of_batteries` loses its rounds to three separate things, each now measured rather than guessed:
+    the object below the head frame, the object hidden behind the robot's own arm, and one case where the camera
+    resolves past the object entirely (0.36 m away, rendered depth 0.51 m) that still needs a look.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
