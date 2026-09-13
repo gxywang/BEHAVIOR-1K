@@ -41,6 +41,7 @@ from omnigibson.tiptop.run import (
 log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
+STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
 UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
 FLOOR_LEVEL = 0.15  # m: a target whose bottom is lower than this stands on the floor (the workspace reaches down)
@@ -118,21 +119,43 @@ class Episode:
     def stand_for(self, *names: str) -> dict:
         """Teleport the base to a pose from which the named objects are in the left arm's reach and in view. A
         second call for the same objects stands somewhere else; when nothing is found within the arm's usual
-        reach, the search is widened to ``REACH_FAR`` (the torso leans that far) before giving up."""
+        reach, the search is widened to ``REACH_FAR`` (the torso leans that far) before giving up.
+
+        The base is read back after it settles (``settled_level``): a pose that intersects furniture is resolved
+        by the physics lifting and rolling the whole robot, and since every field of a request is expressed in the
+        base frame, a tilted base hands the planner the whole scene tilted. Over runs/bench_batteries_ten only 1
+        of the 14 rounds that ran from a base off level executed, against 29 of the 46 that ran from a level one,
+        so such a pose is treated as occupied and the search is asked for another (2026-09-13).
+        """
         avoid = self.stood.setdefault(names, [])
         self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
-        try:
-            pose = self.sim.place_robot_for(*names, avoid=avoid)
-        except RuntimeError as e:
-            log.info(f"{e}; widening the search to {REACH_FAR} m")
+        for attempt in range(STANCE_ATTEMPTS):
             try:
-                pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid)
-            except RuntimeError as far:
-                self.records.append({"stand_for": list(names), "error": str(far), "step": self.sim.n_steps})
-                raise Unreachable(str(far)) from far
-        avoid.append((pose["x"], pose["y"]))
-        self.sim.hold(self.args.settle_steps, self.sim.last_gripper)  # a held object keeps its gripper closed
-        self.records.append({"stand_for": list(names), "pose": pose, "step": self.sim.n_steps})
+                pose = self.sim.place_robot_for(*names, avoid=avoid)
+            except RuntimeError as e:
+                log.info(f"{e}; widening the search to {REACH_FAR} m")
+                try:
+                    pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid)
+                except RuntimeError as far:
+                    self.records.append({"stand_for": list(names), "error": str(far), "step": self.sim.n_steps})
+                    raise Unreachable(str(far)) from far
+            avoid.append((pose["x"], pose["y"]))
+            self.sim.hold(self.args.settle_steps, self.sim.last_gripper)  # a held object keeps its gripper closed
+            level, why = self.sim.settled_level(pose["x"], pose["y"])
+            self.records.append(
+                {"stand_for": list(names), "pose": pose, "step": self.sim.n_steps, "level": level, "why": why}
+            )
+            if level:
+                return pose
+            log.warning(
+                f"{why} at ({pose['x']:.2f}, {pose['y']:.2f}): the pose is occupied by something the footprint "
+                f"test missed"
+                + (
+                    f"; standing somewhere else ({attempt + 1}/{STANCE_ATTEMPTS})"
+                    if attempt + 1 < STANCE_ATTEMPTS
+                    else "; out of attempts, working from here"
+                )
+            )
         return pose
 
     def has_arm(self, arm: str) -> bool:

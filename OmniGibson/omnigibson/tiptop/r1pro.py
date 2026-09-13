@@ -223,11 +223,14 @@ HIDE_DEPTH, HIDE_MARGIN = 0.05, 0.06  # m: a container nearer by less than HIDE_
 # seen from the camera, when their bearings are within its angular half-width plus an item margin of HIDE_MARGIN
 # _footprint_free: what an AABB in the footprint means
 HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings and say nothing about the floor
-FLAT_COVERING_HEIGHT, GROUND_CLEARANCE = 0.08, 0.05  # m; boxes flatter than that on the ground are stood on
+# What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
+# how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
+TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
+SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # What the robot folds to before the base teleports, and back out of afterwards. The footprint the stance search
 # guards is the BASE's, but the base is not what sticks out: with the challenge torso posture the arms' links sit
 # up to 0.43 m beyond the base's own rectangle (x 0.31..0.67 where the base ends at 0.24), so a stance whose base
@@ -1005,6 +1008,7 @@ class R1ProSim(TiptopSim):
                 for cy in (rect[0][1], rect[1][1])
             ] + [(x, y)]
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        underside = float(self.base_pose()[0][2]) + float(self.base_box()[0][2])  # world z the base clears
         clearance = float("inf")  # the least room to any obstacle, so the score can prefer a stance with some
         floors = [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
         for cx, cy in corners:
@@ -1028,10 +1032,13 @@ class R1ProSim(TiptopSim):
                 continue  # merged walls, roof, ceilings say nothing; the floor test handles walls
             if lo[2] > ROBOT_HEIGHT:
                 continue  # entirely above the robot (roof, lamps)
-            if hi[2] - lo[2] < FLAT_COVERING_HEIGHT and lo[2] < GROUND_CLEARANCE:
-                continue  # flat floor coverings (pavers, rugs, mats) are stood on, not avoided
-            if hi[2] <= GROUND_CLEARANCE:
-                continue
+            if hi[2] <= underside:
+                continue  # it passes under the base: a rug, a threshold, a cable. Anything standing taller than
+                # the base's underside is an obstacle, however thin. The old test exempted everything under 8 cm
+                # lying on the floor, which is written for pavers and mats and matches the task's own objects: 7
+                # of the 8 toy figures of runs/bench_toys_7 are 0.043-0.079 m thick and were exempt in 32 to 40 of
+                # the 41 captures each, and the base ended up 28 cm inside toy_figure_6's box, riding on it at
+                # -4.5 deg of roll (2026-09-13).
             if rect is not None:
                 gap = rect_box_gap((x, y), yaw, rect[0], rect[1], lo, hi)
                 if gap <= 0.0:
@@ -1040,6 +1047,28 @@ class R1ProSim(TiptopSim):
             elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
                 return False, f"overlaps {obj.name}", 0.0
         return True, "free", float(clearance)
+
+    def settled_level(self, x: float, y: float, tilt_deg: float = TILT_LIMIT_DEG, shift: float = SHIFT_LIMIT) -> tuple:
+        """(level, why) for where the base actually settled after being teleported to ``x``, ``y``.
+
+        Nothing used to read the base back. When a commanded pose intersects furniture the physics resolves it by
+        lifting and rolling the whole robot, and the round then runs from a base frame that is not level -- which
+        every field of the request is expressed in, so the planner receives the whole scene tilted against gravity.
+        Measured over runs/bench_batteries_ten: 15 of 61 rounds settled off the nominal, up to 0.101 m of lift and
+        20.4 deg of roll, and **1 of those 14 rounds executed against 29 of the 46 level ones** (2026-09-13).
+
+        Roll and pitch and the xy shift are used rather than the height, because their nominal value is exactly
+        zero while the settled height is a property of the scene's floor.
+        """
+        pos, quat = self.base_pose()
+        roll, pitch, _ = T.quat2euler(quat)
+        tilt = math.degrees(max(abs(float(roll)), abs(float(pitch))))
+        moved = float(np.hypot(float(pos[0]) - x, float(pos[1]) - y))
+        if tilt > tilt_deg:
+            return False, f"the base settled {tilt:.1f} deg off level"
+        if moved > shift:
+            return False, f"the base slid {moved * 100:.0f} cm from where it was put"
+        return True, ""
 
     def place_robot_near(self, support: str, side: str = "auto", standoff: float = 0.30, ignore_names=()) -> dict:
         """Put the robot next to a piece of furniture, facing it ("navigation done" stand-in).
