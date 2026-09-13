@@ -926,6 +926,20 @@ stopped, once when the arm was found short of ready afterwards, which a blocked 
 That spent the whole `BLOCKED_SWINGS_MAX` allowance on a single capture and turned wrist look poses off for the
 rest of the instance.
 
+**The dominant collision was presenting, not looking.** With head views alone there is no wrist camera to see a
+carried object with, so every carry round lifts it in front of the head camera (`present_held`) -- and in
+`runs/bench_toys_6`, **28 of 29 presentations were stopped against something**. It took the first of eight
+offsets the arm could reach, checked only at its destination. It now ranks them by `path_contacts` like the look
+poses. The motion labels are what found this: the run reported 28 blocked "capture swing out" ramps in a run where
+`wrist_look` never ran once.
+
+**A ramp could call itself blocked on a joint it was not moving.** Harmless while every capture ramp commanded the
+whole nominal posture; the moment head views stopped doing that, an arm merely sagging against furniture
+accumulated lag against its own hold target, head-view ramps aborted on `left_arm_joint1/4/5/7`, the torso was
+left partway through its turn, and four rounds died on "the torso did not return". Only the joints a ramp moves
+can call it blocked now; a held joint that drifts is reported in its own line. (An agent proposed this mechanism
+before the head-view change and was correctly refuted -- it became real only afterwards.)
+
 **And the check that abandoned rounds on settling.** The guard that gives up when the torso has not returned from
 the head views shared `LOOK_TOL`'s 0.03 rad -- inside the settling distribution. The 32 successful returns of one
 run spread 0.0000-0.0282 rad and all three rounds lost to the check were "off by 0.030". It has its own number now
