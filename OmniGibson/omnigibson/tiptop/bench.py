@@ -202,20 +202,44 @@ class Episode:
     # ---------------------------------------------------------------- the retry policy, the same for every task
     def satisfied(self, atoms: list[dict], record: dict | None = None) -> bool:
         """Whether every atom holds, judged from the robot's own readings and localization: ``holding`` by the hand
-        record, a placement by ``placed``, and a press (or any other atom) by its round having run without error:
-        the switch's state is the simulator's to know, so a press is open loop."""
+        record, a placement by ``placed``, ``nextto`` by ``beside``, and a press by its round having run without
+        error (the switch's state is the simulator's to know, so a press is open loop).
+
+        A predicate the runner does not know is NOT taken to hold because a round ran. That is what this did, and
+        it would score every new predicate satisfied the moment a round was attempted -- the first task to name one
+        would be reported as solved without anything having been achieved.
+        """
         ran = record is not None and not record.get("error")
         for a in atoms:
             predicate, args = a["predicate"], a["args"]
             if predicate == "holding":
                 ok = self.holding(args[0])
+            elif predicate == "nextto" and len(args) == 2:
+                ok = self.beside(args[0], args[1])
             elif predicate in PLACE_PREDICATES and len(args) == 2:
                 ok = self.placed(args[0], args[1])
+            elif predicate == "toggled_on" or (predicate == "not" and "toggled_on" in args):
+                ok = ran  # a press is open loop: it ran, and the switch's state is the simulator's to know
             else:
-                ok = ran
+                log.warning(f"no test for {predicate}({', '.join(args)}); the round counts as unfinished")
+                ok = False
             if not ok:
                 return False
         return True
+
+    def beside(self, item: str, other: str) -> bool:
+        """OmniGibson's own NextTo measure, on the boxes the knowledge source localizes.
+
+        ``object_states/next_to.py``: the per-axis gap between the two boxes, as a norm, within a sixth of the mean
+        of their extents. The simulator's version also asks for horizontal adjacency (a raycast test that the thing
+        beside you is not behind something else); this half is the geometry, and the adjacency half is not
+        available without the simulator, so a placement that satisfies this can still fail the evaluator's test.
+        """
+        boxes = self.boxes(item, other)
+        a, b = boxes[item], boxes[other]
+        gap = np.array([max(0.0, max(a["lo"][d], b["lo"][d]) - min(a["hi"][d], b["hi"][d])) for d in range(3)])
+        extents = (np.asarray(a["hi"]) - np.asarray(a["lo"])) + (np.asarray(b["hi"]) - np.asarray(b["lo"]))
+        return bool(np.linalg.norm(gap) <= float(np.mean(extents)) / 6.0)
 
     def achieve(self, atoms: list[dict], arm: str = "left", floor: bool | None = None, done=None) -> bool:
         """Up to ``--rounds`` planning rounds for ``atoms`` with the planner of ``arm``, stopping as soon as

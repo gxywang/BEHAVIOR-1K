@@ -29,7 +29,12 @@ from omnigibson.tiptop.protocol import bddl_category
 log = logging.getLogger(__name__)
 
 TASKS_DIR = Path(__file__).resolve().parent / "tasks"
-PLACE_PREDICATES = ("inside", "ontop", "on")
+# Goal predicates the transfer plan can act on: a pick, a carry and a release at the target. "nextto" joins
+# them because the planner has had the operator all along -- cuTAMP's PlaceNear with its Near fluent and
+# NearPlacement constraint -- and the bridge already maps nextto -> near on the wire. 16 of the 100 challenge
+# tasks name it, and expanding the goals says it lifts the vocabulary's ceiling over the whole set from a mean
+# q_score of 0.415 to 0.480 (2026-09-13).
+PLACE_PREDICATES = ("inside", "ontop", "on", "nextto")
 GOAL_OPTIONS_READ = 20000  # ground goal options read to learn the demand (assembling_gift_baskets has 331,776)
 
 

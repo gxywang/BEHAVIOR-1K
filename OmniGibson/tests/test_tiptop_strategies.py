@@ -426,3 +426,52 @@ def test_the_episode_judges_rounds_without_the_simulator():
     assert not ep.satisfied([atom("toggled_on", "radio.n.01_1")], record={"error": "no plan"})
     assert ep.satisfied([atom("toggled_on", "radio.n.01_1")], record={"round": 3})
     assert ep.satisfied([atom("inside", "candle.n.01_1", "basket.n.01_1")], record={"round": 4})
+
+
+# --------------------------------------------------------------- nextto, OmniGibson's own measure
+def test_beside_matches_omnigibsons_nextto_threshold():
+    """object_states/next_to.py: the per-axis AABB gap, as a norm, within a sixth of the mean of the extents."""
+    from omnigibson.tiptop.bench import Episode
+
+    class Boxes(Episode):
+        def __init__(self, boxes):
+            self._boxes = boxes
+
+        def boxes(self, *names):
+            return {n: self._boxes[n] for n in names}
+
+    def box(cx, cy, half):
+        return {"lo": [cx - half, cy - half, 0.0], "hi": [cx + half, cy + half, 2 * half]}
+
+    # two 0.2 m cubes: mean extent 0.2, so the threshold is 0.2 / 6 = 0.033 m of gap
+    near = Boxes({"a": box(0.0, 0.0, 0.1), "b": box(0.22, 0.0, 0.1)})  # 2 cm apart
+    far = Boxes({"a": box(0.0, 0.0, 0.1), "b": box(0.30, 0.0, 0.1)})  # 10 cm apart
+    assert near.beside("a", "b") is True
+    assert far.beside("a", "b") is False
+
+
+def test_beside_scales_the_threshold_with_the_objects():
+    from omnigibson.tiptop.bench import Episode
+
+    class Boxes(Episode):
+        def __init__(self, boxes):
+            self._boxes = boxes
+
+        def boxes(self, *names):
+            return {n: self._boxes[n] for n in names}
+
+    # a 2 m object and a 0.2 m one: mean extent is much larger, so 10 cm of gap is still "beside"
+    big = {"lo": [0.0, 0.0, 0.0], "hi": [2.0, 2.0, 1.0]}
+    small = {"lo": [2.10, 0.0, 0.0], "hi": [2.30, 0.2, 0.2]}
+    assert Boxes({"a": small, "b": big}).beside("a", "b") is True
+
+
+def test_an_unknown_predicate_is_not_counted_satisfied_just_because_a_round_ran():
+    from omnigibson.tiptop.bench import Episode
+
+    class Ran(Episode):
+        def __init__(self):
+            pass
+
+    atoms = [{"predicate": "open", "args": ["cabinet.n.01_1"]}]
+    assert Ran().satisfied(atoms, record={"round": 1}) is False
