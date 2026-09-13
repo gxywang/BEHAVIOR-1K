@@ -317,3 +317,13 @@ def test_sampling_an_empty_or_single_point_polyline_is_harmless():
 
     assert sample_polyline([], step=0.02).shape == (0, 3)
     assert sample_polyline([(1.0, 2.0, 3.0)], step=0.02).shape == (1, 3)
+
+
+def test_the_head_view_return_tolerance_clears_the_settling_it_must_not_abort_on():
+    # measured over one putting_away_toys run (2026-09-13): 32 successful returns spread 0.0000-0.0282 rad, and
+    # the three rounds this check aborted were "off by 0.030" -- indistinguishable from settling
+    from omnigibson.tiptop.r1pro import HEAD_VIEW_RETURN_TOL, HEAD_VIEWS
+
+    assert HEAD_VIEW_RETURN_TOL > 0.0282 * 2, "the abort threshold must sit clear of normal settling"
+    smallest_delta = min(abs(delta) for _, delta in HEAD_VIEWS.values())
+    assert HEAD_VIEW_RETURN_TOL < smallest_delta / 2, "but must still catch a torso that did not come back"

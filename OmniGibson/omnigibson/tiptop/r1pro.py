@@ -127,6 +127,13 @@ SCENE_CLEARANCE = 0.03  # m: a look configuration keeps the hand links this far 
 BLOCKED_SWINGS_MAX = 2  # capture swings stopped against something before an instance gives up on look poses
 ELBOW = 3  # index of the elbow in an arm's joint list: folded before a capture swing, straightened after it
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
+# How far the torso may be from where it started after the head views before the round is abandoned. It is a
+# separate number from LOOK_TOL because it is a different question, and because sharing LOOK_TOL's 0.03 put the
+# abort threshold *inside* the normal settling distribution: over one putting_away_toys run (2026-09-13) the 32
+# returns that succeeded spread 0.0000-0.0282 rad, and the three rounds lost to this check were "off by 0.030".
+# Those were noise, not a torso that failed to return -- a real failure leaves a large fraction of the head view's
+# own 0.3 rad delta behind, which this still catches.
+HEAD_VIEW_RETURN_TOL = 0.10
 # An arm link whose origin passes this close (m) to the head camera's line of sight to the look target is taken to
 # block it. About the half width of the gripper, which is the widest thing on the arm; the test is on link origins,
 # so a link is a point and this radius stands in for its mesh. The arm in front of the target does not merely darken
@@ -1939,7 +1946,7 @@ class R1ProSim(TiptopSim):
             abs(float(self.q_arm()[self.planned_joints.index(j)]) - q_arm[self.planned_joints.index(j)])
             for j in moved_joints
         )
-        if back > LOOK_TOL:
+        if back > HEAD_VIEW_RETURN_TOL:
             raise RuntimeError(f"the torso did not return after the head views (off by {back:.3f} rad)")
         request["q_init"] = self.q_arm()  # the plan starts here, not at a turned head view
         log.info(f"head views {head_views} taken; {sorted(moved_joints)} back (error {back:.4f} rad)")
