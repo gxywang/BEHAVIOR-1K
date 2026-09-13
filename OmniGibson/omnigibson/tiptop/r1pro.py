@@ -1726,9 +1726,10 @@ class R1ProSim(TiptopSim):
                 continue
             # An arm is posed for one of two reasons: its wrist camera is one of the views, or it stands in the
             # head camera's way. The planned arm was posed whatever the views were, so with head views alone
-            # (--views head head_up head_down) it was swung on every capture for nothing -- and that swing is the
-            # only arm motion of such a round. It is what produced all 26 blocked ramps of the putting_away_toys
-            # run of 2026-09-13, where the user watched the arm knock the toys about.
+            # (--views head head_up head_down) it could be swung with no camera to aim. How often: over the 23
+            # saved captures of runs/bench_toys_4, 2 swung, 7 tried and were blocked, and 14 never reached this
+            # branch at all -- so this is a real motion for nothing, but a rare one, not the source of that run's
+            # 26 blocked ramps (those were the head-view ramps; see _capture_views).
             if not holding and f"{arm}_wrist" not in views:
                 in_the_way = self.links_on_sight_line(arm, target)
                 if not in_the_way:

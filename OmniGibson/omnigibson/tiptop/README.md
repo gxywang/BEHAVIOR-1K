@@ -871,15 +871,18 @@ same runs. So the arm was not fighting the planner's paths; it was fighting the 
 cameras. Every motion the bridge starts now carries a name ("capture swing out", "torso to the head_up view"), a
 blocked ramp prints it, and `scripts/read_run.py` counts them per name.
 
-**A head view was moving the arm.** 24 of the 28 blocked ramps in the toys run were head-view ramps, and the joint
+**A head view was moving the arm -- this is the big one.** 24 of the 28 blocked ramps in the toys run were
+head-view ramps, and the joint
 that blocked was always an arm joint, never the torso. A head view was built on the posture the caller *intended*,
 so it re-commanded the arm to that posture -- dragging an arm that a blocked swing or a short grasp had left
 elsewhere, against whatever had stopped it. It is now built on the measured joints and moves the torso alone.
 
-**An arm was swung for nothing.** `capture()` posed the planned arm on every capture whatever the views were. With
-head views alone there is no wrist camera to aim, so the swing served nothing at all -- and it was the only arm
-motion of such a round. An arm is now posed only if its wrist camera is one of the views or its links stand on the
-head camera's line to what the capture is about.
+**An arm was swung for nothing, though less often than it first looked.** `capture()` posed the planned arm
+whatever the views were, so with head views alone there was no wrist camera to aim and the swing served nothing.
+The first reading of this called it the source of the 26 blocked ramps; checking the saved captures refutes that.
+Over the 23 captures of `runs/bench_toys_4`: 2 swung, 7 tried and were blocked, 14 never reached the branch. It is
+a real motion for nothing and a rare one. An arm is now posed only if its wrist camera is one of the views or its
+links stand on the head camera's line to what the capture is about.
 
 **A furniture box is not the furniture.** At the READY posture, where the robot has just teleported in and is
 touching nothing, the boxes of a swivel chair and a desk both contain the hand -- and the hand-only test that
@@ -908,6 +911,11 @@ a pose the arm never reached for 25 steps.
 stopped, once when the arm was found short of ready afterwards, which a blocked swing causes almost by definition.
 That spent the whole `BLOCKED_SWINGS_MAX` allowance on a single capture and turned wrist look poses off for the
 rest of the instance.
+
+**And the check that abandoned rounds on settling.** The guard that gives up when the torso has not returned from
+the head views shared `LOOK_TOL`'s 0.03 rad -- inside the settling distribution. The 32 successful returns of one
+run spread 0.0000-0.0282 rad and all three rounds lost to the check were "off by 0.030". It has its own number now
+(`HEAD_VIEW_RETURN_TOL`, 0.10), clear of settling and still far under the head view's own 0.3 rad delta.
 
 **What was proposed and refused.** Each finding was given to an agent told to refute it. Three of eight were
 refuted on the code and were never implemented: that `ramp_to`'s block test fires on joints the ramp does not move
