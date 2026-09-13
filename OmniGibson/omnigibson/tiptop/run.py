@@ -335,6 +335,30 @@ def build_sim(args, embodiment: dict | None = None):
     return sim
 
 
+def log_missing_objects(sim, request: dict, extras: dict, atoms: list[dict]) -> None:
+    """Where each goal object was when a capture could not see it: its pixel in every view, whether that pixel is
+    inside the image, and what the view's own depth says is in front of it there (nearer than the object means
+    something is in the way). Read with ``rgb_failed.png``."""
+    from omnigibson.tiptop.protocol import capture_views, points_to_pixels
+
+    poses = extras.get("object_poses_base") or {}
+    names = {sim.tracked_label(a) for atom in atoms for a in atom["args"]}
+    for label in sorted(names & set(poses)):
+        point = np.asarray(poses[label]["aabb_center"], dtype=np.float64)
+        for name, view, _ in capture_views(request, extras):
+            depth = np.asarray(view["depth"], dtype=np.float64)
+            h, w = depth.shape
+            px, z = points_to_pixels([point], view["intrinsics"], view["world_from_cam"])
+            (u, v), ahead = px[0], float(z[0])
+            inside = ahead > 0 and 0 <= u < w and 0 <= v < h
+            seen = f"{float(depth[int(v), int(u)]):.2f} m" if inside else "-"
+            log.warning(
+                f"{label} in the {name} view: {ahead:.2f} m ahead at pixel ({u:.0f}, {v:.0f}) of {w}x{h}, "
+                + ("inside the image" if inside else "OUTSIDE the image")
+                + f", depth there {seen}"
+            )
+
+
 def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bool = False) -> tuple[dict, dict]:
     """Render, attach what the knowledge source knows about ``atoms``, validate, and save the observation."""
     import imageio
@@ -346,7 +370,15 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bo
     try:
         known = knowledge.describe(atoms, request, extras, floor=floor)
     except GoalNotVisible:
+        # Say where the object the capture could not see actually was: which pixel it projects to in each view,
+        # whether that pixel is in the image at all, and what the depth there says is in front of it. Three
+        # hypotheses about empty masks were tested by hand before this was written (2026-09-12); the answer is in
+        # the numbers this prints.
         imageio.imwrite(out_dir / "rgb_failed.png", sim.last_capture_rgb)  # what the camera saw
+        try:
+            log_missing_objects(sim, request, extras, atoms)
+        except Exception as why:  # noqa: BLE001 - a diagnostic must never replace the failure it explains
+            log.warning(f"could not work out where the goal objects were: {type(why).__name__}: {why}")
         raise
     known.attach(request)
     report = sim.validate_capture(request, extras)
