@@ -629,6 +629,20 @@ nothing but the robot, stances that framed nothing whole, and where each object 
 was. No simulator, no GPU. Update a `baselines.json` entry only when a run beats it on the same number of
 instances; the script says when a comparison is not like for like.
 
+**How many instances a claim needs (2026-09-13).** Two instances cannot judge a change on these tasks, and the
+measurement to prove it was cheap: run the same code twice.
+
+| task | same code, run A | run B |
+| --- | --- | --- |
+| `dispose_of_batteries` | 0.375 (0.50 / 0.25), 9 rounds executed, 3 planning failures | **0.125** (0.00 / 0.25), 3 executed, 6 planning failures |
+| `putting_away_toys` | 0.8125, 9 rounds lost to empty masks, 46 arm motions blocked | 0.8125, **17** lost, **62** blocked |
+
+So: a two-instance mean of `dispose_of_batteries` swings by 0.25 on identical code, and the per-run mechanism
+counts of `putting_away_toys` swing by a factor of nearly two while its score does not move at all. A single run
+is an observation. Before crediting a change, repeat the run or use more instances; and prefer a claim about a
+*composition* that a mechanism explains (head-view ramps falling from 24 of 28 to 6 of 58 when head views stopped
+commanding the arm) over a claim about a count.
+
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
 already exercised. What the first runs of `dispose_of_batteries` and `putting_away_toys` cost (2026-09-12) says
