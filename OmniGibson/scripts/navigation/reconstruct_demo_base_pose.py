@@ -336,8 +336,8 @@ def load_raw_global_base_pose(path: Path) -> np.ndarray:
     n_joints = len(robot_state["joint_pos"])
     offsets = find_robot_offsets(states, np.float32(get_uuid(robot_name)), n_joints)
     row_idx = np.arange(states.shape[0])[:, None]
-    root_pos = states[:, offsets[:, None] + np.asarray([2, 3, 4], dtype=np.int64)].astype(np.float64)
-    root_quat = states[:, offsets[:, None] + np.asarray([5, 6, 7, 8], dtype=np.int64)].astype(np.float64)
+    root_pos = states[row_idx, offsets[:, None] + np.asarray([2, 3, 4], dtype=np.int64)].astype(np.float64)
+    root_quat = states[row_idx, offsets[:, None] + np.asarray([5, 6, 7, 8], dtype=np.int64)].astype(np.float64)
     base_qpos = states[row_idx, offsets[:, None] + 15 + np.arange(n_joints, dtype=np.int64)].astype(np.float64)
 
     base_position = root_pos + base_qpos[:, :3]
@@ -379,6 +379,8 @@ def compare_to_raw(trajectory: np.ndarray, raw_qpos: np.ndarray) -> dict[str, An
     n = min(len(trajectory), len(raw_qpos))
     recon = trajectory[:n, 2:6][:, [0, 1, 3]]
     exact = raw_qpos[:n]
+    if exact.shape != recon.shape:
+        raise ValueError(f"Raw pose shape {exact.shape} does not match reconstructed pose shape {recon.shape}")
     error = recon - exact
     error[:, 2] = wrap_angle(error[:, 2])
     xy_error = np.linalg.norm(error[:, :2], axis=1)
