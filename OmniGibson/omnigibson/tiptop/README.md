@@ -236,6 +236,13 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     search.
 - **putting_away_toys** (eight toy figures off two floors into either of two toy boxes, one on a floor and one
   on a table; the goal's 256 ground options say any box takes any toy, and the runner fills the nearest),
+  2026-09-13, `runs/bench_toys_4`, instances 301 and 302 with head pitch views and the projection-based stance
+  test: **0.50 and 0.375, mean 0.4375** -- the first toys placed, four of eight and three of eight. Both instances
+  ran out of step budget rather than out of toys, and the run is also the clearest picture of what the arm costs:
+  **59 arm motions blocked against something** and 23 capture swings stopped, against 19 rounds lost to empty
+  masks and 9 to planning. The arm-collision fixes of the same day (see "Why the arm hits things") came after this
+  run; it is their baseline.
+
   2026-09-12, `runs/bench_toys_1`, instance 301: **0.0**, and the first task whose picks are all off the floor.
   What it showed, in order:
   - A floor pick can work: `toy_figure_5` was picked at the second stance. The two attempts on `toy_figure_7`
