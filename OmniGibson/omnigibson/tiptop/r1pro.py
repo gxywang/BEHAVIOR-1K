@@ -295,6 +295,28 @@ def sample_polyline(points, step: float) -> np.ndarray:
     return np.asarray(out, dtype=np.float64)
 
 
+def rect_hits_box(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> bool:
+    """Whether a rectangle at ``centre`` turned by ``yaw`` overlaps a world-axis-aligned box, in xy.
+
+    ``rect_lo``/``rect_hi``: the rectangle's own extent in its frame, which for the robot's base is NOT centred on
+    the origin -- it reaches further behind the base frame than in front of it. Separating-axis test over the four
+    axes (the two world axes and the two the rectangle turns to); no separating axis means they overlap.
+    """
+    c = np.asarray(centre, dtype=np.float64).reshape(2)
+    lo = np.asarray(rect_lo, dtype=np.float64).reshape(2)
+    hi = np.asarray(rect_hi, dtype=np.float64).reshape(2)
+    rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+    rect = np.array([[x, y] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])]) @ rot.T + c
+    box_lo = np.asarray(box_lo, dtype=np.float64).reshape(-1)[:2]
+    box_hi = np.asarray(box_hi, dtype=np.float64).reshape(-1)[:2]
+    box = np.array([[x, y] for x in (box_lo[0], box_hi[0]) for y in (box_lo[1], box_hi[1])])
+    for axis in (np.array([1.0, 0.0]), np.array([0.0, 1.0]), rot[:, 0], rot[:, 1]):
+        a, b = rect @ axis, box @ axis
+        if a.max() < b.min() or b.max() < a.min():
+            return False
+    return True
+
+
 def box_corners(lo, hi) -> np.ndarray:
     """The 8 corners of an axis-aligned box given as its low and high xyz, as (8, 3)."""
     lo = np.asarray(lo, dtype=np.float64).reshape(3)
@@ -927,13 +949,29 @@ class R1ProSim(TiptopSim):
         the collision meshes on every access, ~50 ms for a house scene), to reuse across footprint checks."""
         return [(o, *[v.cpu().numpy() for v in o.aabb]) for o in self.env.scene.objects if o is not self.robot]
 
-    def _footprint_free(self, x: float, y: float, ignore, aabbs=None) -> tuple[bool, str]:
-        """Floor under the whole footprint, inside a room, and no other object's AABB overlapping the footprint.
+    def _footprint_free(self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None) -> tuple[bool, str]:
+        """Floor under the whole footprint, inside a room, and no object's box overlapping the base.
+
+        With ``yaw``, the base is tested as the rectangle it actually is, turned to face that way
+        (``base_box``/``rect_hits_box``); without one, as the ``ROBOT_FOOTPRINT`` square, which is what callers
+        that have no yaw yet get. The square is centred and yaw-independent, and the base is neither: it reaches
+        0.40 m behind the base frame and 0.24 m ahead, so a turned base puts its rear corner 0.52 m out where the
+        square guards 0.36. Measured over runs/bench_batteries_ten: **23 of the 60 stances taken overlapped a
+        piece of furniture**, up to 0.15 m into a cabinet and 0.05 m into a desk, which is what the user saw in
+        the videos as the robot standing too close and clipping the cabinet (2026-09-13).
 
         ``aabbs``: a scene_aabbs() snapshot to test against (taken here otherwise; nothing moves during a search).
         """
         r = ROBOT_FOOTPRINT
+        rect = self.base_box()[:, :2] if yaw is not None else None
         corners = [(x + sx * r, y + sy * r) for sx in (-1, 1) for sy in (-1, 1)] + [(x, y)]
+        if rect is not None:  # the floor test wants the real corners too
+            rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+            corners = [
+                tuple(np.array([cx, cy]) @ rot.T + np.array([x, y]))
+                for cx in (rect[0][0], rect[1][0])
+                for cy in (rect[0][1], rect[1][1])
+            ] + [(x, y)]
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         floors = [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
         for cx, cy in corners:
@@ -959,7 +997,12 @@ class R1ProSim(TiptopSim):
                 continue  # entirely above the robot (roof, lamps)
             if hi[2] - lo[2] < FLAT_COVERING_HEIGHT and lo[2] < GROUND_CLEARANCE:
                 continue  # flat floor coverings (pavers, rugs, mats) are stood on, not avoided
-            if lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r and hi[2] > GROUND_CLEARANCE:
+            if hi[2] <= GROUND_CLEARANCE:
+                continue
+            if rect is not None:
+                if rect_hits_box((x, y), yaw, rect[0], rect[1], lo, hi):
+                    return False, f"overlaps {obj.name}"
+            elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
                 return False, f"overlaps {obj.name}"
         return True, "free"
 
@@ -1055,7 +1098,7 @@ class R1ProSim(TiptopSim):
         t = len(pts) - 1  # the target (container) is last
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
-        best, rejected, footprint = None, {}, {}  # footprint: (x, y) -> _footprint_free result (yaw-independent)
+        best, rejected, footprint = None, {}, {}  # footprint: (x, y, yaw) -> _footprint_free result
         for radius in np.arange(RING_START, reach + RING_STEP, RING_STEP):  # rings out to the reach itself
             for angle in np.arange(0.0, 2 * np.pi, RING_ANGLE_STEP):
                 x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
@@ -1118,9 +1161,9 @@ class R1ProSim(TiptopSim):
                         + (FRAMING_PENALTY_PX * off_frame if view is not None else FRAMING_PENALTY * clipped)
                     )
                     if best is None or score < best[0]:
-                        key = (float(x), float(y))
+                        key = (float(x), float(y), round(float(yaw), 3))  # the base's box turns with the yaw
                         if key not in footprint:
-                            footprint[key] = self._footprint_free(x, y, ignore, aabbs=aabbs)
+                            footprint[key] = self._footprint_free(x, y, ignore, aabbs=aabbs, yaw=float(yaw))
                         free, why = footprint[key]
                         if free:
                             best = (score, x, y, yaw, dist, side)
@@ -1534,17 +1577,38 @@ class R1ProSim(TiptopSim):
         return solution
 
     def base_box(self) -> np.ndarray:
-        """(min, max) corners of base_link's collision bounding box in the base frame, inflated by nothing."""
+        """(min, max) corners of base_link's own box in the base frame, whatever the base's yaw.
+
+        Measured from the link's mesh vertices rather than from its world AABB: re-bounding a world AABB in a
+        turned frame inflates it, and this box was reported as 0.64 x 0.68 m square-on and 0.98 x 0.98 m at an
+        angle in the same code (2026-09-13). It is not centred on the base frame -- the base reaches about 0.40 m
+        behind the origin and 0.24 m ahead.
+        """
         if self._base_box is None:
-            lo, hi = self.robot.links["base_link"].aabb
-            unit = th.tensor([0.0, 0.0, 0.0, 1.0])
-            corners = [
-                self.to_base(th.tensor([float(x), float(y), float(z)]), unit)[0].cpu().numpy()
-                for x in (lo[0], hi[0])
-                for y in (lo[1], hi[1])
-                for z in (lo[2], hi[2])
-            ]
-            pts = np.asarray(corners, dtype=np.float64)
+            link = self.robot.links["base_link"]
+            pts = None
+            mesh = self.link_trimesh_world(link)  # the link's own geometry, exact whatever the base's yaw
+            if mesh is not None and len(mesh.vertices):
+                unit = th.tensor([0.0, 0.0, 0.0, 1.0])
+                pts = np.asarray(
+                    [
+                        self.to_base(th.tensor(v, dtype=th.float32), unit)[0].cpu().numpy()
+                        for v in np.asarray(mesh.vertices, dtype=np.float64)
+                    ],
+                    dtype=np.float64,
+                )
+            if pts is None:  # no meshes: fall back to the world AABB's corners, which a turned base inflates
+                lo, hi = link.aabb
+                unit = th.tensor([0.0, 0.0, 0.0, 1.0])
+                pts = np.asarray(
+                    [
+                        self.to_base(th.tensor([float(x), float(y), float(z)]), unit)[0].cpu().numpy()
+                        for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1])
+                        for z in (lo[2], hi[2])
+                    ],
+                    dtype=np.float64,
+                )
             self._base_box = np.stack([pts.min(axis=0), pts.max(axis=0)])
             log.info(f"base box (base frame): {np.round(self._base_box, 2).tolist()}")
         return self._base_box

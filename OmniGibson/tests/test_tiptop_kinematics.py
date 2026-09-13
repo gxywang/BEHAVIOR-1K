@@ -327,3 +327,42 @@ def test_the_head_view_return_tolerance_clears_the_settling_it_must_not_abort_on
     assert HEAD_VIEW_RETURN_TOL > 0.0282 * 2, "the abort threshold must sit clear of normal settling"
     smallest_delta = min(abs(delta) for _, delta in HEAD_VIEWS.values())
     assert HEAD_VIEW_RETURN_TOL < smallest_delta / 2, "but must still catch a torso that did not come back"
+
+
+# --------------------------------------------------------------- the base's real rectangle against furniture
+# The R1Pro's base_link box in its own frame: it reaches 0.40 m behind the base frame's origin and 0.24 m ahead
+# (logged by every run as "base box (base frame)"). ROBOT_FOOTPRINT's 0.36 m square is centred, so it under-covers
+# the rear by 4 cm and, once the base is turned, misses its corners by up to 16 cm -- which is what put the base
+# 15 cm inside cabinet_1 in runs/bench_batteries_ten.
+BASE_LO, BASE_HI = (-0.40, -0.34), (0.24, 0.34)
+
+
+def base_hits(box_lo, box_hi, centre=(0.0, 0.0), yaw=0.0):
+    from omnigibson.tiptop.r1pro import rect_hits_box
+
+    return rect_hits_box(centre, yaw, BASE_LO, BASE_HI, box_lo, box_hi)
+
+
+def test_a_box_the_base_is_clear_of_does_not_overlap():
+    assert not base_hits((0.5, -0.5), (1.5, 0.5))
+
+
+def test_the_base_reaches_further_behind_its_origin_than_a_centred_square_says():
+    behind = ((-0.45, -0.2), (-0.38, 0.2))  # 0.38 to 0.45 m behind: outside a 0.36 square, inside the real base
+    assert base_hits(*behind)
+
+
+def test_turning_the_base_sweeps_its_corners_into_a_box_a_square_test_misses():
+    # at 45 deg the rear corner (-0.40, +0.34) swings to (-0.52, -0.04): 0.52 m out, where neither the unturned
+    # base nor ROBOT_FOOTPRINT's 0.36 m square reaches
+    corner = ((-0.55, -0.15), (-0.45, 0.05))
+    assert not base_hits(*corner)
+    assert base_hits(*corner, yaw=np.radians(45.0))
+
+
+def test_the_test_is_symmetric_in_the_sense_that_overlap_does_not_depend_on_which_box_moves():
+    from omnigibson.tiptop.r1pro import rect_hits_box
+
+    near = ((0.20, -0.1), (0.40, 0.1))
+    assert rect_hits_box((0, 0), 0.0, BASE_LO, BASE_HI, *near)
+    assert not rect_hits_box((-0.5, 0), 0.0, BASE_LO, BASE_HI, *near)
