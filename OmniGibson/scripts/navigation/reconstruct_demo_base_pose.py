@@ -84,6 +84,49 @@ def yaw_to_quat_xyzw(yaw: float) -> list[float]:
     return [0.0, 0.0, math.sin(0.5 * yaw), math.cos(0.5 * yaw)]
 
 
+def quat_xyzw_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    x1, y1, z1, w1 = np.moveaxis(q1, -1, 0)
+    x2, y2, z2, w2 = np.moveaxis(q2, -1, 0)
+    return np.stack(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        axis=-1,
+    )
+
+
+def euler_xyz_to_quat_xyzw(euler: np.ndarray) -> np.ndarray:
+    roll = euler[..., 0]
+    pitch = euler[..., 1]
+    yaw = euler[..., 2]
+    cr = np.cos(0.5 * roll)
+    sr = np.sin(0.5 * roll)
+    cp = np.cos(0.5 * pitch)
+    sp = np.sin(0.5 * pitch)
+    cy = np.cos(0.5 * yaw)
+    sy = np.sin(0.5 * yaw)
+    return np.stack(
+        [
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        ],
+        axis=-1,
+    )
+
+
+def quat_xyzw_array_to_yaw(quat: np.ndarray) -> np.ndarray:
+    x = quat[..., 0]
+    y = quat[..., 1]
+    z = quat[..., 2]
+    w = quat[..., 3]
+    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -278,7 +321,7 @@ def natural_demo_key(name: str) -> tuple[int, str]:
     return -1, name
 
 
-def load_raw_base_qpos(path: Path) -> np.ndarray:
+def load_raw_global_base_pose(path: Path) -> np.ndarray:
     import h5py
 
     with h5py.File(path, "r") as f:
@@ -293,8 +336,14 @@ def load_raw_base_qpos(path: Path) -> np.ndarray:
     n_joints = len(robot_state["joint_pos"])
     offsets = find_robot_offsets(states, np.float32(get_uuid(robot_name)), n_joints)
     row_idx = np.arange(states.shape[0])[:, None]
-    cols = offsets[:, None] + 15 + BASE_QPOS_INDICES[None, :]
-    return states[row_idx, cols].astype(np.float64)
+    root_pos = states[:, offsets[:, None] + np.asarray([2, 3, 4], dtype=np.int64)].astype(np.float64)
+    root_quat = states[:, offsets[:, None] + np.asarray([5, 6, 7, 8], dtype=np.int64)].astype(np.float64)
+    base_qpos = states[row_idx, offsets[:, None] + 15 + np.arange(n_joints, dtype=np.int64)].astype(np.float64)
+
+    base_position = root_pos + base_qpos[:, :3]
+    base_quat = quat_xyzw_multiply(root_quat, euler_xyz_to_quat_xyzw(base_qpos[:, 3:6]))
+    yaw = quat_xyzw_array_to_yaw(base_quat)
+    return np.column_stack([base_position[:, 0], base_position[:, 1], yaw])
 
 
 def resolve_raw_hdf5(args: argparse.Namespace, row: pd.Series) -> Path | None:
@@ -410,7 +459,7 @@ def main() -> None:
 
     raw_hdf5 = resolve_raw_hdf5(args, row)
     if raw_hdf5 is not None:
-        raw_qpos = load_raw_base_qpos(raw_hdf5)
+        raw_qpos = load_raw_global_base_pose(raw_hdf5)
         summary["raw_hdf5_path"] = str(raw_hdf5)
         summary["raw_comparison"] = compare_to_raw(trajectory, raw_qpos)
     elif args.raw_hdf5 or args.raw_root:
