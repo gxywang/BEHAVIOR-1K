@@ -78,3 +78,36 @@ def test_is_open_matches_omnigibsons_five_percent_rule_at_both_ends():
     assert not is_open(0.0, 0.4, position=0.01)  # 2.5% out: still closed
     assert is_open(0.0, 0.4, position=0.03)  # 7.5% out: open
     assert not is_open(0.0, 0.4, position=0.39), "a joint resting at its far limit is closed too"
+
+
+# --------------------------------------------------------------- the handle heuristic
+class _Link:
+    """A link with just the box the handle heuristic reads."""
+
+    def __init__(self, lo, hi):
+        import torch as th
+
+        self.aabb = (th.tensor(lo, dtype=th.float32), th.tensor(hi, dtype=th.float32))
+
+
+def test_the_handle_sits_on_the_face_that_leads_when_the_drawer_opens():
+    from omnigibson.tiptop.articulation import handle_point
+
+    drawer = _Link([0.0, -0.25, 0.5], [0.5, 0.25, 0.65])  # 0.5 m deep, opening along +x
+    point = handle_point(drawer, [1.0, 0.0, 0.0], opening_sign=+1.0)
+    assert point[0] == pytest.approx(0.5), "the drawer front, not its middle"
+    assert point[1] == pytest.approx(0.0) and point[2] == pytest.approx(0.575)
+
+
+def test_the_handle_follows_the_direction_the_joint_actually_opens():
+    from omnigibson.tiptop.articulation import handle_point
+
+    drawer = _Link([0.0, -0.25, 0.5], [0.5, 0.25, 0.65])
+    assert handle_point(drawer, [1.0, 0.0, 0.0], opening_sign=-1.0)[0] == pytest.approx(0.0)
+
+
+def test_a_degenerate_axis_falls_back_to_the_middle_of_the_link():
+    from omnigibson.tiptop.articulation import handle_point
+
+    link = _Link([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    assert np.allclose(handle_point(link, [0.0, 0.0, 0.0], 1.0), [0.5, 0.5, 0.5])

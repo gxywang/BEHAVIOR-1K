@@ -106,3 +106,75 @@ def is_open(lower: float, upper: float, position: float, threshold: float = 0.05
     if hi - lo < 1e-6:
         return False
     return min(abs(float(position) - lo), abs(float(position) - hi)) > threshold * (hi - lo)
+
+
+# ---------------------------------------------------------------- reading a joint out of a scene
+AXIS_VECTORS = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
+OPENABLE_TYPES = ("revolute", "prismatic")
+
+
+def openable_joints(obj) -> list:
+    """Every joint of ``obj`` that could open, as dicts in the WORLD frame.
+
+    Each: name, kind (revolute/prismatic), axis, origin, lower, upper, position, link (the moving link's name).
+    The axis a joint reports is a letter in its own local frame, so it is composed with the parent link's pose to
+    get a world direction; the origin likewise. Joints with no range are skipped -- a fixed joint cannot open.
+
+    Privileged, like the button poses the oracle knowledge source sends: at evaluation the same fields would have
+    to come from perception. It is written as a reader so that the rest of the skill does not care which.
+    """
+    import omnigibson.utils.transform_utils as T
+    import torch as th
+
+    out = []
+    for name, joint in (getattr(obj, "joints", None) or {}).items():
+        try:
+            kind = str(joint.joint_type).lower()
+            if not any(k in kind for k in OPENABLE_TYPES):
+                continue
+            lower, upper = float(joint.lower_limit), float(joint.upper_limit)
+            if not np.isfinite([lower, upper]).all() or abs(upper - lower) < 1e-6:
+                continue
+            position = float(np.asarray(joint.get_state()[0]).reshape(-1)[0])
+            local = np.asarray(AXIS_VECTORS.get(str(joint.axis).upper(), (1.0, 0.0, 0.0)), dtype=np.float64)
+            parent = obj.links.get(str(joint.body0).split("/")[-1]) if getattr(joint, "body0", None) else None
+            child = obj.links.get(str(joint.body1).split("/")[-1]) if getattr(joint, "body1", None) else None
+            frame = parent if parent is not None else child
+            if frame is None:
+                continue
+            pos, quat = frame.get_position_orientation()
+            rot = T.quat2mat(th.as_tensor(quat)).cpu().numpy().astype(np.float64)
+            out.append(
+                {
+                    "name": name,
+                    "kind": "revolute" if "revolute" in kind or "continuous" in kind else "prismatic",
+                    "axis": rot @ local,
+                    "origin": np.asarray(pos.cpu().numpy(), dtype=np.float64),
+                    "lower": lower,
+                    "upper": upper,
+                    "position": position,
+                    "link": str(child.name) if child is not None else "",
+                }
+            )
+        except Exception as e:  # a joint that does not answer is not one to open
+            log_name = getattr(obj, "name", "?")
+            print(f"openable_joints: skipping {log_name}.{name}: {type(e).__name__}: {e}")
+    return out
+
+
+def handle_point(link, axis, opening_sign: float) -> np.ndarray:
+    """A point to take hold of on a moving link: the middle of the face that leads when the joint opens.
+
+    Nothing in the dataset marks a handle, so this takes the link's own box and steps to the face furthest along
+    the direction the link travels -- the drawer front, the door's swinging edge -- which is where a handle is when
+    there is one and a reasonable place to push or pull when there is not.
+    """
+    lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.aabb)
+    centre = (lo + hi) / 2.0
+    a = np.asarray(axis, dtype=np.float64)
+    n = float(np.linalg.norm(a))
+    if n < 1e-9:
+        return centre
+    a = a / n * (1.0 if opening_sign >= 0 else -1.0)
+    half = (hi - lo) / 2.0
+    return centre + a * float(np.abs(half @ a))
