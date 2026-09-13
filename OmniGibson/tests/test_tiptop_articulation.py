@@ -129,3 +129,38 @@ def test_a_degenerate_axis_falls_back_to_the_middle_of_the_link():
 
     link = _Link([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
     assert np.allclose(handle_point(link, [0.0, 0.0, 0.0], 1.0), [0.5, 0.5, 0.5])
+
+
+# --------------------------------------------------------------- grasp orientations for a handle
+def test_the_hands_own_orientation_is_offered_first():
+    from omnigibson.tiptop.articulation import grasp_orientations
+
+    cur = np.eye(3)
+    out = grasp_orientations(cur, [1.0, 0.0, 0.0])
+    assert np.allclose(out[0], cur), "what the hand is already holding costs nothing to try"
+    assert len(out) > 1, "and it is rarely the one that works"
+
+
+def test_every_offered_orientation_is_a_rotation():
+    from omnigibson.tiptop.articulation import grasp_orientations
+
+    cur = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    for rot in grasp_orientations(cur, [0.0, 1.0, 0.3]):
+        assert np.allclose(rot @ rot.T, np.eye(3), atol=1e-9), "orthonormal"
+        assert float(np.linalg.det(rot)) == pytest.approx(1.0, abs=1e-9), "right handed, not a reflection"
+
+
+def test_some_offered_orientation_faces_the_way_the_drawer_comes_out():
+    from omnigibson.tiptop.articulation import grasp_orientations
+
+    pull = np.array([1.0, 0.0, 0.0])  # the drawer comes toward +x, so a jaw axis should point back along -x
+    out = grasp_orientations(np.eye(3), pull)
+    assert any(any(np.allclose(rot[:, i], -pull, atol=1e-6) for i in range(3)) for rot in out), (
+        "at least one candidate turns an axis of the hand to face the drawer"
+    )
+
+
+def test_a_degenerate_pull_direction_just_offers_what_the_hand_has():
+    from omnigibson.tiptop.articulation import grasp_orientations
+
+    assert len(grasp_orientations(np.eye(3), [0.0, 0.0, 0.0])) == 1

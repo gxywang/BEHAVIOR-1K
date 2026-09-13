@@ -33,6 +33,7 @@ from omnigibson.tasks.behavior_task import BehaviorTask
 from omnigibson.tiptop.articulation import (
     OPEN_FRACTION_SCORED,
     follow_joint,
+    grasp_orientations,
     handle_point,
     is_open,
     openable_joints,
@@ -1113,28 +1114,36 @@ class R1ProSim(TiptopSim):
         grip = self.eef_pose_base(arm)
         handle_world = handle_point(link, joint["axis"], np.sign(travel) or 1.0)
         handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
-        start = pose_matrix(
-            handle_base.cpu().numpy(), T.mat2quat(th.tensor(grip[:3, :3], dtype=th.float32)).cpu().numpy()
-        )
         axis_base = self.to_base(th.tensor(joint["axis"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
         origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
         base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
-        path = follow_joint(
-            start,
-            joint["kind"],
-            axis_base.cpu().numpy() - base_pos,  # a direction, so the base translation comes back out
-            origin_base.cpu().numpy(),
-            travel,
-            steps=OPEN_PATH_STEPS,
-        )
+        axis_dir = axis_base.cpu().numpy() - base_pos  # a direction, so the base translation comes back out
+        pull = axis_dir * float(np.sign(travel) or 1.0)
         ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
         joints_of = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         seed = [float(q[self.joint_index[j]]) for j in joints_of]
+        # Which way the jaw must face to hold a drawer front is written down nowhere, and the orientation the hand
+        # happens to carry is rarely reachable at the handle -- the first smoke test failed with "no inverse
+        # kinematics for step 1 of 10" for that. Several are tried and the one that solves is logged, which is how
+        # the convention gets learned instead of assumed.
+        start, first = None, None
+        for k, rot in enumerate(grasp_orientations(grip[:3, :3], pull)):
+            quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
+            first = ik.solve(handle_base.cpu().numpy(), quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+            if first is not None:
+                log.info(f"taking hold of {name}.{joint['name']} with grasp orientation {k} of the candidates")
+                start = pose_matrix(handle_base.cpu().numpy(), quat)
+                break
+        if start is None:
+            return {"opened": False, "why": f"no grasp orientation reaches the handle of {joint['name']}"}
+        path = follow_joint(start, joint["kind"], axis_dir, origin_base.cpu().numpy(), travel, steps=OPEN_PATH_STEPS)
         reached, blocked = 0, ""
         for i, pose in enumerate(path):
             quat = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
-            solution = ik.solve(pose[:3, 3], quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+            solution = (
+                first if i == 0 else ik.solve(pose[:3, 3], quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+            )
             if solution is None:
                 blocked = f"no inverse kinematics for step {i + 1} of {len(path)}"
                 break

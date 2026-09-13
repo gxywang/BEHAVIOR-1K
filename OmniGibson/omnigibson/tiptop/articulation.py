@@ -85,6 +85,37 @@ def follow_joint(handle_pose, joint_type: str, axis, origin, travel: float, step
     return out
 
 
+def grasp_orientations(current_rot, pull_direction) -> list:
+    """Rotations to try for taking hold of a handle, best guess first.
+
+    Nothing says which way the R1Pro's jaw must face to hold a drawer front, and the orientation the hand happens
+    to be carrying is rarely one the arm can reach at the handle -- the first smoke test on store_honey's cabinet
+    failed with "no inverse kinematics for step 1 of 10" for exactly that. So the caller is given several: the
+    hand's own orientation, and orientations that turn its three axes to face along the pull, each with a quarter
+    turn about that direction so the fingers can close either way across the handle. The one that solves is logged,
+    which is how the right convention gets learned rather than assumed.
+    """
+    cur = np.asarray(current_rot, dtype=np.float64).reshape(3, 3)
+    pull = np.asarray(pull_direction, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(pull))
+    if n < 1e-9:
+        return [cur]
+    pull = pull / n
+    out = [cur]
+    for axis_index in range(3):  # turn the hand's x, y or z to face the way the drawer comes out
+        a = cur[:, axis_index]
+        v = np.cross(a, -pull)
+        c = float(np.dot(a, -pull))
+        if np.linalg.norm(v) < 1e-9:
+            aligned = cur if c > 0 else rotation_about(cur[:, (axis_index + 1) % 3], math.pi) @ cur
+        else:
+            k = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+            aligned = (np.eye(3) + k + k @ k * (1.0 / (1.0 + c))) @ cur
+        for turn in (0.0, math.pi / 2):
+            out.append(rotation_about(-pull, turn) @ aligned)
+    return out
+
+
 def opening_travel(joint_type: str, lower: float, upper: float, position: float, fraction: float) -> float:
     """How far the joint must move from ``position`` to reach ``fraction`` of its range, signed.
 
