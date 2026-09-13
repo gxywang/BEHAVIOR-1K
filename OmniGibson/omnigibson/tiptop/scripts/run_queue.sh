@@ -22,6 +22,19 @@ KNOWLEDGE="${KNOWLEDGE:-oracle}"
 cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."   # repo root
 export OMNIGIBSON_HEADLESS=1 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU"
 mkdir -p "$(dirname "$OUT")" runs/queue_logs
+# The pipeline needs three services, not one: the planner this queue talks to, and the M2T2 grasp server the
+# planner itself calls for grasp proposals (perception.m2t2.url in the planner's config, 127.0.0.1:8123). A run
+# without M2T2 does not fail loudly -- every round comes back "TiptopPlanningError: Cannot connect to host
+# localhost:8123" and the instance scores 0.0, which reads exactly like a task the pipeline cannot do. That cost
+# three runs on 2026-09-13. Check both before spending an hour on a job.
+for service in "$PORT:the planner" "8123:the M2T2 grasp server"; do
+  port="${service%%:*}"
+  if ! python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if not s.connect_ex(('127.0.0.1', int('$port'))) else 1)"; then
+    echo "=== QUEUE REFUSED: nothing is listening on 127.0.0.1:$port (${service#*:})" >> "$OUT"
+    exit 2
+  fi
+done
+
 while read -r task instances; do
   [ -z "${task:-}" ] && continue
   case "$task" in \#*) continue ;; esac
