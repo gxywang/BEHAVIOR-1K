@@ -1763,6 +1763,7 @@ class R1ProSim(TiptopSim):
         if not moved:
             return self._capture_views(task, ready)
         original = self.posture
+        struck = False  # whether this capture has already counted a blocked swing
         if self.ramp_arms(
             look,
             posture,
@@ -1789,6 +1790,7 @@ class R1ProSim(TiptopSim):
                 note="return to ready after the capture",
             )
         else:  # it met something on the way out: go back first, then capture from where the arms rest
+            struck = True  # this capture has already spent its strike; being stuck afterwards is the same event
             self.blocked_swings += 1
             log.warning("the capture swing stopped against something; capturing from the ready posture instead")
             self.ramp_arms(
@@ -1812,8 +1814,12 @@ class R1ProSim(TiptopSim):
         if lag > LOOK_TOL:
             # The arm is resting against something. The plan is asked for from where the arm actually is
             # (``q_init`` below is the measured posture), so the round goes ahead rather than being lost; what
-            # this costs is the ready posture's clean start, and the room gets one strike (BLOCKED_SWINGS_MAX).
-            self.blocked_swings += 1
+            # this costs is the ready posture's clean start, and the room gets one strike (BLOCKED_SWINGS_MAX) --
+            # one strike per capture, not two. A blocked swing leaves the arm short of ready almost by
+            # definition, so counting both spent the whole allowance on a single bad capture and turned the wrist
+            # look poses off for the rest of the instance (measured 2026-09-13, batteries8.log instance 301).
+            if not struck:
+                self.blocked_swings += 1
             log.warning(
                 f"arm {lag:.3f} rad from the ready posture after the capture and stuck there; planning from where "
                 f"it is ({self.blocked_swings} blocked swing(s) this instance)"
@@ -1876,8 +1882,8 @@ class R1ProSim(TiptopSim):
     def _capture_views(self, task: str, q_arm) -> tuple[dict, dict]:
         """``TiptopSim.capture`` for the primary view and the wrist views, where the joints stand now (``q_arm``: the
         planned joints' targets, at torso yaw 0), then each head view of ``HEAD_VIEWS`` among ``extra_views``
-        with the torso ramped to its yaw (``ramp_to``; the other planned joints and the locked posture stay, so the
-        arms come along), and the torso ramped back. The base frame does not turn with the torso, so a view's
+        with the torso ramped to its yaw (``ramp_to``; every other joint stays where the capture found it, so a head
+        view moves the torso and nothing else), and the torso ramped back. The base frame does not turn with the torso, so a view's
         camera pose, read from the simulator as it is rendered, is right as it is."""
         self.log_blocked_sight()
         head_views = [v for v in self.extra_views if v in HEAD_VIEWS]
@@ -1890,10 +1896,17 @@ class R1ProSim(TiptopSim):
         if not head_views:
             return request, extras
         q_arm = [float(v) for v in q_arm]
+        # A head view moves the torso and NOTHING else. It used to be built on the posture the caller intended,
+        # so every head view also re-commanded the arm to that posture -- and an arm that was somewhere else,
+        # because a swing had been blocked or a grasp had left it short, was dragged there against whatever had
+        # stopped it. 24 of the 28 blocked ramps in the putting_away_toys run of 2026-09-13 were head-view ramps,
+        # and the joint that blocked was always an arm joint being dragged, never the torso. Building the view on
+        # the MEASURED joints leaves the arm where it is.
+        where_it_is = [float(v) for v in self.q_arm()]
         for name in head_views:
             joint, delta = HEAD_VIEWS[name]
             self.ramp_to(
-                turned_joints(self.planned_joints, q_arm, joint, delta),
+                turned_joints(self.planned_joints, where_it_is, joint, delta),
                 self.posture,
                 self.last_gripper,
                 HEAD_VIEW_SETTLE_STEPS,
@@ -1914,7 +1927,13 @@ class R1ProSim(TiptopSim):
                 f"head view {name}: {joint} moved {math.degrees(delta):+.0f} deg, camera at base "
                 f"{np.round(view_extras['cam_pos_base'], 2).tolist()}"
             )
-        self.ramp_to(q_arm, self.posture, self.last_gripper, HEAD_VIEW_SETTLE_STEPS, note="back from a head view")
+        # Back the same way: the torso to where it was, every other joint left where the views found it.
+        back_to = list(where_it_is)
+        for name in head_views:
+            joint = HEAD_VIEWS[name][0]
+            if joint in self.planned_joints:
+                back_to[self.planned_joints.index(joint)] = q_arm[self.planned_joints.index(joint)]
+        self.ramp_to(back_to, self.posture, self.last_gripper, HEAD_VIEW_SETTLE_STEPS, note="back from a head view")
         moved_joints = {HEAD_VIEWS[name][0] for name in head_views}
         back = max(
             abs(float(self.q_arm()[self.planned_joints.index(j)]) - q_arm[self.planned_joints.index(j)])
