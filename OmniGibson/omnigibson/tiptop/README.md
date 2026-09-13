@@ -655,6 +655,12 @@ is an observation. Before crediting a change, repeat the run or use more instanc
 *composition* that a mechanism explains (head-view ramps falling from 24 of 28 to 6 of 58 when head views stopped
 commanding the arm) over a claim about a count.
 
+**Running a queue without watching it.** `scripts/run_queue.sh JOBS.txt GPU PORT [OUT]` works through a list of
+`task instances...` lines, and appends each finished run's `read_run.py` summary -- score, baseline comparison,
+what failed, the counts the pipeline reports about itself -- to `runs/queue_report.txt` under a
+`=== JOB` / `=== DONE` header. Tail that one file to follow any number of runs; `VIEWS` and `KNOWLEDGE` override
+the defaults. It exists so that a measurement reports itself instead of waiting to be looked at.
+
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
 already exercised. What the first runs of `dispose_of_batteries` and `putting_away_toys` cost (2026-09-12) says
