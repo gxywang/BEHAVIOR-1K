@@ -146,7 +146,18 @@ LOOK_OFFSETS = ((0.2, 0.3, -0.05), (0.1, 0.25, -0.1), (0.0, 0.25, -0.1), (0.1, 0
 # below the head camera's frame, so a carry planned from head views alone has no picture of what it carries
 # (putting_away_toys with --views head_up head_down, 2026-09-12).
 PRESENT_POINT = (0.62, 0.18, 1.00)
-PRESENT_OFFSETS = ((0.0, 0.0, 0.0), (-0.06, 0.0, 0.05), (0.06, 0.0, -0.05), (0.0, 0.06, 0.0), (0.0, -0.06, 0.0))
+# Tried in order from the point itself: higher and further out (over a container the robot stands at), wider to
+# the arm's side, lower and nearer. Each stays within about 0.45 m of the head camera and inside its frame.
+PRESENT_OFFSETS = (
+    (0.0, 0.0, 0.0),
+    (0.08, 0.0, 0.12),
+    (0.16, 0.0, 0.22),
+    (0.0, 0.10, 0.06),
+    (0.10, 0.12, 0.16),
+    (-0.06, 0.0, -0.08),
+    (0.0, -0.08, 0.04),
+    (-0.10, 0.10, 0.10),
+)
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
@@ -1137,7 +1148,8 @@ class R1ProSim(TiptopSim):
         base = np.array([PRESENT_POINT[0], side * PRESENT_POINT[1], PRESENT_POINT[2]], dtype=np.float64)
         for offset in PRESENT_OFFSETS:
             target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
-            solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.03, tolerance_rad=0.5)
+            # the orientation is loose: what matters is that the object is in the picture, not how it is held
+            solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.04, tolerance_rad=1.2)
             if solution is None:
                 continue
             blocked = self.links_in_base_box(arm, ik, solution) + self.links_in_scene(arm, ik, solution, aabbs)
