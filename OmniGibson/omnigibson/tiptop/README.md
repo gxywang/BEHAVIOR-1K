@@ -152,8 +152,19 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     the held toy failed on empty masks. Fixed: the look poses stay while a hand holds something.
   - It ended on a crash: emptying a hand stood for the item's support, which for a toy on the floor is the task
     floor, and a floor is not an object to stand at. Fixed.
-  - Next: the same two instances with `--views head_up head_down` (the torso leans instead of an arm swinging, so
-    nothing moves near the furniture and the floor object is seen from two heights).
+  - `runs/bench_toys_head1`, the same instance with `--views head_up head_down` (the torso leans instead of an
+    arm swinging): **the floor pick that failed twice with the wrist views worked at the first attempt**, from
+    the same standing spot. The three head views span 30 cm front to back and 17 cm vertically, against 4 cm for
+    a pair of yaw views, and the numbers moved with it: `toy_figure_7` 2.6 cm off the truth with the wrist views
+    against **2.1 cm**, a second toy 2.7 cm against **1.4 cm**, and the arm reached the planned grasp exactly
+    (final error 0.000 rad) where the wrist-view attempt stopped 0.33 rad short. The torso came back to its
+    posture with zero error, so the plan still started where it expected.
+  - The same run then found the other half of the problem: with no wrist view there is nothing to look at the
+    hand, and at the ready posture the gripper sits below the head camera's frame, so every place and put-down
+    round of the carried toy failed on empty masks. `present_held` now holds the object in front of the head
+    camera for the capture (see "Look poses"). Two limits noted while carrying: leaning the torso down presses a
+    held object toward the floor, so the ramp stops and that view repeats the one before it; and a pitch view
+    moves both arms, which is the same hazard as a swing in a tight room, only smaller.
 
 ## Architecture
 
