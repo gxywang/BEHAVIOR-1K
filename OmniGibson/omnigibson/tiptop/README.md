@@ -137,6 +137,11 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     at fault, not the capture: it compared the camera's bottom-edge distance with the radial distance to the
     object instead of how far ahead it is, and the head camera sits 0.44 m ahead of the base, so a battery 0.48 m
     ahead passed the test and fell out of the bottom of the frame. Fixed after this run.
+  - run 5 (`runs/bench_batteries_5`, instances 301 and 302, every fix above): **0.25 on both**, one battery of
+    three each time, 3,073 and 2,981 of the 21,642 allowed env steps. Nine rounds were lost to the same thing:
+    `GoalNotVisible`, the object framed out of the bottom of the capture. The stance that does it is the same one
+    each time, 0.53 m ahead where the camera's bottom edge meets the desk at 0.42 m, so `CAMERA_MIN_MARGIN` went
+    from 0.08 m to 0.15 m after this run; `runs/bench_batteries_6` tests that.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
