@@ -1,14 +1,16 @@
-"""The executor's two ways of stopping a push, against a scripted arm. No simulator.
+"""How the executor behaves against an arm that cannot reach its target. No simulator.
 
-Both exist because an arm that meets furniture used to keep being commanded: the rest of the trajectory, and then
-another 90 steps of converge() leaning on a target it could not reach. The stub below is a joint that moves toward
-its target until it is "blocked", after which it stays put however hard it is commanded.
+An arm that meets furniture used to keep being commanded: the rest of the trajectory, and then another 90 steps of
+converge() leaning on a target it could not reach. The trajectory now stops; converge still spends its budget, but
+records what it spent it on, because the error is a maximum over every joint and a plateau can be one joint
+stalled while the rest are still closing. The stub below is a joint that moves toward its target until it is
+"blocked", after which it stays put however hard it is commanded.
 """
 
 import numpy as np
 import pytest
 
-from omnigibson.tiptop.executor import CONVERGE_PATIENCE, PlanExecutor
+from omnigibson.tiptop.executor import PlanExecutor
 
 
 class StubSim:
@@ -38,11 +40,15 @@ def executor(sim):
     return PlanExecutor(sim)
 
 
-def test_converge_stops_when_the_arm_stops_getting_closer():
+def test_converge_records_that_it_spent_the_whole_budget_on_a_jam():
     sim = StubSim(wall=0.2)  # the joint jams at 0.2; the target is 1.0
-    err = executor(sim).converge(np.array([1.0], dtype=np.float32), tol=0.01, max_steps=500)
-    assert err == pytest.approx(0.8, abs=0.02), "it should report the error it was stuck at"
-    assert sim.steps < 60, f"it pushed for {sim.steps} steps against a jam; the patience is {CONVERGE_PATIENCE}"
+    ex = executor(sim)
+    err = ex.converge(np.array([1.0], dtype=np.float32), tol=0.01, max_steps=40)
+    assert err == pytest.approx(0.8, abs=0.02), "it reports the error it was stuck at"
+    trace = ex.last_converge
+    assert trace["capped"] is True and trace["steps"] == 40
+    # it stopped getting closer early and then pushed for the rest: that gap is what a later exit rule needs
+    assert trace["last_improving_step"] < 10
 
 
 def test_converge_still_reaches_a_target_it_can_reach():
@@ -52,7 +58,11 @@ def test_converge_still_reaches_a_target_it_can_reach():
     assert sim.q[0] == pytest.approx(1.0, abs=0.01)
 
 
-def test_converge_is_not_tripped_by_slow_but_steady_progress():
-    sim = StubSim(speed=0.002)  # slower than CONVERGE_NO_PROGRESS per step would be, but always improving
-    err = executor(sim).converge(np.array([0.05], dtype=np.float32), tol=0.005, max_steps=500)
-    assert err < 0.005, "steady progress must not count as no progress"
+def test_converge_keeps_settling_a_joint_that_is_still_creeping():
+    # 9% of gripper events follow a segment that ended 0.01-0.05 rad short and used the whole budget; cutting
+    # those settles is the regression a no-progress exit would cause, so a slow creep must still reach its target
+    sim = StubSim(speed=0.002)
+    ex = executor(sim)
+    err = ex.converge(np.array([0.05], dtype=np.float32), tol=0.005, max_steps=500)
+    assert err < 0.005
+    assert ex.last_converge["capped"] is False

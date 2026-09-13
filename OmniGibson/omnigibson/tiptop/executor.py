@@ -17,8 +17,7 @@ LARGE_FINAL_ERROR = 0.05  # rad: a segment that ends this far from its target di
 # cannot trip it; the same numbers as the capture ramps use (RAMP_BLOCK_TOL / RAMP_BLOCK_STEPS).
 EXEC_BLOCK_TOL = 0.1  # rad behind its target
 EXEC_BLOCK_STEPS = 5  # consecutive steps behind before the segment is abandoned
-CONVERGE_NO_PROGRESS = 1e-3  # rad: converge() gives up when the error stops improving by at least this much
-CONVERGE_PATIENCE = 10  # steps of no progress before it does
+CONVERGE_NO_PROGRESS = 1e-3  # rad: what counts as converge() having got closer, for the trace it records
 
 
 def compose_views(views: dict, column_width: int = 560, caption: str | None = None) -> np.ndarray:
@@ -107,6 +106,7 @@ class PlanExecutor:
         self.gripper = sim.last_gripper  # a hand that holds something stays closed through the plan's start
         self.n_steps = 0
         self.close_eef = None  # base-frame eef pose at the last gripper close (where a held object was taken)
+        self.last_converge = {}  # what the last converge() did: steps, whether it was capped, the error trace
 
     def _step(self, q_arm) -> np.ndarray:
         self.sim.step(q_arm, self.gripper)
@@ -114,26 +114,43 @@ class PlanExecutor:
         return self.sim.q_arm()
 
     def converge(self, q_target, tol=None, max_steps=None, stop=None) -> float:
-        """Hold ``q_target`` until the arm is within ``tol`` of it, it stops getting closer, or ``max_steps``.
+        """Hold ``q_target`` until the arm is within ``tol`` of it or ``max_steps`` run out; the error reached.
 
-        The no-progress exit is what keeps a blocked arm from leaning on an unreachable target for the whole
-        budget: an arm against a desk never converges, and 90 steps of pushing is three seconds of moving whatever
-        it is against.
+        Whether this is settling or pushing is recorded in ``self.last_converge`` rather than decided here. An arm
+        against furniture never converges, so the whole budget (90 steps, 3 s) is spent leaning on it -- but the
+        error is a maximum over every planned joint, so a plateau can equally be one joint stalled while the rest
+        are still creeping into the pose. On 2026-09-13 a no-progress exit was written for this and taken out
+        again: 9% of all gripper events in the run corpus follow a segment that ended 0.01-0.05 rad short and used
+        the full budget, and nothing recorded says whether those were flat or closing, so the exit would have cut
+        a settle right before the fingers move. The trace below is what makes that question answerable; the rule
+        can be chosen once a run has been read with it.
         """
         tol = self.converge_tol if tol is None else tol
         max_steps = self.converge_max_steps if max_steps is None else max_steps
-        err, best, stalled = np.inf, np.inf, 0
-        for _ in range(max_steps):
+        err, best, improving, steps = np.inf, np.inf, 0, 0
+        first = None
+        for i in range(max_steps):
             err = float(np.abs(self._step(q_target) - q_target).max())
+            steps = i + 1
+            first = err if first is None else first
+            if err < best - CONVERGE_NO_PROGRESS:
+                best, improving = err, steps
             if err < tol or (stop is not None and stop()):
                 break
-            if err < best - CONVERGE_NO_PROGRESS:
-                best, stalled = err, 0
-            else:
-                stalled += 1
-                if stalled >= CONVERGE_PATIENCE:
-                    log.info(f"holding a target the arm is not getting closer to ({err:.4f} rad); stopped pushing")
-                    break
+        self.last_converge = {
+            "steps": steps,
+            "capped": steps >= max_steps and err >= tol,
+            "err_first": first,
+            "err_last": err,
+            "err_best": None if best is np.inf else best,
+            "last_improving_step": improving,
+        }
+        if self.last_converge["capped"]:
+            flat = steps - improving
+            log.info(
+                f"held a target for the whole budget ({steps} steps, {err:.4f} rad short); it last got closer "
+                f"{flat} step(s) before the end"
+            )
         return err
 
     def home_to(self, q_target, tol: float = 0.02, max_steps: int = 300) -> float:
@@ -200,10 +217,12 @@ class PlanExecutor:
                         break
                 if gave_up:
                     final_err = self.converge(self.sim.q_arm(), max_steps=self.gripper_hold_steps)
+                    stats.setdefault("converges", []).append({"step": i, **self.last_converge})
                 elif stopped_early:
                     final_err = float(errs[-1])
                 else:
                     final_err = self.converge(traj[-1], stop=stop)
+                    stats.setdefault("converges", []).append({"step": i, **self.last_converge})
                 if stopped_early:
                     pressed.add(step["label"])
                 # which joint is short, when one is: a segment that ends far from its target means the arm never
