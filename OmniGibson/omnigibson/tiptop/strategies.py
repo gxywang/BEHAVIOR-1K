@@ -212,9 +212,12 @@ class Runner:
                 if item in done:
                     continue
                 try:
-                    if not ep.placed(item, container):
-                        continue
+                    # "on the floor" has no box to test against, so ask how low the item stands; Episode.placed
+                    # reads a floor target as "the hand let go of it", which every loose item satisfies.
+                    there = ep.near_floor(item) if container == ep.floor else ep.placed(item, container)
                 except (KeyError, NotImplementedError):  # not localized yet: treat it as loose
+                    continue
+                if not there:
                     continue
                 done.add(item)
                 n -= 1

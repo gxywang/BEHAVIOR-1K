@@ -99,6 +99,11 @@ class FakeEpisode:
             return not self.holding(item)
         return placed_over(self.boxes[item], self.boxes[target], from_bottom=True)
 
+    def near_floor(self, name):
+        from omnigibson.tiptop.bench import FLOOR_LEVEL
+
+        return name == self.floor or float(self.boxes[name]["lo"][2]) < FLOOR_LEVEL
+
     def support_of(self, item):
         for name, b in self.boxes.items():
             if name != item and self.on_support(item, name) and ("table" in name or "desk" in name):
@@ -234,6 +239,20 @@ def test_a_container_gets_every_item_of_a_kind_its_goal_asks_for():
     achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
     assert sorted(a[0] for a in achieved) == ["battery.n.02_1", "battery.n.02_2", "battery.n.02_3"]
     assert all(a[1] == "ashcan.n.01_1" for a in achieved)
+
+
+def test_a_goal_atom_that_puts_something_on_the_floor_is_judged_by_how_low_it_stands():
+    """An item on a desk is not "on the floor" just because no hand holds it."""
+    boxes = {
+        "desk.n.01_1": box((0, 0, 0.7), half=(0.6, 0.4, 0.02)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "ashcan.n.01_1": box((1.5, 0, 0.15), half=(0.15, 0.15, 0.15)),
+    }
+    goal = [atom("ontop", "battery.n.02_1", "floor.n.01_1"), atom("ontop", "ashcan.n.01_1", "floor.n.01_1")]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks == ["battery.n.02_1"]  # the bin already stands on the floor; the battery on the desk does not
 
 
 def test_a_goal_atom_that_already_holds_is_never_worked_on():
