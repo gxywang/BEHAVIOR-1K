@@ -243,6 +243,14 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     search.
 - **putting_away_toys** (eight toy figures off two floors into either of two toy boxes, one on a floor and one
   on a table; the goal's 256 ground options say any box takes any toy, and the runner fills the nearest),
+  2026-09-13, `runs/bench_toys_7`, the same two instances after the arm-collision work: **0.75 and 0.875, mean
+  0.8125** -- seven of eight toys placed in one instance, the best this task has done. Against `bench_toys_4` on
+  the same instances: 37 rounds executed against 27, 9 lost to empty masks against 19, 46 arm motions blocked
+  against 59. Read those counts before the mean: `bench_toys_6`, between the two, scored 0.0 and 0.75 on these
+  same instances, so a two-instance mean swings further than any one change moves it. What the runs agree on is
+  the direction of the mechanism counts, and each of the three runs found a different dominant blocked motion --
+  head-view ramps (fixed), presentations (fixed), and now the capture swing out, 21 of 46.
+
   2026-09-13, `runs/bench_toys_4`, instances 301 and 302 with head pitch views and the projection-based stance
   test: **0.50 and 0.375, mean 0.4375** -- the first toys placed, four of eight and three of eight. Both instances
   ran out of step budget rather than out of toys, and the run is also the clearest picture of what the arm costs:

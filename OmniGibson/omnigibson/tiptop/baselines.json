@@ -32,12 +32,12 @@
     "instance_count": 2
   },
   "putting_away_toys": {
-    "mean": 0.4375,
-    "run": "runs/bench_toys_4",
+    "mean": 0.8125,
+    "run": "runs/bench_toys_7",
     "instances": "0 1",
     "instance_count": 2,
     "date": "2026-09-13",
-    "note": "0.50 and 0.375, both instances out of step budget. Replaces the 0.0 of runs/bench_toys_1 (one instance, 2026-09-12), which is a different measurement, not a like-for-like comparison. Taken with head pitch views and the projection-based stance test, before the arm-collision fixes of the same day; 59 arm motions in this run were blocked against something."
+    "note": "0.75 and 0.875, seven of eight toys placed in one instance. Against runs/bench_toys_4's 0.4375 on the same two instances: 37 rounds executed against 27, 9 lost to empty masks against 19, 46 arm motions blocked against 59. The instance scores of this task swing hard between runs (toys_6 gave 0.0 and 0.75 on these same two), so read the blocked-motion and empty-mask counts before the mean."
   },
   "clean_up_broken_glass": {
     "mean": 0.0,
