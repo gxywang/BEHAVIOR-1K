@@ -376,6 +376,20 @@ def trajectory_pose_at(trajectory: np.ndarray, frame: int) -> dict[str, Any]:
     }
 
 
+def pose_error_stats(error: np.ndarray) -> dict[str, Any]:
+    xy_error = np.linalg.norm(error[:, :2], axis=1)
+    return {
+        "xy_rmse_m": float(np.sqrt(np.mean(xy_error**2))),
+        "xy_mean_m": float(np.mean(xy_error)),
+        "xy_max_m": float(np.max(xy_error)),
+        "yaw_rmse_rad": float(np.sqrt(np.mean(error[:, 2] ** 2))),
+        "yaw_mean_abs_rad": float(np.mean(np.abs(error[:, 2]))),
+        "yaw_max_abs_rad": float(np.max(np.abs(error[:, 2]))),
+        "first_error": error[0].tolist(),
+        "last_error": error[-1].tolist(),
+    }
+
+
 def compare_to_raw(trajectory: np.ndarray, raw_qpos: np.ndarray) -> dict[str, Any]:
     n = min(len(trajectory), len(raw_qpos))
     recon = trajectory[:n, 2:6][:, [0, 1, 3]]
@@ -384,17 +398,15 @@ def compare_to_raw(trajectory: np.ndarray, raw_qpos: np.ndarray) -> dict[str, An
         raise ValueError(f"Raw pose shape {exact.shape} does not match reconstructed pose shape {recon.shape}")
     error = recon - exact
     error[:, 2] = wrap_angle(error[:, 2])
-    xy_error = np.linalg.norm(error[:, :2], axis=1)
+    aligned_error = error - error[0]
+    aligned_error[:, 2] = wrap_angle(aligned_error[:, 2])
     return {
         "frames_compared": int(n),
-        "xy_rmse_m": float(np.sqrt(np.mean(xy_error**2))),
-        "xy_mean_m": float(np.mean(xy_error)),
-        "xy_max_m": float(np.max(xy_error)),
-        "yaw_rmse_rad": float(np.sqrt(np.mean(error[:, 2] ** 2))),
-        "yaw_mean_abs_rad": float(np.mean(np.abs(error[:, 2]))),
-        "yaw_max_abs_rad": float(np.max(np.abs(error[:, 2]))),
-        "first_error": error[0].tolist(),
-        "last_error": error[n - 1].tolist(),
+        "reconstructed_initial_pose": recon[0].tolist(),
+        "raw_initial_pose": exact[0].tolist(),
+        "initial_error": error[0].tolist(),
+        "absolute": pose_error_stats(error),
+        "aligned_to_initial_pose": pose_error_stats(aligned_error),
     }
 
 
