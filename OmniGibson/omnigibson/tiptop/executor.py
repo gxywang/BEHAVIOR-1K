@@ -10,6 +10,15 @@ from omnigibson.tiptop.protocol import resample_trajectory
 log = logging.getLogger(__name__)
 
 LARGE_FINAL_ERROR = 0.05  # rad: a segment that ends this far from its target did not arrive (see execute)
+# Executing a planner trajectory used to command every remaining target however far behind the arm had fallen, so
+# an arm that met furniture pushed through the whole segment and then leaned on its end for another 90 steps of
+# converge(). These stop that. The tolerance is five times the worst tracking error measured on healthy segments
+# (0.000-0.019 rad over runs/bench_batteries_8 and the putting_away_toys run of 2026-09-13), so normal dynamics
+# cannot trip it; the same numbers as the capture ramps use (RAMP_BLOCK_TOL / RAMP_BLOCK_STEPS).
+EXEC_BLOCK_TOL = 0.1  # rad behind its target
+EXEC_BLOCK_STEPS = 5  # consecutive steps behind before the segment is abandoned
+CONVERGE_NO_PROGRESS = 1e-3  # rad: converge() gives up when the error stops improving by at least this much
+CONVERGE_PATIENCE = 10  # steps of no progress before it does
 
 
 def compose_views(views: dict, column_width: int = 560, caption: str | None = None) -> np.ndarray:
@@ -105,13 +114,26 @@ class PlanExecutor:
         return self.sim.q_arm()
 
     def converge(self, q_target, tol=None, max_steps=None, stop=None) -> float:
+        """Hold ``q_target`` until the arm is within ``tol`` of it, it stops getting closer, or ``max_steps``.
+
+        The no-progress exit is what keeps a blocked arm from leaning on an unreachable target for the whole
+        budget: an arm against a desk never converges, and 90 steps of pushing is three seconds of moving whatever
+        it is against.
+        """
         tol = self.converge_tol if tol is None else tol
         max_steps = self.converge_max_steps if max_steps is None else max_steps
-        err = np.inf
+        err, best, stalled = np.inf, np.inf, 0
         for _ in range(max_steps):
             err = float(np.abs(self._step(q_target) - q_target).max())
             if err < tol or (stop is not None and stop()):
                 break
+            if err < best - CONVERGE_NO_PROGRESS:
+                best, stalled = err, 0
+            else:
+                stalled += 1
+                if stalled >= CONVERGE_PATIENCE:
+                    log.info(f"holding a target the arm is not getting closer to ({err:.4f} rad); stopped pushing")
+                    break
         return err
 
     def home_to(self, q_target, tol: float = 0.02, max_steps: int = 300) -> float:
@@ -158,12 +180,30 @@ class PlanExecutor:
                 stop = self.press_done if (self.press_done is not None and pressing) else None
                 errs = []
                 stopped_early = False
+                blocked = 0  # consecutive steps the arm has been further than EXEC_BLOCK_TOL behind its target
+                gave_up = False
                 for q in traj:
                     errs.append(float(np.abs(self._step(q) - q).max()))
                     if stop is not None and stop():
                         stopped_early = True
                         break
-                final_err = self.converge(traj[-1], stop=stop) if not stopped_early else float(errs[-1])
+                    blocked = blocked + 1 if errs[-1] > EXEC_BLOCK_TOL else 0
+                    if blocked >= EXEC_BLOCK_STEPS:
+                        # The arm is not following the plan: something is in its way that the planner did not know
+                        # about. Commanding the rest of the segment only pushes harder on it.
+                        gave_up = True
+                        log.warning(
+                            f"[{i}] {step['label']}: the arm has been {errs[-1]:.2f} rad behind for "
+                            f"{EXEC_BLOCK_STEPS} steps at step {len(errs)} of {len(traj)}; it is pushing against "
+                            "something, so the rest of this segment is abandoned"
+                        )
+                        break
+                if gave_up:
+                    final_err = self.converge(self.sim.q_arm(), max_steps=self.gripper_hold_steps)
+                elif stopped_early:
+                    final_err = float(errs[-1])
+                else:
+                    final_err = self.converge(traj[-1], stop=stop)
                 if stopped_early:
                     pressed.add(step["label"])
                 # which joint is short, when one is: a segment that ends far from its target means the arm never
@@ -176,7 +216,8 @@ class PlanExecutor:
                     name = list(self.sim.planned_joints)[j] if j < len(self.sim.planned_joints) else f"joint {j}"
                     short = f"; {name} stopped {gap[j]:.3f} rad short of {float(traj[-1][j]):+.3f}"
                     log.warning(f"[{i}] {step['label']}: the arm did not reach the end of this segment{short}")
-                q_last = traj[-1]
+                q_last = self.sim.q_arm()  # where the arm IS, not where it was told to be: a gripper event holds
+                # this for gripper_hold_steps, and holding a pose the arm never reached is 25 more steps of push
                 stats["trajectories"].append(
                     {
                         "step": i,
@@ -188,6 +229,7 @@ class PlanExecutor:
                         "max_tracking_error_rad": float(max(errs)),
                         "final_error_rad": final_err,
                         "stopped_early": stopped_early,
+                        "abandoned": gave_up,
                     }
                 )
                 log.info(
