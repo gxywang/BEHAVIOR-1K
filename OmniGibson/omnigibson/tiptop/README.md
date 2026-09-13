@@ -1027,6 +1027,14 @@ margin, which is zero and cannot be set from the bridge at all: it needs one num
 
 ## Known limits
 
+- **"Inside" a container that has to be opened is placed ON it (2026-09-13).** `store_honey` asks for a jar inside
+  a cabinet. The pick and the place both executed and the jar finished with its bottom at z 0.84 against the
+  cabinet's top at 0.85: on the cabinet. With no skill that opens a door or a drawer, an articulated container is
+  a solid hull to the perception and the planner, and the only surface a placement can find is its top. The task
+  is the cheapest end-to-end test of an open/close skill there is -- one item, one container, and the door is the
+  only thing in the way.
+
+
 - **The planner sometimes fails on its own tensor shapes (2026-09-13).** Two rounds of `runs/bench_batteries_10`
   were lost to `stack expects each tensor to be equal size, but got [256, 2, 50, 4] at entry 0 and [256, 2, 42, 4]
   at entry 1` inside cuTAMP -- two skeletons whose trajectories have different lengths (50 and 42 waypoints) being

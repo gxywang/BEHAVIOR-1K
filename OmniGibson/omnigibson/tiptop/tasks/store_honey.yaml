@@ -1,6 +1,13 @@
 # One jar of honey from a countertop into a cabinet: the smallest transfer in the challenge set, one item and one
 # container, which makes it the cheapest end-to-end check that a task the pipeline has never seen works at all.
 # New ground: the item stands on a countertop, which is not one of SUPPORT_CATEGORIES (tables and floors).
+#
+# RUN 1 (2026-09-13, runs/bench_store_honey_1): 0.0, and it is the cleanest demonstration of the missing
+# skill in the set. The pick worked and the place executed; the jar finished with its bottom at z 0.84 and
+# the cabinet's top at 0.85 -- ON the cabinet, not in it. "inside a cabinet" needs the door opened and the
+# jar put in the cavity, and with no open skill the cabinet is a solid hull whose top is the only surface
+# the placement can find. This task is therefore the cheapest end-to-end test of an open/close skill:
+# one item, one container, and opening the door is the only thing between the runner and the goal.
 task: store_honey
 instruction: put the jar of honey in the cabinet
 plan: transfer
