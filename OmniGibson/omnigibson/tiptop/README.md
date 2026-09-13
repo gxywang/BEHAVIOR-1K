@@ -903,6 +903,17 @@ stopped, once when the arm was found short of ready afterwards, which a blocked 
 That spent the whole `BLOCKED_SWINGS_MAX` allowance on a single capture and turned wrist look poses off for the
 rest of the instance.
 
+**What was proposed and refused.** Each finding was given to an agent told to refute it. Three of eight were
+refuted on the code and were never implemented: that `ramp_to`'s block test fires on joints the ramp does not move
+(every ramp re-baselines on the measured positions), that a stopped ramp rests *in* the obstacle for the settle,
+and that each segment opens with a command jump (`start_gap` is a servo lag, not a jump). A fourth was refuted as
+a *fix* after being implemented here, and taken out again: a no-progress exit for `converge()`. Its error is a
+maximum over eleven joints, so a plateau can be one joint stalled while the rest are still closing, and 9% of all
+gripper events in the corpus follow a segment that ended 0.01-0.05 rad short and used the full budget -- the exit
+would have cut those settles right before the fingers move. `converge()` now records its trace (steps, capped,
+first / last / best error, the step it last got closer) so the rule can be chosen from a run instead of from
+reasoning.
+
 **What was found and not fixed.** The planner's collision world holds the task's own objects and one table slab;
 every other real thing in the room is absent, so cuTAMP plans through furniture it has never been told about. The
 analysis proposes sending the room through the `held_labels` channel, which reaches cuTAMP as statics. That is a
