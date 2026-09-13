@@ -14,7 +14,7 @@ from omnigibson.tiptop.kinematics import (
     matrix_pose,
     pose_matrix,
 )
-from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, turned_joints
+from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, R1ProSim, turned_joints
 
 URDF = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro/urdf/r1pro.urdf"
 LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 8)]
@@ -418,3 +418,63 @@ def test_every_footprint_verdict_carries_its_clearance():
             f"a return at line {r.lineno} of _footprint_free has "
             f"{len(r.value.elts) if isinstance(r.value, ast.Tuple) else 1} values, not 3"
         )
+
+
+class _StubHand:
+    """Just enough of the sim class to exercise grasp_target's geometry without Isaac Sim."""
+
+    def __init__(self, approach, jaw, grasp, tip):
+        self._hand_convention = {
+            "left": {
+                "approach": np.asarray(approach, dtype=np.float64),
+                "jaw": np.asarray(jaw, dtype=np.float64),
+                "grasp": np.asarray(grasp, dtype=np.float64),
+                "tip": float(tip),
+            }
+        }
+
+    hand_convention = R1ProSim.hand_convention
+    grasp_target = R1ProSim.grasp_target
+
+
+# the R1Pro's hand as measured off the robot: fingers out along -z of the IK frame, jaw across y, the grasp
+# centre 6 cm out and the fingertips 1.9 cm past that
+R1PRO_HAND = ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (0.0, 0.0, -0.06), 0.019)
+
+
+def test_grasp_target_puts_the_fingertips_on_the_point():
+    """The IK frame goes wherever it must for the tips to reach the point -- 6 cm back, not on top of it."""
+    hand = _StubHand(*R1PRO_HAND)
+    point = np.array([0.6, 0.1, 0.8])
+    approach = np.array([1.0, 0.0, 0.0])  # straight ahead into a panel facing the robot
+    pos, rot = hand.grasp_target("left", point, approach, jaw_dir=[0.0, 0.0, 1.0], press=0.0)
+    # the hand's approach axis now points the way we asked
+    assert np.allclose(rot @ np.array([0.0, 0.0, -1.0]), approach, atol=1e-9)
+    # the grasp centre lands one fingertip-length short, and the tips land on the point
+    centre = pos + rot @ np.array([0.0, 0.0, -0.06])
+    assert np.allclose(centre, point - approach * 0.019, atol=1e-9)
+    assert np.allclose(centre + approach * 0.019, point, atol=1e-9)
+    # and the IK frame itself is well behind the panel face, which is the whole point
+    assert np.isclose(float(np.linalg.norm(pos - point)), 0.06 + 0.019, atol=1e-9)
+
+
+def test_grasp_target_presses_the_tips_past_the_surface():
+    """press drives the fingertips that far in, so the assisted grasp gets the contact it waits for."""
+    hand = _StubHand(*R1PRO_HAND)
+    point = np.array([0.6, 0.0, 0.8])
+    approach = np.array([1.0, 0.0, 0.0])
+    near, _ = hand.grasp_target("left", point, approach, press=0.0)
+    into, _ = hand.grasp_target("left", point, approach, press=0.005)
+    assert np.allclose(into - near, approach * 0.005, atol=1e-9)
+
+
+def test_grasp_target_jaw_is_square_to_the_approach():
+    """A jaw asked for along the approach cannot be had; the returned rotation stays a rotation either way."""
+    hand = _StubHand(*R1PRO_HAND)
+    approach = np.array([1.0, 0.0, 0.0])
+    for jaw in ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.3, 0.0, 0.9]):
+        _, rot = hand.grasp_target("left", [0.5, 0.0, 0.9], approach, jaw_dir=jaw)
+        assert np.allclose(rot @ rot.T, np.eye(3), atol=1e-9)
+        assert np.isclose(float(np.linalg.det(rot)), 1.0, atol=1e-9)
+        jaw_world = rot @ np.array([0.0, 1.0, 0.0])
+        assert abs(float(jaw_world @ approach)) < 1e-9

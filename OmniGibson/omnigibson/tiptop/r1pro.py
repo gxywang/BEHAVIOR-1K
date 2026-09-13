@@ -267,7 +267,14 @@ OPEN_PATH_STEPS = 10
 OPEN_SETTLE_STEPS = 15
 OPEN_GRASP_STEPS = 25  # closing on the handle before any pulling starts
 OPEN_APPROACH = 0.12  # m off the grip point: where the hand waits before it comes in
-OPEN_GRIPS = ("edge", "face")  # pinch the panel's top edge first, then the middle of its face
+OPEN_GRIPS = ("face",)  # the middle of the leading face, which is where OmniGibson's own opener grasps
+# How far the fingertips are driven past the surface they are taking hold of. The assisted grasp the
+# simulator uses fires on finger CONTACT, so the tips have to reach the panel; a few millimetres of overlap
+# makes the contact certain without the panel pushing the arm off its target.
+GRASP_PRESS = 0.005
+# The arm IK tolerance used when closing on something. The pipeline's usual 2 cm is wider than the press
+# above, so a "solved" grasp can sit clear of the surface with nothing between the fingers.
+OPEN_GRASP_TOLERANCE = 0.004
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -721,6 +728,7 @@ class R1ProSim(TiptopSim):
         self.look_target = None  # base-frame point the wrist cameras look at in a capture (place_robot_for sets it)
         self.look_names = ()  # the objects it was chosen for: one of them in a hand is looked at there instead
         self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
+        self._hand_convention = {}  # arm -> how its hand approaches and closes (constant; measured on first use)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -1088,6 +1096,86 @@ class R1ProSim(TiptopSim):
             return False, f"the base slid {moved * 100:.0f} cm from where it was put"
         return True, ""
 
+    def hand_convention(self, arm: str) -> dict:
+        """Which way this hand approaches, which way its jaw closes, and where the grasp actually happens.
+
+        All of it measured off the robot rather than assumed, because the assumption was wrong: the frame the arm
+        IK solves for, ``<arm>_gripper_link``, is 6 cm BEHIND the point the fingers close on (``<arm>_eef_link``),
+        so every pose aimed straight at a surface put the fingers 6 cm inside it. That is what stopped the drawer
+        smoke tests, blocked one step after the approach every time (2026-09-13).
+
+        Returned in the IK frame's own axes, so it holds at any arm configuration:
+          approach  unit vector from the IK frame towards the fingertips (the way the hand goes in)
+          jaw       unit vector between the two fingers (the way the jaw closes), square to ``approach``
+          grasp     offset of the grasp centre, i.e. where a held object ends up
+          tip       how far the fingertips reach past that grasp centre, along ``approach``
+        """
+        if arm in self._hand_convention:
+            return self._hand_convention[arm]
+        link = self.robot.links[f"{arm}_gripper_link"]
+        pos, quat = link.get_position_orientation()
+        rot = T.quat2mat(quat).cpu().numpy().astype(np.float64)
+        origin = pos.cpu().numpy().astype(np.float64)
+
+        def to_frame(points):
+            return (rot.T @ (np.asarray(points, dtype=np.float64) - origin).T).T
+
+        centroids, cloud = [], []
+        for finger in self.robot.finger_links[arm]:
+            mesh = self.link_trimesh_world(finger)
+            if mesh is None or not len(mesh.vertices):
+                continue
+            local = to_frame(mesh.vertices)
+            centroids.append(local.mean(axis=0))
+            cloud.append(local)
+        if len(centroids) < 2:
+            raise RuntimeError(f"{arm} hand has fewer than two fingers with meshes; cannot measure its convention")
+        # The fingers sit either side of the approach axis, so their midpoint lies on it and the line between them
+        # is the jaw. Both come out of the meshes, so a differently built hand measures differently and still works.
+        middle = np.mean(centroids, axis=0)
+        approach = middle / max(float(np.linalg.norm(middle)), 1e-9)
+        jaw = centroids[0] - centroids[1]
+        jaw = jaw - approach * float(jaw @ approach)
+        jaw = jaw / max(float(np.linalg.norm(jaw)), 1e-9)
+        eef = self.robot.eef_links.get(arm)
+        if eef is not None and eef.prim_path != link.prim_path:
+            grasp = to_frame([eef.get_position_orientation()[0].cpu().numpy()])[0]
+        else:  # no separate end-effector frame: the grasp happens between the fingertips
+            grasp = approach * float(np.concatenate(cloud) @ approach).max() * 0.5
+        tip = float(np.max(np.concatenate(cloud) @ approach) - grasp @ approach)
+        out = {"approach": approach, "jaw": jaw, "grasp": grasp, "tip": tip}
+        self._hand_convention[arm] = out
+        log.info(
+            f"{arm} hand: approach {np.round(approach, 3).tolist()}, jaw {np.round(jaw, 3).tolist()}, "
+            f"grasp centre {np.round(grasp, 3).tolist()} ({float(np.linalg.norm(grasp)):.3f} m out), "
+            f"fingertips {tip:.3f} m past it -- all in the {arm}_gripper_link frame"
+        )
+        return out
+
+    def grasp_target(self, arm: str, point, approach_dir, jaw_dir=None, press: float = GRASP_PRESS):
+        """Pose for the arm IK that closes this hand on ``point``, coming in along ``approach_dir``.
+
+        Takes the point the FINGERTIPS should reach and returns where the IK frame has to be, which are 6 cm and a
+        rotation apart (``hand_convention``). ``press`` drives the tips that far past the point so the contact the
+        assisted grasp waits for actually happens. Base frame in, base frame out.
+        """
+        hand = self.hand_convention(arm)
+        a_dir = np.asarray(approach_dir, dtype=np.float64)
+        a_dir = a_dir / max(float(np.linalg.norm(a_dir)), 1e-9)
+        j_dir = np.asarray(jaw_dir if jaw_dir is not None else [0.0, 0.0, 1.0], dtype=np.float64)
+        j_dir = j_dir - a_dir * float(j_dir @ a_dir)
+        if float(np.linalg.norm(j_dir)) < 1e-6:  # asked for a jaw along the approach: any square direction will do
+            j_dir = np.cross(a_dir, [1.0, 0.0, 0.0])
+            if float(np.linalg.norm(j_dir)) < 1e-6:
+                j_dir = np.cross(a_dir, [0.0, 1.0, 0.0])
+        j_dir = j_dir / max(float(np.linalg.norm(j_dir)), 1e-9)
+        local = np.stack([hand["approach"], hand["jaw"], np.cross(hand["approach"], hand["jaw"])], axis=1)
+        world = np.stack([a_dir, j_dir, np.cross(a_dir, j_dir)], axis=1)
+        rot = world @ local.T
+        # tips ``press`` past the point, so the grasp centre sits back by the fingertip reach less the press
+        centre = np.asarray(point, dtype=np.float64) + a_dir * (press - hand["tip"])
+        return centre - rot @ hand["grasp"], rot
+
     def open_container(self, arm: str, name: str, fraction: float = OPEN_FRACTION_SCORED) -> dict:
         """Take hold of a container's moving link and follow its joint, opening it by ``fraction`` of its range.
 
@@ -1140,18 +1228,33 @@ class R1ProSim(TiptopSim):
             axis_dir = self.to_base(th.tensor(joint["axis"], dtype=th.float32), unit)[0].cpu().numpy() - base_pos
             origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), unit)[0].cpu().numpy()
             pull = axis_dir * float(np.sign(travel) or 1.0)
-            # Which way the jaw must face to hold a drawer front is written down nowhere, and the orientation the
-            # hand happens to carry is rarely reachable at the handle. Several are tried and the one that solves is
-            # logged, which is how the convention gets learned rather than assumed.
-            for k, rot in enumerate(grasp_orientations(grip[:3, :3], pull)):
+            pull_hat = pull / max(float(np.linalg.norm(pull)), 1e-9)
+            # The hand goes straight at the face the drawer leads with, against the pull, which is where
+            # OmniGibson's own opener (utils.grasping_planning_utils.get_grasp_position_for_open) grasps one. Only
+            # the roll about that line is free, so the jaw is offered upright and across, and after those the
+            # hand's own orientation as a last resort.
+            uprights = [np.array([0.0, 0.0, 1.0]), np.cross(pull_hat, [0.0, 0.0, 1.0])]
+            tries = [self.grasp_target(arm, handle_base, -pull_hat, jaw) for jaw in uprights]
+            tries += [(handle_base, np.asarray(r, dtype=np.float64)) for r in grasp_orientations(grip[:3, :3], pull)]
+            for k, (where, rot) in enumerate(tries):
                 quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
-                first = ik.solve(handle_base, quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+                # Solve this one tightly. The tolerance the rest of the pipeline uses is 2 cm, four times the
+                # depth the fingertips are pressed in by, so a solution inside tolerance can still leave the hand
+                # short of the panel with nothing to take hold of -- and a grasp that never touches looks exactly
+                # like a grasp that slipped. Loosen only if nothing solves.
+                for tolerance in (OPEN_GRASP_TOLERANCE, 0.02):
+                    first = ik.solve(where, quat, seed=seed, tolerance_pos=tolerance, tolerance_rad=0.5)
+                    if first is not None:
+                        break
                 if first is not None:
+                    reached_pos, _ = ik.fk(first, f"{arm}_gripper_link")
                     log.info(
                         f"taking hold of {name}.{joint['name']} at {np.round(handle_world, 2).tolist()} "
-                        f"by its {grip_kind} with grasp orientation {k}"
+                        f"by its {grip_kind}, jaw {k}: hand frame goes to {np.round(where, 3).tolist()}, "
+                        f"arm reaches {np.round(reached_pos, 3).tolist()} "
+                        f"({float(np.linalg.norm(reached_pos - where)) * 100:.1f} cm off, tolerance {tolerance})"
                     )
-                    chosen = (joint, travel, pose_matrix(handle_base, quat), axis_dir, origin_base, first, grip_kind)
+                    chosen = (joint, travel, pose_matrix(where, quat), axis_dir, origin_base, first, grip_kind)
                     break
             if chosen is not None:
                 break
@@ -1160,16 +1263,12 @@ class R1ProSim(TiptopSim):
             return {"opened": False, "why": f"no joint of {name} has a handle this arm can reach"}
         joint, travel, start_pose, axis_dir, origin_base, first, grip_kind = chosen
         path = follow_joint(start_pose, joint["kind"], axis_dir, origin_base, travel, steps=OPEN_PATH_STEPS)
-        # Come at the handle from outside it. The handle point is the middle of the face that leads, so sending the
-        # gripper straight there puts its fingers through the drawer front: the fourth smoke test reached the
-        # handle and was stopped on the way in, "left_arm_joint4 stopped following at step 1 of 10" (2026-09-13).
-        # An approach pose OPEN_APPROACH back along the pull is clear, and the hand closes only once it is there.
+        # Come at the face from outside it, along the pull, and close only once the hand is there -- the same
+        # standoff-then-approach the engine's own opener uses.
         approach = np.asarray(start_pose, dtype=np.float64).copy()
         pull_unit = axis_dir * float(np.sign(travel) or 1.0)
         pull_unit = pull_unit / max(float(np.linalg.norm(pull_unit)), 1e-9)
-        # An edge grip comes down onto the panel from above; a face grip comes in from outside, along the pull.
-        away = np.array([0.0, 0.0, 1.0]) if grip_kind == "edge" else pull_unit
-        approach[:3, 3] = approach[:3, 3] + away * OPEN_APPROACH
+        approach[:3, 3] = approach[:3, 3] + pull_unit * OPEN_APPROACH
         path = [approach] + path
         reached, blocked = 0, ""
         for i, pose in enumerate(path):
@@ -1195,6 +1294,27 @@ class R1ProSim(TiptopSim):
             reached = i
             if i == 1:
                 self.hold(OPEN_GRASP_STEPS, self.CLOSE)  # take hold of the handle before pulling on it
+                # Whether the assist actually took hold, rather than inferred from the drawer having moved: the
+                # eighth smoke test tracked the whole opening path and left the drawer shut, and without this
+                # there is no telling a grasp that never happened from one that slipped (2026-09-13).
+                held = self.robot._ag_obj_in_hand.get(arm)
+                grabbed = held is not None and held.name == obj.name
+                touching = ""
+                if not grabbed:  # say what the fingers are actually on, so "no grasp" and "no contact" differ
+                    try:
+                        candidates, _ = self.robot._find_gripper_contacts(arm=arm)
+                        touching = "; the fingers touch " + (
+                            ", ".join(sorted(c.rsplit("/", 2)[-2] + "/" + c.rsplit("/", 1)[-1] for c in candidates))
+                            or "nothing at all"
+                        )
+                    except Exception as why:  # noqa: BLE001 - a diagnostic must not replace the failure
+                        touching = f"; could not read the finger contacts ({type(why).__name__})"
+                log.info(
+                    f"after closing on {name}.{joint['name']}: the assist holds "
+                    f"{held.name if held is not None else 'nothing'}"
+                    + ("" if grabbed else f" -- NOT {obj.name}, so the pull will slide off it")
+                    + touching
+                )
             if stopped is not None:
                 blocked = f"{stopped[0]} stopped following at step {i + 1} of {len(path)}"
                 break
@@ -1491,6 +1611,20 @@ class R1ProSim(TiptopSim):
         moved = False
         for joint, value in TRAVEL_TORSO.items():
             if joint in self.planned_joints:
+                # Keep the fold inside the joint's own limits. The target was worked out over the URDF, and asking
+                # for a hair past the stop leaves the joint sitting against it, permanently behind its command --
+                # which the ramp reads as "pushing against something" and reports as a blocked fold. Every teleport
+                # in assembling_gift_baskets 301 logged exactly that (2026-09-13).
+                limits = self.robot.joints.get(joint)
+                if limits is not None:
+                    low, high = float(limits.lower_limit), float(limits.upper_limit)
+                    clamped = min(max(float(value), low), high)
+                    if abs(clamped - float(value)) > 1e-6:
+                        log.info(
+                            f"fold for travel: {joint} asked for {value:+.3f}, its limits are "
+                            f"[{low:+.3f}, {high:+.3f}], folding to {clamped:+.3f}"
+                        )
+                    value = clamped
                 folded[self.planned_joints.index(joint)] = float(value)
                 moved = True
         if not moved:

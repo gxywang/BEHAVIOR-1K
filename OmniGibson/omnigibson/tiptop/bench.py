@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from omnigibson.tiptop.knowledge import GoalNotVisible
 from omnigibson.tiptop.protocol import bddl_category
 from omnigibson.tiptop.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
 from omnigibson.tiptop.run import (
@@ -42,6 +43,7 @@ log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
 STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
+BLIND_LIMIT = 3  # captures in a row that fail to see a goal object before the runner stops trying for it
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
 UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
 FLOOR_LEVEL = 0.15  # m: a target whose bottom is lower than this stands on the floor (the workspace reaches down)
@@ -97,6 +99,16 @@ def verdict_caption(reason: str, success: bool, goal: dict) -> str:
     return f"{head}\nunsatisfied: {', '.join(missing[:UNSATISFIED_SHOWN])}{more}"
 
 
+def atom_objects(atoms: list[dict]) -> list[str]:
+    """Every object an atom names, in order, without repeats -- what a capture of it has to be able to see."""
+    out = []
+    for a in atoms:
+        for name in a.get("args", ()):
+            if name not in out:
+                out.append(name)
+    return out
+
+
 class Episode:
     """One task instance as a strategy sees it. The base moves by teleport (``stand_for``); the planner of an arm
     plans one round at a time (``plan_and_execute``, which never raises on a failed round: the runner decides what
@@ -112,6 +124,7 @@ class Episode:
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
         self.rounds = args.rounds
         self.records = []  # one per round, in order
+        self.blind = {}  # goal object -> captures in a row that could not see it (BLIND_LIMIT gives up on it)
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
         self.floor = sim.floor_name()
 
@@ -216,6 +229,25 @@ class Episode:
         from omnigibson.tiptop.scene import EpisodeOver
 
         i = len(self.records)
+        # An object no capture can see is not worth another capture. Instance 301 of assembling_gift_baskets spent
+        # rounds 7 to 15 -- nine rounds, thirteen minutes, a quarter of its step budget -- on swiss_cheese_2, which
+        # was invisible from every stance it tried, and then hit the time limit with eight atoms still open
+        # (2026-09-13). The strategy's per-item cap does not cover this: it counts transfers, and each failed
+        # transfer starts put-down rounds on the same unseeable object. Giving up on the object frees the budget
+        # for atoms that can still be had; seeing it once anywhere clears the count.
+        unseeable = [o for o in atom_objects(atoms) if self.blind.get(o, 0) >= BLIND_LIMIT]
+        if unseeable:
+            record = {
+                "round": i,
+                "atoms": atoms,
+                "arm": arm,
+                "step": self.sim.n_steps,
+                "error": f"GoalNotVisible: skipped, {', '.join(unseeable)} not seen in {BLIND_LIMIT} captures",
+                "seconds": 0.0,
+            }
+            self.records.append(record)
+            log.info(f"round {i} {atom_text(atoms)} [{arm}]: {record['error']}")
+            return record
         round_dir = self.out_dir / f"r{i:02d}_{arm}_{atoms[0]['predicate']}"
         round_dir.mkdir(parents=True, exist_ok=True)
         self.sim.video_caption = f"round {i}: {atom_text(atoms)} [{arm} arm]"
@@ -237,6 +269,12 @@ class Episode:
         except Exception as e:  # noqa: BLE001 - one failed round must not end the instance
             log.exception(f"round {i} {atom_text(atoms)} failed")
             record["error"] = f"{type(e).__name__}: {e}"
+            if isinstance(e, GoalNotVisible):
+                for name in atom_objects(atoms):
+                    self.blind[name] = self.blind.get(name, 0) + 1
+        else:
+            for name in atom_objects(atoms):  # the capture saw them; whatever hid them before is no longer hiding
+                self.blind.pop(name, None)
         record["seconds"] = round(time.time() - t0, 1)
         self.records.append(record)
         log.info(f"round {i} {atom_text(atoms)} [{arm}]: {record.get('error') or 'executed'} ({record['seconds']}s)")
