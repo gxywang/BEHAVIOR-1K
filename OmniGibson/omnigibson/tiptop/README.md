@@ -146,11 +146,17 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     margin is back at 0.08 m -- and `bench_batteries_6` scored **0.25 and 0.0** (mean 0.125) against run 5's 0.25
     on both, so the wider margin cost a battery by pushing the search past the poses that work. What the two runs
     do say is that the failure is a property of the stance, not of the object, and that the retry from another
-    pose recovers it every time. The measurement to make next is the
-    head camera's real footprint at the challenge posture: render one capture, unproject its depth, and find the
-    nearest visible point on a horizontal plane at each height. `camera_floor_distance` predicts that edge from
-    the intrinsics and the camera pose, the stance search trusts it, and these runs suggest it is optimistic;
-    a measured curve would replace both the guess and the margin.
+    pose recovers it every time.
+  - **What it actually is (`runs/bench_batteries_7`, with the diagnostic of `log_missing_objects`).** The battery
+    projects to pixel row **791 of a 720-row** head image: 71 pixels below the frame. In the left wrist view it
+    lands inside the image but the depth there is 0.28 m while the battery is 0.95 m away, so something is in
+    front of it; in the right wrist view it is at row 1029 of 480. Out of frame twice, occluded once. And the
+    stance search had accepted that pose because `camera_floor_distance` says the head camera sees the desk from
+    0.42 m ahead. **The projection and the prediction disagree, and that is the bug to chase**: the same
+    `points_to_pixels` the masks use puts the object outside the image where `camera_floor_distance` puts it
+    comfortably inside. A footprint measurement at the same posture (`scratchpad/footprint.py`) agrees with the
+    prediction at floor height to 4 mm, so whatever is wrong shows up above the floor. Until it is fixed the
+    retry carries the task, at one wasted round each time.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
