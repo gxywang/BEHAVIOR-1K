@@ -82,7 +82,7 @@ class VisualStepGate:
 
     def wait(self, message):
         self.advance_requested = False
-        print(f"\n{message}\nClick the OmniGibson viewport, then press N for the next step. Press Esc to close.")
+        print(f"\n{message}\nClick the viewer, then press N for the next step. Press Esc to close.")
         while not self.advance_requested and not self.closed:
             og.sim.render()
             time.sleep(0.01)
@@ -173,10 +173,10 @@ def restore_tro_state(env, episode):
 
 def main(argv=None):
     args = parse_args(argv)
-    if gm.HEADLESS or gm.REMOTE_STREAMING:
+    if gm.HEADLESS:
         raise RuntimeError(
-            "This script needs a desktop OmniGibson session. Unset OMNIGIBSON_HEADLESS "
-            "and OMNIGIBSON_REMOTE_STREAMING first."
+            "This script needs a viewer camera. Unset OMNIGIBSON_HEADLESS; "
+            "OMNIGIBSON_REMOTE_STREAMING=native is supported."
         )
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
@@ -208,6 +208,8 @@ def main(argv=None):
 
     try:
         env = og.Environment(configs=cfg)
+        if gm.REMOTE_STREAMING:
+            print(f"Remote streaming enabled: {gm.REMOTE_STREAMING}")
         gate = VisualStepGate()
         KeyboardEventHandler.add_keyboard_callback(lazy.carb.input.KeyboardInput.N, gate.advance)
         KeyboardEventHandler.add_keyboard_callback(lazy.carb.input.KeyboardInput.ESCAPE, gate.close)
