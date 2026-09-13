@@ -5,7 +5,7 @@ This is a diagnostic helper for demo-derived navigation benchmark generation. It
 uses a task-instance TRO file for the initial R1Pro pose, then integrates the
 demo's robot-local base velocity from the LeRobot parquet frames. If a matching
 raw HDF5 file is provided, it also compares the reconstructed trajectory against
-the exact simulator base qpos stored in raw replay state.
+the exact global simulator base pose stored in raw replay state.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import pandas as pd
 
 
 ROBOT_TYPE = "R1Pro"
-BASE_QPOS_INDICES = np.asarray([0, 1, 5], dtype=np.int64)
 
 
 def parse_args() -> argparse.Namespace:
@@ -349,7 +348,9 @@ def load_raw_global_base_pose(path: Path) -> np.ndarray:
 def resolve_raw_hdf5(args: argparse.Namespace, row: pd.Series) -> Path | None:
     if args.raw_hdf5:
         path = Path(args.raw_hdf5).expanduser()
-        return path if path.exists() else None
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
     if not args.raw_root:
         return None
     path = (
