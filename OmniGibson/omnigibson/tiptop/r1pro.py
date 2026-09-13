@@ -266,6 +266,7 @@ TRAVEL_SETTLE_STEPS = 20  # after folding or unfolding: one joint moved, so it s
 OPEN_PATH_STEPS = 10
 OPEN_SETTLE_STEPS = 15
 OPEN_GRASP_STEPS = 25  # closing on the handle before any pulling starts
+OPEN_APPROACH = 0.12  # m back along the pull: where the hand waits before it comes in to the handle
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -1152,11 +1153,20 @@ class R1ProSim(TiptopSim):
             return {"opened": False, "why": f"no joint of {name} has a handle this arm can reach"}
         joint, travel, start_pose, axis_dir, origin_base, first = chosen
         path = follow_joint(start_pose, joint["kind"], axis_dir, origin_base, travel, steps=OPEN_PATH_STEPS)
+        # Come at the handle from outside it. The handle point is the middle of the face that leads, so sending the
+        # gripper straight there puts its fingers through the drawer front: the fourth smoke test reached the
+        # handle and was stopped on the way in, "left_arm_joint4 stopped following at step 1 of 10" (2026-09-13).
+        # An approach pose OPEN_APPROACH back along the pull is clear, and the hand closes only once it is there.
+        approach = np.asarray(start_pose, dtype=np.float64).copy()
+        pull_unit = axis_dir * float(np.sign(travel) or 1.0)
+        pull_unit = pull_unit / max(float(np.linalg.norm(pull_unit)), 1e-9)
+        approach[:3, 3] = approach[:3, 3] + pull_unit * OPEN_APPROACH
+        path = [approach] + path
         reached, blocked = 0, ""
         for i, pose in enumerate(path):
             quat = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
             solution = (
-                first if i == 0 else ik.solve(pose[:3, 3], quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+                first if i == 1 else ik.solve(pose[:3, 3], quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
             )
             if solution is None:
                 blocked = f"no inverse kinematics for step {i + 1} of {len(path)}"
@@ -1168,13 +1178,13 @@ class R1ProSim(TiptopSim):
             stopped = self.ramp_to(
                 targets,
                 self.posture,
-                self.CLOSE if i else self.OPEN,
+                self.OPEN if i <= 1 else self.CLOSE,  # open on the way in, closed from the handle onward
                 OPEN_SETTLE_STEPS,
-                note=f"open {name} step {i + 1}",
+                note=f"open {name} step {i} of {len(path) - 1}",
             )
             seed = [float(v) for v in solution]
-            reached = i + 1
-            if i == 0:
+            reached = i
+            if i == 1:
                 self.hold(OPEN_GRASP_STEPS, self.CLOSE)  # take hold of the handle before pulling on it
             if stopped is not None:
                 blocked = f"{stopped[0]} stopped following at step {i + 1} of {len(path)}"
