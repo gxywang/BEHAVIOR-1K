@@ -936,7 +936,13 @@ maximum over eleven joints, so a plateau can be one joint stalled while the rest
 gripper events in the corpus follow a segment that ended 0.01-0.05 rad short and used the full budget -- the exit
 would have cut those settles right before the fingers move. `converge()` now records its trace (steps, capped,
 first / last / best error, the step it last got closer) so the rule can be chosen from a run instead of from
-reasoning.
+reasoning. **The first run with that trace (`runs/bench_batteries_10`) answers it**: of 39 converges, 10 spent the
+whole 90-step budget, and every one of them was flat -- six ending at 0.0101-0.0151 rad with the error *unchanged
+from the first step*, four at 0.20-0.76 rad (one improving until step 52, the rest flat). The mild band the
+refutation was protecting is not settling at all: it is the arm sitting at its steady-state error, 0.003 rad
+outside a 0.01 tolerance. A no-progress exit with a patience well past any observed improvement would cut nothing
+that was still closing and would return roughly 27 s an instance. Left for one more run's data before it is
+written, since ten samples from one run is how the last two mistakes started.
 
 **And the fallback sweep, the motion that swept a battery off a desk.** When no look pose is found for the planned
 arm, the bridge swung it out of view with `LOOK_ARM = {"left_arm_joint2": 2.0}` -- against a home of 0.2636, a
