@@ -1437,7 +1437,9 @@ class R1ProSim(TiptopSim):
                 inside.append(f"{arm}_{suffix}")
         return inside
 
-    def ramp_arms(self, q_arm, posture: dict, arms, gripper: float, settle_steps: int, elbow_first: bool) -> bool:
+    def ramp_arms(
+        self, q_arm, posture: dict, arms, gripper: float, settle_steps: int, elbow_first: bool, note: str = ""
+    ) -> bool:
         """``ramp_to`` the targets through a via configuration: for each arm in ``arms`` the elbow alone has moved
         (``elbow_first``, a swing out: the hand rises before it travels) or every joint but the elbow has (a swing
         back: the hand travels folded and straightens last). Both legs ramp at the capture speed; the via is not
@@ -1448,15 +1450,17 @@ class R1ProSim(TiptopSim):
         goal = dict(zip(names, [float(v) for v in q_arm] + [float(posture[j]) for j in posture]))
         via = via_configuration(names, now, goal, {a: self.robot.arm_joint_names[a] for a in arms}, ELBOW, elbow_first)
         if any(abs(via[j] - now[j]) > 1e-3 for j in names):
-            if self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0):
+            if self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0, note):
                 self.hold(settle_steps, gripper)  # blocked on the first leg; do not drive the second into it
                 return False
-        return self.ramp_to(q_arm, posture, gripper, settle_steps) is None
+        return self.ramp_to(q_arm, posture, gripper, settle_steps, note) is None
 
-    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int) -> tuple | None:
+    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int, note: str = "") -> tuple | None:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
         than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
-        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``.
+        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``. ``note``
+        names the motion in the log when it is blocked, so a run says which motion met the obstacle rather than
+        only which joint did (the user watched a video of arms knocking objects about, 2026-09-13).
 
         A joint that falls more than ``RAMP_BLOCK_TOL`` behind its target is pushing against something, and the ramp
         stops there and holds where the joints actually are rather than leaning on it for the rest of the path
@@ -1493,7 +1497,7 @@ class R1ProSim(TiptopSim):
             log.warning(
                 f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
                 f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
-                f"ramp stopped there"
+                f"ramp stopped there [motion: {note or 'unnamed'}]"
             )
             held = self.robot.get_joint_positions()
             self.posture = {j: float(held[self.joint_index[j]]) for j in posture}
@@ -1579,7 +1583,15 @@ class R1ProSim(TiptopSim):
         if not moved:
             return self._capture_views(task, ready)
         original = self.posture
-        if self.ramp_arms(look, posture, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=True):
+        if self.ramp_arms(
+            look,
+            posture,
+            sorted(moved),
+            self.last_gripper,
+            LOOK_SETTLE_STEPS,
+            elbow_first=True,
+            note="capture swing out",
+        ):
             now = self.robot.get_joint_positions()
             for arm, targets in moved.items():
                 lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
@@ -1587,18 +1599,34 @@ class R1ProSim(TiptopSim):
                     log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
             request, extras = self._capture_views(task, look)
             self._log_wrist_framing(request, moved)
-            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+            self.ramp_arms(
+                ready,
+                original,
+                sorted(moved),
+                self.last_gripper,
+                LOOK_SETTLE_STEPS,
+                elbow_first=False,
+                note="return to ready after the capture",
+            )
         else:  # it met something on the way out: go back first, then capture from where the arms rest
             self.blocked_swings += 1
             log.warning("the capture swing stopped against something; capturing from the ready posture instead")
-            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+            self.ramp_arms(
+                ready,
+                original,
+                sorted(moved),
+                self.last_gripper,
+                LOOK_SETTLE_STEPS,
+                elbow_first=False,
+                note="return to ready after a blocked swing",
+            )
             moved, look = {}, list(ready)
             request, extras = self._capture_views(task, ready)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:  # it caught on something on the way back: try the direct path before giving up on it
             log.warning(f"arm {lag:.3f} rad short of the ready posture after the capture; ramping straight back")
-            self.ramp_to(ready, original, self.last_gripper, LOOK_SETTLE_STEPS)
+            self.ramp_to(ready, original, self.last_gripper, LOOK_SETTLE_STEPS, note="straight back to ready")
             q_ready = self.q_arm()
             lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:
@@ -1683,6 +1711,7 @@ class R1ProSim(TiptopSim):
                 self.posture,
                 self.last_gripper,
                 HEAD_VIEW_SETTLE_STEPS,
+                note=f"torso to the {name} view",
             )
             view, view_extras = self.view_frame(name)
             add_view(
@@ -1699,7 +1728,7 @@ class R1ProSim(TiptopSim):
                 f"head view {name}: {joint} moved {math.degrees(delta):+.0f} deg, camera at base "
                 f"{np.round(view_extras['cam_pos_base'], 2).tolist()}"
             )
-        self.ramp_to(q_arm, self.posture, self.last_gripper, HEAD_VIEW_SETTLE_STEPS)
+        self.ramp_to(q_arm, self.posture, self.last_gripper, HEAD_VIEW_SETTLE_STEPS, note="back from a head view")
         moved_joints = {HEAD_VIEWS[name][0] for name in head_views}
         back = max(
             abs(float(self.q_arm()[self.planned_joints.index(j)]) - q_arm[self.planned_joints.index(j)])

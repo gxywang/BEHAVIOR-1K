@@ -36,6 +36,7 @@ if log and log.exists():
         "rounds lost to empty masks": r"\[\w+\]: GoalNotVisible",
         "rounds lost to planning": r"\[\w+\]: TiptopPlanningError",
         "capture swings blocked": r"capture swing stopped against something",
+        "arms blocked against something": r"stopped following the ramp",
         "arm on the camera's line of sight": r"stands between the head camera",
         "views dropped (all robot)": r"nothing but the robot in this view",
         "stances with nothing framed whole": r"no stance frames every object whole",
@@ -46,6 +47,14 @@ if log and log.exists():
     print("\n  from the log:")
     for name, n in counts.items():
         print(f"    {n:4d}  {name}")
+    motions = re.findall(r"stopped following the ramp .*?\[motion: ([^\]]+)\]", text)
+    if motions:
+        print("\n  which motion met the obstacle:")
+        for motion, n in Counter(motions).most_common():
+            print(f"    {n:4d}  {motion}")
+    elif counts.get("arms blocked against something"):
+        print("\n  (the ramps in this run predate the motion labels; rerun to attribute them)")
+
     missing = re.findall(
         r"(\w+) in the (\w+) view: ([\d.-]+) m ahead at pixel \(([\d.-]+), ([\d.-]+)\) of (\d+)x(\d+), "
         r"(OUTSIDE the image|inside the image), depth there ([\d.]+ m|-)",
