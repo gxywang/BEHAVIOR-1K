@@ -1,0 +1,6 @@
+# One jar of honey from a countertop into a cabinet: the smallest transfer in the challenge set, one item and one
+# container, which makes it the cheapest end-to-end check that a task the pipeline has never seen works at all.
+# New ground: the item stands on a countertop, which is not one of SUPPORT_CATEGORIES (tables and floors).
+task: store_honey
+instruction: put the jar of honey in the cabinet
+plan: transfer

@@ -1,0 +1,6 @@
+# Three soda cans off one floor into a trash can standing on the floor of another room. The same shape as
+# dispose_of_batteries, with one thing that is new: a can of soda is 7 to 8.3 cm across and the fingers open to
+# FINGER_OPEN (4 cm each, 8 cm between them), so this is the first task whose items sit at the gripper's limit.
+task: picking_up_trash
+instruction: put the cans in the trash can
+plan: transfer
