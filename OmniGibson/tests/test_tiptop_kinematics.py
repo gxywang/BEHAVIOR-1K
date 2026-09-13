@@ -273,3 +273,31 @@ def test_a_slab_the_line_runs_parallel_to_is_hit_only_when_the_line_is_inside_it
     flat = ((0.2, -0.5, 1.0), (0.9, 0.5, 1.2))  # the sight line passes through this height band
     assert hits(*flat)
     assert not hits((0.2, -0.5, 1.5), (0.9, 0.5, 1.7))  # the same band, above the line
+
+
+# --------------------------------------------------------------- the whole arm against a scene box
+def arm_hits(points, lo=(0.5, -0.2, 0.6), hi=(0.9, 0.2, 0.9), clearance=0.0):
+    from omnigibson.tiptop.r1pro import polyline_hits_box
+
+    return polyline_hits_box(points, lo, hi, clearance)
+
+
+def test_an_arm_that_reaches_over_a_box_does_not_enter_it():
+    over = [(0.2, 0.0, 1.2), (0.5, 0.0, 1.1), (0.8, 0.0, 1.0)]
+    assert not arm_hits(over)
+
+
+def test_an_arm_whose_elbow_crosses_the_box_is_caught_even_when_both_ends_are_clear():
+    # both endpoints outside, the segment between them straight through: the case a point test on the hand misses
+    through = [(0.2, 0.0, 0.75), (1.2, 0.0, 0.75)]
+    assert arm_hits(through)
+
+
+def test_clearance_catches_a_limb_that_only_grazes():
+    beside = [(0.2, 0.0, 0.95), (1.2, 0.0, 0.95)]  # 5 cm above the box's top
+    assert not arm_hits(beside)
+    assert arm_hits(beside, clearance=0.06)
+
+
+def test_a_polyline_of_one_point_hits_nothing():
+    assert not arm_hits([(0.7, 0.0, 0.75)])

@@ -132,6 +132,12 @@ LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is 
 # so a link is a point and this radius stands in for its mesh. The arm in front of the target does not merely darken
 # it: the self-mask zeroes the robot's own pixels, so the target comes back with no depth and an empty mask.
 LOOK_BLOCK_RADIUS = 0.08
+# The whole arm against the scene (arm_hits_scene): the arm is taken as the polyline through its link origins and a
+# scene box is grown by ARM_RADIUS before the segments are tested against it, which stands in for the limbs' own
+# thickness -- the R1Pro's upper arm and forearm are about 0.1 m across. PATH_SAMPLES configurations are checked
+# along a motion, because the endpoint being clear says nothing about what the arm sweeps through on the way.
+ARM_RADIUS = 0.06
+PATH_SAMPLES = 9
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
 # and the leaning torso, so the support plane the wrist cameras see beside the robot never runs under it. The head
@@ -245,6 +251,17 @@ def segment_hits_box(eye, target, lo, hi) -> bool:
         if near > far:
             return False
     return True
+
+
+def polyline_hits_box(points, lo, hi, clearance: float = 0.0) -> bool:
+    """Whether a polyline (a list of points, in order) enters the axis-aligned box grown by ``clearance``.
+
+    The arm modelled as the chain through its link origins: a limb is a segment, and growing the box stands in for
+    the limb's own thickness.
+    """
+    low = np.asarray(lo, dtype=np.float64).reshape(3) - clearance
+    high = np.asarray(hi, dtype=np.float64).reshape(3) + clearance
+    return any(segment_hits_box(a, b, low, high) for a, b in zip(points, points[1:]))
 
 
 def box_corners(lo, hi) -> np.ndarray:
@@ -1424,6 +1441,53 @@ class R1ProSim(TiptopSim):
                 continue
             if blocks_ray(eye, target, pos, LOOK_BLOCK_RADIUS):
                 hits.append(link)
+        return hits
+
+    def arm_points(self, arm: str, ik: ArmIK, q) -> list[np.ndarray]:
+        """World positions of ``arm``'s link origins at joints ``q``, shoulder to fingertips, in order."""
+        points = []
+        for name in list(self.robot.arm_link_names[arm]) + [f"{arm}_{suffix}" for suffix in HAND_LINKS]:
+            try:
+                pos, _ = ik.fk(q, name)
+            except Exception:
+                continue  # a link Lula's description does not carry
+            points.append(np.asarray(self.base_to_world(np.asarray(pos, dtype=np.float64)), dtype=np.float64))
+        return points
+
+    def arm_hits_scene(self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS) -> list[str]:
+        """Scene objects the whole arm reaches into at joints ``q``: "desk_1".
+
+        The arm is the polyline through its link origins (``arm_points``) and each scene box is grown by
+        ``clearance`` for the limbs' thickness, so a segment crossing the grown box means the arm is in it.
+        ``links_in_scene`` tests only the hand's links, and only as points -- but the joints the runs report
+        pushing against furniture are the shoulder and elbow (left_arm_joint4, left_arm_joint5, right_arm_joint3),
+        which no test covered. Objects a hand holds travel with the arm and do not count.
+        """
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        held = {self.objects[label] for label in self.hands() if label in self.objects}
+        points = self.arm_points(arm, ik, q)
+        hits = []
+        for obj, lo, hi in aabbs:
+            if obj not in held and polyline_hits_box(points, lo, hi, clearance):
+                hits.append(obj.name)
+        return hits
+
+    def path_hits_scene(self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES) -> list[str]:
+        """Scene objects the arm reaches into anywhere along the straight joint-space path from ``q_from`` to
+        ``q_to``, sampled at ``samples`` configurations (the ends included).
+
+        The bridge's own capture motion is a straight ramp in joint space (``ramp_to``), so this is the path the
+        arm really takes. Checking only the destination is what let a swing sweep a battery off a desk on the way
+        (2026-09-12) and what leaves a run with tens of "the arm is pushing against something" (2026-09-13).
+        """
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        hits = []
+        for t in np.linspace(0.0, 1.0, max(2, samples)):
+            for name in self.arm_hits_scene(arm, ik, q_from + t * (q_to - q_from), aabbs):
+                if name not in hits:
+                    hits.append(name)
         return hits
 
     def links_in_base_box(self, arm: str, ik: ArmIK, q) -> list[str]:
