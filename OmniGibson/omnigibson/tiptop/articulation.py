@@ -92,11 +92,15 @@ def opening_travel(joint_type: str, lower: float, upper: float, position: float,
     lower limit) and a door hung the other way both open without the caller knowing which.
     """
     lo, hi = float(min(lower, upper)), float(max(lower, upper))
-    if hi - lo < 1e-6:
+    span = hi - lo
+    if span < 1e-6:
         return 0.0
-    target_hi, target_lo = lo + fraction * (hi - lo), hi - fraction * (hi - lo)
-    to_hi, to_lo = target_hi - float(position), target_lo - float(position)
-    return to_hi if abs(to_hi) <= abs(to_lo) else to_lo
+    here = float(position)
+    # Open AWAY from the limit the joint is resting at. Picking whichever target was nearer -- which this did --
+    # sends a drawer closed at 0.0 to 0.078 of its 0.39 range and calls that 80% open, because 0.078 is nearer to
+    # 0.0 than 0.312 is. The probe on store_honey's cabinet is what showed it (2026-09-13).
+    target = lo + fraction * span if abs(here - lo) <= abs(here - hi) else hi - fraction * span
+    return float(min(max(target, lo), hi) - here)
 
 
 def is_open(lower: float, upper: float, position: float, threshold: float = 0.05) -> bool:

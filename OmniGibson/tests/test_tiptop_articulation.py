@@ -65,6 +65,24 @@ def test_travel_goes_toward_whichever_limit_is_nearer_so_either_hinging_works():
     assert opening_travel("revolute", -1.6, 0.0, position=0.0, fraction=0.5) == pytest.approx(-0.8)
 
 
+def test_opening_a_closed_drawer_by_a_fraction_means_that_fraction_of_its_range():
+    # store_honey's cabinet: four drawers, range [0, 0.39], all resting closed. 80% open is 0.312 m of travel --
+    # the earlier version answered 0.078, being the distance to a target 80% of the way from the FAR limit
+    assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=0.80) == pytest.approx(0.312, abs=1e-6)
+    assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=OPEN_FRACTION_SCORED) == pytest.approx(
+        0.0312, abs=1e-6
+    )
+
+
+def test_a_partly_open_joint_travels_only_the_rest_of_the_way():
+    assert opening_travel("prismatic", 0.0, 0.4, position=0.1, fraction=0.5) == pytest.approx(0.1)
+
+
+def test_travel_never_asks_for_more_than_the_joint_has():
+    far = opening_travel("prismatic", 0.0, 0.4, position=0.0, fraction=2.0)
+    assert far == pytest.approx(0.4), "clamped to the limit, not 0.8 m into the cabinet"
+
+
 def test_a_joint_with_no_range_asks_for_no_travel():
     assert opening_travel("prismatic", 0.3, 0.3, position=0.3, fraction=0.8) == 0.0
 
