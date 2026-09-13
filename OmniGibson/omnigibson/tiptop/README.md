@@ -143,8 +143,10 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     from the one that works. Raising `CAMERA_MIN_MARGIN` from 0.08 m to 0.15 m on the theory that it was falling
     past the frame's bottom edge moved the stance from 0.55 m to 0.60 m (0.578 m ahead against the new 0.57 m
     requirement) and the mask was **still empty** (`runs/bench_batteries_6`), so that theory is wrong and the
-    margin is back at 0.08 m. What the two runs do say is that the failure is a property of the stance, not of
-    the object, and that the retry from another pose recovers it every time. The measurement to make next is the
+    margin is back at 0.08 m -- and `bench_batteries_6` scored **0.25 and 0.0** (mean 0.125) against run 5's 0.25
+    on both, so the wider margin cost a battery by pushing the search past the poses that work. What the two runs
+    do say is that the failure is a property of the stance, not of the object, and that the retry from another
+    pose recovers it every time. The measurement to make next is the
     head camera's real footprint at the challenge posture: render one capture, unproject its depth, and find the
     nearest visible point on a horizontal plane at each height. `camera_floor_distance` predicts that edge from
     the intrinsics and the camera pose, the stance search trusts it, and these runs suggest it is optimistic;
