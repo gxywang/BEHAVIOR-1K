@@ -9,6 +9,8 @@ from omnigibson.tiptop.protocol import resample_trajectory
 
 log = logging.getLogger(__name__)
 
+LARGE_FINAL_ERROR = 0.05  # rad: a segment that ends this far from its target did not arrive (see execute)
+
 
 def compose_views(views: dict, column_width: int = 560, caption: str | None = None) -> np.ndarray:
     """One video frame from the simulator's views ({name: (H, W, 3) uint8}, the capture camera first): the first
@@ -164,6 +166,16 @@ class PlanExecutor:
                 final_err = self.converge(traj[-1], stop=stop) if not stopped_early else float(errs[-1])
                 if stopped_early:
                     pressed.add(step["label"])
+                # which joint is short, when one is: a segment that ends far from its target means the arm never
+                # reached the pose the plan chose (a floor grasp asks the torso to swing a radian), and what comes
+                # next -- closing the gripper on the object -- happens somewhere else entirely.
+                short = ""
+                if final_err > LARGE_FINAL_ERROR:
+                    gap = np.abs(self.sim.q_arm() - traj[-1])
+                    j = int(np.argmax(gap))
+                    name = list(self.sim.planned_joints)[j] if j < len(self.sim.planned_joints) else f"joint {j}"
+                    short = f"; {name} stopped {gap[j]:.3f} rad short of {float(traj[-1][j]):+.3f}"
+                    log.warning(f"[{i}] {step['label']}: the arm did not reach the end of this segment{short}")
                 q_last = traj[-1]
                 stats["trajectories"].append(
                     {
@@ -181,7 +193,7 @@ class PlanExecutor:
                 log.info(
                     f"[{i}] {step['label']}: {len(step['positions'])} wp -> {len(traj)} steps"
                     f"{f' (button flipped after {len(errs)})' if stopped_early else ''}, "
-                    f"max lag {max(errs):.3f} rad, final err {final_err:.4f} rad"
+                    f"max lag {max(errs):.3f} rad, final err {final_err:.4f} rad{short}"
                 )
             else:
                 fingers_before = self.sim.q_fingers().tolist()
