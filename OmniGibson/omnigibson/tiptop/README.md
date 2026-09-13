@@ -857,6 +857,59 @@ for one task and is kept here, with what it did, in case a task needs it later.
 - **A pass with assisted grasping (not run).** The challenge's default `grasping_mode` is `assisted`; the passes
   used `sticky` (allowed). Same code, one flag.
 
+## Why the arm hits things (2026-09-13)
+
+The user watched the run videos and saw the arm meeting furniture and knocking the task's own objects about. The
+logs agreed: 26 blocked ramps in one `putting_away_toys` run, 8 in `dispose_of_batteries`, every one of them
+"the arm is pushing against something". Five agents read the capture path, the executor, what the planner is told,
+the run logs and the stance search; each finding was then checked by an agent trying to refute it. What follows is
+what was measured, what was fixed, and what was left.
+
+**Where the contacts come from.** "Stopped following the ramp" is only ever the bridge's own capture motion -- the
+planner's trajectories go through `executor.py`, which reports its own lag and measured 0.000-0.019 rad on the
+same runs. So the arm was not fighting the planner's paths; it was fighting the motions the bridge makes to pose
+cameras. Every motion the bridge starts now carries a name ("capture swing out", "torso to the head_up view"), a
+blocked ramp prints it, and `scripts/read_run.py` counts them per name.
+
+**A head view was moving the arm.** 24 of the 28 blocked ramps in the toys run were head-view ramps, and the joint
+that blocked was always an arm joint, never the torso. A head view was built on the posture the caller *intended*,
+so it re-commanded the arm to that posture -- dragging an arm that a blocked swing or a short grasp had left
+elsewhere, against whatever had stopped it. It is now built on the measured joints and moves the torso alone.
+
+**An arm was swung for nothing.** `capture()` posed the planned arm on every capture whatever the views were. With
+head views alone there is no wrist camera to aim, so the swing served nothing at all -- and it was the only arm
+motion of such a round. An arm is now posed only if its wrist camera is one of the views or its links stand on the
+head camera's line to what the capture is about.
+
+**A furniture box is not the furniture.** At the READY posture, where the robot has just teleported in and is
+touching nothing, the boxes of a swivel chair and a desk both contain the hand -- and the hand-only test that
+guarded look poses (`links_in_scene`) called that a collision (`scratchpad/arm_clearance.py`). Boxes are far
+looser than what they stand for, so a box now only decides which objects are worth measuring, and the object's own
+mesh decides the rest (`arm_hits_scene`, the same exact point-triangle distance the geometry masks use).
+
+**There is no honest threshold, so the choice is a ranking.** An arm working at a desk is near the desk whatever
+it does. `wrist_look` no longer takes the first offset that solves: every offset that keeps clear of the base and
+of the head camera's sight line is scored by how much of the arm passes within `ARM_RADIUS` of a scene mesh *along
+the path the ramp will follow*, and the roomiest is taken. Ranking cannot leave a capture with no look pose.
+
+**Nothing stopped a push.** The executor commanded every remaining target of a segment however far behind the arm
+had fallen, then leaned on its end for up to 90 more steps of `converge()`, then held the *commanded* endpoint for
+25 more while the gripper moved. All three now stop: a segment whose arm has been more than `EXEC_BLOCK_TOL`
+behind for `EXEC_BLOCK_STEPS` is abandoned, `converge()` gives up when the error stops improving, and a segment
+carries forward where the arm *is*.
+
+**One bad capture spent two strikes.** `capture()` counted a blocked swing twice -- once when the out-swing
+stopped, once when the arm was found short of ready afterwards, which a blocked swing causes almost by definition.
+That spent the whole `BLOCKED_SWINGS_MAX` allowance on a single capture and turned wrist look poses off for the
+rest of the instance.
+
+**What was found and not fixed.** The planner's collision world holds the task's own objects and one table slab;
+every other real thing in the room is absent, so cuTAMP plans through furniture it has never been told about. The
+analysis proposes sending the room through the `held_labels` channel, which reaches cuTAMP as statics. That is a
+change to what the planner is told rather than to how the bridge moves, it is not what the videos show, and it
+deserves its own measurement -- so it is written down here rather than done. The same goes for the collision
+margin, which is zero and cannot be set from the bridge at all: it needs one number plumbed through the submodule.
+
 ## Known limits
 
 - **A view with nothing but the robot in it is no longer sent (2026-09-13).** When a capture swing is blocked the
