@@ -157,6 +157,14 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     comfortably inside. A footprint measurement at the same posture (`scratchpad/footprint.py`) agrees with the
     prediction at floor height to 4 mm, so whatever is wrong shows up above the floor. Until it is fixed the
     retry carries the task, at one wasted round each time.
+  - Three measurements name the pattern: the capture that **works** has the battery 0.84-0.91 m from the camera
+    with 492 pixels; one that fails has it 0.72 m away and 71 pixels below the frame; another has it 0.36 m away
+    at a pixel inside the image where the rendered depth reads 0.51 m, so the camera resolves past it. Standing
+    too close is the common thread, and the fix is not a margin on `camera_floor_distance`, which models a
+    surface's frame edge rather than the object: **the stance search should project the object itself into the
+    candidate's camera and reject poses where it falls outside the image or nearer than the camera resolves.**
+    It already computes each candidate's camera pose, and `points_to_pixels` is the same projection the masks
+    use, so the test is exact rather than a proxy.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
