@@ -32,12 +32,12 @@
     "instance_count": 2
   },
   "putting_away_toys": {
-    "mean": 0.0,
-    "run": "runs/bench_toys_1",
-    "instances": "0",
-    "date": "2026-09-12",
-    "note": "first run of the task; no round placed a toy",
-    "instance_count": 1
+    "mean": 0.4375,
+    "run": "runs/bench_toys_4",
+    "instances": "0 1",
+    "instance_count": 2,
+    "date": "2026-09-13",
+    "note": "0.50 and 0.375, both instances out of step budget. Replaces the 0.0 of runs/bench_toys_1 (one instance, 2026-09-12), which is a different measurement, not a like-for-like comparison. Taken with head pitch views and the projection-based stance test, before the arm-collision fixes of the same day; 59 arm motions in this run were blocked against something."
   },
   "clean_up_broken_glass": {
     "mean": 0.0,
