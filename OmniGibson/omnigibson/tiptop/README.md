@@ -471,7 +471,23 @@ has 331,776, putting_away_toys 256, the two disposal tasks 1).
 
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
-already exercised.
+already exercised. What the first runs of `dispose_of_batteries` and `putting_away_toys` cost (2026-09-12) says
+where to look first, in this order:
+
+1. **The room, not the planner.** Both tasks lost most of their rounds to the capture posture, not to planning:
+   an office cubicle and a furnished living room stop the wrist swing, and what the log shows is
+   `stopped following the ramp`, `the capture swing stopped against something` and `arm N rad from the ready
+   posture`. `--views head_up head_down` takes the two extra captures by leaning the torso instead, which needs
+   no room beside the robot.
+2. **Whether the object is in the picture.** `GoalNotVisible ... (empty masks)` with `rgb_failed.png` beside the
+   round directory is a stance that framed the object out, usually below the bottom edge; a small object on a low
+   support is the case to check.
+3. **Whether the grasp arrived.** `the hand closed but the object is not at the hand` after a round that
+   executed: read the round's `live_result.json`. A large `final_error_rad` means the arm never reached the pose
+   (the executor now names the joint); a small one with nothing in the hand means the grasp pose was wrong, and
+   the line `perceived 'x' ... = simulated x (N cm off)` says by how much.
+4. **What the runner decided.** The `goal demand` line names what each container is to receive and what was
+   already true; if that reads wrong, nothing downstream can be right.
 
 Outputs per instance: `videos/<task>_<instance>_0.mp4` is the whole episode in one video, every env step from the
 first teleport to the end (the capture camera left, the overview and the wrist camera right), each frame stamped
