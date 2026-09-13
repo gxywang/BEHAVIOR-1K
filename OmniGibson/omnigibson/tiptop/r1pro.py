@@ -1137,11 +1137,17 @@ class R1ProSim(TiptopSim):
         }
         return ArmIK(self.robot.urdf_path, joints, fixed, frame=frame or CAMERA_LINKS[f"{arm}_wrist"])
 
-    def present_held(self, arm: str, aabbs=None) -> np.ndarray | None:
+    def present_held(self, arm: str, aabbs=None, ignore=()) -> np.ndarray | None:
         """Joints of ``arm`` that hold what it is carrying in front of the head camera (``PRESENT_POINT`` on its
         own side, the first of ``PRESENT_OFFSETS`` it reaches, clear of the base and of the scene), the gripper
-        keeping the orientation it grasped with so the object is not turned in the hand. None when no
+        keeping the orientation it grasped with so the object is not turned in the hand. ``ignore``: objects the
+        round is about, which do not count as obstacles here -- the robot stands at the container it is going to
+        place into, and the place motion enters it anyway with the planner's own collision geometry, so refusing
+        every pose near it leaves nothing (putting_away_toys at a toy box, 2026-09-12). None when no
         configuration does."""
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        skip = {self.scene_object(n) for n in ignore}
+        aabbs = [row for row in aabbs if row[0] not in skip]
         ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
         joints = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
@@ -1351,7 +1357,7 @@ class R1ProSim(TiptopSim):
             if not holding and arm != self.arm and f"{arm}_wrist" not in views:
                 continue
             joints = list(self.robot.arm_joint_names[arm])
-            q = self.present_held(arm, aabbs) if holding else self.wrist_look(arm, target, aabbs)
+            q = self.present_held(arm, aabbs, self.look_names) if holding else self.wrist_look(arm, target, aabbs)
             if q is not None:
                 moved[arm] = {j: float(v) for j, v in zip(joints, q)}
             elif holding:
