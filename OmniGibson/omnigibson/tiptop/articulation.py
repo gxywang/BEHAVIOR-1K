@@ -19,7 +19,13 @@ import numpy as np
 # OmniGibson's Open state (object_states/open_state.py) calls a joint open at 5% of its range, for both revolute
 # and prismatic joints. So the SCORED atom is cheap -- a drawer 2-3 cm out already satisfies it -- while reaching
 # INTO the container needs the full stroke. The two are different targets and the caller says which it wants.
-OPEN_FRACTION_SCORED = 0.08  # a little past the 5% the state flips at, for the atom alone
+OPEN_FRACTION_SCORED = 0.80  # measured: a short stroke does not move the drawer at all (see below)
+# Why the scored fraction is the same long stroke as the reach one. Asked for 8% of store_honey's drawer
+# range (31 mm over ten steps, 3 mm a step) the drawer moved 7 mm and stayed shut; asked for 80% (312 mm,
+# 31 mm a step) it tracked the hand one-to-one -- 0.031, 0.066, 0.101, 0.134 against 0.031, 0.063, 0.094,
+# 0.125 -- until the ARM ran out of reach at 13 cm, which is well past the 5% of range the `open` state
+# flips at. Short steps do not break the joint's stiction; long ones do. Being stopped early costs nothing,
+# because whatever travel was achieved is kept (2026-09-13).
 OPEN_FRACTION_REACH = 0.80  # enough of the range to put something in
 
 

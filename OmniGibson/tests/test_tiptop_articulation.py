@@ -70,7 +70,7 @@ def test_opening_a_closed_drawer_by_a_fraction_means_that_fraction_of_its_range(
     # the earlier version answered 0.078, being the distance to a target 80% of the way from the FAR limit
     assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=0.80) == pytest.approx(0.312, abs=1e-6)
     assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=OPEN_FRACTION_SCORED) == pytest.approx(
-        0.0312, abs=1e-6
+        0.312, abs=1e-6
     )
 
 
@@ -87,9 +87,20 @@ def test_a_joint_with_no_range_asks_for_no_travel():
     assert opening_travel("prismatic", 0.3, 0.3, position=0.3, fraction=0.8) == 0.0
 
 
-def test_the_scored_atom_is_far_cheaper_than_reaching_inside():
+def test_both_open_strokes_clear_the_state_threshold_and_stiction():
+    """Both fractions ask for a long pull, and the reason is measured rather than assumed.
+
+    This test used to assert the opposite -- that scoring an `open` atom was a much shorter, cheaper stroke than
+    reaching inside. Trying it in the simulator refuted that: asked for 8% of store_honey's drawer range (31 mm
+    spread over ten steps, 3 mm a step) the drawer moved 7 mm and stayed shut, while 80% (31 mm a step) tracked
+    the hand one-to-one to 13 cm, where the ARM ran out of reach. Short steps do not break the joint's stiction.
+    """
     assert OPEN_FRACTION_SCORED > 0.05, "OmniGibson flips Open at 5% of the range; clear it"
-    assert OPEN_FRACTION_REACH > 4 * OPEN_FRACTION_SCORED, "reaching in is a different, much longer stroke"
+    assert OPEN_FRACTION_REACH > 0.05
+    assert OPEN_FRACTION_SCORED >= 0.5, "a short stroke was measured not to move the drawer at all"
+    # 10% of a range is the most that can be asked before the per-step move is under a centimetre on a 0.39 m
+    # drawer split into OPEN_PATH_STEPS steps, which is the regime that failed.
+    assert OPEN_FRACTION_SCORED * 0.39 / 10 > 0.01, "per-step move must be over a centimetre to break stiction"
 
 
 def test_is_open_matches_omnigibsons_five_percent_rule_at_both_ends():

@@ -20,6 +20,7 @@ import math
 import re
 from pathlib import Path
 
+import trimesh
 import numpy as np
 import torch as th
 import yaml
@@ -275,6 +276,15 @@ GRASP_PRESS = 0.005
 # The arm IK tolerance used when closing on something. The pipeline's usual 2 cm is wider than the press
 # above, so a "solved" grasp can sit clear of the surface with nothing between the fingers.
 OPEN_GRASP_TOLERANCE = 0.004
+# Pressing in until the fingers actually touch. The arm does not land exactly where it is commanded -- with
+# the fingertips sent 5 mm INTO store_honey's drawer front they settled 3 mm clear of it, about 8 mm of
+# tracking error against a 5 mm press -- and the assist fires on contact, so a press smaller than that error
+# grasps nothing. Rather than guess a constant big enough, the hand presses deeper a step at a time and stops
+# as soon as the fingers report contact. The cap keeps it inside a drawer front's thickness (15.5 mm here).
+GRASP_NUDGE = 0.008  # m deeper per attempt
+GRASP_NUDGES = 3  # attempts after the first, so at most 24 mm past where the fingertips were first sent
+GRASP_FACE_SAMPLES = 5  # rays across each direction of a face when looking for the surface to close on
+GRASP_FACE_FRACTION = 0.35  # how far across the face they spread, as a fraction of its half-extent
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -1096,6 +1106,32 @@ class R1ProSim(TiptopSim):
             return False, f"the base slid {moved * 100:.0f} cm from where it was put"
         return True, ""
 
+    def surface_point(self, link, point, direction, reach: float = 0.5):
+        """First point of ``link``'s own surface that a ray along ``direction`` meets, starting ``reach`` outside
+        ``point``. Returns ``point`` unchanged when the link has no mesh or the ray misses it. World frame.
+
+        A bounding box is not a surface. store_honey's drawer fronts have their box face 3.0 cm in FRONT of the
+        panel -- the box picks up a lip at the drawer's outer edges, and every one of the four drawers reports the
+        same face -- so a hand sent to the box face closed on empty air 2.6 cm short of the panel and the assist
+        had nothing to take hold of ("the fingers touch nothing at all", 2026-09-13). Taking the point off the
+        geometry works whatever the shape: a flat drawer front, a door, a handle that protrudes.
+        """
+        mesh = self.link_trimesh_world(link)
+        if mesh is None or not len(mesh.faces):
+            return np.asarray(point, dtype=np.float64)
+        d = np.asarray(direction, dtype=np.float64)
+        d = d / max(float(np.linalg.norm(d)), 1e-9)
+        origin = np.asarray(point, dtype=np.float64) - d * reach
+        try:
+            hits, _, _ = mesh.ray.intersects_location(ray_origins=origin.reshape(1, 3), ray_directions=d.reshape(1, 3))
+        except Exception as why:  # noqa: BLE001 - a missing ray engine must not stop the round
+            log.debug(f"ray against {link.name} failed ({type(why).__name__}); using the box face")
+            return np.asarray(point, dtype=np.float64)
+        if not len(hits):
+            return np.asarray(point, dtype=np.float64)
+        along = (np.asarray(hits, dtype=np.float64) - origin) @ d
+        return np.asarray(hits, dtype=np.float64)[int(np.argmin(along))]
+
     def hand_convention(self, arm: str) -> dict:
         """Which way this hand approaches, which way its jaw closes, and where the grasp actually happens.
 
@@ -1152,6 +1188,58 @@ class R1ProSim(TiptopSim):
         )
         return out
 
+    def grasp_point_on(self, link, aim_world, approach_world, back_off: float = 0.35) -> tuple:
+        """Where a link's surface actually is along the line the hand comes in on, and how far it stands proud.
+
+        A bounding box is not a surface. store_honey's drawer link measures x[1.3301, 1.8221] and the hand aimed at
+        1.3301 as the front of the panel -- but a ray down the approach at the middle of that drawer first meets it
+        at 1.3599, so the fingertips stopped 2.6 cm short, in clear air, and the assist had nothing to hold: "the
+        fingers touch nothing at all" (2026-09-13). Whatever stands 3 cm proud of the panel sets the box and is not
+        where the hand was going.
+
+        Rays are cast over a patch of the face and the most protruding hit wins, so a handle is taken hold of when
+        the asset has one and the flat panel when it does not -- without either being named anywhere.
+
+        Returns (point, hits, proud): the world point to close on, how many rays found the link, and how far the
+        chosen point stands in front of the flattest one. Falls back to ``aim_world`` when no ray finds it.
+        """
+        mesh = self.link_trimesh_world(link)
+        aim = np.asarray(aim_world, dtype=np.float64)
+        direction = np.asarray(approach_world, dtype=np.float64)
+        direction = direction / max(float(np.linalg.norm(direction)), 1e-9)
+        if mesh is None or not len(mesh.faces):
+            return aim, 0, 0.0
+        # Two directions across the face, and how far the link reaches along each, so the patch scales to the part
+        up = np.array([0.0, 0.0, 1.0])
+        side = np.cross(direction, up)
+        if float(np.linalg.norm(side)) < 1e-6:
+            side = np.cross(direction, [1.0, 0.0, 0.0])
+        side = side / max(float(np.linalg.norm(side)), 1e-9)
+        up = np.cross(side, direction)
+        lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.aabb)
+        half = (hi - lo) / 2.0
+        reach_side = float(np.abs(half @ side)) * GRASP_FACE_FRACTION
+        reach_up = float(np.abs(half @ up)) * GRASP_FACE_FRACTION
+        best = None
+        hits = 0
+        for a in np.linspace(-reach_side, reach_side, GRASP_FACE_SAMPLES):
+            for b in np.linspace(-reach_up, reach_up, GRASP_FACE_SAMPLES):
+                start = aim + side * a + up * b - direction * back_off
+                where, _, _ = mesh.ray.intersects_location([start], [direction])
+                if not len(where):
+                    continue
+                hits += 1
+                travel = [(float((w - start) @ direction), np.asarray(w, dtype=np.float64)) for w in where]
+                travel.sort(key=lambda row: row[0])
+                # nearest along the approach, and nearest the middle of the patch when two stand equally proud
+                key = (round(travel[0][0], 3), abs(a) + abs(b))
+                if best is None or key < best[0]:
+                    best = (key, travel[0][0], travel[0][1])
+        if best is None:
+            return aim, 0, 0.0
+        aim_travel = float((aim - (aim - direction * back_off)) @ direction)
+        return best[2], hits, aim_travel - best[1]
+
     def grasp_target(self, arm: str, point, approach_dir, jaw_dir=None, press: float = GRASP_PRESS):
         """Pose for the arm IK that closes this hand on ``point``, coming in along ``approach_dir``.
 
@@ -1175,6 +1263,57 @@ class R1ProSim(TiptopSim):
         # tips ``press`` past the point, so the grasp centre sits back by the fingertip reach less the press
         centre = np.asarray(point, dtype=np.float64) + a_dir * (press - hand["tip"])
         return centre - rot @ hand["grasp"], rot
+
+    def close_on(self, arm: str, ik, obj, link_name: str, pose, into, seed, joints_of) -> tuple:
+        """Close the hand on ``obj``'s link and press in until the assist takes hold. (seed, held) afterwards.
+
+        The assist fires on finger CONTACT, and the arm does not stop exactly where it is told, so a fixed press
+        depth either misses (and grasps nothing) or is chosen big enough to shove the thing being grasped. This
+        presses a step at a time along ``into`` and stops at the first contact, which needs no constant to be
+        right and reports the gap it measured when it fails.
+        """
+        panel = self.link_trimesh_world(obj.links[link_name])
+        for attempt in range(GRASP_NUDGES + 1):
+            self.hold(OPEN_GRASP_STEPS, self.CLOSE)
+            held = self.robot._ag_obj_in_hand.get(arm)
+            if held is not None and held.name == obj.name:
+                log.info(f"the assist has {obj.name} after {attempt + 1} press(es)")
+                return seed, True
+            gap = ""
+            try:
+                touching, _ = self.robot._find_gripper_contacts(arm=arm)
+                gaps = []
+                for finger in self.robot.finger_links[arm]:
+                    mesh = self.link_trimesh_world(finger)
+                    if mesh is None or panel is None or not len(panel.faces):
+                        continue
+                    _, dist, _ = trimesh.proximity.closest_point(panel, np.asarray(mesh.vertices, dtype=np.float64))
+                    gaps.append(float(np.min(dist)))
+                gap = f"fingers {'touch ' + str(len(touching)) + ' thing(s)' if touching else 'touch nothing'}" + (
+                    f", nearest the panel by {min(gaps) * 100:.1f} cm" if gaps else ""
+                )
+            except Exception as why:  # noqa: BLE001 - a diagnostic must not replace the failure
+                gap = f"could not measure the gap ({type(why).__name__})"
+            if attempt == GRASP_NUDGES:
+                log.info(f"no hold on {obj.name} after {attempt + 1} presses; {gap}")
+                return seed, False
+            deeper = np.asarray(pose, dtype=np.float64).copy()
+            deeper[:3, 3] = deeper[:3, 3] + np.asarray(into, dtype=np.float64) * GRASP_NUDGE * (attempt + 1)
+            quat = T.mat2quat(th.tensor(deeper[:3, :3], dtype=th.float32)).cpu().numpy()
+            solution = ik.solve(deeper[:3, 3], quat, seed=seed, tolerance_pos=OPEN_GRASP_TOLERANCE, tolerance_rad=0.5)
+            if solution is None:
+                log.info(
+                    f"no hold on {obj.name}; cannot press {GRASP_NUDGE * (attempt + 1) * 100:.1f} cm deeper; {gap}"
+                )
+                return seed, False
+            log.info(f"{gap}; pressing {GRASP_NUDGE * (attempt + 1) * 100:.1f} cm deeper")
+            targets = [float(v) for v in self.q_arm()]
+            for name_j, value in zip(joints_of, solution):
+                if name_j in self.planned_joints:
+                    targets[self.planned_joints.index(name_j)] = float(value)
+            self.ramp_to(targets, self.posture, self.CLOSE, OPEN_SETTLE_STEPS, note="press onto the panel")
+            seed = [float(v) for v in solution]
+        return seed, False
 
     def open_container(self, arm: str, name: str, fraction: float = OPEN_FRACTION_SCORED) -> dict:
         """Take hold of a container's moving link and follow its joint, opening it by ``fraction`` of its range.
@@ -1209,6 +1348,16 @@ class R1ProSim(TiptopSim):
             # face, which is right when something protrudes there. No asset marks a handle.
             for grip_kind in OPEN_GRIPS:
                 where = handle_point(link_j, j["axis"], np.sign(t) or 1.0, grip=grip_kind)
+                # The box face is a guess at where the panel is; the mesh knows. Come at it along the approach.
+                into = -np.asarray(j["axis"], dtype=np.float64) * float(np.sign(t) or 1.0)
+                on_surface = self.surface_point(link_j, where, into)
+                if float(np.linalg.norm(on_surface - where)) > 1e-4:
+                    log.info(
+                        f"{name}.{j['name']}: its box face is at {np.round(where, 4).tolist()} but the panel is "
+                        f"{float(np.linalg.norm(on_surface - where)) * 100:.1f} cm behind it, at "
+                        f"{np.round(on_surface, 4).tolist()}; taking hold there"
+                    )
+                where = on_surface
                 usable.append(
                     (float(np.linalg.norm(where - hand)), OPEN_GRIPS.index(grip_kind), j, t, where, grip_kind)
                 )
@@ -1224,11 +1373,23 @@ class R1ProSim(TiptopSim):
         unit = th.tensor([0.0, 0.0, 0.0, 1.0])
         chosen = None
         for _, _, joint, travel, handle_world, grip_kind in usable:
-            handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), unit)[0].cpu().numpy()
             axis_dir = self.to_base(th.tensor(joint["axis"], dtype=th.float32), unit)[0].cpu().numpy() - base_pos
             origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), unit)[0].cpu().numpy()
             pull = axis_dir * float(np.sign(travel) or 1.0)
             pull_hat = pull / max(float(np.linalg.norm(pull)), 1e-9)
+            # Where the link's surface really is along the approach, rather than where its box ends
+            world_pull = self.base_to_world(pull_hat) - self.base_to_world(np.zeros(3))
+            world_pull = world_pull / max(float(np.linalg.norm(world_pull)), 1e-9)
+            link_j = obj.links.get(joint["link"])
+            surface, rays, proud = self.grasp_point_on(link_j, handle_world, -world_pull)
+            if rays:
+                log.info(
+                    f"{name}.{joint['name']}: its box says the face is at "
+                    f"{np.round(handle_world, 3).tolist()}, {rays} rays say the surface is at "
+                    f"{np.round(surface, 3).tolist()} ({proud * 100:+.1f} cm)"
+                )
+                handle_world = surface
+            handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), unit)[0].cpu().numpy()
             # The hand goes straight at the face the drawer leads with, against the pull, which is where
             # OmniGibson's own opener (utils.grasping_planning_utils.get_grasp_position_for_open) grasps one. Only
             # the roll about that line is free, so the jaw is offered upright and across, and after those the
@@ -1292,29 +1453,17 @@ class R1ProSim(TiptopSim):
             )
             seed = [float(v) for v in solution]
             reached = i
+            if i > 1:  # what the container's own joint did while the hand pulled, step by step
+                now_j = next((k for k in openable_joints(obj) if k["name"] == joint["name"]), None)
+                if now_j is not None:
+                    log.info(
+                        f"  pull step {i - 1} of {len(path) - 2}: hand asked for "
+                        f"{travel * (i - 1) / OPEN_PATH_STEPS:+.4f}, {joint['name']} is at {now_j['position']:+.4f}"
+                    )
             if i == 1:
-                self.hold(OPEN_GRASP_STEPS, self.CLOSE)  # take hold of the handle before pulling on it
-                # Whether the assist actually took hold, rather than inferred from the drawer having moved: the
-                # eighth smoke test tracked the whole opening path and left the drawer shut, and without this
-                # there is no telling a grasp that never happened from one that slipped (2026-09-13).
-                held = self.robot._ag_obj_in_hand.get(arm)
-                grabbed = held is not None and held.name == obj.name
-                touching = ""
-                if not grabbed:  # say what the fingers are actually on, so "no grasp" and "no contact" differ
-                    try:
-                        candidates, _ = self.robot._find_gripper_contacts(arm=arm)
-                        touching = "; the fingers touch " + (
-                            ", ".join(sorted(c.rsplit("/", 2)[-2] + "/" + c.rsplit("/", 1)[-1] for c in candidates))
-                            or "nothing at all"
-                        )
-                    except Exception as why:  # noqa: BLE001 - a diagnostic must not replace the failure
-                        touching = f"; could not read the finger contacts ({type(why).__name__})"
-                log.info(
-                    f"after closing on {name}.{joint['name']}: the assist holds "
-                    f"{held.name if held is not None else 'nothing'}"
-                    + ("" if grabbed else f" -- NOT {obj.name}, so the pull will slide off it")
-                    + touching
-                )
+                seed, grabbed = self.close_on(arm, ik, obj, joint["link"], pose, -pull_unit, seed, joints_of)
+                if not grabbed:
+                    log.info(f"nothing to pull on: the assist never took hold of {name}.{joint['name']}")
             if stopped is not None:
                 blocked = f"{stopped[0]} stopped following at step {i + 1} of {len(path)}"
                 break
