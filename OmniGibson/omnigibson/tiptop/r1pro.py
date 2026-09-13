@@ -1675,7 +1675,7 @@ class R1ProSim(TiptopSim):
             log.warning(
                 f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
                 f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
-                f"ramp stopped there [motion: {note or 'unnamed'}]"
+                f"ramp stopped there [motion: {note or 'unnamed'}, env step {self.n_steps}]"
             )
             held = self.robot.get_joint_positions()
             self.posture = {j: float(held[self.joint_index[j]]) for j in posture}

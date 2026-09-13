@@ -77,7 +77,13 @@ if log and log.exists():
             " out -- this is what an exit rule for converge() needs, see executor.converge)"
         )
 
-    motions = re.findall(r"stopped following the ramp .*?\[motion: ([^\]]+)\]", text)
+    motions = re.findall(r"stopped following the ramp .*?\[motion: ([^,\]]+)", text)
+    steps = re.findall(r"stopped following the ramp .*?env step (\d+)\]", text)
+    if steps:
+        print(
+            f"\n  env steps to watch in the video (the arm met something): {', '.join(steps[:20])}"
+            + (" ..." if len(steps) > 20 else "")
+        )
     if motions:
         print("\n  which motion met the obstacle:")
         for motion, n in Counter(motions).most_common():
