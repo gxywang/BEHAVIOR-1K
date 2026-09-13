@@ -88,8 +88,22 @@ def masks_from_geometry(depth, intrinsics, world_from_cam, meshes: dict, tol: fl
     return {label: (owner == i).reshape(depth.shape) for i, label in enumerate(labels)}
 
 
+_PREPARED: dict = {}  # id(mesh) -> (mesh, prepared): see _prepare
+
+
 def _prepare(mesh: trimesh.Trimesh):
-    """Subdivide oversized triangles; return (triangles, referenced vertices, max edge, centroids, centroid radii)."""
+    """Subdivide oversized triangles; return (triangles, referenced vertices, max edge, centroids, centroid radii).
+
+    Cached per mesh object, because the subdivision is the expensive part and the same scene mesh is queried again
+    and again: the stance and look-pose ranking asks about a desk once per candidate pose, and a desk top is two
+    big triangles that subdivide into thousands every time. Uncached, that took a putting-away round from about
+    150 s to 880 s (2026-09-13). The mesh itself is kept in the cache entry so the id cannot be reused by another
+    object after a collection.
+    """
+    hit = _PREPARED.get(id(mesh))
+    if hit is not None and hit[0] is mesh:
+        return hit[1]
+    original = mesh
     tris = np.asarray(mesh.triangles, dtype=np.float64)
     edge_max = float(np.linalg.norm(tris - np.roll(tris, 1, axis=1), axis=2).max())
     if edge_max > MAX_TRIANGLE_EDGE:
@@ -99,7 +113,9 @@ def _prepare(mesh: trimesh.Trimesh):
     vertices = np.asarray(mesh.vertices, dtype=np.float64)[np.unique(mesh.faces)]  # referenced vertices only
     centroids = tris.mean(axis=1)
     radii = np.linalg.norm(tris - centroids[:, None, :], axis=2).max(axis=1)
-    return tris, vertices, edge_max, centroids, radii
+    prepared = (tris, vertices, edge_max, centroids, radii)
+    _PREPARED[id(original)] = (original, prepared)
+    return prepared
 
 
 def _triangle_distances(tris, centroids, radii, points, tol: float) -> np.ndarray:

@@ -160,3 +160,31 @@ def test_surface_distances_exact():
     assert (
         surface_distances(trimesh.Trimesh(), pts, tol).shape == (5,) and surface_distances(box, pts[:0], tol).size == 0
     )
+
+
+def test_preparing_a_mesh_is_cached_so_a_repeated_query_does_not_subdivide_it_again():
+    """The stance and look-pose ranking asks about the same desk once per candidate pose.
+
+    Preparation subdivides oversized triangles -- a table top is two big triangles that become thousands -- and
+    doing that per query took a putting_away_toys round from about 150 s to 880 s (2026-09-13).
+    """
+    import time
+
+    import trimesh
+
+    from omnigibson.tiptop.gt_masks import _prepare, points_within_tol
+
+    # one big quad: two triangles with 4 m edges, which subdivision turns into a great many
+    mesh = trimesh.Trimesh(
+        vertices=[[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]], faces=[[0, 1, 2], [0, 2, 3]], process=False
+    )
+    points = np.array([[1.0, 1.0, 0.5], [2.0, 2.0, 0.001]])
+    first = time.perf_counter()
+    points_within_tol(mesh, points, 0.05)
+    cold = time.perf_counter() - first
+    second = time.perf_counter()
+    for _ in range(5):
+        points_within_tol(mesh, points, 0.05)
+    warm = (time.perf_counter() - second) / 5
+    assert _prepare(mesh) is _prepare(mesh), "the same prepared mesh comes back"
+    assert warm < cold, f"a repeated query should reuse the preparation (cold {cold:.3f}s, warm {warm:.3f}s)"
