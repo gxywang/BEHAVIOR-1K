@@ -1,0 +1,5 @@
+# Eight toys off two floors into either toy box (one stands on the floor, one on a table): the goal's options say
+# any box takes any toy, so the runner fills the nearest one.
+task: putting_away_toys
+instruction: put the toys in the toy boxes
+plan: transfer

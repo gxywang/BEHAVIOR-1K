@@ -9,6 +9,19 @@ processes in separate Python environments and talk over a websocket.
 The runbook for the lab server (GPU pinning, tunnels, the exact shell lines) is [USAGE_DOCS.md](../../../USAGE_DOCS.md);
 installing the planner and grasp server on a new machine and the problems you will meet is [DEPLOYMENT.md](DEPLOYMENT.md).
 
+> **Read this before quoting any number from here.** Every score in this file was produced with the simulator
+> telling the policy where every object is, at every moment. Object boxes decide whether a pick worked (is the
+> object at the hand?), whether a place worked (is its box over the container's?), which item to go for next,
+> which container is nearest, and where to stand; object masks and the switch pose go to the planner
+> (`--knowledge oracle`); and the base teleports instead of driving. **None of that exists at evaluation.** The
+> challenge gives a policy three camera images, joint readings, camera poses and a task id, nothing else. To run
+> as a policy the robot has to look again after each action and localize objects with its own cameras
+> (`--knowledge onboard` feeds the checks from the planner's reports, which are stale the moment the arm moves:
+> nothing re-perceives yet). So the numbers here measure the manipulation with navigation and perception handed
+> to it, and they are an upper bound on a challenge score, not an estimate of one. Anything that changes this is
+> the first thing to write here.
+
+
 ## Results
 
 2026-09-09, the challenge's public test instances 0-9, `python -m omnigibson.tiptop.bench` (the challenge's metric,
@@ -398,12 +411,24 @@ is the challenge's metric and not the policy's business. Ordering (containers ne
 items nearest its edge), the support an item stands on (any task object under it, not only tables) and whether
 a target stands on the floor (the workspace reaches down) are all read off the same localization.
 
-**Task descriptions.** A task says what it needs in `tasks/<task>.yaml` (strategies.py, `TaskSpec`): the
-instruction the planner is given, the sub-plan (`transfer` for inside/ontop atoms: pick, carry, place;
-`press` for toggled_on atoms, `hold` to pick the object first) and the ordering choices tuned on it. One generic
-`Runner` executes any description; the goal atoms come from the task's BDDL definition (the TiPToP paper had a
-language model write goals from an instruction; we read them from the task, and at evaluation the task id says
-which definition applies). Nothing tuned on a task lives in code.
+**What the runner reads from a task (2026-09-12).** The goal comes from the task's BDDL definition at run time,
+as *ground options*: the ways the goal can be satisfied, each a list of atoms. Reading all of them, not one, is
+what tells the runner what to do without a per-task rule (`strategies.py`, `place_demand`): how many items of a
+kind each container takes (the most any one option puts there) and which containers are interchangeable. Four
+wicker baskets that each want one candle, one cheese, one cookie and one bow; one bin that wants three batteries;
+two toy boxes that will take any of the eight toys; all read off the same table. Atoms that already hold when the
+instance starts are dropped (`Runner.settled`), so the bin the batteries task wants on the floor -- where it
+already stands -- is never picked up. `Runner.run_transfers` then works the table: containers nearest the items
+that could fill them first, and for each item a container wants, the items of that kind still loose, nearest the
+edge of whatever they stand on (any support, not one per task) and nearest the container. An item gets
+`attempts_per_item` transfers in the whole instance. `tasks/<task>.yaml` (`TaskSpec`) holds only what the
+definition does not say: the instruction the planner is given, whether a press picks the object up first
+(`press: hold`), and that number. The TiPToP paper had a language model write goals from an instruction; we read
+them from the task, and at evaluation the task id says which definition applies.
+
+Reading the options is cheap where it matters: the demand is complete after the first option (every option names
+every container), and the read is capped at `GOAL_OPTIONS_READ` for goals with many (assembling_gift_baskets
+has 331,776, putting_away_toys 256, the two disposal tasks 1).
 
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have
@@ -433,8 +458,9 @@ radio up with the left hand and presses the switch with the right (the second pl
 required: a held radio cannot slide away under the press, a free-standing one did, 20 cm across the glass table,
 without toggling); `assembling_gift_baskets` does 16 transfers, each a pick at the table, a teleport to the basket with
 the item in the gripper (OmniGibson moves a grasp-assisted object with the robot) and a place round that starts
-holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). Baskets nearest the table come
-first; within a kind, the items nearest the table's edge are tried first, `--attempts-per-item` of them per basket.
+holding it (`in_hand` in the request; the planner's `MoveHolding` -> `Place`). Baskets nearest the items come
+first; within a kind, the items nearest the edge of what they stand on are tried first; an item gets
+`--attempts-per-item` transfers in the instance.
 
 Results, 2026-09-09, public test instances 0-9, oracle knowledge, teleported base, sticky grasps (`runs/bench_radio_pass1`,
 `runs/bench_radio_pass2`, `runs/bench_radio_pass3`, `runs/bench_radio_pass4`, `runs/bench_radio_pass5`,
@@ -695,22 +721,25 @@ for one task and is kept here, with what it did, in case a task needs it later.
 - Perception's table used to be whatever plane most objects' contact points touched; on the radio (its underside
   hidden, 8 cm above the glass) that was a tilted plane through its own face, which cut its hull to the top slab.
   The planner now takes only near-horizontal planes and allows contact points up to 10 cm above the table.
-- **Gaps found by reading the other 98 challenge tasks (2026-09-11).** A second review of the 16 tasks rated most
-  doable checked the ratings against this code and found five runner gaps, none task-specific and none fixed yet:
-  a goal that says `(not (toggled_on x))` reaches `task_goal_atoms` as a predicate called `not` and the press
-  runner ignores it (`turning_out_all_lights_before_sleep`, `setting_the_fire`); `Runner.run_transfers` takes the
-  support of the first goal item and never tries items resting elsewhere (`organizing_art_supplies`: four items
-  from the desk into a tote, then the tote from the floor onto the desk); a press that holds leaves the object in
-  the hand, so a goal that also places the object ends with it held (`installing_a_modem`, fax machine, scanner);
-  `placed_over` accepts an item whose bottom is up to 15 cm above the container's top, so an item resting on a
-  half-open lid counts as inside (`composting_waste`); and `SUPPORT_CATEGORIES` is tables and floors only, so a
-  desk, counter or carrel named as a support is a hull object and the placement aims at its hull top
-  (`installing_a_fax_machine`: the partition tops of a cubicle). Also noted: the fingers open to `FINGER_OPEN`
-  4 cm each where the URDF allows 5 cm, and cans, glasses and onions of 7 to 8.3 cm sit at that 8 cm limit;
-  nothing has been lifted out of a deep container (a basket's hull is solid to the planner); passes 4 and 5 used
-  sticky grasps where the challenge grasps physically. The full ranking of the 100 tasks is on the architecture
-  page, section 10: after the check, three tasks are the shape we already run (`putting_away_toys`,
-  `dispose_of_batteries`, `clean_up_broken_glass`).
+- **Gaps found by reading the other 98 challenge tasks (2026-09-11), and what is left of them (2026-09-12).** A
+  second review of the 16 tasks rated most doable checked them against this code. Four of the gaps are now
+  closed by the goal-driven runner (see "What the runner reads from a task"): a container gets as many items of
+  a kind as its goal asks for (three batteries into one bin, not one); items are taken from whatever support
+  each stands on, not from the first goal item's support (a battery on a cabinet in another room, toys on two
+  floors); goal atoms already true when the instance starts are dropped, so the bin the batteries task wants on
+  the floor is never picked up; and a pick lowers the planner's workspace to the floor when the item stands
+  there (`Episode.pick`), which the place round already did. Four are open, all in the goal translation or the
+  gate rather than the runner: a goal that says `(not (toggled_on x))` reaches `task_goal_atoms` as a predicate
+  called `not` and no sub-plan claims it (`turning_out_all_lights_before_sleep`, `setting_the_fire`); a press
+  that holds leaves the object in the hand, so a goal that also places it ends unsatisfied (`installing_a_modem`,
+  fax machine, scanner); `placed_over` accepts an item whose bottom is up to 15 cm above the container's top, so
+  an item resting on a half-open lid counts as inside (`composting_waste`); and `SUPPORT_CATEGORIES` is tables
+  and floors only, so a desk, counter or carrel named as a support is a hull object and the placement aims at
+  its hull top (`installing_a_fax_machine`: the partition tops of a cubicle). Also noted and unchanged: the
+  fingers open to `FINGER_OPEN` 4 cm each where the URDF allows 5 cm, and cans, glasses and onions of 7 to
+  8.3 cm sit at that 8 cm limit; nothing has been lifted out of a deep container (a basket's hull is solid to
+  the planner); passes 4 and 5 used sticky grasps where the challenge grasps physically. The full ranking of the
+  100 tasks is on the architecture page, section 10.
 
 ## Tests
 

@@ -1,17 +1,24 @@
-"""How a challenge task is broken into planning rounds: one generic runner, driven by a per-task description.
+"""How a challenge task is broken into planning rounds: one generic runner, driven by the task's own goal.
 
-A task says what it needs in ``tasks/<task>.yaml`` (``TaskSpec``): the instruction the planner is given, which
-sub-plan handles its goal atoms (``transfer``: pick each item, carry it to its container, place it; ``press``: press
-each object's button, holding the object first when the description says so), and the ordering choices that were
-tuned on it. The goal atoms come from the task's BDDL definition at run time (``task_goal_atoms``): the TiPToP
-paper had a language model write such goals from an instruction, we read them from the task, and at evaluation
-the task id says which definition applies. The ``Runner`` orders the atoms, runs them against an ``Episode``
-(bench.py) under the one retry policy every task gets (``--rounds``), and skips what cannot be reached. Nothing
-here knows how the planner is told about the scene (knowledge.py), how it plans, or what the simulator thinks:
-the episode judges every round from the robot's own readings and from localization.
+The goal comes from the task's BDDL definition at run time as *ground options*: the ways the goal can be
+satisfied, each a list of atoms (the TiPToP paper had a language model write such a goal from an instruction; we
+read it from the task, and at evaluation the task id says which definition applies). Reading all the options,
+rather than one, is what tells the runner how many items of a kind each container wants and which containers are
+interchangeable: four wicker baskets that each want one candle, one bin that wants three batteries, two toy boxes
+that will take any toy. ``place_demand`` turns the options into that table; ``Runner.run_transfers`` works through
+it (nearest container first, and for each item wanted, the items nearest the edge of whatever they stand on),
+and ``Runner.run_press`` handles ``toggled_on`` atoms. Atoms already true when the instance starts are never
+worked on.
+
+``tasks/<task>.yaml`` (``TaskSpec``) holds only what cannot be read from the definition: the instruction the
+planner is given, whether a press picks the object up first, and how many tries an item gets. The ``Episode``
+(bench.py) runs each round under the one retry policy every task gets (``--rounds``) and judges it from the
+robot's own readings and localization; nothing here knows how the planner is told about the scene (knowledge.py),
+how it plans, or what the simulator thinks.
 """
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +30,7 @@ log = logging.getLogger(__name__)
 
 TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 PLACE_PREDICATES = ("inside", "ontop", "on")
+GOAL_OPTIONS_READ = 20000  # ground goal options read to learn the demand (assembling_gift_baskets has 331,776)
 
 
 class Unreachable(RuntimeError):
@@ -33,31 +41,81 @@ def atom(predicate: str, *args: str) -> dict:
     return {"predicate": predicate, "args": list(args)}
 
 
-def task_goal_atoms(sim) -> list[dict]:
-    """The task's goal as BDDL atoms: the first ground goal option (all options name the same predicates over the
-    same objects up to their pairing, which is what a runner needs to know)."""
+def option_atoms(option) -> list[dict]:
+    """One ground goal option as atoms; compiled forms other than ground atoms are dropped."""
     from bddl.condition_evaluation import HEAD
 
-    return [
-        atom(head.terms[0], *head.terms[1:])
-        for head in sim.env.task.ground_goal_state_options[0]
-        if isinstance(head, HEAD)  # a ground atom; the tasks here have no other compiled form in their goal
-    ]
+    return [atom(head.terms[0], *head.terms[1:]) for head in option if isinstance(head, HEAD)]
+
+
+def task_goal_atoms(sim) -> list[dict]:
+    """The task's goal as BDDL atoms: the first ground option (one way to satisfy the goal)."""
+    return option_atoms(sim.env.task.ground_goal_state_options[0])
+
+
+def task_goal_options(sim, limit: int = GOAL_OPTIONS_READ) -> list[list[dict]]:
+    """Every way the task's goal can be satisfied, each as a list of atoms. A goal that pairs things off has one
+    option per pairing (331,776 for the gift baskets), so the read is capped: the options are generated in a
+    regular order and what the runner takes from them (how many items of a kind a container wants) repeats."""
+    options = sim.env.task.ground_goal_state_options
+    if len(options) > limit:
+        log.info(f"{len(options)} ground goal options; reading the first {limit}")
+    return [option_atoms(option) for option in options[:limit]]
+
+
+@dataclass
+class Demand:
+    """What the goal asks for, read from its ground options. ``wanted[(kind, container)]``: how many items of that
+    kind the container takes (the most any one option puts there). ``items[kind]``: the objects of that kind the
+    goal names, in the order it names them. ``predicate[(kind, container)]``: ``inside`` or ``ontop``."""
+
+    wanted: dict = field(default_factory=dict)
+    items: dict = field(default_factory=dict)
+    predicate: dict = field(default_factory=dict)
+
+    @property
+    def containers(self) -> list[str]:
+        return list(dict.fromkeys(container for _, container in self.wanted))
+
+    def kinds_for(self, container: str) -> list[str]:
+        return [kind for (kind, c) in self.wanted if c == container]
+
+    def total(self) -> int:
+        return sum(self.wanted.values())
+
+
+def place_demand(options: list[list[dict]]) -> Demand:
+    """Read the demand off the goal's ground options (see ``Demand``)."""
+    demand = Demand()
+    for option in options:
+        counts = Counter()
+        for a in option:
+            if a["predicate"] not in PLACE_PREDICATES or len(a["args"]) != 2:
+                continue
+            item, container = a["args"]
+            kind = bddl_category(item)
+            counts[(kind, container)] += 1
+            demand.items.setdefault(kind, [])
+            if item not in demand.items[kind]:
+                demand.items[kind].append(item)
+            demand.predicate[(kind, container)] = a["predicate"]
+        for key, n in counts.items():
+            demand.wanted[key] = max(demand.wanted.get(key, 0), n)
+    return demand
 
 
 @dataclass
 class TaskSpec:
-    """What a task says about itself (``tasks/<task>.yaml``). ``plan``: ``transfer``, ``press`` or ``auto`` (both,
-    transfers first). ``press``: ``hold`` (pick the object, press with the other hand) or ``in_place``. ``order``:
-    ``containers`` (``nearest_first`` from the items' support, or ``goal``) and ``items`` (``nearest_edge_first`` on
-    their support, or ``goal``). ``phrases``: detector words per category, for the onboard source."""
+    """What a task says about itself (``tasks/<task>.yaml``): only what its BDDL definition does not say.
+    ``plan``: ``transfer``, ``press`` or ``auto`` (both, transfers first). ``press``: ``hold`` (pick the object,
+    press with the other hand) or ``in_place``. ``attempts_per_item``: tries an item gets before the runner moves
+    on. ``phrases``: detector words per category, for the onboard source."""
 
     task: str
     instruction: str
     plan: str = "auto"
     press: str = "hold"
-    order: dict = field(default_factory=lambda: {"containers": "nearest_first", "items": "nearest_edge_first"})
-    attempts_per_kind: int = 2
+    attempts_per_item: int = 2
     phrases: dict = field(default_factory=dict)
 
     @classmethod
@@ -89,26 +147,31 @@ STRATEGIES = load_specs()
 
 
 class Runner:
-    """Runs a task's goal atoms against an episode the way its description says."""
+    """Runs a task's goal against an episode: transfers from the demand its goal options describe, presses the
+    way its description says."""
 
-    def __init__(self, spec: TaskSpec, goal: list[dict], attempts: int | None = None):
+    def __init__(self, spec: TaskSpec, goal: list[dict], options: list[list[dict]] | None = None, attempts=None):
         self.spec = spec
         self.goal = list(goal)
-        self.attempts = spec.attempts_per_kind if attempts is None else int(attempts)
+        self.options = [list(o) for o in options] if options else [list(goal)]
+        self.demand = place_demand(self.options)
+        self.attempts = spec.attempts_per_item if attempts is None else int(attempts)
+        self.tries = Counter()  # item -> transfers attempted for it, over the whole instance
 
     @property
     def instruction(self) -> str:
         return self.spec.instruction
 
     def run(self, ep) -> None:
-        transfers = [
-            (a["predicate"], a["args"][0], a["args"][1])
-            for a in self.goal
-            if a["predicate"] in PLACE_PREDICATES and len(a["args"]) == 2
-        ]
+        self.tries.clear()  # one instance's attempts say nothing about the next
         presses = [a["args"][0] for a in self.goal if a["predicate"] == "toggled_on"]
-        if self.spec.plan in ("transfer", "auto") and transfers:
-            self.run_transfers(ep, transfers)
+        other = {
+            a["predicate"] for a in self.goal if a["predicate"] not in (*PLACE_PREDICATES, "toggled_on", "holding")
+        }
+        if other:
+            log.warning(f"{self.spec.task}: no sub-plan for goal atoms {sorted(other)}; they are left alone")
+        if self.spec.plan in ("transfer", "auto") and self.demand.total():
+            self.run_transfers(ep)
         elif self.spec.plan == "transfer":
             raise ValueError(f"{self.spec.task}: the goal has no inside/ontop atoms for the transfer plan")
         if self.spec.plan in ("press", "auto") and presses:
@@ -118,44 +181,93 @@ class Runner:
             raise ValueError(f"{self.spec.task}: the goal has no toggled_on atoms for the press plan")
 
     # ---------------------------------------------------------------- transfers
-    def run_transfers(self, ep, transfers: list[tuple[str, str, str]]) -> None:
-        """Every container gets one item of each kind named for it. Containers nearest the items' support first;
-        within a kind, the items still on that support nearest its edge first, ``attempts`` of them per container.
-        An item still in the hand after a failed place is put down where the robot stands, and a hand still full
-        at the next transfer is emptied first."""
-        support = ep.support_of(transfers[0][1])
-        containers = list(dict.fromkeys(c for _, _, c in transfers))
-        if self.spec.order.get("containers", "nearest_first") == "nearest_first":
-            containers.sort(key=lambda c: ep.distance(c, support))
-        predicate_for = {(i, c): p for p, i, c in transfers}
-        kinds = {}
-        for _, item, _ in transfers:
-            kinds.setdefault(bddl_category(item), [])
-            if item not in kinds[bddl_category(item)]:
-                kinds[bddl_category(item)].append(item)
+    def run_transfers(self, ep) -> None:
+        """Fill the demand the goal options describe. Containers nearest the items that could go in them first;
+        for each item a container wants, the items of that kind still loose, nearest the edge of whatever they
+        stand on (the reachable ones) and nearest the container. An item is tried ``attempts`` times in the whole
+        instance; one still in the hand after a failed place is put down, and a hand still full at the next
+        transfer is emptied first."""
+        wanted = dict(self.demand.wanted)
+        done = self.settled(ep, wanted)
         log.info(
-            f"{len(containers)} containers x {sorted(kinds)}; containers in order {containers}; items on {support}"
+            f"goal demand {sorted((f'{k} x{n} -> {c}') for (k, c), n in wanted.items() if n > 0)}"
+            + (f"; already there: {sorted(done)}" if done else "")
         )
-        placed = set()
-        for container in containers:
-            wanted = {bddl_category(i) for _, i, c in transfers if c == container}
-            for kind, items in kinds.items():
-                if kind not in wanted:
-                    continue
-                candidates = [i for i in items if i not in placed and ep.on_support(i, support)]
-                if self.spec.order.get("items", "nearest_edge_first") == "nearest_edge_first":
-                    candidates.sort(key=lambda i: ep.edge_gap(i, support))
-                for item in candidates[: self.attempts]:
-                    predicate = predicate_for.get((item, container), "inside")
-                    if self.transfer(ep, predicate, item, container, support):
-                        placed.add(item)
+        for container in self.order_containers(ep, wanted, done):
+            for kind in self.demand.kinds_for(container):
+                for _ in range(wanted.get((kind, container), 0)):
+                    item = self.transfer_one(ep, kind, container, done)
+                    if item is None:
                         break
+                    done.add(item)
+
+    def settled(self, ep, wanted: dict) -> set:
+        """Items the goal already has where it wants them when the instance starts (a bin that stands on the floor
+        already, an item in its container): they cost nothing and are never worked on."""
+        done = set()
+        for (kind, container), n in list(wanted.items()):
+            for item in self.demand.items.get(kind, []):
+                if n <= 0:
+                    break
+                if item in done:
+                    continue
+                try:
+                    if not ep.placed(item, container):
+                        continue
+                except (KeyError, NotImplementedError):  # not localized yet: treat it as loose
+                    continue
+                done.add(item)
+                n -= 1
+                wanted[(kind, container)] = n
+        return done
+
+    @staticmethod
+    def gap(ep, a: str, b: str) -> float:
+        """Distance between two objects, or infinity when one has no box (the task floor has none)."""
+        try:
+            return ep.distance(a, b)
+        except (KeyError, NotImplementedError):
+            return float("inf")
+
+    def order_containers(self, ep, wanted: dict, done: set) -> list[str]:
+        """Containers that still want something, nearest first: by the distance to the closest item that could go
+        in them (the items' support for a table-to-floor task, the room for a scattered one)."""
+        containers = [
+            c for c in self.demand.containers if any(wanted.get((k, c), 0) > 0 for k in self.demand.kinds_for(c))
+        ]
+
+        def near(container: str) -> float:
+            gaps = [
+                self.gap(ep, container, item)
+                for kind in self.demand.kinds_for(container)
+                for item in self.demand.items.get(kind, [])
+                if item not in done
+            ]
+            return min(gaps) if gaps else float("inf")
+
+        return sorted(containers, key=near)
+
+    def transfer_one(self, ep, kind: str, container: str, done: set) -> str | None:
+        """Move one item of ``kind`` into ``container``; the item moved, or None when none could be."""
+        candidates = [i for i in self.demand.items.get(kind, []) if i not in done and self.tries[i] < self.attempts]
+        if not candidates:
+            return None
+        supports = {i: ep.support_of(i) for i in candidates}
+        candidates.sort(key=lambda i: (ep.edge_gap(i, supports[i]), self.gap(ep, i, container)))
+        predicate = self.demand.predicate.get((kind, container), "inside")
+        for item in candidates[: self.attempts]:
+            self.tries[item] += 1
+            if self.transfer(ep, predicate, item, container, supports[item]):
+                return item
+        return None
 
     def transfer(self, ep, predicate: str, item: str, container: str, support: str) -> bool:
         if not self.free_hand(ep, support):
             return False
         if not ep.pick(item):
             return False
+        if container == ep.floor:  # "on the floor": wherever the robot stands is the floor
+            return ep.put_down(item, ep.floor)
         try:
             ep.stand_for(container)  # carrying the item
         except Unreachable as e:
@@ -172,7 +284,7 @@ class Runner:
     @staticmethod
     def free_hand(ep, support: str) -> bool:
         """Put down whatever the hand still holds (a place that failed left it there) before the next pick: on the
-        floor where the robot stands, else from a fresh pose at the items' support, else by opening the hand where
+        floor where the robot stands, else from a fresh pose at the item's support, else by opening the hand where
         it is (the item falls; better than a hand that stays full for the rest of the episode). False when it
         stays."""
         held = ep.held_names()
@@ -203,7 +315,7 @@ class Runner:
             ep.achieve([atom("toggled_on", obj)])
 
 
-def strategy_for(task: str, goal: list[dict], **kwargs) -> Runner:
+def strategy_for(task: str, goal: list[dict], options=None, **kwargs) -> Runner:
     if task not in STRATEGIES:
         raise ValueError(f"no task description for {task!r} in {TASKS_DIR}; known: {sorted(STRATEGIES)}")
-    return Runner(STRATEGIES[task], goal, **kwargs)
+    return Runner(STRATEGIES[task], goal, options=options, **kwargs)

@@ -216,7 +216,8 @@ class Episode:
             except Unreachable as e:
                 log.warning(f"{bddl}: {e}")
                 return False
-            self.plan_and_execute([atom("holding", bddl)])
+            # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
+            self.plan_and_execute([atom("holding", bddl)], floor=self.near_floor(bddl))
             if self.holding(bddl):
                 return True
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
@@ -331,7 +332,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--max-steps", type=int, default=None, help="episode timeout in env steps (default: the challenge's)"
     )
     p.add_argument(
-        "--attempts-per-item", type=int, default=None, help="items of a kind tried per container (default: the task's)"
+        "--attempts-per-item",
+        type=int,
+        default=None,
+        help="transfers an item gets before it is left (default: the task's)",
     )
     p.add_argument(
         "--rounds",
@@ -371,7 +375,7 @@ def main(argv=None) -> None:
     from omnigibson.tiptop.executor import VideoRecorder
     from omnigibson.tiptop.knowledge import make_knowledge
     from omnigibson.tiptop.scene import EpisodeOver
-    from omnigibson.tiptop.strategies import strategy_for, task_goal_atoms
+    from omnigibson.tiptop.strategies import strategy_for, task_goal_atoms, task_goal_options
 
     human = load_human_stats(args.task_name)
     max_steps = args.max_steps or int(human["length"] * EVAL_TIMEOUT_MULTIPLIER)
@@ -391,7 +395,9 @@ def main(argv=None) -> None:
         sim = build_r1pro_sim(args, metadata["embodiment"], max_steps=max_steps)
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
-        strategy = strategy_for(args.task_name, task_goal_atoms(sim), attempts=args.attempts_per_item)
+        strategy = strategy_for(
+            args.task_name, task_goal_atoms(sim), options=task_goal_options(sim), attempts=args.attempts_per_item
+        )
         for index, instance_id in zip(args.instances, instance_ids):
             t0 = time.time()
             name = f"{args.task_name}_{instance_id}_0"

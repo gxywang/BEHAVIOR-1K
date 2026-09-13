@@ -1,11 +1,23 @@
-"""The generic task runner and the episode's own judgement of rounds (no simulator answers): task descriptions load,
-transfers are ordered as the description says, the hand is freed before a pick, a press holds the object first,
-and placements are judged by geometry on localized boxes."""
+"""The generic task runner and the episode's own judgement of rounds (no simulator answers): what each container
+wants is read from the task's goal options, atoms already true are left alone, transfers are ordered nearest
+first, items on any support are moved, the hand is freed before a pick, a press holds the object first, and
+placements are judged by geometry on localized boxes."""
+
+import itertools
 
 import numpy as np
 import pytest
 
-from omnigibson.tiptop.strategies import STRATEGIES, TASKS_DIR, Runner, TaskSpec, Unreachable, atom, strategy_for
+from omnigibson.tiptop.strategies import (
+    STRATEGIES,
+    TASKS_DIR,
+    Runner,
+    TaskSpec,
+    Unreachable,
+    atom,
+    place_demand,
+    strategy_for,
+)
 
 
 def box(center, half=(0.05, 0.05, 0.05)):
@@ -49,6 +61,7 @@ class FakeEpisode:
         item, target = a["args"]
         if item in self.place_ok:
             self.hand = None
+            self.boxes[item] = box(self.boxes[target]["center"])  # it is where it was put
             return True
         return False
 
@@ -79,13 +92,22 @@ class FakeEpisode:
 
         return support == self.floor or placed_over(self.boxes[item], self.boxes[support], from_bottom=False)
 
+    def placed(self, item, target):
+        from omnigibson.tiptop.bench import placed_over
+
+        if target == self.floor:
+            return not self.holding(item)
+        return placed_over(self.boxes[item], self.boxes[target], from_bottom=True)
+
     def support_of(self, item):
         for name, b in self.boxes.items():
-            if name != item and self.on_support(item, name) and "table" in name:
+            if name != item and self.on_support(item, name) and ("table" in name or "desk" in name):
                 return name
         return self.floor
 
     def edge_gap(self, item, support):
+        if support == self.floor:
+            return 0.0
         lo, hi, c = self.boxes[support]["lo"], self.boxes[support]["hi"], self.boxes[item]["center"]
         return float(min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1]))
 
@@ -109,10 +131,9 @@ def basket_world():
 
 
 def test_task_descriptions_load_from_the_tasks_directory():
-    assert set(STRATEGIES) >= {"assembling_gift_baskets", "turning_on_radio"}
+    assert set(STRATEGIES) >= {"assembling_gift_baskets", "turning_on_radio", "dispose_of_batteries"}
     baskets = STRATEGIES["assembling_gift_baskets"]
-    assert baskets.plan == "transfer" and baskets.attempts_per_kind == 2
-    assert baskets.order == {"containers": "nearest_first", "items": "nearest_edge_first"}
+    assert baskets.plan == "transfer" and baskets.attempts_per_item == 2
     radio = STRATEGIES["turning_on_radio"]
     assert radio.plan == "press" and radio.press == "hold"
     assert all(path.stem in STRATEGIES for path in TASKS_DIR.glob("*.yaml"))
@@ -128,6 +149,48 @@ def test_a_description_with_an_unknown_field_or_plan_is_refused(tmp_path):
         TaskSpec.load(bad)
 
 
+# ---------------------------------------------------------------- what the goal asks for
+def test_the_demand_is_read_from_every_way_the_goal_can_be_satisfied():
+    # a goal that pairs one item of each kind with each container (the gift baskets): every pairing is an option
+    candles = ["candle.n.01_1", "candle.n.01_2"]
+    bows = ["bow.n.08_1", "bow.n.08_2"]
+    containers = ["wicker_basket.n.01_1", "wicker_basket.n.01_2"]
+    options = [
+        [atom("inside", c, containers[i]) for i, c in enumerate(candle_order)]
+        + [atom("inside", b, containers[i]) for i, b in enumerate(bow_order)]
+        for candle_order in itertools.permutations(candles)
+        for bow_order in itertools.permutations(bows)
+    ]
+    demand = place_demand(options)
+    assert demand.wanted == {
+        ("candle", "wicker_basket.n.01_1"): 1,
+        ("candle", "wicker_basket.n.01_2"): 1,
+        ("bow", "wicker_basket.n.01_1"): 1,
+        ("bow", "wicker_basket.n.01_2"): 1,
+    }
+    assert demand.items == {"candle": candles, "bow": bows}
+    assert demand.containers == containers and demand.total() == 4
+
+    # a goal that takes any container (the toys): one option per assignment, so a box may want every toy
+    toys = [f"toy_figure.n.01_{i}" for i in (1, 2, 3)]
+    boxes = ["toy_box.n.01_1", "toy_box.n.01_2"]
+    options = [
+        [atom("inside", toy, target) for toy, target in zip(toys, choice)]
+        for choice in itertools.product(boxes, repeat=3)
+    ]
+    demand = place_demand(options)
+    assert demand.wanted == {("toy_figure", "toy_box.n.01_1"): 3, ("toy_figure", "toy_box.n.01_2"): 3}
+
+    # a goal with one option, several items of a kind into one bin, and an atom that names a support
+    option = [atom("inside", f"battery.n.02_{i}", "ashcan.n.01_1") for i in (1, 2, 3)] + [
+        atom("ontop", "ashcan.n.01_1", "floor.n.01_1")
+    ]
+    demand = place_demand([option])
+    assert demand.wanted == {("battery", "ashcan.n.01_1"): 3, ("ashcan", "floor.n.01_1"): 1}
+    assert demand.predicate[("ashcan", "floor.n.01_1")] == "ontop"
+
+
+# ---------------------------------------------------------------- transfers
 def test_transfers_go_container_by_container_nearest_first_and_items_nearest_the_edge_first():
     boxes, goal = basket_world()
     ep = FakeEpisode(
@@ -147,13 +210,84 @@ def test_transfers_go_container_by_container_nearest_first_and_items_nearest_the
     assert ("candle.n.01_1", "basket.n.01_2") in achieved  # the nearest candle went to the nearest basket
 
 
-def test_attempts_per_kind_limits_the_items_tried_per_container():
+def test_an_item_is_tried_a_fixed_number_of_times_and_then_left():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())  # nothing can be picked
     Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
     picks = [c[1] for c in ep.calls if c[0] == "pick"]
-    # basket_2 wants one candle: one attempt; basket_1 wants a candle and a cookie: one attempt each
-    assert len(picks) == 3
+    # three items wanted, one try each, and no item is tried twice
+    assert len(picks) == 3 and len(set(picks)) == 3
+
+
+def test_a_container_gets_every_item_of_a_kind_its_goal_asks_for():
+    """Three batteries into one bin: the old runner stopped after the first."""
+    boxes = {
+        "desk.n.01_1": box((0, 0, 0.7), half=(0.6, 0.4, 0.02)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "battery.n.02_2": box((0.0, 0, 0.77)),
+        "battery.n.02_3": box((-0.4, 0, 0.77)),
+        "ashcan.n.01_1": box((1.5, 0, 0.15), half=(0.15, 0.15, 0.15)),
+    }
+    goal = [atom("inside", f"battery.n.02_{i}", "ashcan.n.01_1") for i in (1, 2, 3)]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
+    assert sorted(a[0] for a in achieved) == ["battery.n.02_1", "battery.n.02_2", "battery.n.02_3"]
+    assert all(a[1] == "ashcan.n.01_1" for a in achieved)
+
+
+def test_a_goal_atom_that_already_holds_is_never_worked_on():
+    """The batteries task also asks for the bin to stand on the floor, which it already does."""
+    boxes = {
+        "desk.n.01_1": box((0, 0, 0.7), half=(0.6, 0.4, 0.02)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "ashcan.n.01_1": box((1.5, 0, 0.15), half=(0.15, 0.15, 0.15)),
+    }
+    goal = [atom("inside", "battery.n.02_1", "ashcan.n.01_1"), atom("ontop", "ashcan.n.01_1", "floor.n.01_1")]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks == ["battery.n.02_1"]  # the bin is where the goal wants it; nobody picks it up
+
+
+def test_any_container_the_goal_allows_takes_the_item():
+    """Two boxes, and the goal lets either box have any toy: the nearest box gets them all."""
+    boxes = {
+        "toy_box.n.01_1": box((4.0, 0, 0.2), half=(0.3, 0.3, 0.2)),
+        "toy_box.n.01_2": box((1.0, 0, 0.2), half=(0.3, 0.3, 0.2)),
+    }
+    toys = [f"toy_figure.n.01_{i}" for i in (1, 2, 3)]
+    for i, toy in enumerate(toys):
+        boxes[toy] = box((0.2 * i, 0.5, 0.05))
+    options = [
+        [atom("inside", toy, target) for toy, target in zip(toys, choice)]
+        for choice in itertools.product(["toy_box.n.01_1", "toy_box.n.01_2"], repeat=3)
+    ]
+    ep = FakeEpisode(boxes, pick_ok=set(toys), place_ok=set(toys))
+    Runner(STRATEGIES["putting_away_toys"], options[0], options=options).run(ep)
+    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
+    assert sorted(a[0] for a in achieved) == toys
+    assert all(a[1] == "toy_box.n.01_2" for a in achieved)  # the nearer box took all three
+
+
+def test_items_on_a_second_support_are_transferred_too():
+    """Two batteries on a desk and one on a cabinet: the old runner only looked at the first item's support."""
+    boxes = {
+        "desk.n.01_1": box((0, 0, 0.7), half=(0.6, 0.4, 0.02)),
+        "cabinet.n.01_1": box((2.0, 2.0, 0.9), half=(0.4, 0.3, 0.02)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "battery.n.02_2": box((0.0, 0, 0.77)),
+        "battery.n.02_3": box((2.0, 2.0, 0.97)),
+        "ashcan.n.01_1": box((1.0, 1.0, 0.15), half=(0.15, 0.15, 0.15)),
+    }
+    goal = [atom("inside", f"battery.n.02_{i}", "ashcan.n.01_1") for i in (1, 2, 3)]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    assert sorted(c[1] for c in ep.calls if c[0] == "pick") == [
+        "battery.n.02_1",
+        "battery.n.02_2",
+        "battery.n.02_3",
+    ]
 
 
 def test_an_unreachable_container_puts_the_item_back_on_its_support():
@@ -173,6 +307,7 @@ def test_a_full_hand_is_emptied_before_the_next_pick():
     assert first == ("put_down", "cookie.n.01_1", "floor.n.01_1")
 
 
+# ---------------------------------------------------------------- presses
 def test_a_press_that_holds_picks_first_and_presses_with_the_other_arm():
     ep = FakeEpisode({}, pick_ok={"radio.n.01_1"})
     strategy_for("turning_on_radio", [atom("toggled_on", "radio.n.01_1")]).run(ep)
@@ -185,6 +320,7 @@ def test_a_press_that_holds_picks_first_and_presses_with_the_other_arm():
         strategy_for("turning_on_radio", [atom("toggled_on", "radio.n.01_1")]).run(ep)
 
 
+# ---------------------------------------------------------------- the episode's own judgement
 def test_placement_geometry_judges_on_and_in_from_boxes():
     from omnigibson.tiptop.bench import placed_over
 

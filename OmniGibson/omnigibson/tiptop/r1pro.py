@@ -107,6 +107,7 @@ HAND_LINKS = (
     "gripper_finger_link2",
 )
 BASE_CLEARANCE = 0.10  # m
+SCENE_CLEARANCE = 0.03  # m: a look configuration keeps the hand links this far outside every scene object's box
 ELBOW = 3  # index of the elbow in an arm's joint list: folded before a capture swing, straightened after it
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
@@ -1082,16 +1083,23 @@ class R1ProSim(TiptopSim):
         return float(ahead[0])
 
     # ---------------------------------------------------------------- observation
-    def wrist_look(self, arm: str, target) -> np.ndarray | None:
-        """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
-        (``kinematics.look_pose``, the first of ``LOOK_OFFSETS`` the arm reaches), every other joint where it is;
-        None when no configuration does."""
+    def arm_ik(self, arm: str) -> ArmIK:
+        """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for its
+        wrist camera's link."""
         joints = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         fixed = {
             name: float(q[i]) for name, i in self.joint_index.items() if name in self.urdf_joints and name not in joints
         }
-        ik = ArmIK(self.robot.urdf_path, joints, fixed, frame=CAMERA_LINKS[f"{arm}_wrist"])
+        return ArmIK(self.robot.urdf_path, joints, fixed, frame=CAMERA_LINKS[f"{arm}_wrist"])
+
+    def wrist_look(self, arm: str, target, aabbs=None) -> np.ndarray | None:
+        """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
+        (``kinematics.look_pose``, the first of ``LOOK_OFFSETS`` the arm reaches) and keep the hand clear of the
+        base and of every scene object, every other joint where it is; None when no configuration does."""
+        joints = list(self.robot.arm_joint_names[arm])
+        q = self.robot.get_joint_positions()
+        ik = self.arm_ik(arm)
         shoulder, _ = self.to_base(*self.robot.links[self.robot.arm_link_names[arm][0]].get_position_orientation())
         seed = [float(q[self.joint_index[j]]) for j in joints]
         for offset in LOOK_OFFSETS:
@@ -1104,6 +1112,10 @@ class R1ProSim(TiptopSim):
                 log.info(
                     f"{arm} arm: look offset {offset} puts {inside} within {BASE_CLEARANCE} m of the base; skipped"
                 )
+                continue
+            blocked = self.links_in_scene(arm, ik, solution, aabbs)
+            if blocked:
+                log.info(f"{arm} arm: look offset {offset} puts {blocked}; skipped")
                 continue
             return solution
         return None
@@ -1123,6 +1135,28 @@ class R1ProSim(TiptopSim):
             self._base_box = np.stack([pts.min(axis=0), pts.max(axis=0)])
             log.info(f"base box (base frame): {np.round(self._base_box, 2).tolist()}")
         return self._base_box
+
+    def links_in_scene(self, arm: str, ik: ArmIK, q, aabbs=None) -> list[str]:
+        """Where the arm's hand links (``HAND_LINKS``) at joints ``q`` would sit inside a scene object's box
+        (inflated by ``SCENE_CLEARANCE``): "left_gripper_link in desk_1". Objects the hands hold travel with the
+        arm and do not count. A capture swing into furniture is what this exists to refuse: in a cubicle the look
+        pose put the wrist against the desk, the joints stopped following the ramp, and the arm swept a battery
+        onto the floor on the way (2026-09-12)."""
+        aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        held = {self.objects[label] for label in self.hands() if label in self.objects}
+        hits = []
+        for suffix in HAND_LINKS:
+            pos, _ = ik.fk(q, f"{arm}_{suffix}")
+            point = np.asarray(self.base_to_world(np.asarray(pos, dtype=np.float64)), dtype=np.float64)
+            for obj, lo, hi in aabbs:
+                if obj in held:
+                    continue
+                if np.all(point > np.asarray(lo) - SCENE_CLEARANCE) and np.all(
+                    point < np.asarray(hi) + SCENE_CLEARANCE
+                ):
+                    hits.append(f"{arm}_{suffix} in {obj.name}")
+                    break
+        return hits
 
     def links_in_base_box(self, arm: str, ik: ArmIK, q) -> list[str]:
         """The arm's hand links (``HAND_LINKS``) whose frame origin at arm joints ``q`` lies inside the base's box
@@ -1212,18 +1246,29 @@ class R1ProSim(TiptopSim):
         look = list(ready)  # the planned joints during the capture
         posture = dict(self.posture)  # the other arm's joints during the capture
         moved = {}  # arm -> {joint: value}
+        aabbs = self.scene_aabbs()  # one snapshot for both arms' look configurations (nothing moves meanwhile)
         for arm in ("left", "right"):
             if arm in held_arms or (arm != self.arm and f"{arm}_wrist" not in (self.primary_view, *self.extra_views)):
                 continue
             joints = list(self.robot.arm_joint_names[arm])
-            q = self.wrist_look(arm, target)
+            q = self.wrist_look(arm, target, aabbs)
             if q is not None:
                 moved[arm] = {j: float(v) for j, v in zip(joints, q)}
             elif arm == self.arm and any(j in self.look_arm for j in joints):
-                log.warning(
-                    f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; swinging it out of view"
-                )
-                moved[arm] = {j: float(self.look_arm[j]) for j in joints if j in self.look_arm}
+                out = {j: float(self.look_arm[j]) for j in joints if j in self.look_arm}
+                q_now = self.robot.get_joint_positions()
+                full = [out.get(j, float(q_now[self.joint_index[j]])) for j in joints]
+                blocked = self.links_in_scene(arm, self.arm_ik(arm), full, aabbs)
+                if blocked:
+                    log.warning(
+                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}, and swinging it out "
+                        f"of view puts {blocked}; it stays where it is"
+                    )
+                else:
+                    log.warning(
+                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; swinging it out of view"
+                    )
+                    moved[arm] = out
             else:
                 log.warning(
                     f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; it stays where it is"
@@ -1246,6 +1291,11 @@ class R1ProSim(TiptopSim):
         self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
+        if lag > LOOK_TOL:  # it caught on something on the way back: one more try before the round is lost
+            log.warning(f"arm {lag:.3f} rad short of the ready posture after the capture; ramping again")
+            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+            q_ready = self.q_arm()
+            lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:
             raise RuntimeError(f"arm did not return to the ready posture after the capture (max error {lag:.3f} rad)")
         now = self.robot.get_joint_positions()
