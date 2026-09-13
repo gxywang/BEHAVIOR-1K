@@ -955,6 +955,15 @@ margin, which is zero and cannot be set from the bridge at all: it needs one num
 
 ## Known limits
 
+- **The planner sometimes fails on its own tensor shapes (2026-09-13).** Two rounds of `runs/bench_batteries_10`
+  were lost to `stack expects each tensor to be equal size, but got [256, 2, 50, 4] at entry 0 and [256, 2, 42, 4]
+  at entry 1` inside cuTAMP -- two skeletons whose trajectories have different lengths (50 and 42 waypoints) being
+  stacked into one tensor. It is a defect in the submodule, not in the request: the bridge sends one goal and gets
+  an exception instead of a plan, and the round is lost. The retry recovers it (round 13 failed this way and round
+  14 executed the same goal), so it costs a round rather than an atom. Reproducing it needs the saved
+  `tiptop_server_outputs` directory the message names.
+
+
 - **A view with nothing but the robot in it is no longer sent (2026-09-13).** When a capture swing is blocked the
   arm stays at the ready posture, where its own wrist camera looks at the robot's body: one left wrist view came
   back with all 230,400 of its pixels in the self-mask, so its depth was zero everywhere. `TiptopSim.capture` now
