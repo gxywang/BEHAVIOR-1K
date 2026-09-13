@@ -245,8 +245,12 @@ class Episode:
     # ---------------------------------------------------------------- the retry policy, the same for every task
     def satisfied(self, atoms: list[dict], record: dict | None = None) -> bool:
         """Whether every atom holds, judged from the robot's own readings and localization: ``holding`` by the hand
-        record, a placement by ``placed``, ``nextto`` by ``beside``, and a press by its round having run without
-        error (the switch's state is the simulator's to know, so a press is open loop).
+        record, a placement by ``placed``, ``nextto`` by ``beside``, ``open`` by the container's own joint, and a
+        press by its round having run without error (the switch's state is the simulator's to know, so a press is
+        open loop).
+
+        Reading a joint back is privileged, like the oracle's masks: at evaluation an ``open`` verdict would have
+        to come from the hand's travel and a fresh look at the container.
 
         A predicate the runner does not know is NOT taken to hold because a round ran. That is what this did, and
         it would score every new predicate satisfied the moment a round was attempted -- the first task to name one
@@ -261,6 +265,10 @@ class Episode:
                 ok = self.beside(args[0], args[1])
             elif predicate in PLACE_PREDICATES and len(args) == 2:
                 ok = self.placed(args[0], args[1])
+            elif predicate == "open" and args:
+                ok = not self.is_shut(args[0])
+            elif predicate == "not" and len(args) >= 2 and args[0] == "open":
+                ok = self.is_shut(args[1])
             elif predicate == "toggled_on" or (predicate == "not" and "toggled_on" in args):
                 ok = ran  # a press is open loop: it ran, and the switch's state is the simulator's to know
             else:

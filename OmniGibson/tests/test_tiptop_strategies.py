@@ -487,7 +487,8 @@ def test_an_unknown_predicate_is_not_counted_satisfied_just_because_a_round_ran(
         def __init__(self):
             pass
 
-    atoms = [{"predicate": "open", "args": ["cabinet.n.01_1"]}]
+    # "cooked" is a predicate the runner has no skill for; "open" used to stand here and is now one it does
+    atoms = [{"predicate": "cooked", "args": ["bacon.n.01_1"]}]
     assert Ran().satisfied(atoms, record={"round": 1}) is False
 
 
@@ -529,3 +530,20 @@ def test_an_open_goal_atom_is_acted_on_rather_than_left_alone():
     goal = [atom("open", "cabinet.n.01_1")]
     Runner(STRATEGIES["store_honey"], goal, attempts=1).run(ep)
     assert [c for c in ep.calls if c[0] == "open_up"], "an open atom should open something"
+
+
+def test_the_gate_reads_an_open_atom_off_the_container_rather_than_the_round_running():
+    from omnigibson.tiptop.bench import Episode
+
+    class Shut(Episode):
+        def __init__(self, shut):
+            self._shut = shut
+
+        def is_shut(self, name):
+            return self._shut
+
+    assert Shut(True).satisfied([atom("open", "cabinet.n.01_1")], record={"round": 1}) is False
+    assert Shut(False).satisfied([atom("open", "cabinet.n.01_1")], record={"round": 1}) is True
+    shut_goal = [{"predicate": "not", "args": ["open", "cabinet.n.01_1"]}]
+    assert Shut(True).satisfied(shut_goal, record={"round": 1}) is True
+    assert Shut(False).satisfied(shut_goal, record={"round": 1}) is False
