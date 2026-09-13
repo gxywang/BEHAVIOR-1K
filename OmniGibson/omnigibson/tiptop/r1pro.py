@@ -1102,42 +1102,56 @@ class R1ProSim(TiptopSim):
         joints = openable_joints(obj)
         if not joints:
             return {"opened": False, "why": f"{name} has no joint that opens"}
-        # the widest range first: on a bank of drawers any one satisfies the atom, and the widest is the easiest
-        joints.sort(key=lambda j: -(abs(j["upper"] - j["lower"])))
-        joint = joints[0]
-        travel = opening_travel(joint["kind"], joint["lower"], joint["upper"], joint["position"], fraction)
-        if abs(travel) < 1e-4:
-            return {"opened": is_open(joint["lower"], joint["upper"], joint["position"]), "why": "already open"}
-        link = obj.links.get(joint["link"])
-        if link is None:
-            return {"opened": False, "why": f"{name}.{joint['name']} has no link to take hold of"}
+        # On a bank of drawers any one of them satisfies the atom, so take the one whose handle the hand can most
+        # easily get to -- nearest where the hand already is -- rather than the first or the widest. store_honey's
+        # cabinet is four identical drawers at z 0.11, 0.32, 0.53 and 0.74, and picking by range took the bottom
+        # one, 11 cm off the floor, which this arm cannot reach with the challenge torso (2026-09-13).
         grip = self.eef_pose_base(arm)
-        handle_world = handle_point(link, joint["axis"], np.sign(travel) or 1.0)
-        handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
-        axis_base = self.to_base(th.tensor(joint["axis"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
-        origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), th.tensor([0.0, 0.0, 0.0, 1.0]))[0]
-        base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
-        axis_dir = axis_base.cpu().numpy() - base_pos  # a direction, so the base translation comes back out
-        pull = axis_dir * float(np.sign(travel) or 1.0)
+        hand = self.base_to_world(grip[:3, 3])
+        usable = []
+        for j in joints:
+            t = opening_travel(j["kind"], j["lower"], j["upper"], j["position"], fraction)
+            link_j = obj.links.get(j["link"])
+            if link_j is None or abs(t) < 1e-4:
+                continue
+            where = handle_point(link_j, j["axis"], np.sign(t) or 1.0)
+            usable.append((float(np.linalg.norm(where - hand)), j, t, where))
+        if not usable:
+            already = any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
+            return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
+        usable.sort(key=lambda row: row[0])
         ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
         joints_of = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         seed = [float(q[self.joint_index[j]]) for j in joints_of]
-        # Which way the jaw must face to hold a drawer front is written down nowhere, and the orientation the hand
-        # happens to carry is rarely reachable at the handle -- the first smoke test failed with "no inverse
-        # kinematics for step 1 of 10" for that. Several are tried and the one that solves is logged, which is how
-        # the convention gets learned instead of assumed.
-        start, first = None, None
-        for k, rot in enumerate(grasp_orientations(grip[:3, :3], pull)):
-            quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
-            first = ik.solve(handle_base.cpu().numpy(), quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
-            if first is not None:
-                log.info(f"taking hold of {name}.{joint['name']} with grasp orientation {k} of the candidates")
-                start = pose_matrix(handle_base.cpu().numpy(), quat)
+        base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
+        unit = th.tensor([0.0, 0.0, 0.0, 1.0])
+        chosen = None
+        for _, joint, travel, handle_world in usable:
+            handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), unit)[0].cpu().numpy()
+            axis_dir = self.to_base(th.tensor(joint["axis"], dtype=th.float32), unit)[0].cpu().numpy() - base_pos
+            origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), unit)[0].cpu().numpy()
+            pull = axis_dir * float(np.sign(travel) or 1.0)
+            # Which way the jaw must face to hold a drawer front is written down nowhere, and the orientation the
+            # hand happens to carry is rarely reachable at the handle. Several are tried and the one that solves is
+            # logged, which is how the convention gets learned rather than assumed.
+            for k, rot in enumerate(grasp_orientations(grip[:3, :3], pull)):
+                quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
+                first = ik.solve(handle_base, quat, seed=seed, tolerance_pos=0.02, tolerance_rad=0.5)
+                if first is not None:
+                    log.info(
+                        f"taking hold of {name}.{joint['name']} at {np.round(handle_world, 2).tolist()} "
+                        f"with grasp orientation {k}"
+                    )
+                    chosen = (joint, travel, pose_matrix(handle_base, quat), axis_dir, origin_base, first)
+                    break
+            if chosen is not None:
                 break
-        if start is None:
-            return {"opened": False, "why": f"no grasp orientation reaches the handle of {joint['name']}"}
-        path = follow_joint(start, joint["kind"], axis_dir, origin_base.cpu().numpy(), travel, steps=OPEN_PATH_STEPS)
+            log.info(f"{name}.{joint['name']}: no grasp orientation reaches its handle; trying the next joint")
+        if chosen is None:
+            return {"opened": False, "why": f"no joint of {name} has a handle this arm can reach"}
+        joint, travel, start_pose, axis_dir, origin_base, first = chosen
+        path = follow_joint(start_pose, joint["kind"], axis_dir, origin_base, travel, steps=OPEN_PATH_STEPS)
         reached, blocked = 0, ""
         for i, pose in enumerate(path):
             quat = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
