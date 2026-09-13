@@ -1391,6 +1391,24 @@ class R1ProSim(TiptopSim):
         }
         return ArmIK(self.robot.urdf_path, joints, fixed, frame=frame or CAMERA_LINKS[f"{arm}_wrist"])
 
+    def in_head_frame(self, ik: ArmIK, q, frame: str) -> bool:
+        """Whether ``frame`` at arm joints ``q`` would land inside the head camera's image as it stands now.
+
+        What a presentation is *for*: the point of lifting a carried object is that the head camera sees it, and
+        the present points are fixed offsets chosen for one torso posture. The posture varies in a run -- the head
+        camera stood between 1.26 m and 1.37 m over runs/bench_toys_7 -- so whether a given point is still in
+        frame is worth asking rather than assuming. All nine rounds that run lost to empty masks were place
+        rounds, every one of them a carried object the capture could not see.
+        """
+        try:
+            pos, _ = ik.fk(q, frame)
+        except Exception:
+            return True  # no forward kinematics for it: do not let this decide anything
+        k, base_from_cam, _ = self.head_camera_in_base()
+        px, z = points_to_pixels([np.asarray(pos, dtype=np.float64)], k, base_from_cam)
+        (u, v), ahead = px[0], float(z[0])
+        return bool(ahead > 0 and 0 <= u < self.robot_cam.image_width and 0 <= v < self.robot_cam.image_height)
+
     def present_held(self, arm: str, aabbs=None, ignore=()) -> np.ndarray | None:
         """Joints of ``arm`` that hold what it is carrying in front of the head camera (``PRESENT_POINT`` on its
         own side, the roomiest of the ``PRESENT_OFFSETS`` it reaches, clear of the base), the gripper
@@ -1429,7 +1447,16 @@ class R1ProSim(TiptopSim):
                 log.info(f"{arm} arm: presenting at {np.round(target, 2).tolist()} puts {inside} at the base; skipped")
                 continue
             touched, objects = self.path_contacts(arm, ik, here, solution, aabbs)
-            candidates.append((touched, len(candidates), target, solution, objects))
+            candidates.append(
+                (
+                    not self.in_head_frame(ik, solution, f"{arm}_gripper_link"),
+                    touched,
+                    len(candidates),
+                    target,
+                    solution,
+                    objects,
+                )
+            )
         if not candidates:
             # Which of the two it is matters: an arm that cannot reach any present point from where it stands is a
             # different problem from one whose every reach is refused. The seed is where the arm actually is, and
@@ -1440,7 +1467,12 @@ class R1ProSim(TiptopSim):
                 f"{len(PRESENT_OFFSETS) - unreachable} refused at the base"
             )
             return None
-        touched, _, target, solution, objects = min(candidates)
+        out_of_frame, touched, _, target, solution, objects = min(candidates)
+        if out_of_frame:
+            log.warning(
+                f"{arm} arm: no present point puts what it holds inside the head camera's frame; using "
+                f"{np.round(target, 2).tolist()} anyway"
+            )
         if touched:
             log.info(
                 f"{arm} arm: presenting what it holds at {np.round(target, 2).tolist()}, the roomiest of "
