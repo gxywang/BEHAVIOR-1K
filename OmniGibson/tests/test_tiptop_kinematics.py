@@ -366,3 +366,31 @@ def test_the_test_is_symmetric_in_the_sense_that_overlap_does_not_depend_on_whic
     near = ((0.20, -0.1), (0.40, 0.1))
     assert rect_hits_box((0, 0), 0.0, BASE_LO, BASE_HI, *near)
     assert not rect_hits_box((-0.5, 0), 0.0, BASE_LO, BASE_HI, *near)
+
+
+def test_the_gap_is_positive_when_clear_and_zero_or_less_when_overlapping():
+    from omnigibson.tiptop.r1pro import rect_box_gap
+
+    clear = rect_box_gap((0, 0), 0.0, BASE_LO, BASE_HI, (0.60, -0.2), (1.0, 0.2))
+    assert clear == pytest.approx(0.36, abs=0.01), "0.60 m away, the base reaching 0.24 m forward"
+    touching = rect_box_gap((0, 0), 0.0, BASE_LO, BASE_HI, (0.24, -0.2), (0.6, 0.2))
+    assert touching <= 0.0
+
+
+def test_the_rectangle_is_more_generous_in_front_than_the_square_it_replaced():
+    # the measured trap: the base reaches 0.24 m forward where ROBOT_FOOTPRINT's square guarded 0.36, so an honest
+    # shape alone lets the search stand 12 cm closer to whatever it faces. The clearance term in the score is what
+    # pays that back -- these two numbers are why it exists.
+    from omnigibson.tiptop.r1pro import ROBOT_FOOTPRINT, rect_box_gap
+
+    front = ((0.30, -0.2), (0.7, 0.2))
+    assert rect_box_gap((0, 0), 0.0, BASE_LO, BASE_HI, *front) == pytest.approx(0.06, abs=0.01)
+    assert 0.30 - ROBOT_FOOTPRINT < 0.0, "the square would have called this stance occupied"
+
+
+def test_a_stance_short_of_the_wanted_clearance_costs_more_than_the_approach_it_buys():
+    from omnigibson.tiptop.r1pro import CLEAR_WEIGHT, STANCE_CLEARANCE
+
+    shortfall = 0.05  # standing 5 cm nearer than wanted
+    assert CLEAR_WEIGHT * shortfall > shortfall, "the score's distance term is 1 per metre"
+    assert STANCE_CLEARANCE > 0.0

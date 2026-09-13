@@ -237,6 +237,15 @@ AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from th
 # and it is the one moment the robot moves without the planner's collision checking, since a teleport does not
 # sweep: it materialises wherever it lands.
 TRAVEL_TORSO = {"torso_joint2": -2.25}
+FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
+# Room the stance search wants between the robot and everything it is not there to touch, and what a metre short
+# of it costs in the score. Without this the score is indifferent between standing 1 mm from a cabinet and 6 cm
+# from it and takes the nearer one, because it is 6 cm closer to the object: the filter decides everything and the
+# objective pushes straight back against it. A clearance term also covers every residual error in the shapes at
+# once -- box against mesh, the arms the footprint does not model, the base settling -- which a bigger footprint
+# does not. At 4.0 per metre a 5 cm shortfall costs 0.20 against the 0.05 of approach it buys.
+STANCE_CLEARANCE = 0.05
+CLEAR_WEIGHT = 4.0
 TRAVEL_SETTLE_STEPS = 20  # after folding or unfolding: one joint moved, so it settles quickly
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
@@ -305,12 +314,18 @@ def sample_polyline(points, step: float) -> np.ndarray:
     return np.asarray(out, dtype=np.float64)
 
 
-def rect_hits_box(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> bool:
-    """Whether a rectangle at ``centre`` turned by ``yaw`` overlaps a world-axis-aligned box, in xy.
+def rect_box_gap(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> float:
+    """How much room there is between a rectangle at ``centre`` turned by ``yaw`` and an axis-aligned box, in xy.
 
-    ``rect_lo``/``rect_hi``: the rectangle's own extent in its frame, which for the robot's base is NOT centred on
-    the origin -- it reaches further behind the base frame than in front of it. Separating-axis test over the four
-    axes (the two world axes and the two the rectangle turns to); no separating axis means they overlap.
+    Positive is clearance in metres; zero or less means they overlap. ``rect_lo``/``rect_hi``: the rectangle's own
+    extent in its frame, which for the robot's base is NOT centred on the origin -- it reaches further behind the
+    base frame than in front of it. Separating-axis test over the four axes (the two world axes and the two the
+    rectangle turns to); the widest separation is the clearance, and no separation at all means overlap.
+
+    The number matters as much as the verdict. Swapping the old centred 0.36 m square for this rectangle tightens
+    the robot's rear by up to 16 cm and LOOSENS its front by 12 cm (the base reaches only 0.24 m forward), and the
+    front is the side that faces the furniture -- so with nothing in the score to want clearance, an honest shape
+    alone would just let the search stand 12 cm closer (measured over the 61 stances of runs/bench_batteries_ten).
     """
     c = np.asarray(centre, dtype=np.float64).reshape(2)
     lo = np.asarray(rect_lo, dtype=np.float64).reshape(2)
@@ -320,11 +335,16 @@ def rect_hits_box(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> bool:
     box_lo = np.asarray(box_lo, dtype=np.float64).reshape(-1)[:2]
     box_hi = np.asarray(box_hi, dtype=np.float64).reshape(-1)[:2]
     box = np.array([[x, y] for x in (box_lo[0], box_hi[0]) for y in (box_lo[1], box_hi[1])])
+    gap = -np.inf
     for axis in (np.array([1.0, 0.0]), np.array([0.0, 1.0]), rot[:, 0], rot[:, 1]):
         a, b = rect @ axis, box @ axis
-        if a.max() < b.min() or b.max() < a.min():
-            return False
-    return True
+        gap = max(gap, float(b.min() - a.max()), float(a.min() - b.max()))
+    return gap
+
+
+def rect_hits_box(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> bool:
+    """Whether a turned rectangle overlaps an axis-aligned box (``rect_box_gap`` at or below zero)."""
+    return rect_box_gap(centre, yaw, rect_lo, rect_hi, box_lo, box_hi) <= 0.0
 
 
 def box_corners(lo, hi) -> np.ndarray:
@@ -973,7 +993,9 @@ class R1ProSim(TiptopSim):
         ``aabbs``: a scene_aabbs() snapshot to test against (taken here otherwise; nothing moves during a search).
         """
         r = ROBOT_FOOTPRINT
-        rect = self.base_box()[:, :2] if yaw is not None else None
+        rect = (
+            self.base_box()[:, :2] + np.array([[-FOLD_OVERHANG] * 2, [FOLD_OVERHANG] * 2]) if yaw is not None else None
+        )
         corners = [(x + sx * r, y + sy * r) for sx in (-1, 1) for sy in (-1, 1)] + [(x, y)]
         if rect is not None:  # the floor test wants the real corners too
             rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
@@ -983,6 +1005,7 @@ class R1ProSim(TiptopSim):
                 for cy in (rect[0][1], rect[1][1])
             ] + [(x, y)]
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
+        clearance = float("inf")  # the least room to any obstacle, so the score can prefer a stance with some
         floors = [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
         for cx, cy in corners:
             on_floor = False
@@ -1010,11 +1033,13 @@ class R1ProSim(TiptopSim):
             if hi[2] <= GROUND_CLEARANCE:
                 continue
             if rect is not None:
-                if rect_hits_box((x, y), yaw, rect[0], rect[1], lo, hi):
-                    return False, f"overlaps {obj.name}"
+                gap = rect_box_gap((x, y), yaw, rect[0], rect[1], lo, hi)
+                if gap <= 0.0:
+                    return False, f"overlaps {obj.name}", 0.0
+                clearance = min(clearance, gap)
             elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
-                return False, f"overlaps {obj.name}"
-        return True, "free"
+                return False, f"overlaps {obj.name}", 0.0
+        return True, "free", float(clearance)
 
     def place_robot_near(self, support: str, side: str = "auto", standoff: float = 0.30, ignore_names=()) -> dict:
         """Put the robot next to a piece of furniture, facing it ("navigation done" stand-in).
@@ -1035,7 +1060,7 @@ class R1ProSim(TiptopSim):
         }
         for s in [side] if side != "auto" else ["-x", "+x", "-y", "+y"]:
             x, y, yaw = cands[s]
-            ok, why = self._footprint_free(x, y, ignore=ignore)
+            ok, why, _ = self._footprint_free(x, y, ignore=ignore, yaw=float(yaw))
             log.info(f"candidate {s} side of {support} at ({x:.2f}, {y:.2f}): {why}")
             if side == "auto" and not ok:
                 continue
@@ -1081,7 +1106,7 @@ class R1ProSim(TiptopSim):
         test), and the world height each object stands at (one value, or one per point) so the head camera's reach
         for it can be measured (``camera_floor_distance``; None skips that test). ``avoid``: (x, y) poses already
         tried; candidates within ``AVOID_RADIUS`` of one are rejected, so a retry gets a different viewpoint.
-        Returns ((score, x, y, yaw, dists, sides) or None, rejection counts by reason).
+        Returns ((score, x, y, yaw, dists, sides, clearance) or None, rejection counts by reason).
         """
         pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
         if not pts:
@@ -1174,11 +1199,15 @@ class R1ProSim(TiptopSim):
                         key = (float(x), float(y), round(float(yaw), 3))  # the base's box turns with the yaw
                         if key not in footprint:
                             footprint[key] = self._footprint_free(x, y, ignore, aabbs=aabbs, yaw=float(yaw))
-                        free, why = footprint[key]
-                        if free:
-                            best = (score, x, y, yaw, dist, side)
-                        else:
+                        free, why, clearance = footprint[key]
+                        if not free:
                             rejected[why] = rejected.get(why, 0) + 1
+                        else:
+                            # Standing closer is worth 1 per metre to the score above, so without this the search
+                            # takes every centimetre the filter allows and stops a hair from the furniture.
+                            score += CLEAR_WEIGHT * max(0.0, STANCE_CLEARANCE - clearance)
+                            if best is None or score < best[0]:
+                                best = (score, x, y, yaw, dist, side, clearance)
         if best is None and boxes is not None and frame_strict:
             log.info(
                 f"no stance frames every object whole ({dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:4])}); allowing a clipped one"
@@ -1262,10 +1291,11 @@ class R1ProSim(TiptopSim):
                 f"{[np.round(p, 2).tolist() for p in points]}; rejections "
                 f"{dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
             )
-        score, x, y, yaw, dist, side = best
+        score, x, y, yaw, dist, side, clearance = best
         log.info(
             f"standing for {' + '.join(names)}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
-            f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m"
+            f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m, "
+            f"{clearance:.2f} m of room to the nearest obstacle"
         )
         pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
         hidden = self.hidden_from_here(names)
