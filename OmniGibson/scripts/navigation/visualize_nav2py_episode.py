@@ -161,7 +161,6 @@ def main(argv=None):
         camera_mover = og.sim.enable_viewer_camera_teleoperation()
         camera_mover.set_delta(0.5)
         robot = env.robots[0]
-        goal_marker, goal_marker_position = add_goal_marker(env, episode)
         if robot.model in ("r1", "r1pro"):
             og.sim.stop()
             robot.base_footprint_link.mass = 250.0
@@ -178,6 +177,7 @@ def main(argv=None):
         print(f"Success criterion: {runner.format_success_criterion(args, robot)}")
 
         def after_reset():
+            goal_marker, goal_marker_position = add_goal_marker(env, episode)
             goal_marker.set_position_orientation(position=goal_marker_position)
             gate.wait_until_ready()
 
