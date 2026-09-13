@@ -1018,13 +1018,13 @@ class R1ProSim(TiptopSim):
                     on_floor = True
                     break
             if not on_floor:
-                return False, f"no floor under ({cx:.2f}, {cy:.2f})"
+                return False, f"no floor under ({cx:.2f}, {cy:.2f})", 0.0
         try:
             room = self.env.scene.seg_map.get_room_instance_by_point(th.tensor([x, y]))
         except Exception:  # noqa: BLE001 - a point off the map's raster raises inside the lookup; it is a filter only
             room = "unknown"
         if room is None:
-            return False, "outside every room"
+            return False, "outside every room", 0.0
         for obj, lo, hi in aabbs:
             if obj is self.robot or obj in ignore or obj.category in FLOOR_COVERINGS:
                 continue

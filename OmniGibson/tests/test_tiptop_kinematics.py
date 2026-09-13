@@ -394,3 +394,27 @@ def test_a_stance_short_of_the_wanted_clearance_costs_more_than_the_approach_it_
     shortfall = 0.05  # standing 5 cm nearer than wanted
     assert CLEAR_WEIGHT * shortfall > shortfall, "the score's distance term is 1 per metre"
     assert STANCE_CLEARANCE > 0.0
+
+
+def test_every_footprint_verdict_carries_its_clearance():
+    """All of _footprint_free's returns are (free, why, clearance).
+
+    Two of them were left at two values when the clearance was added, and the caller unpacks three: the first task
+    to stand somewhere with no floor under a corner crashed the whole instance (clean_up_broken_glass, 2026-09-13,
+    "not enough values to unpack (expected 3, got 2)"). Arity is not something to find in a benchmark.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    src = textwrap.dedent(inspect.getsource(R1ProSim._footprint_free))
+    tree = ast.parse(src)
+    returns = [n for n in ast.walk(tree) if isinstance(n, ast.Return)]
+    assert returns, "the function should return"
+    for r in returns:
+        assert isinstance(r.value, ast.Tuple) and len(r.value.elts) == 3, (
+            f"a return at line {r.lineno} of _footprint_free has "
+            f"{len(r.value.elts) if isinstance(r.value, ast.Tuple) else 1} values, not 3"
+        )
