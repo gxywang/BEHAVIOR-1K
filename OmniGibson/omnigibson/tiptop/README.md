@@ -243,13 +243,24 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     search.
 - **putting_away_toys** (eight toy figures off two floors into either of two toy boxes, one on a floor and one
   on a table; the goal's 256 ground options say any box takes any toy, and the runner fills the nearest),
-  2026-09-13, `runs/bench_toys_7`, the same two instances after the arm-collision work: **0.75 and 0.875, mean
-  0.8125** -- seven of eight toys placed in one instance, the best this task has done. Against `bench_toys_4` on
-  the same instances: 37 rounds executed against 27, 9 lost to empty masks against 19, 46 arm motions blocked
-  against 59. Read those counts before the mean: `bench_toys_6`, between the two, scored 0.0 and 0.75 on these
-  same instances, so a two-instance mean swings further than any one change moves it. What the runs agree on is
-  the direction of the mechanism counts, and each of the three runs found a different dominant blocked motion --
-  head-view ramps (fixed), presentations (fixed), and now the capture swing out, 21 of 46.
+  2026-09-13, **four runs over instances 301 and 302**, which is what it takes to say anything here:
+
+  | run | what changed | mean | per instance | empty masks | arms blocked |
+  | --- | --- | --- | --- | --- | --- |
+  | `bench_toys_4` | head views, projection stances | 0.4375 | 0.50 / 0.375 | 19 | 59 |
+  | `bench_toys_6` | + arm-collision fixes | 0.375 | 0.00 / 0.75 | 13 | 58 |
+  | `bench_toys_7` | + ramp block test, presenting ranked | **0.8125** | 0.75 / 0.875 | 9 | 46 |
+  | `bench_toys_8` | + present where the camera sees | **0.8125** | 0.75 / 0.875 | 17 | 62 |
+
+  **The last two runs are the same code for this task** -- the in-frame preference of run 8 never fired once, every
+  reachable present point already being in frame -- so their difference is the measurement noise of this task:
+  the same behaviour gave 9 and 17 rounds lost to empty masks, and 46 and 62 blocked arm motions. Nothing about
+  the blocked-motion counts can be read as a trend, and an earlier note here that claimed one was wrong.
+
+  What survives that noise: the score. Two runs before the ramp and presenting fixes gave 0.4375 and 0.375; the two
+  after gave 0.8125 twice, with identical per-instance scores. And the *composition* of the blocked motions
+  changed for a reason rather than by luck -- head-view ramps were 24 of 28 in run 4 and about 6 of 58 after the
+  head views stopped commanding the arm.
 
   2026-09-13, `runs/bench_toys_4`, instances 301 and 302 with head pitch views and the projection-based stance
   test: **0.50 and 0.375, mean 0.4375** -- the first toys placed, four of eight and three of eight. Both instances
