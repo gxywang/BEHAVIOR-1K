@@ -139,9 +139,16 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     ahead passed the test and fell out of the bottom of the frame. Fixed after this run.
   - run 5 (`runs/bench_batteries_5`, instances 301 and 302, every fix above): **0.25 on both**, one battery of
     three each time, 3,073 and 2,981 of the 21,642 allowed env steps. Nine rounds were lost to the same thing:
-    `GoalNotVisible`, the object framed out of the bottom of the capture. The stance that does it is the same one
-    each time, 0.53 m ahead where the camera's bottom edge meets the desk at 0.42 m, so `CAMERA_MIN_MARGIN` went
-    from 0.08 m to 0.15 m after this run; `runs/bench_batteries_6` tests that.
+    `GoalNotVisible`: the battery has no pixels at all in any view from certain stances, and 493 in the head view
+    from the one that works. Raising `CAMERA_MIN_MARGIN` from 0.08 m to 0.15 m on the theory that it was falling
+    past the frame's bottom edge moved the stance from 0.55 m to 0.60 m (0.578 m ahead against the new 0.57 m
+    requirement) and the mask was **still empty** (`runs/bench_batteries_6`), so that theory is wrong and the
+    margin is back at 0.08 m. What the two runs do say is that the failure is a property of the stance, not of
+    the object, and that the retry from another pose recovers it every time. The measurement to make next is the
+    head camera's real footprint at the challenge posture: render one capture, unproject its depth, and find the
+    nearest visible point on a horizontal plane at each height. `camera_floor_distance` predicts that edge from
+    the intrinsics and the camera pose, the stance search trusts it, and these runs suggest it is optimistic;
+    a measured curve would replace both the guess and the margin.
   - The standing room is the other limit, as the task review predicted: 842 of the candidate poses for one
     battery overlapped a swivel chair and 376 the desk, and both cubicle batteries needed the widened 1.1 m
     search.
