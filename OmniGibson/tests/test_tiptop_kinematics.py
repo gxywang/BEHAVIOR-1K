@@ -301,3 +301,19 @@ def test_clearance_catches_a_limb_that_only_grazes():
 
 def test_a_polyline_of_one_point_hits_nothing():
     assert not arm_hits([(0.7, 0.0, 0.75)])
+
+
+def test_sampling_a_polyline_keeps_the_corners_and_bounds_the_spacing():
+    from omnigibson.tiptop.r1pro import sample_polyline
+
+    pts = sample_polyline([(0, 0, 0), (0.1, 0, 0), (0.1, 0.05, 0)], step=0.02)
+    assert np.allclose(pts[0], [0, 0, 0]) and np.allclose(pts[-1], [0.1, 0.05, 0])
+    assert np.linalg.norm(np.diff(pts, axis=0), axis=1).max() <= 0.02 + 1e-9
+    assert any(np.allclose(p, [0.1, 0, 0]) for p in pts)  # the corner itself is a sample
+
+
+def test_sampling_an_empty_or_single_point_polyline_is_harmless():
+    from omnigibson.tiptop.r1pro import sample_polyline
+
+    assert sample_polyline([], step=0.02).shape == (0, 3)
+    assert sample_polyline([(1.0, 2.0, 3.0)], step=0.02).shape == (1, 3)

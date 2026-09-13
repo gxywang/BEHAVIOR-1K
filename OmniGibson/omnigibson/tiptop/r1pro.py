@@ -30,7 +30,7 @@ import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
 from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
-from omnigibson.tiptop.gt_masks import masks_from_geometry
+from omnigibson.tiptop.gt_masks import masks_from_geometry, points_within_tol
 from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
 from omnigibson.tiptop.protocol import (
     add_view,
@@ -138,6 +138,12 @@ LOOK_BLOCK_RADIUS = 0.08
 # along a motion, because the endpoint being clear says nothing about what the arm sweeps through on the way.
 ARM_RADIUS = 0.06
 PATH_SAMPLES = 9
+ARM_SAMPLE_STEP = 0.02  # m between the points taken along the arm when it is measured against an object's mesh
+# A box is a loose model of furniture: measured on 2026-09-13 (dispose_of_batteries, scratchpad/arm_clearance.py),
+# at the READY posture -- where the arm has just teleported in and is touching nothing -- the boxes of a swivel
+# chair and a desk both contain the hand, and the existing hand-only test (links_in_scene) calls it a collision.
+# So a box decides nothing on its own: it is the cheap prefilter, and the object's own mesh decides.
+ARM_MESH_CHECK = True
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
 # and the leaning torso, so the support plane the wrist cameras see beside the robot never runs under it. The head
@@ -262,6 +268,18 @@ def polyline_hits_box(points, lo, hi, clearance: float = 0.0) -> bool:
     low = np.asarray(lo, dtype=np.float64).reshape(3) - clearance
     high = np.asarray(hi, dtype=np.float64).reshape(3) + clearance
     return any(segment_hits_box(a, b, low, high) for a, b in zip(points, points[1:]))
+
+
+def sample_polyline(points, step: float) -> np.ndarray:
+    """Points along a polyline at no more than ``step`` apart, the corners included; (N, 3)."""
+    points = [np.asarray(p, dtype=np.float64).reshape(3) for p in points]
+    if not points:
+        return np.zeros((0, 3), dtype=np.float64)
+    out = [points[0]]
+    for a, b in zip(points, points[1:]):
+        n = max(1, int(np.ceil(float(np.linalg.norm(b - a)) / max(step, 1e-6))))
+        out += [a + (b - a) * (i / n) for i in range(1, n + 1)]
+    return np.asarray(out, dtype=np.float64)
 
 
 def box_corners(lo, hi) -> np.ndarray:
@@ -624,6 +642,7 @@ class R1ProSim(TiptopSim):
         self.posture = {}
         self.q_home = None
         self.blocked_swings = 0  # capture swings stopped against something this instance (see capture)
+        self._scene_meshes = {}  # object name -> (box stamp, world trimesh) for the arm's collision check
         self._init_state()
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
@@ -1471,11 +1490,36 @@ class R1ProSim(TiptopSim):
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         held = {self.objects[label] for label in self.hands() if label in self.objects}
         points = self.arm_points(arm, ik, q)
+        near = [
+            (obj, lo, hi) for obj, lo, hi in aabbs if obj not in held and polyline_hits_box(points, lo, hi, clearance)
+        ]
+        if not (ARM_MESH_CHECK and near):
+            return [obj.name for obj, _, _ in near]
+        samples = sample_polyline(points, ARM_SAMPLE_STEP)
         hits = []
-        for obj, lo, hi in aabbs:
-            if obj not in held and polyline_hits_box(points, lo, hi, clearance):
+        for obj, _, _ in near:  # the box only says "look closer"; the object's own surface decides
+            try:
+                mesh = self.scene_mesh(obj)
+            except Exception:
+                hits.append(obj.name)  # no mesh to check against: keep the box's word
+                continue
+            if bool(points_within_tol(mesh, samples, clearance).any()):
                 hits.append(obj.name)
         return hits
+
+    def scene_mesh(self, obj):
+        """World-frame trimesh of a scene object, kept until the object moves (its box is the stamp).
+
+        Furniture never moves, so this is built once per object per run; a task object that is carried about gets
+        a new mesh when its box changes. Building one concatenates every link's visual mesh, which is far too slow
+        to do per candidate -- hence the box prefilter in ``arm_hits_scene``.
+        """
+        lo, hi = (v.cpu().numpy() for v in obj.aabb)
+        stamp = (tuple(np.round(lo, 4)), tuple(np.round(hi, 4)))
+        cached = self._scene_meshes.get(obj.name)
+        if cached is None or cached[0] != stamp:
+            self._scene_meshes[obj.name] = (stamp, self.trimesh_world(obj))
+        return self._scene_meshes[obj.name][1]
 
     def path_hits_scene(self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES) -> list[str]:
         """Scene objects the arm reaches into anywhere along the straight joint-space path from ``q_from`` to
