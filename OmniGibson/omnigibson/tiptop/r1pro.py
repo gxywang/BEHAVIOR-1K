@@ -1664,6 +1664,20 @@ class R1ProSim(TiptopSim):
                 continue
             if not holding and arm != self.arm and f"{arm}_wrist" not in views:
                 continue
+            # An arm is posed for one of two reasons: its wrist camera is one of the views, or it stands in the
+            # head camera's way. The planned arm was posed whatever the views were, so with head views alone
+            # (--views head head_up head_down) it was swung on every capture for nothing -- and that swing is the
+            # only arm motion of such a round. It is what produced all 26 blocked ramps of the putting_away_toys
+            # run of 2026-09-13, where the user watched the arm knock the toys about.
+            if not holding and f"{arm}_wrist" not in views:
+                in_the_way = self.links_on_sight_line(arm, target)
+                if not in_the_way:
+                    log.info(
+                        f"{arm} arm: no wrist view in this capture and it is clear of the head camera's line to "
+                        f"{np.round(target, 2).tolist()}; left where it is"
+                    )
+                    continue
+                log.info(f"{arm} arm: {in_the_way} in the head camera's way; posing it out of the line")
             joints = list(self.robot.arm_joint_names[arm])
             q = self.present_held(arm, aabbs, self.look_names) if holding else self.wrist_look(arm, target, aabbs)
             if q is not None:
@@ -1780,25 +1794,31 @@ class R1ProSim(TiptopSim):
         """
         if self.look_target is None:
             return []
-        eye = self.base_to_world(self.head_camera_in_base()[1][:3, 3])
-        target = self.base_to_world(np.asarray(self.look_target, dtype=np.float64))
         held_arms = set(self.hands().values())
         blocking = []
         for arm in ("left", "right"):
             if arm in held_arms:
                 continue
-            hits = []
-            for name in self.robot.arm_link_names[arm]:
-                link = self.robot.links.get(name)
-                if link is None:
-                    continue
-                lo, hi = link.aabb
-                if segment_hits_box(eye, target, lo.cpu().numpy(), hi.cpu().numpy()):
-                    hits.append(name)
+            hits = self.links_on_sight_line(arm, self.look_target)
             if hits:
                 log.warning(f"{arm} arm stands between the head camera and the look target: {hits}")
             blocking += hits
         return blocking
+
+    def links_on_sight_line(self, arm: str, target) -> list[str]:
+        """Links of ``arm``, as they stand now, whose own box the head camera's line to ``target`` (base frame)
+        passes through."""
+        eye = self.base_to_world(self.head_camera_in_base()[1][:3, 3])
+        goal = self.base_to_world(np.asarray(target, dtype=np.float64))
+        hits = []
+        for name in self.robot.arm_link_names[arm]:
+            link = self.robot.links.get(name)
+            if link is None:
+                continue
+            lo, hi = link.aabb
+            if segment_hits_box(eye, goal, lo.cpu().numpy(), hi.cpu().numpy()):
+                hits.append(name)
+        return hits
 
     def _capture_views(self, task: str, q_arm) -> tuple[dict, dict]:
         """``TiptopSim.capture`` for the primary view and the wrist views, where the joints stand now (``q_arm``: the
