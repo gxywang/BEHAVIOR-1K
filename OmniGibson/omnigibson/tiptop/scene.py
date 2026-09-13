@@ -381,7 +381,7 @@ class TiptopSim:
         the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``)."""
         self.n_steps = 0
         self.max_steps = max_steps
-        self.held_objects, self.teleports = {}, 0
+        self.held_objects, self.teleports, self.blocked_swings = {}, 0, 0
         self.metrics = list(metrics)
         for metric in self.metrics:
             metric.reset(self.env)

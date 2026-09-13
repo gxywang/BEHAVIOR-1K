@@ -108,6 +108,7 @@ HAND_LINKS = (
 )
 BASE_CLEARANCE = 0.10  # m
 SCENE_CLEARANCE = 0.03  # m: a look configuration keeps the hand links this far outside every scene object's box
+BLOCKED_SWINGS_MAX = 2  # capture swings stopped against something before an instance gives up on look poses
 ELBOW = 3  # index of the elbow in an arm's joint list: folded before a capture swing, straightened after it
 LOOK_TOL = 0.03  # rad: an arm this far from its look posture after settling is blocked; from the ready posture, wrong
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
@@ -465,6 +466,7 @@ class R1ProSim(TiptopSim):
         self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
+        self.blocked_swings = 0  # capture swings stopped against something this instance (see capture)
         self._init_state()
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
@@ -1169,25 +1171,31 @@ class R1ProSim(TiptopSim):
                 inside.append(f"{arm}_{suffix}")
         return inside
 
-    def ramp_arms(self, q_arm, posture: dict, arms, gripper: float, settle_steps: int, elbow_first: bool) -> None:
+    def ramp_arms(self, q_arm, posture: dict, arms, gripper: float, settle_steps: int, elbow_first: bool) -> bool:
         """``ramp_to`` the targets through a via configuration: for each arm in ``arms`` the elbow alone has moved
         (``elbow_first``, a swing out: the hand rises before it travels) or every joint but the elbow has (a swing
         back: the hand travels folded and straightens last). Both legs ramp at the capture speed; the via is not
-        held."""
+        held. False when a leg stopped against something (the arms are then wherever that left them)."""
         q = self.robot.get_joint_positions()
         names = list(self.planned_joints) + list(posture)
         now = {j: float(q[self.joint_index[j]]) for j in names}
         goal = dict(zip(names, [float(v) for v in q_arm] + [float(posture[j]) for j in posture]))
         via = via_configuration(names, now, goal, {a: self.robot.arm_joint_names[a] for a in arms}, ELBOW, elbow_first)
         if any(abs(via[j] - now[j]) > 1e-3 for j in names):
-            self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0)
-        self.ramp_to(q_arm, posture, gripper, settle_steps)
+            if self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0):
+                self.hold(settle_steps, gripper)  # blocked on the first leg; do not drive the second into it
+                return False
+        return self.ramp_to(q_arm, posture, gripper, settle_steps) is None
 
-    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int) -> int:
+    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int) -> tuple | None:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
         than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
-        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``. Returns the
-        number of ramp steps."""
+        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``.
+
+        A joint that falls more than ``RAMP_BLOCK_TOL`` behind its target is pushing against something, and the ramp
+        stops there and holds where the joints actually are rather than leaning on it for the rest of the path
+        (a capture swing in a cubicle sweeps what is on the desk onto the floor, 2026-09-12). Returns None when the
+        joints followed, else (joint, step, lag)."""
         now = self.robot.get_joint_positions()
         names = list(self.planned_joints) + list(posture)
         start = [float(now[self.joint_index[j]]) for j in names]
@@ -1207,22 +1215,28 @@ class R1ProSim(TiptopSim):
                 fastest = float(speed[j])
                 culprit = f" ({names[j]} at step {i + 1}: {last[j]:+.3f} -> {measured[j]:+.3f} rad, target {q[j]:+.3f})"
             lag = np.where(ramped, np.abs(measured - q), 0.0)
-            if blocked is None and lag.max() > RAMP_BLOCK_TOL:
+            last = measured
+            if lag.max() > RAMP_BLOCK_TOL:
                 j = int(lag.argmax())
                 blocked = (names[j], i + 1, float(lag[j]))
-            last = measured
+                break  # stop pushing: the rest of the path would only lean harder on whatever is in the way
         if blocked is not None:
             log.warning(
                 f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
-                f"behind its target): the arm is pushing against something"
+                f"behind its target): the arm is pushing against something, so the ramp stopped there"
             )
-        self.posture = {j: float(v) for j, v in posture.items()}
-        self.hold(settle_steps, gripper, q_arm=[float(v) for v in q_arm])
+            held = self.robot.get_joint_positions()
+            self.posture = {j: float(held[self.joint_index[j]]) for j in posture}
+            q_hold = [float(held[self.joint_index[j]]) for j in self.planned_joints]
+        else:
+            self.posture = {j: float(v) for j, v in posture.items()}
+            q_hold = [float(v) for v in q_arm]
+        self.hold(settle_steps, gripper, q_arm=q_hold)
         log.info(
             f"joints ramped over {len(path)} steps at up to {CAPTURE_MAX_JOINT_VEL} rad/s commanded, "
             f"{fastest:.2f} rad/s measured{culprit}, then {settle_steps} settle steps"
         )
-        return len(path)
+        return blocked
 
     def capture(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
@@ -1235,6 +1249,8 @@ class R1ProSim(TiptopSim):
         as they are (``_capture_views``). The plan starts from the ready posture the arms return to."""
         ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
         if self.look_arm is None:
+            return self._capture_views(task, ready)
+        if self.blocked_swings >= BLOCKED_SWINGS_MAX:  # this room stops the arms; stop trying and stop nudging things
             return self._capture_views(task, ready)
         hands = self.hands()
         held_arms = set(hands.values())
@@ -1280,24 +1296,37 @@ class R1ProSim(TiptopSim):
         if not moved:
             return self._capture_views(task, ready)
         original = self.posture
-        self.ramp_arms(look, posture, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=True)
-        now = self.robot.get_joint_positions()
-        for arm, targets in moved.items():
-            lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
-            if lag > LOOK_TOL:
-                log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
-        request, extras = self._capture_views(task, look)
-        self._log_wrist_framing(request, moved)
-        self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+        if self.ramp_arms(look, posture, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=True):
+            now = self.robot.get_joint_positions()
+            for arm, targets in moved.items():
+                lag = max(abs(float(now[self.joint_index[j]]) - v) for j, v in targets.items())
+                if lag > LOOK_TOL:
+                    log.warning(f"{arm} arm is {lag:.3f} rad short of its look posture (blocked?); capturing anyway")
+            request, extras = self._capture_views(task, look)
+            self._log_wrist_framing(request, moved)
+            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+        else:  # it met something on the way out: go back first, then capture from where the arms rest
+            self.blocked_swings += 1
+            log.warning("the capture swing stopped against something; capturing from the ready posture instead")
+            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+            moved, look = {}, list(ready)
+            request, extras = self._capture_views(task, ready)
         q_ready = self.q_arm()
         lag = float(np.abs(q_ready - np.asarray(ready)).max())
-        if lag > LOOK_TOL:  # it caught on something on the way back: one more try before the round is lost
-            log.warning(f"arm {lag:.3f} rad short of the ready posture after the capture; ramping again")
-            self.ramp_arms(ready, original, sorted(moved), self.last_gripper, LOOK_SETTLE_STEPS, elbow_first=False)
+        if lag > LOOK_TOL:  # it caught on something on the way back: try the direct path before giving up on it
+            log.warning(f"arm {lag:.3f} rad short of the ready posture after the capture; ramping straight back")
+            self.ramp_to(ready, original, self.last_gripper, LOOK_SETTLE_STEPS)
             q_ready = self.q_arm()
             lag = float(np.abs(q_ready - np.asarray(ready)).max())
         if lag > LOOK_TOL:
-            raise RuntimeError(f"arm did not return to the ready posture after the capture (max error {lag:.3f} rad)")
+            # The arm is resting against something. The plan is asked for from where the arm actually is
+            # (``q_init`` below is the measured posture), so the round goes ahead rather than being lost; what
+            # this costs is the ready posture's clean start, and the room gets one strike (BLOCKED_SWINGS_MAX).
+            self.blocked_swings += 1
+            log.warning(
+                f"arm {lag:.3f} rad from the ready posture after the capture and stuck there; planning from where "
+                f"it is ({self.blocked_swings} blocked swing(s) this instance)"
+            )
         now = self.robot.get_joint_positions()
         for arm in moved:
             if arm != self.arm:
