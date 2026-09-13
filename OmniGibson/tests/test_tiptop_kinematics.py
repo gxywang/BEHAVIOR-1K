@@ -244,3 +244,32 @@ def test_the_measured_head_camera_frames_a_battery_on_a_desk_but_not_one_at_the_
 
 def test_the_measured_head_camera_reaches_the_floor_close_in():
     assert measured_framing([cube([0.55, 0.0, 0.04])])[0] is None  # a toy on the floor, within reach
+
+
+# --------------------------------------------------------------- a link's box on the line of sight
+def hits(lo, hi, eye=(0.1, 0.0, 1.4), target=(0.8, 0.0, 0.75)):
+    from omnigibson.tiptop.r1pro import segment_hits_box
+
+    return segment_hits_box(eye, target, lo, hi)
+
+
+def test_a_box_straddling_the_sight_line_is_hit():
+    assert hits((0.40, -0.10, 1.00), (0.55, 0.10, 1.15))
+
+
+def test_a_box_beside_the_sight_line_is_missed():
+    assert not hits((0.40, 0.30, 1.00), (0.55, 0.50, 1.15))
+
+
+def test_a_box_past_the_target_is_missed():
+    assert not hits((1.00, -0.10, 0.55), (1.20, 0.10, 0.75))
+
+
+def test_a_box_behind_the_camera_is_missed():
+    assert not hits((-0.50, -0.10, 1.50), (-0.30, 0.10, 1.70))
+
+
+def test_a_slab_the_line_runs_parallel_to_is_hit_only_when_the_line_is_inside_it():
+    flat = ((0.2, -0.5, 1.0), (0.9, 0.5, 1.2))  # the sight line passes through this height band
+    assert hits(*flat)
+    assert not hits((0.2, -0.5, 1.5), (0.9, 0.5, 1.7))  # the same band, above the line

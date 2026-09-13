@@ -223,6 +223,30 @@ def blocks_ray(eye, target, point, radius: float) -> bool:
     return 0.0 < along < length and float(np.linalg.norm(rel - along * ray / length)) < radius
 
 
+def segment_hits_box(eye, target, lo, hi) -> bool:
+    """Whether the segment from ``eye`` to ``target`` passes through the axis-aligned box (slab method).
+
+    Exact for a box, and a link's box is what the camera actually sees of it -- unlike a link origin, which is a
+    point and misses a gripper whose fingers reach well past it.
+    """
+    eye = np.asarray(eye, dtype=np.float64).reshape(3)
+    ray = np.asarray(target, dtype=np.float64).reshape(3) - eye
+    lo = np.asarray(lo, dtype=np.float64).reshape(3)
+    hi = np.asarray(hi, dtype=np.float64).reshape(3)
+    near, far = 0.0, 1.0  # the segment as a fraction of ray
+    for axis in range(3):
+        if abs(ray[axis]) < 1e-12:
+            if eye[axis] < lo[axis] or eye[axis] > hi[axis]:
+                return False  # parallel to this slab and outside it
+            continue
+        t1 = (lo[axis] - eye[axis]) / ray[axis]
+        t2 = (hi[axis] - eye[axis]) / ray[axis]
+        near, far = max(near, min(t1, t2)), min(far, max(t1, t2))
+        if near > far:
+            return False
+    return True
+
+
 def box_corners(lo, hi) -> np.ndarray:
     """The 8 corners of an axis-aligned box given as its low and high xyz, as (8, 3)."""
     lo = np.asarray(lo, dtype=np.float64).reshape(3)
@@ -1608,20 +1632,28 @@ class R1ProSim(TiptopSim):
         something and went back to the ready posture -- is not, and that is the posture most captures end in.
         Measured on 2026-09-13 (dispose_of_batteries, `scratchpad/stance_check.py`): the *same* stance, with the
         battery at the same pixel 0.67 m away, gave an empty mask in one capture and 499 pixels in the next; the
-        stance was identical and the arms were not. An arm holding something is skipped, since what it holds is
-        usually the look target itself.
+        stance was identical and the arms were not. The test is the segment against each arm link's own box
+        (``segment_hits_box``), which is what the camera sees of the link -- ``links_before_camera`` has to use
+        link origins because it judges a posture the arm has not taken yet. An arm holding something is skipped,
+        since what it holds is usually the look target itself.
         """
         if self.look_target is None:
             return []
-        q = self.robot.get_joint_positions()
+        eye = self.base_to_world(self.head_camera_in_base()[1][:3, 3])
+        target = self.base_to_world(np.asarray(self.look_target, dtype=np.float64))
         held_arms = set(self.hands().values())
         blocking = []
         for arm in ("left", "right"):
             if arm in held_arms:
                 continue
-            joints = list(self.robot.arm_joint_names[arm])
-            now = [float(q[self.joint_index[j]]) for j in joints]
-            hits = self.links_before_camera(arm, self.arm_ik(arm), now, self.look_target)
+            hits = []
+            for name in self.robot.arm_link_names[arm]:
+                link = self.robot.links.get(name)
+                if link is None:
+                    continue
+                lo, hi = link.aabb
+                if segment_hits_box(eye, target, lo.cpu().numpy(), hi.cpu().numpy()):
+                    hits.append(name)
             if hits:
                 log.warning(f"{arm} arm stands between the head camera and the look target: {hits}")
             blocking += hits
