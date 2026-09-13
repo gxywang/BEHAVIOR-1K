@@ -1462,6 +1462,11 @@ class R1ProSim(TiptopSim):
         ``links_in_scene`` tests only the hand's links, and only as points -- but the joints the runs report
         pushing against furniture are the shoulder and elbow (left_arm_joint4, left_arm_joint5, right_arm_joint3),
         which no test covered. Objects a hand holds travel with the arm and do not count.
+
+        A box is a coarse model of a piece of furniture and the polyline a coarse model of an arm, so this says
+        "the arm is inside that object's box", not "the arm is in contact". Before it decides anything, check what
+        it reports at the ready posture in a real scene: a detector that fires where the arm plainly is not
+        touching anything would only cost the capture its look poses.
         """
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         held = {self.objects[label] for label in self.hands() if label in self.objects}
