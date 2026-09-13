@@ -5,7 +5,8 @@
     "when a run beats it on the SAME instances -- a different instance set is a different measurement. Every",
     "number here was taken with --knowledge oracle and sticky grasping, which the challenge does not allow; they",
     "measure the planning and motion pipeline, not a submission.",
-    "instance_count is what read_run.py compares: a run over a different number of instances is not a like-for-like comparison, however its mean turns out."
+    "instance_count is what read_run.py compares: a run over a different number of instances is not a like-for-like comparison, however its mean turns out.",
+    "Two runs of the same code on the same two instances of putting_away_toys gave blocked-motion counts of 46 and 62 and empty-mask counts of 9 and 17. Treat a single run's counts as an observation, not a measurement."
   ],
   "turning_on_radio": {
     "mean": 0.9,
@@ -37,7 +38,7 @@
     "instances": "0 1",
     "instance_count": 2,
     "date": "2026-09-13",
-    "note": "0.75 and 0.875, seven of eight toys placed in one instance. Against runs/bench_toys_4's 0.4375 on the same two instances: 37 rounds executed against 27, 9 lost to empty masks against 19, 46 arm motions blocked against 59. The instance scores of this task swing hard between runs (toys_6 gave 0.0 and 0.75 on these same two), so read the blocked-motion and empty-mask counts before the mean."
+    "note": "0.75 and 0.875, seven of eight toys placed in one instance, and runs/bench_toys_8 repeated it exactly. Two runs before the ramp block-test and presenting fixes gave 0.4375 and 0.375. Read scores, not mechanism counts: runs 7 and 8 are the same behaviour for this task and gave 9 against 17 rounds lost to empty masks and 46 against 62 blocked arm motions, which is this task's noise floor."
   },
   "clean_up_broken_glass": {
     "mean": 0.0,
