@@ -956,6 +956,18 @@ parsing and resampling, the H5 layout, the name helpers, the position-based perc
 masks, the knowledge sources (what each attaches to a request, the button tracker), the task strategies against
 a scripted episode, and the benchmark's summary.
 
+`test_tiptop_kinematics.py` adds the geometry the capture depends on, all of it pure: the wrist look pose and Lula
+IK on the R1Pro URDF, whether a stance frames an object (`frame_objects`, checked against the head camera's
+*measured* pose, not an invented one), whether a link or a whole arm stands on a line or in a box
+(`blocks_ray`, `segment_hits_box`, `polyline_hits_box`).
+
+`test_tiptop_projection.py` holds the bridge to the pictures it took: `tiptop_capture_fixture.json` carries the
+camera, the object poses and the rendered mask centroids from two real captures of `runs/bench_batteries_8`, and
+the tests assert that a small object's pose projects onto the pixels Isaac actually drew for it (within 8 px; the
+measured gaps are 0.7 and 4.5). Everything the planner is given rests on those two agreeing, and on 2026-09-13
+two annotated images made it look as though they had come apart by 22 cm. They had not -- but the afternoon that
+established it is now a test that runs in ten milliseconds.
+
 ## History
 
 - 2026-09-02: Panda, mug into bowl over the websocket (25 of 256 particles feasible, 1.3 s cuTAMP); R1Pro in Rs_int,

@@ -1,0 +1,157 @@
+{
+ "_comment": "Two real captures from runs/bench_batteries_8 (dispose_of_batteries, instance 302). For each: the head camera as the capture recorded it (base frame, OpenCV axes), the bridge-reported pose of each tracked object, and the centroid and pixel count of the mask Isaac actually rendered for it. Used by tests/test_tiptop_projection.py to keep the projection honest: what the pose says and what the renderer drew must land on the same pixel for a small object.",
+ "captures": [
+  {
+   "round": "r01_left_holding",
+   "intrinsics": [
+    [
+     306.0,
+     0.0,
+     360.0
+    ],
+    [
+     0.0,
+     306.0,
+     360.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "world_from_cam": [
+    [
+     0.00015687942504882812,
+     -0.6790207624435425,
+     0.7341190576553345,
+     0.4392852783203125
+    ],
+    [
+     -1.0,
+     -5.8531761169433594e-05,
+     0.000159531831741333,
+     1.71661376953125e-05
+    ],
+    [
+     -6.535649299621582e-05,
+     -0.7341190576553345,
+     -0.679020881652832,
+     1.250114917755127
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "image": [
+    720,
+    720
+   ],
+   "objects": {
+    "battery_2": {
+     "aabb_center_base": [
+      0.6011878252029419,
+      0.21247005462646484,
+      0.7893732786178589
+     ],
+     "mask_pixels": 414,
+     "mask_centroid": [
+      209.0169082125604,
+      522.3574879227053
+     ]
+    },
+    "desk_1": {
+     "aabb_center_base": [
+      1.0793859958648682,
+      0.4870481491088867,
+      0.37263771891593933
+     ],
+     "mask_pixels": 16140,
+     "mask_centroid": [
+      531.4767038413878,
+      520.4632589838909
+     ]
+    }
+   }
+  },
+  {
+   "round": "r07_left_holding",
+   "intrinsics": [
+    [
+     306.0,
+     0.0,
+     360.0
+    ],
+    [
+     0.0,
+     306.0,
+     360.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "world_from_cam": [
+    [
+     6.276369094848633e-05,
+     -0.6213839054107666,
+     0.7835062742233276,
+     0.3691568374633789
+    ],
+    [
+     -1.0,
+     -2.300739288330078e-05,
+     6.192922592163086e-05,
+     8.821487426757812e-06
+    ],
+    [
+     -2.047419548034668e-05,
+     -0.7835062742233276,
+     -0.6213839054107666,
+     1.2867205142974854
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "image": [
+    720,
+    720
+   ],
+   "objects": {
+    "battery_1": {
+     "aabb_center_base": [
+      0.5298166275024414,
+      0.10284948348999023,
+      0.8031218647956848
+     ],
+     "mask_pixels": 700,
+     "mask_centroid": [
+      286.35857142857145,
+      564.8171428571428
+     ]
+    },
+    "desk_1": {
+     "aabb_center_base": [
+      -0.036956787109375,
+      1.2345664501190186,
+      0.37246519327163696
+     ],
+     "mask_pixels": 84093,
+     "mask_centroid": [
+      161.30928852579882,
+      564.7355665751014
+     ]
+    }
+   }
+  }
+ ]
+}
