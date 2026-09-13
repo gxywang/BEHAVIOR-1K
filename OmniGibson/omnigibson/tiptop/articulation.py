@@ -141,8 +141,10 @@ def openable_joints(obj) -> list:
                 continue
             position = float(np.asarray(joint.get_state()[0]).reshape(-1)[0])
             local = np.asarray(AXIS_VECTORS.get(str(joint.axis).upper(), (1.0, 0.0, 0.0)), dtype=np.float64)
-            parent = obj.links.get(str(joint.body0).split("/")[-1]) if getattr(joint, "body0", None) else None
-            child = obj.links.get(str(joint.body1).split("/")[-1]) if getattr(joint, "body1", None) else None
+            parent_key = str(joint.body0).split("/")[-1] if getattr(joint, "body0", None) else ""
+            child_key = str(joint.body1).split("/")[-1] if getattr(joint, "body1", None) else ""
+            parent = obj.links.get(parent_key)
+            child = obj.links.get(child_key)
             frame = parent if parent is not None else child
             if frame is None:
                 continue
@@ -157,7 +159,10 @@ def openable_joints(obj) -> list:
                     "lower": lower,
                     "upper": upper,
                     "position": position,
-                    "link": str(child.name) if child is not None else "",
+                    # the KEY in obj.links, not the link's .name: they differ, and the caller looks the link up
+                    # by key. The smoke test on store_honey's cabinet failed with "has no link to take hold of"
+                    # for exactly this (2026-09-13).
+                    "link": child_key if child is not None else "",
                 }
             )
         except Exception as e:  # a joint that does not answer is not one to open

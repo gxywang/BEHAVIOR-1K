@@ -116,6 +116,49 @@ class Episode:
         self.floor = sim.floor_name()
 
     # ---------------------------------------------------------------- moving
+    def open_up(self, name: str, fraction: float | None = None) -> bool:
+        """Stand at ``name`` and open it, by ``fraction`` of its joint's range (the scored atom's worth by default).
+
+        Reading the joint back afterwards is privileged, the way the oracle's masks are: the motion reports what
+        the joint says, and at evaluation that verdict would have to come from the hand's own travel and a fresh
+        look at the container.
+        """
+        from omnigibson.tiptop.articulation import OPEN_FRACTION_SCORED
+
+        try:
+            self.stand_for(name)
+        except Unreachable as e:
+            log.info(f"{name}: {e}; cannot reach it to open it")
+            self.records.append({"open": name, "error": str(e), "step": self.sim.n_steps})
+            return False
+        self.sim.video_caption = f"open {name}"
+        result = self.sim.open_container(
+            self.sim.arm, name, fraction=OPEN_FRACTION_SCORED if fraction is None else fraction
+        )
+        self.records.append({"open": name, **result, "step": self.sim.n_steps})
+        if not result.get("opened"):
+            log.info(f"{name} did not open: {result.get('why') or 'the joint did not move'}")
+        return bool(result.get("opened"))
+
+    def openable(self, name: str) -> bool:
+        """Whether ``name`` has a joint that opens at all (a bin and a basket do not)."""
+        from omnigibson.tiptop.articulation import openable_joints
+
+        try:
+            return bool(openable_joints(self.sim.scene_object(name)))
+        except Exception:
+            return False
+
+    def is_shut(self, name: str) -> bool:
+        """Whether every joint of ``name`` that could open is closed."""
+        from omnigibson.tiptop.articulation import is_open, openable_joints
+
+        try:
+            joints = openable_joints(self.sim.scene_object(name))
+        except Exception:
+            return False
+        return bool(joints) and not any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
+
     def stand_for(self, *names: str) -> dict:
         """Teleport the base to a pose from which the named objects are in the left arm's reach and in view. A
         second call for the same objects stands somewhere else; when nothing is found within the arm's usual

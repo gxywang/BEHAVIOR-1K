@@ -24,6 +24,7 @@ from pathlib import Path
 
 import yaml
 
+from omnigibson.tiptop.articulation import OPEN_FRACTION_REACH, OPEN_FRACTION_SCORED
 from omnigibson.tiptop.protocol import bddl_category
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,23 @@ def place_demand(options: list[list[dict]]) -> Demand:
     return demand
 
 
+def open_targets(goal: list[dict]) -> dict:
+    """Objects a goal wants open or shut: {name: True to open, False to close}.
+
+    ``open(x)`` asks for it open; the negation compiles to a flat ``not`` atom the way a switch-off goal does
+    (``['not', 'open', 'cabinet.n.01_1']``), and asks for it shut. 23 of the 100 challenge tasks score such an
+    atom directly.
+    """
+    out = {}
+    for atom_ in goal:
+        args = list(atom_.get("args", []))
+        if atom_.get("predicate") == "open" and args:
+            out[args[0]] = True
+        elif atom_.get("predicate") == "not" and len(args) >= 2 and args[0] == "open":
+            out[args[1]] = False
+    return out
+
+
 def press_targets(goal: list[dict]) -> list[str]:
     """The objects whose button the goal asks to be pressed, in goal order. A goal atom that asks for a switch to
     be *off* reaches the runner as ``not(toggled_on, x)`` (a HEAD's flat tokens; bddl compiles the negation into
@@ -184,7 +202,8 @@ class Runner:
     def run(self, ep) -> None:
         self.tries.clear()  # one instance's attempts say nothing about the next
         presses = press_targets(self.goal)
-        handled = (*PLACE_PREDICATES, "toggled_on", "holding")
+        opens = open_targets(self.goal)
+        handled = (*PLACE_PREDICATES, "toggled_on", "holding", "open")
         other = {
             a["predicate"]
             for a in self.goal
@@ -192,9 +211,14 @@ class Runner:
         }
         if other:
             log.warning(f"{self.spec.task}: no sub-plan for goal atoms {sorted(other)}; they are left alone")
+        for name, wanted_open in opens.items():
+            # A goal that asks for a container open (or shut) in its own right, rather than as the way into one.
+            # Before the transfers, since a container this goal wants open is very often the one they fill.
+            if ep.is_shut(name) == wanted_open:
+                ep.open_up(name, fraction=OPEN_FRACTION_SCORED if wanted_open else 0.0)
         if self.spec.plan in ("transfer", "auto") and self.demand.total():
             self.run_transfers(ep)
-        elif self.spec.plan == "transfer":
+        elif self.spec.plan == "transfer" and not opens:
             raise ValueError(f"{self.spec.task}: the goal has no inside/ontop atoms for the transfer plan")
         if self.spec.plan in ("press", "auto") and presses:
             for obj in presses:
@@ -289,6 +313,15 @@ class Runner:
     def transfer(self, ep, predicate: str, item: str, container: str, support: str) -> bool:
         if not self.free_hand(ep, support):
             return False
+        # A shut container has no inside to place into: its hull's top is the only surface a placement can find,
+        # which is how store_honey put its jar ON the cabinet (2026-09-13). Open it BEFORE picking anything up --
+        # the hand that pulls the drawer is the hand that would be carrying the item -- and open it far enough to
+        # reach in, which is a much longer stroke than the one that scores an `open` atom.
+        if ep.is_shut(container):
+            log.info(f"{container} is shut; opening it before fetching {item}")
+            if not ep.open_up(container, fraction=OPEN_FRACTION_REACH):
+                log.info(f"{container} would not open; {item} has nowhere to go")
+                return False
         if not ep.pick(item):
             return False
         if container == ep.floor:  # "on the floor": wherever the robot stands is the floor

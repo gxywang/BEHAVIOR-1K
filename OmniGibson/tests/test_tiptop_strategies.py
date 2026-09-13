@@ -29,13 +29,27 @@ def box(center, half=(0.05, 0.05, 0.05)):
 class FakeEpisode:
     """An episode whose rounds are scripted: which picks succeed, which places succeed, and where things are."""
 
-    def __init__(self, boxes, pick_ok=(), place_ok=(), unreachable=(), arms=("left", "right")):
+    def __init__(self, boxes, pick_ok=(), place_ok=(), unreachable=(), arms=("left", "right"), shut=(), opens_ok=True):
         self.boxes = dict(boxes)
         self.pick_ok, self.place_ok, self.unreachable = set(pick_ok), set(place_ok), set(unreachable)
         self.arms = set(arms)
         self.floor = "floor.n.01_1"
         self.hand = None
         self.calls = []
+        self.shut, self.opens_ok = set(shut), opens_ok
+
+    # articulated containers
+    def is_shut(self, name):
+        return name in self.shut
+
+    def openable(self, name):
+        return name in self.shut
+
+    def open_up(self, name, fraction=None):
+        self.calls.append(("open_up", name, fraction))
+        if self.opens_ok:
+            self.shut.discard(name)
+        return self.opens_ok
 
     # moving
     def stand_for(self, *names):
@@ -475,3 +489,43 @@ def test_an_unknown_predicate_is_not_counted_satisfied_just_because_a_round_ran(
 
     atoms = [{"predicate": "open", "args": ["cabinet.n.01_1"]}]
     assert Ran().satisfied(atoms, record={"round": 1}) is False
+
+
+# --------------------------------------------------------------- opening a container that is shut
+def test_a_shut_container_is_opened_before_the_item_is_picked_up():
+    """The hand that pulls the drawer is the hand that would be carrying the item, so the order matters."""
+    from omnigibson.tiptop.articulation import OPEN_FRACTION_REACH
+
+    ep = FakeEpisode(
+        {"jar.n.01_1": box((0.0, 0.0, 0.8)), "cabinet.n.01_1": box((1.0, 0.0, 0.5))},
+        pick_ok={"jar.n.01_1"},
+        place_ok={("jar.n.01_1", "cabinet.n.01_1")},
+        shut={"cabinet.n.01_1"},
+    )
+    goal = [atom("inside", "jar.n.01_1", "cabinet.n.01_1")]
+    Runner(STRATEGIES["store_honey"], goal, attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert "open_up" in kinds, "a shut container must be opened"
+    assert kinds.index("open_up") < kinds.index("pick"), "and opened before the hand is full"
+    opened = next(c for c in ep.calls if c[0] == "open_up")
+    assert opened[2] == OPEN_FRACTION_REACH, "far enough to reach in, not just far enough to score the atom"
+
+
+def test_a_container_that_will_not_open_is_not_filled():
+    ep = FakeEpisode(
+        {"jar.n.01_1": box((0.0, 0.0, 0.8)), "cabinet.n.01_1": box((1.0, 0.0, 0.5))},
+        pick_ok={"jar.n.01_1"},
+        place_ok={("jar.n.01_1", "cabinet.n.01_1")},
+        shut={"cabinet.n.01_1"},
+        opens_ok=False,
+    )
+    goal = [atom("inside", "jar.n.01_1", "cabinet.n.01_1")]
+    Runner(STRATEGIES["store_honey"], goal, attempts=1).run(ep)
+    assert "pick" not in [c[0] for c in ep.calls], "nothing should be picked up with nowhere to put it"
+
+
+def test_an_open_goal_atom_is_acted_on_rather_than_left_alone():
+    ep = FakeEpisode({"cabinet.n.01_1": box((1.0, 0.0, 0.5))}, shut={"cabinet.n.01_1"})
+    goal = [atom("open", "cabinet.n.01_1")]
+    Runner(STRATEGIES["store_honey"], goal, attempts=1).run(ep)
+    assert [c for c in ep.calls if c[0] == "open_up"], "an open atom should open something"
