@@ -587,10 +587,14 @@ Reading the options is cheap where it matters: the demand is complete after the 
 every container), and the read is capped at `GOAL_OPTIONS_READ` for goals with many (assembling_gift_baskets
 has 331,776, putting_away_toys 256, the two disposal tasks 1).
 
-**Reading a run.** `scripts/read_run.py runs/<dir> [log]` prints the score per instance, what was left
+**Reading a run.** `scripts/read_run.py runs/<dir> [log]` prints the score per instance, judges it against
+`baselines.json` (the best mean on record per task, and the run that produced it, so a regression is caught by
+reading the run rather than by remembering), and reports what was left
 unsatisfied, and the counts the pipeline writes about its own trouble: rounds executed and lost, blocked capture
-swings, an arm on the head camera's line of sight, views dropped for holding nothing but the robot, stances that
-framed nothing whole, and where each object a capture could not see actually was. No simulator, no GPU.
+swings **and which motion met the obstacle**, an arm on the head camera's line of sight, views dropped for holding
+nothing but the robot, stances that framed nothing whole, and where each object a capture could not see actually
+was. No simulator, no GPU. Update a `baselines.json` entry only when a run beats it on the same number of
+instances; the script says when a comparison is not like for like.
 
 **Testing a new task.** Run one or two instances first (`--instances 0` or `--instances 0 1`), look at the video
 and the round logs, and fix what shows; the ten-instance passes are for a pipeline the two tested tasks have

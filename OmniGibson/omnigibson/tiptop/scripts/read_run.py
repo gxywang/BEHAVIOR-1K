@@ -15,6 +15,7 @@ from pathlib import Path
 
 run = Path(sys.argv[1])
 log = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+BASELINES = Path(__file__).resolve().parent.parent / "baselines.json"
 
 summary = json.loads((run / "summary.json").read_text()) if (run / "summary.json").exists() else None
 if summary:
@@ -22,6 +23,17 @@ if summary:
         f"{summary['task']}: mean {summary['mean_q_score']:.4f} over {summary['instances']} instance(s), "
         f"{summary['successes']} complete"
     )
+    known = json.loads(BASELINES.read_text()).get(summary["task"]) if BASELINES.exists() else None
+    if known:
+        gap = summary["mean_q_score"] - float(known["mean"])
+        verdict = "BETTER than" if gap > 1e-9 else ("WORSE than" if gap < -1e-9 else "level with")
+        same = int(known.get("instance_count", -1)) == int(summary["instances"])
+        print(
+            f"  {verdict} the best on record ({float(known['mean']):.4f}, {known['run']}, "
+            f"instances {known['instances'] or '-'})"
+            + (f": {gap:+.4f}" if abs(gap) > 1e-9 else "")
+            + ("" if same else "   [different instances: not like for like]")
+        )
     for p in summary["per_instance"]:
         print(f"  {p['instance_id']}: {p['q_score']:.4f}  teleports {p['teleports']}  {p['wall_time_s']:.0f}s")
         print(f"      {p['what_failed']}")

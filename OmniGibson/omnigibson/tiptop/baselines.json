@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Best measured mean q_score per task, and the run that produced it. scripts/read_run.py compares a run",
+    "against this, so a regression is caught by reading the run rather than by remembering. Update an entry only",
+    "when a run beats it on the SAME instances -- a different instance set is a different measurement. Every",
+    "number here was taken with --knowledge oracle and sticky grasping, which the challenge does not allow; they",
+    "measure the planning and motion pipeline, not a submission.",
+    "instance_count is what read_run.py compares: a run over a different number of instances is not a like-for-like comparison, however its mean turns out."
+  ],
+  "turning_on_radio": {
+    "mean": 0.9,
+    "run": "pass 6",
+    "instances": "301-310",
+    "date": "2026-09-11",
+    "note": "ten instances; the button pose is oracle",
+    "instance_count": 10
+  },
+  "assembling_gift_baskets": {
+    "mean": 0.881,
+    "run": "runs/bench_baskets_pass6",
+    "instances": "301-310",
+    "date": "2026-09-11",
+    "note": "single instance best: 0.875 on 301 in the 2026-09-12 regression",
+    "instance_count": 10
+  },
+  "dispose_of_batteries": {
+    "mean": 0.375,
+    "run": "runs/bench_batteries_8",
+    "instances": "0 1",
+    "date": "2026-09-13",
+    "note": "0.25 and 0.50; the baseline it beat was 0.25 on both (runs/bench_batteries_5)",
+    "instance_count": 2
+  },
+  "putting_away_toys": {
+    "mean": 0.0,
+    "run": "runs/bench_toys_1",
+    "instances": "0",
+    "date": "2026-09-12",
+    "note": "first run of the task; no round placed a toy",
+    "instance_count": 1
+  },
+  "clean_up_broken_glass": {
+    "mean": 0.0,
+    "run": "not run yet",
+    "instances": "",
+    "date": "",
+    "note": "task file written, never benchmarked",
+    "instance_count": 0
+  }
+}
