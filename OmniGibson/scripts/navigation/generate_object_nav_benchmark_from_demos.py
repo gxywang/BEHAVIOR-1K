@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch as th
@@ -36,6 +37,7 @@ from generate_nav_benchmark import (
 )
 from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
 from omnigibson.macros import gm
+from omnigibson.utils.motion_planning_utils import astar
 
 
 DEFAULT_OUTPUT = "outputs/navigation/object_nav_benchmark.json"
@@ -69,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated candidate radii in meters around the target object.",
     )
     parser.add_argument("--angles-per-radius", type=int, default=36)
+    parser.add_argument(
+        "--extra-clearance",
+        type=float,
+        default=0.2,
+        help="Additional obstacle clearance in meters beyond OmniGibson's robot-base erosion.",
+    )
     parser.add_argument(
         "--start-source",
         choices=("tro-initial", "reconstructed-state", "reconstructed-action"),
@@ -297,17 +305,36 @@ def point_in_loaded_rooms(env: og.Environment, point: th.Tensor) -> bool:
     return env.scene.seg_map.get_room_instance_by_point(point[:2]) in rooms
 
 
-def shortest_path_distance(env: og.Environment, floor: int, start: th.Tensor, goal: th.Tensor) -> float | None:
-    _, distance = env.scene.get_shortest_path(floor, start[:2], goal[:2], entire_path=False, robot=env.robots[0])
-    if distance is None:
+def clearance_floor_map(env: og.Environment, floor_trav_map: th.Tensor, extra_clearance: float) -> th.Tensor:
+    if extra_clearance < 0:
+        raise ValueError("--extra-clearance must be non-negative")
+    if extra_clearance == 0:
+        return floor_trav_map
+
+    resolution = float(env.scene.trav_map.map_resolution)
+    kernel_size = int(math.ceil(extra_clearance / resolution))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return th.tensor(cv2.erode(floor_trav_map.cpu().numpy(), kernel))
+
+
+def clearance_path_distance(
+    env: og.Environment, trav_map: th.Tensor, start: th.Tensor, goal: th.Tensor
+) -> float | None:
+    if not point_is_free(env.scene, trav_map, start) or not point_is_free(env.scene, trav_map, goal):
         return None
-    return float(distance.item() if hasattr(distance, "item") else distance)
+    start_cell = tuple(env.scene.trav_map.world_to_map(start[:2]).tolist())
+    goal_cell = tuple(env.scene.trav_map.world_to_map(goal[:2]).tolist())
+    path = astar(trav_map, start_cell, goal_cell)
+    if path is None:
+        return None
+    path_world = env.scene.trav_map.map_to_world(path)
+    return float(th.sum(th.norm(path_world[1:] - path_world[:-1], dim=1)).item())
 
 
 def project_goal_near_object(
     env: og.Environment,
     floor_trav_map: th.Tensor,
-    floor: int,
+    clearance_trav_map: th.Tensor,
     start_position: list[float],
     object_pos: list[float],
     radii: list[float],
@@ -329,7 +356,7 @@ def project_goal_near_object(
                 continue
             if not point_in_loaded_rooms(env, point):
                 continue
-            distance = shortest_path_distance(env, floor, start, point)
+            distance = clearance_path_distance(env, clearance_trav_map, start, point)
             if distance is None or distance < min_distance or distance > max_distance:
                 continue
             candidates.append(
@@ -349,6 +376,7 @@ def project_goal_near_object(
 def build_episode(
     env: og.Environment,
     floor_trav_map: th.Tensor,
+    clearance_trav_map: th.Tensor,
     row: pd.Series,
     skill: dict[str, Any],
     target_name: str,
@@ -367,7 +395,7 @@ def build_episode(
     projection = project_goal_near_object(
         env=env,
         floor_trav_map=floor_trav_map,
-        floor=args.floor,
+        clearance_trav_map=clearance_trav_map,
         start_position=start_position,
         object_pos=object_pos,
         radii=args.radii,
@@ -382,6 +410,9 @@ def build_episode(
     goal_tensor = th.tensor(projection["goal_position"], dtype=th.float32)
     quat_tensor = th.tensor(start_quat, dtype=th.float32)
     if not episode_points_are_valid(env, floor_trav_map, start_tensor, goal_tensor, quat_tensor, args.settle_steps):
+        return None
+    settled_position, _ = env.robots[0].get_position_orientation()
+    if not point_is_free(env.scene, clearance_trav_map, settled_position[:2]):
         return None
 
     frame_duration = skill.get("frame_duration", [])
@@ -408,6 +439,7 @@ def build_episode(
         "target_bddl_instance": bddl_name,
         "target_object_position": [float(v) for v in object_pos],
         "goal_source": "nearest_traversable_point_near_tro_object_pose",
+        "extra_clearance": args.extra_clearance,
         **projection,
     }
 
@@ -448,6 +480,7 @@ def generate_task_episodes(
     skipped = {}
     trajectory_cache = {}
     floor_trav_map = eroded_floor_map(env.scene, args.floor, env.robots[0])
+    clearance_trav_map = clearance_floor_map(env, floor_trav_map, args.extra_clearance)
 
     for _, row in rows.iterrows():
         if len(episodes) >= args.num_episodes_per_task:
@@ -499,6 +532,7 @@ def generate_task_episodes(
                 episode = build_episode(
                     env=env,
                     floor_trav_map=floor_trav_map,
+                    clearance_trav_map=clearance_trav_map,
                     row=row,
                     skill=skill,
                     target_name=target_name,
@@ -544,6 +578,7 @@ def write_benchmark(path: Path, args: argparse.Namespace, robot_cfg: dict[str, A
                 "start_source": args.start_source,
                 "approach_radii": args.radii,
                 "angles_per_radius": args.angles_per_radius,
+                "extra_clearance": args.extra_clearance,
                 "episodes": episodes,
             },
             f,
