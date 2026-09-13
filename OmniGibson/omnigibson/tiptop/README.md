@@ -892,11 +892,17 @@ it does. `wrist_look` no longer takes the first offset that solves: every offset
 of the head camera's sight line is scored by how much of the arm passes within `ARM_RADIUS` of a scene mesh *along
 the path the ramp will follow*, and the roomiest is taken. Ranking cannot leave a capture with no look pose.
 
-**Nothing stopped a push.** The executor commanded every remaining target of a segment however far behind the arm
-had fallen, then leaned on its end for up to 90 more steps of `converge()`, then held the *commanded* endpoint for
-25 more while the gripper moved. All three now stop: a segment whose arm has been more than `EXEC_BLOCK_TOL`
-behind for `EXEC_BLOCK_STEPS` is abandoned, `converge()` gives up when the error stops improving, and a segment
-carries forward where the arm *is*.
+**Nothing bounded a push.** The executor commanded every remaining target of a segment however far behind the arm
+had fallen, and held the *commanded* endpoint for 25 more steps while the gripper moved. The obvious fix --
+abandon a segment the arm is not following -- was written and then refuted over the whole run corpus: 43 segments
+fall more than 0.1 rad behind and still end within 0.05 rad of target, 18 of those rounds recovered, and 10 earned
+an atom that is in the instance's final satisfied list (`Place(candle_2, wicker_basket_1)` at 0.96 rad of lag and
+0.0063 final). Breaking free is often how a placement lands. What replaced it bounds the force instead of giving
+up: `PlanExecutor._step` leashes the command to within `EXEC_LEASH` of where the arm actually is, so the drive's
+torque -- proportional to that difference -- is bounded, as is the wind-up that lets a lagging joint catch up at
+several rad/s and fling what it holds. A free joint never notices (healthy tracking error is 0.000-0.019 rad). A
+segment also now carries forward where the arm *is*, not where it was told to be, so a gripper event does not hold
+a pose the arm never reached for 25 steps.
 
 **One bad capture spent two strikes.** `capture()` counted a blocked swing twice -- once when the out-swing
 stopped, once when the arm was found short of ready afterwards, which a blocked swing causes almost by definition.
