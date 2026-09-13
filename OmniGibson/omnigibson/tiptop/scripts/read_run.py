@@ -47,6 +47,7 @@ if log and log.exists():
         "rounds executed": r"round \d+ .*: executed",
         "rounds lost to empty masks": r"\[\w+\]: GoalNotVisible",
         "rounds lost to planning": r"\[\w+\]: TiptopPlanningError",
+        "segments abandoned (arm not following)": r"so the rest of this segment is abandoned",
         "capture swings blocked": r"capture swing stopped against something",
         "arms blocked against something": r"stopped following the ramp",
         "arm on the camera's line of sight": r"stands between the head camera",
@@ -59,6 +60,23 @@ if log and log.exists():
     print("\n  from the log:")
     for name, n in counts.items():
         print(f"    {n:4d}  {name}")
+    capped = re.findall(
+        r"held a target for the whole budget \((\d+) steps, ([\d.]+) rad short\); it last got "
+        r"closer (\d+) step\(s\) before the end",
+        text,
+    )
+    if capped:
+        flat = [int(c[2]) for c in capped]
+        print(f"\n  converges that spent the whole budget: {len(capped)}")
+        print(
+            f"    of those, steps spent no longer getting closer: min {min(flat)}, median "
+            f"{sorted(flat)[len(flat) // 2]}, max {max(flat)}"
+        )
+        print(
+            "    (a large number means real pushing; a small one means it was still settling when the budget ran"
+            " out -- this is what an exit rule for converge() needs, see executor.converge)"
+        )
+
     motions = re.findall(r"stopped following the ramp .*?\[motion: ([^\]]+)\]", text)
     if motions:
         print("\n  which motion met the obstacle:")
