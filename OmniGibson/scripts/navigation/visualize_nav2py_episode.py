@@ -132,6 +132,7 @@ def restore_tro_state(env, episode):
     with open(template_path, "r", encoding="utf-8") as f:
         inst_to_name = json.load(f)["metadata"]["task"]["inst_to_name"]
 
+    print(f"Restoring TRO state from: {tro_path}")
     restored = []
     for bddl_name, state in tro_state.items():
         if bddl_name == "robot_poses" or not isinstance(state, dict):
@@ -147,8 +148,6 @@ def restore_tro_state(env, episode):
             position=th.tensor(root_link["pos"], dtype=th.float32),
             orientation=th.tensor(root_link["ori"], dtype=th.float32),
         )
-        obj.set_linear_velocity(th.zeros(3))
-        obj.set_angular_velocity(th.zeros(3))
         if state.get("non_kin"):
             obj.load_non_kin_state({"non_kin": state["non_kin"]})
         restored.append(object_name)
@@ -269,6 +268,9 @@ def main(argv=None):
         gate.wait_until_closed()
     except VisualizationClosed:
         print("\nVisualization closed.")
+    except Exception as exc:
+        print(f"\nVisualizer failed during setup or stepping: {type(exc).__name__}: {exc}")
+        raise
     finally:
         og.shutdown()
 
