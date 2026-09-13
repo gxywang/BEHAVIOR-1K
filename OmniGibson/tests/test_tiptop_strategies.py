@@ -16,6 +16,7 @@ from omnigibson.tiptop.strategies import (
     Unreachable,
     atom,
     place_demand,
+    press_targets,
     strategy_for,
 )
 
@@ -327,6 +328,15 @@ def test_a_full_hand_is_emptied_before_the_next_pick():
 
 
 # ---------------------------------------------------------------- presses
+def test_a_goal_that_asks_for_a_switch_to_be_off_is_a_press_too():
+    """bddl compiles "(not (toggled_on x))" into a ground atom whose tokens start with 'not'; the runner used to
+    drop it and do nothing (turning_out_all_lights_before_sleep, setting_the_fire)."""
+    off = [atom("not", "toggled_on", f"switch.n.01_{i}") for i in (1, 2)]
+    assert press_targets(off) == ["switch.n.01_1", "switch.n.01_2"]
+    assert press_targets([atom("toggled_on", "radio.n.01_1")]) == ["radio.n.01_1"]
+    assert press_targets([atom("inside", "a.n.01_1", "b.n.01_1")]) == []
+
+
 def test_a_press_that_holds_picks_first_and_presses_with_the_other_arm():
     ep = FakeEpisode({}, pick_ok={"radio.n.01_1"})
     strategy_for("turning_on_radio", [atom("toggled_on", "radio.n.01_1")]).run(ep)

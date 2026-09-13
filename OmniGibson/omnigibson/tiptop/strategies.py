@@ -104,6 +104,20 @@ def place_demand(options: list[list[dict]]) -> Demand:
     return demand
 
 
+def press_targets(goal: list[dict]) -> list[str]:
+    """The objects whose button the goal asks to be pressed, in goal order. A goal atom that asks for a switch to
+    be *off* reaches the runner as ``not(toggled_on, x)`` (a HEAD's flat tokens; bddl compiles the negation into
+    the ground atom) and is a press too: the press is open loop either way, and the switch starts in the state the
+    goal wants changed."""
+    targets = []
+    for a in goal:
+        if a["predicate"] == "toggled_on" and a["args"]:
+            targets.append(a["args"][0])
+        elif a["predicate"] == "not" and a["args"][:1] == ["toggled_on"] and len(a["args"]) > 1:
+            targets.append(a["args"][1])
+    return list(dict.fromkeys(targets))
+
+
 @dataclass
 class TaskSpec:
     """What a task says about itself (``tasks/<task>.yaml``): only what its BDDL definition does not say.
@@ -164,10 +178,9 @@ class Runner:
 
     def run(self, ep) -> None:
         self.tries.clear()  # one instance's attempts say nothing about the next
-        presses = [a["args"][0] for a in self.goal if a["predicate"] == "toggled_on"]
-        other = {
-            a["predicate"] for a in self.goal if a["predicate"] not in (*PLACE_PREDICATES, "toggled_on", "holding")
-        }
+        presses = press_targets(self.goal)
+        handled = (*PLACE_PREDICATES, "toggled_on", "holding")
+        other = {a["predicate"] for a in self.goal if a["predicate"] not in handled and a["args"][0] not in handled}
         if other:
             log.warning(f"{self.spec.task}: no sub-plan for goal atoms {sorted(other)}; they are left alone")
         if self.spec.plan in ("transfer", "auto") and self.demand.total():
