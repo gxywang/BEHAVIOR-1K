@@ -228,6 +228,16 @@ FLAT_COVERING_HEIGHT, GROUND_CLEARANCE = 0.08, 0.05  # m; boxes flatter than tha
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
+# What the robot folds to before the base teleports, and back out of afterwards. The footprint the stance search
+# guards is the BASE's, but the base is not what sticks out: with the challenge torso posture the arms' links sit
+# up to 0.43 m beyond the base's own rectangle (x 0.31..0.67 where the base ends at 0.24), so a stance whose base
+# is clear can still land an arm in the furniture. Measured over the URDF with Lula on 2026-09-13: turning
+# torso_joint2 from -1.7 to -2.25 -- one joint, 0.55 rad -- brings the whole upper body to within 0.07 m of the
+# base, and the joints beyond that buy nothing. Folding is cheap (about a second each way at the capture speed)
+# and it is the one moment the robot moves without the planner's collision checking, since a teleport does not
+# sweep: it materialises wherever it lands.
+TRAVEL_TORSO = {"torso_joint2": -2.25}
+TRAVEL_SETTLE_STEPS = 20  # after folding or unfolding: one joint moved, so it settles quickly
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -1270,9 +1280,51 @@ class R1ProSim(TiptopSim):
         self.look_names = tuple(names)
         return pose
 
+    def fold_for_travel(self) -> list | None:
+        """Fold the upper body over the base before a teleport; the joint targets to unfold back to, or None.
+
+        None when there is nothing to fold to yet (no posture applied) or when no folded joint is one this
+        embodiment plans. See ``TRAVEL_TORSO`` for why one joint is enough.
+        """
+        if self.q_home is None or not self.planned_joints:
+            return None
+        here = [float(v) for v in self.q_arm()]
+        folded = list(here)
+        moved = False
+        for joint, value in TRAVEL_TORSO.items():
+            if joint in self.planned_joints:
+                folded[self.planned_joints.index(joint)] = float(value)
+                moved = True
+        if not moved:
+            return None
+        blocked = self.ramp_to(folded, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS, note="fold for travel")
+        if blocked is not None:
+            log.warning(f"the fold before the teleport was stopped by {blocked[0]}; travelling as the robot stands")
+        return here
+
+    def unfold_after_travel(self, targets) -> None:
+        """Come back out of the travel fold at the new base pose."""
+        if targets is None:
+            return
+        blocked = self.ramp_to(
+            targets, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS, note="unfold after travel"
+        )
+        if blocked is not None:
+            log.warning(
+                f"unfolding after the teleport was stopped by {blocked[0]}: the posture the round works from is "
+                "not the one it asked for, and something is in the way of it here"
+            )
+
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
-        grasp assist along with the robot, so a carried object stays in the gripper."""
+        grasp assist along with the robot, so a carried object stays in the gripper.
+
+        The upper body is folded over the base first and unfolded afterwards (``fold_for_travel``): the stance
+        search guards the base's own rectangle, and with the working posture the arms sit up to 0.43 m beyond it,
+        so a stance whose base is clear can still land an arm in the furniture. A teleport does not sweep -- it
+        materialises the robot wherever it lands -- so the posture it lands in is the whole of the question.
+        """
+        unfold_to = self.fold_for_travel()  # the base's rectangle is honest only with the upper body over it
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
@@ -1290,6 +1342,7 @@ class R1ProSim(TiptopSim):
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
+        self.unfold_after_travel(unfold_to)
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
 
     def apply_posture(self, locked: dict, q_home, settle_steps: int = 30, tol: float = 0.03, joint_names=None) -> None:
