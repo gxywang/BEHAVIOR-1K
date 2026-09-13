@@ -140,6 +140,13 @@ SELF_MASK_FACES = (
 # first the arm can reach (Lula IK on the R1Pro URDF, 2026-09-10: the first alone reaches every test target in the
 # upright posture; with the torso leaning the second takes most, and the four together reach nine targets in ten)
 LOOK_OFFSETS = ((0.2, 0.3, -0.05), (0.1, 0.25, -0.1), (0.0, 0.25, -0.1), (0.1, 0.15, -0.3))
+# Where a held object is put so the head camera sees it (base frame, the y on the holding arm's side): about
+# 0.25 m ahead of the camera and 0.3 m below it, which is on the head camera's optical axis in the challenge
+# posture. Only used when the capture has no wrist view to look at the hand: at the ready posture the gripper is
+# below the head camera's frame, so a carry planned from head views alone has no picture of what it carries
+# (putting_away_toys with --views head_up head_down, 2026-09-12).
+PRESENT_POINT = (0.62, 0.18, 1.00)
+PRESENT_OFFSETS = ((0.0, 0.0, 0.0), (-0.06, 0.0, 0.05), (0.06, 0.0, -0.05), (0.0, 0.06, 0.0), (0.0, -0.06, 0.0))
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
@@ -1105,15 +1112,41 @@ class R1ProSim(TiptopSim):
         return float(ahead[0])
 
     # ---------------------------------------------------------------- observation
-    def arm_ik(self, arm: str) -> ArmIK:
-        """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for its
-        wrist camera's link."""
+    def arm_ik(self, arm: str, frame: str | None = None) -> ArmIK:
+        """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for
+        ``frame`` (its wrist camera's link by default)."""
         joints = list(self.robot.arm_joint_names[arm])
         q = self.robot.get_joint_positions()
         fixed = {
             name: float(q[i]) for name, i in self.joint_index.items() if name in self.urdf_joints and name not in joints
         }
-        return ArmIK(self.robot.urdf_path, joints, fixed, frame=CAMERA_LINKS[f"{arm}_wrist"])
+        return ArmIK(self.robot.urdf_path, joints, fixed, frame=frame or CAMERA_LINKS[f"{arm}_wrist"])
+
+    def present_held(self, arm: str, aabbs=None) -> np.ndarray | None:
+        """Joints of ``arm`` that hold what it is carrying in front of the head camera (``PRESENT_POINT`` on its
+        own side, the first of ``PRESENT_OFFSETS`` it reaches, clear of the base and of the scene), the gripper
+        keeping the orientation it grasped with so the object is not turned in the hand. None when no
+        configuration does."""
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
+        joints = list(self.robot.arm_joint_names[arm])
+        q = self.robot.get_joint_positions()
+        seed = [float(q[self.joint_index[j]]) for j in joints]
+        pose = self.eef_pose_base(arm)
+        quat_xyzw = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
+        side = 1.0 if arm == "left" else -1.0
+        base = np.array([PRESENT_POINT[0], side * PRESENT_POINT[1], PRESENT_POINT[2]], dtype=np.float64)
+        for offset in PRESENT_OFFSETS:
+            target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
+            solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.03, tolerance_rad=0.5)
+            if solution is None:
+                continue
+            blocked = self.links_in_base_box(arm, ik, solution) + self.links_in_scene(arm, ik, solution, aabbs)
+            if blocked:
+                log.info(f"{arm} arm: presenting at {np.round(target, 2).tolist()} puts {blocked}; skipped")
+                continue
+            log.info(f"{arm} arm: presenting what it holds at {np.round(target, 2).tolist()}")
+            return solution
+        return None
 
     def wrist_look(self, arm: str, target, aabbs=None) -> np.ndarray | None:
         """Joints of ``arm`` that point its wrist camera at ``target`` (base frame) from beside its own shoulder
@@ -1290,13 +1323,23 @@ class R1ProSim(TiptopSim):
         posture = dict(self.posture)  # the other arm's joints during the capture
         moved = {}  # arm -> {joint: value}
         aabbs = self.scene_aabbs()  # one snapshot for both arms' look configurations (nothing moves meanwhile)
+        views = (self.primary_view, *self.extra_views)
+        # A held object is seen by the other arm's wrist camera. With no wrist view in the capture there is
+        # nothing to look with, and at the ready posture the gripper sits below the head camera's frame, so the
+        # holding arm presents what it carries instead of staying put.
+        present = held_arms and not any(v.endswith("_wrist") for v in views)
         for arm in ("left", "right"):
-            if arm in held_arms or (arm != self.arm and f"{arm}_wrist" not in (self.primary_view, *self.extra_views)):
+            holding = arm in held_arms
+            if holding and not present:
+                continue
+            if not holding and arm != self.arm and f"{arm}_wrist" not in views:
                 continue
             joints = list(self.robot.arm_joint_names[arm])
-            q = self.wrist_look(arm, target, aabbs)
+            q = self.present_held(arm, aabbs) if holding else self.wrist_look(arm, target, aabbs)
             if q is not None:
                 moved[arm] = {j: float(v) for j, v in zip(joints, q)}
+            elif holding:
+                log.warning(f"{arm} arm: no configuration presents what it holds to the head camera; it stays put")
             elif arm == self.arm and any(j in self.look_arm for j in joints):
                 out = {j: float(self.look_arm[j]) for j in joints if j in self.look_arm}
                 q_now = self.robot.get_joint_positions()
