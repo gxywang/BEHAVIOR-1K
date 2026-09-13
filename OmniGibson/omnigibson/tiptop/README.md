@@ -147,6 +147,13 @@ false (the item landed outside the rim or fell); *released* = the last-resort op
     on both, so the wider margin cost a battery by pushing the search past the poses that work. What the two runs
     do say is that the failure is a property of the stance, not of the object, and that the retry from another
     pose recovers it every time.
+  - run 8 (`runs/bench_batteries_8`, instances 301 and 302, with the projection test for stances, the line-of-sight
+    filter for look poses and the empty-view guard): **0.25 and 0.50, mean 0.375** against run 5's 0.25 on both.
+    Seven rounds lost to empty masks where run 5 lost nine, six executed in both. Instance 302 placed two of its
+    three batteries; 301 still places one. Read it as one run of two instances, not as a fixed gain: the same
+    pipeline scored 0.25 twice before, and what separates 302's two placements from 301's one is a single battery.
+    The new counters earned their place -- the arm stood on the head camera's line of sight once, and three
+    stances were taken with the whole-object framing rule relaxed because nothing satisfied it.
   - **What it actually is (`runs/bench_batteries_7`, with the diagnostic of `log_missing_objects`).** The battery
     projects to pixel row **791 of a 720-row** head image: 71 pixels below the frame. In the left wrist view it
     lands inside the image but the depth there is 0.28 m while the battery is 0.95 m away, so something is in
