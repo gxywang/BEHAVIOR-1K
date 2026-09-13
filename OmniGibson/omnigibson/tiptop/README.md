@@ -938,14 +938,13 @@ would have cut those settles right before the fingers move. `converge()` now rec
 first / last / best error, the step it last got closer) so the rule can be chosen from a run instead of from
 reasoning.
 
-**The next one: the fallback sweep.** When no look pose is found for the planned arm, the bridge swings it out of
-view with `LOOK_ARM = {"left_arm_joint2": 2.0}` -- against a home of 0.2636, a **1.74 rad shoulder abduction that
-carries the whole arm across the room** -- and the only test on it is `links_in_scene` at the destination: the
-hand's links, as points, at the end of the motion. Nothing looks at what the arm sweeps through, and this is the
-motion that swept a battery off a desk. It is left for its own measurement because the obvious fix is a rejection,
-and a rejection here costs the wrist view that the capture needs (see "What was proposed and refused"). The shape
-that fits the evidence is the one used for look poses: try a range of sweep magnitudes and take the smallest that
-clears the head camera's line, ranked by what it passes near -- strictly less motion for the same purpose.
+**And the fallback sweep, the motion that swept a battery off a desk.** When no look pose is found for the planned
+arm, the bridge swung it out of view with `LOOK_ARM = {"left_arm_joint2": 2.0}` -- against a home of 0.2636, a
+**1.74 rad shoulder abduction that carries the whole arm across the room** -- tested only by `links_in_scene` at
+its destination. A rejection was not the answer (a capture without that swing keeps an arm on the camera's line),
+so the fix is the shape used for look poses: the swing's *purpose* is to clear the head camera's line, so it now
+tries 30%, 50%, 75% and only then the whole sweep, taking the first that clears the base, the scene and that line.
+Strictly less motion for the same purpose, and never a swing that was not already allowed.
 
 **What was found and not fixed.** The planner's collision world holds the task's own objects and one table slab;
 every other real thing in the room is absent, so cuTAMP plans through furniture it has never been told about. The
