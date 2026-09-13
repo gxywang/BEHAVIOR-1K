@@ -43,7 +43,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=1800)
-    parser.add_argument("--success-distance", type=float, default=0.5)
+    parser.add_argument("--success-distance", type=float, default=0.1)
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
         "--costmap-source",
