@@ -103,6 +103,11 @@ SHADOW_CAM = SHADOW_CAMS["head"]
 # (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
 # 0 robot pixels, no contact. Applied on top of q_home, joint name -> value.
 LOOK_ARM = {"left_arm_joint2": 2.0}
+# Fractions of that sweep to try, smallest first, when the planned arm has to be taken out of the head camera's
+# way and no look pose was found. The full sweep is a 1.74 rad shoulder abduction from the challenge home posture
+# that carries the whole arm across the room, and it is the motion that swept a battery off a desk (2026-09-12);
+# the purpose is only to clear the camera's line, so the smallest swing that does is taken instead.
+LOOK_ARM_FRACTIONS = (0.3, 0.5, 0.75, 1.0)
 LOOK_SETTLE_STEPS = 60
 # A capture posture is reached by ramping the joint targets at no more than this speed (rad/s), one interpolated
 # target per control step: a step change of the targets makes the position controller slam the arms, which shakes
@@ -1746,20 +1751,39 @@ class R1ProSim(TiptopSim):
             elif holding:
                 log.warning(f"{arm} arm: no configuration presents what it holds to the head camera; it stays put")
             elif arm == self.arm and any(j in self.look_arm for j in joints):
-                out = {j: float(self.look_arm[j]) for j in joints if j in self.look_arm}
+                ik = self.arm_ik(arm)
                 q_now = self.robot.get_joint_positions()
-                full = [out.get(j, float(q_now[self.joint_index[j]])) for j in joints]
-                blocked = self.links_in_scene(arm, self.arm_ik(arm), full, aabbs)
-                if blocked:
+                start = [float(q_now[self.joint_index[j]]) for j in joints]
+                chosen, why = None, "the arm is in the way and no swing clears it"
+                for fraction in LOOK_ARM_FRACTIONS:
+                    swung = [
+                        v + fraction * (float(self.look_arm[j]) - v) if j in self.look_arm else v
+                        for j, v in zip(joints, start)
+                    ]
+                    if self.links_in_base_box(arm, ik, swung):
+                        continue
+                    blocked = self.links_in_scene(arm, ik, swung, aabbs)
+                    if blocked:
+                        why = f"swinging it out of view puts {blocked}"
+                        continue
+                    if self.links_before_camera(arm, ik, swung, target):
+                        why = "the swing does not take it off the head camera's line"
+                        continue  # it is still in the way: swing further
+                    chosen, fraction_taken = swung, fraction
+                    break
+                if chosen is None:
                     log.warning(
-                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}, and swinging it out "
-                        f"of view puts {blocked}; it stays where it is"
+                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}, and {why}; it stays "
+                        "where it is"
                     )
                 else:
+                    touched, objects = self.path_contacts(arm, ik, start, chosen, aabbs)
                     log.warning(
-                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; swinging it out of view"
+                        f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; swinging "
+                        f"{fraction_taken:.0%} of the way out of view"
+                        + (f", passing within {ARM_RADIUS} m of {objects} at {touched} point(s)" if touched else "")
                     )
-                    moved[arm] = out
+                    moved[arm] = {j: float(v) for j, v in zip(joints, chosen)}
             else:
                 log.warning(
                     f"{arm} arm: no look configuration for {np.round(target, 2).tolist()}; it stays where it is"
