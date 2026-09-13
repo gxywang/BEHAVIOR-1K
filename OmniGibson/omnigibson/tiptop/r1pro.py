@@ -1119,9 +1119,11 @@ class R1ProSim(TiptopSim):
             # Two ways to take hold, tried in this order: pinch the top edge of the panel from above, which is the
             # only one that can work on the flat drawer fronts these assets have, then the middle of the leading
             # face, which is right when something protrudes there. No asset marks a handle.
-            for grip in OPEN_GRIPS:
-                where = handle_point(link_j, j["axis"], np.sign(t) or 1.0, grip=grip)
-                usable.append((float(np.linalg.norm(where - hand)), OPEN_GRIPS.index(grip), j, t, where, grip))
+            for grip_kind in OPEN_GRIPS:
+                where = handle_point(link_j, j["axis"], np.sign(t) or 1.0, grip=grip_kind)
+                usable.append(
+                    (float(np.linalg.norm(where - hand)), OPEN_GRIPS.index(grip_kind), j, t, where, grip_kind)
+                )
         if not usable:
             already = any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
             return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
@@ -1133,7 +1135,7 @@ class R1ProSim(TiptopSim):
         base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
         unit = th.tensor([0.0, 0.0, 0.0, 1.0])
         chosen = None
-        for _, _, joint, travel, handle_world, grip in usable:
+        for _, _, joint, travel, handle_world, grip_kind in usable:
             handle_base = self.to_base(th.tensor(handle_world, dtype=th.float32), unit)[0].cpu().numpy()
             axis_dir = self.to_base(th.tensor(joint["axis"], dtype=th.float32), unit)[0].cpu().numpy() - base_pos
             origin_base = self.to_base(th.tensor(joint["origin"], dtype=th.float32), unit)[0].cpu().numpy()
@@ -1147,16 +1149,16 @@ class R1ProSim(TiptopSim):
                 if first is not None:
                     log.info(
                         f"taking hold of {name}.{joint['name']} at {np.round(handle_world, 2).tolist()} "
-                        f"by its {grip} with grasp orientation {k}"
+                        f"by its {grip_kind} with grasp orientation {k}"
                     )
-                    chosen = (joint, travel, pose_matrix(handle_base, quat), axis_dir, origin_base, first, grip)
+                    chosen = (joint, travel, pose_matrix(handle_base, quat), axis_dir, origin_base, first, grip_kind)
                     break
             if chosen is not None:
                 break
-            log.info(f"{name}.{joint['name']}: no orientation reaches its {grip}; trying the next")
+            log.info(f"{name}.{joint['name']}: no orientation reaches its {grip_kind}; trying the next")
         if chosen is None:
             return {"opened": False, "why": f"no joint of {name} has a handle this arm can reach"}
-        joint, travel, start_pose, axis_dir, origin_base, first, grip = chosen
+        joint, travel, start_pose, axis_dir, origin_base, first, grip_kind = chosen
         path = follow_joint(start_pose, joint["kind"], axis_dir, origin_base, travel, steps=OPEN_PATH_STEPS)
         # Come at the handle from outside it. The handle point is the middle of the face that leads, so sending the
         # gripper straight there puts its fingers through the drawer front: the fourth smoke test reached the
@@ -1166,7 +1168,7 @@ class R1ProSim(TiptopSim):
         pull_unit = axis_dir * float(np.sign(travel) or 1.0)
         pull_unit = pull_unit / max(float(np.linalg.norm(pull_unit)), 1e-9)
         # An edge grip comes down onto the panel from above; a face grip comes in from outside, along the pull.
-        away = np.array([0.0, 0.0, 1.0]) if grip == "edge" else pull_unit
+        away = np.array([0.0, 0.0, 1.0]) if grip_kind == "edge" else pull_unit
         approach[:3, 3] = approach[:3, 3] + away * OPEN_APPROACH
         path = [approach] + path
         reached, blocked = 0, ""
