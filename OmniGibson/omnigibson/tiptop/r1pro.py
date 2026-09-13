@@ -165,10 +165,12 @@ WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so
 FLOOR_COVERINGS = ("floors", "ceilings", "paver", "carpet", "rug", "mat", "doormat", "tile")  # stood on, not avoided
 ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture is ~1.4
 ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
-CAMERA_MIN_MARGIN = 0.15  # added to where the bottom image edge meets an object's support: room to be whole.
-# 0.08 m was not enough for a small object: a battery 0.53 m ahead, where the bottom edge meets the desk at
-# 0.42 m, came out of two captures with an empty mask and cost the round both times (runs/bench_batteries_4 and
-# _5, round 1 at the same stance). The stance search has other candidates further back; this makes it take one.
+CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole.
+# Raised to 0.15 m on 2026-09-12 on the theory that a battery kept coming out of the capture with an empty mask
+# because it sat just past the frame's bottom edge, and put back: the wider margin moved the stance from 0.55 m
+# to 0.60 m and the mask was still empty (runs/bench_batteries_6 against _5), so the object is hidden at those
+# stances for another reason and the tighter margin only costs reach. What actually recovers the round is the
+# retry from a different pose, which finds the battery every time (493 mask pixels at the stance that works).
 
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
