@@ -873,7 +873,11 @@ class R1ProSim(TiptopSim):
                     if min(ahead) < MIN_AHEAD or min(side) < MIN_SIDE or max(dist) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
-                    if any(d < m for d, m in zip(dist, min_dists)):  # cut by the bottom of the head camera's frame
+                    # cut by the bottom of the head camera's frame. The measure is how far AHEAD the object is,
+                    # which is what camera_floor_distance returns; the radial distance flattered a stance with the
+                    # object off to one side, and a battery 0.48 m ahead of a base whose camera sits 0.44 m ahead
+                    # of it came out of the capture with an empty mask (2026-09-12, dispose_of_batteries).
+                    if any(a < m for a, m in zip(ahead, min_dists)):
                         rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
                         continue
                     # a container nearer than an item and in line with it hides the item (empty mask): keep their
