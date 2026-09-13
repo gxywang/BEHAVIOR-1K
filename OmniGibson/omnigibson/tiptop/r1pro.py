@@ -115,6 +115,7 @@ LOOK_SETTLE_STEPS = 60
 CAPTURE_MAX_JOINT_VEL = 0.6
 RAMP_BLOCK_TOL = 0.1  # rad: a ramped joint this far from its target is not following the ramp (blocked); logged
 RAMP_BLOCK_STEPS = 5  # consecutive steps behind that tolerance before the ramp calls it blocked and stops
+RAMP_MOVING_EPS = 1e-3  # rad: a joint whose target moves less than this over a ramp is being held, not ramped
 # A wrist camera's look configuration must keep these links of its arm (name suffixes) out of the base's box, inflated
 # by BASE_CLEARANCE: Lula IK knows no collisions, and with the torso leaning the first offset put the right hand on the
 # base top, where it stayed for the whole capture (2026-09-11, assembling_gift_baskets: finger and wrist-camera links
@@ -1692,8 +1693,17 @@ class R1ProSim(TiptopSim):
         path = joint_ramp(start, goal, CAPTURE_MAX_JOINT_VEL * self.dt)
         k = len(self.planned_joints)
         idx = [self.joint_index[j] for j in names]
-        ramped = np.array(["finger" not in j for j in names])  # the gripper command drives the fingers, not the ramp
+        # Only the joints this ramp actually MOVES can tell it it is blocked. The fingers are driven by the gripper
+        # command, not the ramp; and a joint whose target does not change is merely being held, so its lag measures
+        # whether it can hold itself -- an arm sagging against furniture, say -- not whether this motion is obstructed.
+        # Measured 2026-09-13 (putting_away_toys, runs/bench_toys_5): once a head view stopped commanding the arm to
+        # the nominal posture and held it where it stood, head-view ramps began reporting themselves blocked on
+        # left_arm_joint1/4/5/7 -- joints a head view does not move. Each such abort left the torso partway, and the
+        # round then died on "the torso did not return after the head views (off by 0.130 / 0.221 rad)".
+        moving = np.abs(np.asarray(goal) - np.asarray(start)) > RAMP_MOVING_EPS
+        ramped = moving & np.array(["finger" not in j for j in names])
         last, fastest, culprit, blocked, behind = np.asarray(start), 0.0, "", None, 0
+        sagged, sagged_joint = 0.0, ""  # the worst a HELD joint drifted from where it was asked to stay
         for i, q in enumerate(path):
             self.posture = {j: float(v) for j, v in zip(posture, q[k:])}
             self.step(q[:k], gripper)
@@ -1707,6 +1717,10 @@ class R1ProSim(TiptopSim):
             last = measured
             # One step behind is a graze the arm slips past (the right arm over the base does it on most basket
             # captures); RAMP_BLOCK_STEPS in a row is something the arm is not going to get past.
+            drift = np.where(~moving & np.array(["finger" not in j for j in names]), np.abs(measured - q), 0.0)
+            if drift.max() > sagged:
+                sagged = float(drift.max())
+                sagged_joint = names[int(drift.argmax())]
             behind = behind + 1 if lag.max() > RAMP_BLOCK_TOL else 0
             if behind >= RAMP_BLOCK_STEPS:
                 j = int(lag.argmax())
@@ -1725,6 +1739,11 @@ class R1ProSim(TiptopSim):
             self.posture = {j: float(v) for j, v in posture.items()}
             q_hold = [float(v) for v in q_arm]
         self.hold(settle_steps, gripper, q_arm=q_hold)
+        if sagged > RAMP_BLOCK_TOL:
+            log.warning(
+                f"{sagged_joint} drifted {sagged:.2f} rad from where it was asked to stay during this ramp "
+                f"({note or 'unnamed'}): it is not holding itself, though this motion does not move it"
+            )
         log.info(
             f"joints ramped over {len(path)} steps at up to {CAPTURE_MAX_JOINT_VEL} rad/s commanded, "
             f"{fastest:.2f} rad/s measured{culprit}, then {settle_steps} settle steps"
