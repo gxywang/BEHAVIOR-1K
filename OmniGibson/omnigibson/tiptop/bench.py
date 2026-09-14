@@ -184,7 +184,10 @@ class Episode:
     def stance_key(self) -> tuple:
         """Where the robot is standing, coarsely: 10 cm and 15 degrees. Two rounds run from the same spot see the
         same things, and two run from different spots do not, which is what the blind count has to distinguish."""
-        pos, quat = self.sim.robot.get_position_orientation()
+        try:
+            pos, quat = self.sim.robot.get_position_orientation()
+        except AttributeError:  # a runner driving this without a simulator (the strategy tests) has no stance
+            return None
         yaw = float(T.quat2euler(quat)[2])
         return (round(float(pos[0]) / 0.1), round(float(pos[1]) / 0.1), round(yaw / (np.pi / 12)))
 
@@ -353,10 +356,30 @@ class Episode:
         that stands on the floor."""
         if floor is None:
             floor = any(self.near_floor(a["args"][1]) for a in atoms if len(a["args"]) == 2)
-        for _ in range(self.rounds):
+        for attempt in range(self.rounds):
+            where = self.stance_key()
             record = self.plan_and_execute(atoms, arm=arm, floor=floor)
             if done() if done is not None else self.satisfied(atoms, record):
                 return True
+            # A round that could not see its goal executed nothing, so the scene is unchanged and the robot has
+            # not moved: capturing again from the same spot asks a question already answered, and pays the full
+            # price of a capture to hear the same answer. The masks come back identical to a pixel or two. Over
+            # the runs read on 2026-09-14 these repeats cost 13% of an episode of putting_away_toys and 38% of
+            # one of assembling_gift_baskets -- 45186 env steps across the corpus, several rounds' worth.
+            #
+            # The blind counter does not catch this any more: it counts DISTINCT stances, so a second look from
+            # the same one never increments it. That change was right for its own purpose (an object invisible
+            # from here may be visible from somewhere else) and wrong for this one.
+            if (
+                attempt + 1 < self.rounds
+                and str(record.get("error", "")).startswith("GoalNotVisible")
+                and where is not None
+                and self.stance_key() == where
+            ):
+                log.info(
+                    f"not capturing {atom_text(atoms)} again from the same spot: nothing moved and nothing was seen"
+                )
+                break
         return False
 
     def pick(self, bddl: str) -> bool:

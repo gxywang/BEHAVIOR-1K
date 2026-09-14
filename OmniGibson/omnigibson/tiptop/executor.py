@@ -24,6 +24,7 @@ EXEC_BLOCK_STEPS = 5  # consecutive steps behind before a segment says so in the
 # within 0.05 rad of their target, 18 of those rounds recovered, and 10 earned an atom that is in the instance's
 # final satisfied list -- including Place(candle_2, wicker_basket_1) at 0.96 rad of lag and 0.006 rad of final
 # error. Abandoning a segment on lag would have thrown those away (measured 2026-09-13 over the whole run corpus).
+TRAJECTORY_MIN_SPEED = 1.0  # rad/s: a planner segment slower than this is played faster (see plan_dt)
 EXEC_LEASH = 0.1
 CONVERGE_NO_PROGRESS = 1e-3  # rad: what counts as converge() having got closer, for the trace it records
 
@@ -103,6 +104,30 @@ def leash(q_target, q_measured, limit: float = EXEC_LEASH) -> np.ndarray:
     q_t = np.asarray(q_target, dtype=np.float64)
     q_m = np.asarray(q_measured, dtype=np.float64)
     return (q_m + np.clip(q_t - q_m, -limit, limit)).astype(np.float32)
+
+
+def plan_dt(step: dict, floor: float = TRAJECTORY_MIN_SPEED) -> float:
+    """The step time to play a planner trajectory at, never slower than planned and never faster than ``floor``.
+
+    Over 1862 saved planner segments the peak joint speed has a median of 0.33 rad/s and 54% of them peak below
+    0.5, so more than half of what the planner returns is a crawl. Every waypoint of a crawl is a simulator step,
+    and simulator steps are what an episode runs out of -- the good runs all end in "timeout", not in ideas.
+    Scaling a segment's clock changes only how fast its own path is played, never the path, so nothing about
+    collision or reachability changes; and the ceiling here is below the speed the planner already asks for in
+    its faster tenth (p90 1.52 rad/s), so this asks nothing of the drives they are not already doing.
+
+    This is not the capture speed cap, which exists because the user watched observation swings knock objects
+    about, and which stays where it is: that governs the bridge's own ramps through a scene it has not planned.
+    """
+    raw = step.get("positions")
+    positions = np.asarray([] if raw is None else raw, dtype=np.float64)  # `or []` is ambiguous for an ndarray
+    dt = float(step.get("dt") or 0.0)
+    if len(positions) < 2 or dt <= 0.0 or floor <= 0.0:
+        return dt
+    peak = float(np.abs(np.diff(positions, axis=0)).max()) / dt
+    if peak <= 0.0 or peak >= floor:
+        return dt
+    return dt * (peak / floor)
 
 
 class PlanExecutor:
@@ -212,7 +237,7 @@ class PlanExecutor:
         pressed = set()  # Push ops whose button has flipped: their remaining segments (the back-off) run unstopped
         for i, step in enumerate(plan["steps"]):
             if step["type"] == "trajectory":
-                traj = resample_trajectory(step["positions"], step["dt"], self.sim.dt)
+                traj = resample_trajectory(step["positions"], plan_dt(step), self.sim.dt)
                 start_gap = float(np.abs(traj[0] - self.sim.q_arm()).max())
                 pressing = step["label"].startswith("Push(") and step["label"] not in pressed
                 stop = self.press_done if (self.press_done is not None and pressing) else None

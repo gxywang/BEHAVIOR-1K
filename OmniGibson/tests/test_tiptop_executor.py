@@ -91,3 +91,28 @@ def test_a_leashed_command_still_reaches_its_target_when_the_arm_is_free():
     ex = executor(sim)
     err = ex.converge(np.array([1.0], dtype=np.float32), tol=0.01, max_steps=500)
     assert err < 0.01, "the leash advances with the arm, so a free joint still arrives"
+
+
+def test_a_crawling_planner_segment_is_played_faster_but_never_slower():
+    """Over half of what the planner returns is a crawl, and every waypoint of it costs a simulator step.
+
+    Measured over 1862 saved planner trajectory segments: the peak joint speed has a median of 0.33 rad/s and 54%
+    peak below 0.5, while the fastest tenth already reaches 1.52. Scaling a segment's clock changes how fast its
+    own path is played and nothing else -- not the path, so not collision or reachability (2026-09-14).
+    """
+    from omnigibson.tiptop.executor import TRAJECTORY_MIN_SPEED, plan_dt
+
+    # a crawl: one joint moving 0.01 rad per 0.1 s step = 0.1 rad/s
+    crawl = {"positions": [[0.0], [0.01], [0.02]], "dt": 0.1}
+    faster = plan_dt(crawl, floor=TRAJECTORY_MIN_SPEED)
+    assert faster < crawl["dt"], "a crawl is played faster"
+    assert np.isclose(faster, 0.1 * (0.1 / TRAJECTORY_MIN_SPEED)), "scaled exactly to the floor speed"
+
+    # already at or above the floor: untouched, so the executor never outruns the planner's own pace
+    brisk = {"positions": [[0.0], [0.2], [0.4]], "dt": 0.1}  # 2 rad/s
+    assert plan_dt(brisk, floor=TRAJECTORY_MIN_SPEED) == brisk["dt"]
+
+    # degenerate segments are returned as they are rather than divided by zero
+    assert plan_dt({"positions": [[0.0]], "dt": 0.1}, floor=1.0) == 0.1
+    assert plan_dt({"positions": [[0.0], [0.1]], "dt": 0.0}, floor=1.0) == 0.0
+    assert plan_dt({"positions": [[0.0], [0.0]], "dt": 0.1}, floor=1.0) == 0.1
