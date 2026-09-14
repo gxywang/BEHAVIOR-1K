@@ -150,7 +150,8 @@ def clearance_floor_map(env, floor_trav_map, extra_clearance):
         return floor_trav_map
 
     resolution = float(env.scene.trav_map.map_resolution)
-    kernel_size = int(math.ceil(extra_clearance / resolution))
+    radius_cells = int(math.ceil(extra_clearance / resolution))
+    kernel_size = 2 * radius_cells + 1
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     return th.tensor(cv2.erode(floor_trav_map.cpu().numpy(), kernel))
 

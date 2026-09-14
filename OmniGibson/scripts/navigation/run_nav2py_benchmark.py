@@ -268,7 +268,8 @@ def apply_extra_clearance(scene, trav_map, extra_clearance):
         return trav_map
 
     resolution = float(scene.trav_map.map_resolution)
-    kernel_size = int(math.ceil(extra_clearance / resolution))
+    radius_cells = int(math.ceil(extra_clearance / resolution))
+    kernel_size = 2 * radius_cells + 1
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     return th.tensor(cv2.erode(trav_map.detach().cpu().numpy(), kernel), device=trav_map.device, dtype=trav_map.dtype)
 
