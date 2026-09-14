@@ -243,14 +243,27 @@ AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from th
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # What the robot folds to before the base teleports, and back out of afterwards. The footprint the stance search
-# guards is the BASE's, but the base is not what sticks out: with the challenge torso posture the arms' links sit
-# up to 0.43 m beyond the base's own rectangle (x 0.31..0.67 where the base ends at 0.24), so a stance whose base
-# is clear can still land an arm in the furniture. Measured over the URDF with Lula on 2026-09-13: turning
-# torso_joint2 from -1.7 to -2.25 -- one joint, 0.55 rad -- brings the whole upper body to within 0.07 m of the
-# base, and the joints beyond that buy nothing. Folding is cheap (about a second each way at the capture speed)
-# and it is the one moment the robot moves without the planner's collision checking, since a teleport does not
-# sweep: it materialises wherever it lands.
-TRAVEL_TORSO = {"torso_joint2": -2.25}
+# guards is the BASE's, but the base is not what sticks out: with the challenge torso posture the arms sit up to
+# 0.41 m beyond the base's own rectangle (x -0.39..0.24, y -0.34..0.34), so a stance whose base is clear can still
+# land an arm in the furniture. A teleport does not sweep -- it materialises the robot wherever it lands -- so the
+# posture it lands in is the whole of the question.
+#
+# Measured on 2026-09-13 by ramping to each candidate and reading back both the overhang and whether the ramp
+# finished, in store_honey's kitchen:
+#
+#     working posture                      41.2 cm   -
+#     torso_joint2 = -2.25                 29.2 cm   BLOCKED (0.29 rad short, every teleport)
+#     arm_joint2 tucked                    36.9 cm   BLOCKED
+#     every planned arm joint to zero       9.5 cm   reached, no joint error
+#     arm joints to zero + torso -2.25     25.7 cm   BLOCKED
+#
+# So the arms are what matters and the torso fold is not worth having: straightening the arms over the base is
+# four times better and is the only candidate that actually arrives. An earlier comment here claimed the torso
+# fold brought the upper body "within 0.07 m of the base"; the direct measurement above refutes that, and the
+# blocked ramp it caused was reported on every teleport of every run ("the fold before the teleport was stopped
+# by torso_joint2; travelling as the robot stands") -- the robot was travelling with its arm out the whole time,
+# which the user saw in a video before this was measured.
+TRAVEL_POSE = 0.0  # every planned <arm>_arm_joint<n> goes here for the teleport; the torso is left alone
 FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
 # Room the stance search wants between the robot and everything it is not there to touch, and what a metre short
 # of it costs in the score. Without this the score is indifferent between standing 1 mm from a cabinet and 6 cm
@@ -1751,30 +1764,16 @@ class R1ProSim(TiptopSim):
         """Fold the upper body over the base before a teleport; the joint targets to unfold back to, or None.
 
         None when there is nothing to fold to yet (no posture applied) or when no folded joint is one this
-        embodiment plans. See ``TRAVEL_TORSO`` for why one joint is enough.
+        embodiment plans. See ``TRAVEL_POSE`` for the measurement that chose it.
         """
         if self.q_home is None or not self.planned_joints:
             return None
         here = [float(v) for v in self.q_arm()]
         folded = list(here)
         moved = False
-        for joint, value in TRAVEL_TORSO.items():
-            if joint in self.planned_joints:
-                # Keep the fold inside the joint's own limits. The target was worked out over the URDF, and asking
-                # for a hair past the stop leaves the joint sitting against it, permanently behind its command --
-                # which the ramp reads as "pushing against something" and reports as a blocked fold. Every teleport
-                # in assembling_gift_baskets 301 logged exactly that (2026-09-13).
-                limits = self.robot.joints.get(joint)
-                if limits is not None:
-                    low, high = float(limits.lower_limit), float(limits.upper_limit)
-                    clamped = min(max(float(value), low), high)
-                    if abs(clamped - float(value)) > 1e-6:
-                        log.info(
-                            f"fold for travel: {joint} asked for {value:+.3f}, its limits are "
-                            f"[{low:+.3f}, {high:+.3f}], folding to {clamped:+.3f}"
-                        )
-                    value = clamped
-                folded[self.planned_joints.index(joint)] = float(value)
+        for index, joint in enumerate(self.planned_joints):
+            if "_arm_joint" in joint:
+                folded[index] = float(TRAVEL_POSE)
                 moved = True
         if not moved:
             return None

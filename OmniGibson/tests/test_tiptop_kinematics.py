@@ -14,7 +14,7 @@ from omnigibson.tiptop.kinematics import (
     matrix_pose,
     pose_matrix,
 )
-from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, R1ProSim, turned_joints
+from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, TRAVEL_POSE, R1ProSim, turned_joints
 
 URDF = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro/urdf/r1pro.urdf"
 LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 8)]
@@ -478,3 +478,25 @@ def test_grasp_target_jaw_is_square_to_the_approach():
         assert np.isclose(float(np.linalg.det(rot)), 1.0, atol=1e-9)
         jaw_world = rot @ np.array([0.0, 1.0, 0.0])
         assert abs(float(jaw_world @ approach)) < 1e-9
+
+
+def test_the_travel_pose_straightens_the_arms_and_leaves_the_torso():
+    """The teleport pose is the arm joints at zero, not a torso fold, and the reason is measured.
+
+    Ramping to each candidate in store_honey's kitchen and reading back both the overhang past the base's own
+    rectangle and whether the ramp finished gave: working posture 41.2 cm; torso_joint2 = -2.25 29.2 cm and
+    BLOCKED; arm_joint2 tucked 36.9 cm and BLOCKED; every planned arm joint to zero 9.5 cm, reached with no joint
+    error; arm joints to zero plus the torso fold 25.7 cm and BLOCKED (2026-09-13). The torso fold had been in the
+    pipeline and was reported blocked on every teleport of every run, so the robot travelled with its arm out.
+    """
+    planned = ["torso_joint1", "torso_joint2", "torso_joint3", "torso_joint4"] + [
+        f"left_arm_joint{n}" for n in range(1, 8)
+    ]
+    here = [1.2, -1.7, -0.9, 0.0, -1.631, 0.264, -1.812, -1.458, -0.051, -0.373, -1.319]
+    folded = list(here)
+    for i, joint in enumerate(planned):
+        if "_arm_joint" in joint:
+            folded[i] = float(TRAVEL_POSE)
+    assert folded[:4] == here[:4], "the torso is left exactly as it was"
+    assert all(v == 0.0 for v in folded[4:]), "every arm joint goes to the travel pose"
+    assert TRAVEL_POSE == 0.0
