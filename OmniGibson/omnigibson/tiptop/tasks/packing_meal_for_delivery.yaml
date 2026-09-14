@@ -1,0 +1,30 @@
+# Three takeaway meals bagged and stacked, all on one kitchen countertop. Start (:init): three wrapped hamburgers
+# lie on a tray, and the tray, three sacks and one storage container all stand ontop countertop.n.01_1; the agent
+# is on the kitchen floor. Goal: a forpairs pairing each hamburger with a sack of its own (inside), and a forall
+# putting every sack ontop storage_container.n.01_1 -- six place atoms, none true at the start. The tray is named
+# only in :init; no goal atom touches it. Nothing is toggled, and neither sack.n.01 nor storage_container.n.01 is
+# openable in synsets.csv (both are fillable), so there is no lid or flap: "inside a sack" is a drop through its
+# open top, and "ontop the storage container" is the box's outer top face.
+#
+# The order matters, because a sack is both a container and an item: it takes a hamburger and then has itself to
+# be carried onto the box. Move it first and it is an empty bag; move it last and the burger rides along inside
+# an 0.05 kg bag held by its rim.
+#
+# Hard for a parallel jaw that opens to 8 cm:
+#  - wrapped_hamburger has one asset (rerdmy), 9.2 x 10.2 x 5.0 cm. Lying flat on the tray, both horizontal axes
+#    are wider than the jaw; the only axis that fits is the 5.0 cm thickness, which the fingers can only span by
+#    coming in from the side and closing vertically, not with a top-down pinch.
+#  - the sacks are paper_bag assets: 10-14 cm by 15-29 cm in footprint and 20-51 cm tall, so wider than the jaw
+#    across both horizontal axes -- the hold is the rim or one wall pinched between the fingertips. At 0.05 kg
+#    they are the lightest things the runner has picked, so a closing finger pushes or tips a bag as easily as it
+#    grips it. They are annotated rigidBody, so they keep their shape and do not slump.
+#  - dropping a burger into a bag means clearing a rim 20-51 cm above the countertop, higher than any container
+#    the runner has released into so far.
+#  - the destination is not a plane but an object: the storage_box assets are 20 x 20 to 40 x 41 cm across and
+#    5.7 to 21 cm tall, and three bags with 10-14 x 15-29 cm footprints have to share that top face.
+#  - neither end is free: the burgers start on a tray (most tray assets are 1-4 cm tall, so nearly flush) standing
+#    on a countertop, and SUPPORT_CATEGORIES is (table, floor), so neither the tray nor the countertop reaches the
+#    planner as the support plane under the objects.
+task: packing_meal_for_delivery
+instruction: put a wrapped hamburger in each of the three paper bags and put the bags on the storage box
+plan: transfer  # no toggled_on and no open atom in the goal; all six atoms are a pick, a carry and a place

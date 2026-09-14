@@ -1,0 +1,24 @@
+# Thirteen vegetables out of two wicker baskets on the kitchen floor and into three mixing bowls on the kitchen
+# countertop, sorted by kind. One basket holds three bok choy and three ears of sweet corn; the other, 2.7 m
+# along the same wall, holds three vidalia onions, two broccoli and two leeks; inside each basket the items lie
+# piled on one another (z 0.04 to 0.13 in a basket 30 x 45 x 19 cm). The three bowls stand on the countertop at
+# z 0.96, about 3.5 m across the kitchen from the baskets, so every item is a pick at floor level, a base move
+# and a place at counter height. Nothing to open, nothing to press, one room throughout.
+# The goal is three independent "exists a mixing bowl": one bowl holding all three bok choy AND all three
+# onions, one holding both leeks AND both broccoli, one holding all three sweet corn. No bowl is named, so the
+# bowls are interchangeable -- but a group split across two bowls satisfies none of its exists, and the bok
+# choy/onion bowl has to take six items.
+# Hard for a parallel jaw that opens to 8 cm (sizes are this instance's models, at their instance scale):
+#  - bok choy, 17 x 12.4 x 10.3 cm: wider than the jaw on every axis, so only a stalk or a leaf can be pinched,
+#    and it is a leafy head rather than a solid block.
+#  - broccoli, 9 x 9 x 6 cm: over the jaw's width on two axes; only the ~6 cm span fits.
+#  - vidalia onion, 10 x 7 x 7 cm: fits across its short axes with about a centimetre to spare, and it is a
+#    smooth bulb.
+#  - leek, 31 x 5.5 x 3.8 cm, and sweet corn, 26 x 5.7 x 5.7 cm: thin enough for the jaw but long, so they have
+#    to be lowered into a bowl 36 x 32 cm across and 16.5 cm deep without catching the rim.
+#  - picks come out of a basket where the vegetables rest on each other, so a pick can drag its neighbours, and
+#    each place goes into a bowl that already holds what went in before it.
+task: sorting_vegetables
+instruction: put the bok choy and vidalia onions in the same mixing bowl, the leeks and broccoli together in a second mixing bowl, and the sweet corn in a third mixing bowl
+plan: transfer
+attempts_per_item: 1  # thirteen items; two tries each would not fit the step budget

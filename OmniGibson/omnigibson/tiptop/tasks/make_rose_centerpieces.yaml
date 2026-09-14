@@ -1,0 +1,27 @@
+# Four objects in a living room, all four starting (ontop ... cabinet.n.01_1): one vase and three roses. The
+# goal puts each of the three roses inside the vase and the vase ontop the coffee table, which is already in
+# the room -- four places in all, three into a container and one onto a surface. Nothing is toggled, nothing
+# starts inside a closed container, so no press and no open is needed.
+#
+# The vase is both an item to be placed and the container the other three go into, which is the one thing about
+# this task that is not in the other transfer tasks: the two halves of the goal interact. Put the roses in
+# first and the vase has to be carried to the coffee table with three stems standing in it; move the vase first
+# and every rose is a carry from the cabinet to the coffee table instead of a short hop on the same surface.
+# The runner picks the order from the demand table, not from here.
+#
+# Hard for a parallel jaw that opens to 8 cm:
+#   - A rose is a long thin stem with a head on one end: narrow enough for the jaw anywhere along the stem, but
+#     the grasp is far from the centre of mass whichever end is taken, and the flower head is the widest part.
+#     Rose assets are the floppy-adjacent kind of object -- a thin shaft that leaves the hand's contact patch
+#     small and the carry pose easy to lose.
+#   - "inside the vase" is a drop through a narrow neck, not a placement on an open plane: the release has to
+#     line the stem up over an opening only somewhat wider than the stem, three times.
+#   - The vase's body is wider than the jaw for most vase assets, so the hold is the rim or the neck, and it has
+#     to stay upright through the carry both for "ontop the coffee table" to read and (if the roses go in first)
+#     to keep the roses inside it.
+#   - The start surface is a cabinet, which is not one of SUPPORT_CATEGORIES (tables and floors), so the
+#     planner does not get that plane for free; the destination, a coffee table, is.
+task: make_rose_centerpieces
+instruction: put the roses in the vase and the vase on the coffee table
+plan: transfer  # no toggled_on atom in the goal; all four atoms are a pick, a carry and a place
+attempts_per_item: 2  # 4 places, well inside the step budget

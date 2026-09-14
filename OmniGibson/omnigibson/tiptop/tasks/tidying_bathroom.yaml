@@ -1,0 +1,40 @@
+# Four items, four different destinations, all in one hotel bathroom (hotel_suite_large, task instance
+# tidying_bathroom_0): the bar of soap onto the soap dish, the tissue dispenser onto the sink, the roll of
+# toilet paper onto the toilet, and the cork into the trash can. Start (:init): soap, soap dish and cork are
+# ontop the sink; the tissue dispenser, the toilet paper and the trash can are ontop the floor. The sink, the
+# toilet and the shelf are fixed room objects (the shelf is named in :objects but no goal atom touches it).
+# Every goal atom is false at start, so all four transfers have to be made. Each item has its OWN container --
+# nothing is interchangeable, so the instruction names all four pairs.
+#
+# New ground: the first task where a goal container is itself a small loose object standing on another object's
+# top (the soap dish, 0.15 kg, resting on the sink counter), and the first where three of the four destinations
+# are not floors, bins or tables but fixtures: a wall-mounted vanity, a toilet, and a tray.
+#
+# Geometry, from the assets the instance loads (bbox_size in misc/metadata.json, scale applied):
+#  - bar_soap feqemg: 11.3 x 8.9 x 6.1 cm, 0.18 kg, lying flat on the counter at z 0.82.
+#  - soap_dish ownvqj: 18.1 x 13.4 x 3.2 cm, 0.15 kg, a shallow tray, loose on the counter.
+#  - cork ncxgpe: 1.8 x 1.8 x 3.4 cm, 15 g, on the counter.
+#  - toilet_paper phrpmu: 9.4 x 9.2 x 11.5 cm roll, 0.17 kg, on the floor.
+#  - tissue_dispenser ypekre: 11.1 x 23.2 x 12.0 cm box, 0.5 kg, on the floor.
+#  - trash_can dnvpag: 35 x 34 x 36 cm, one link, no lid and no openable joint -- an open-topped bin on the floor.
+#  - wall_mounted_sink jbborl: a 2.57 m long fixed vanity; the counter the three items rest on is at z ~0.79.
+#  - toilet aapttl: fixed, scaled to about 0.69 x 0.41 x 0.87 m; its seat lid and tank lid are separate links
+#    and the highest flat surface is the tank lid, roughly 0.37 x 0.30 m at z ~0.85.
+# The 300 instances re-draw the poses of the movable objects inside the bathroom; the models above do not change.
+# The room is about 5 x 2.6 m and the two groups start apart -- the sink wall on one side, the floor items, the
+# trash can and the toilet on the other -- so most transfers cross the room.
+#
+# Hard for a parallel jaw that opens to 8 cm:
+#  - tissue_dispenser is wider than the jaw on EVERY axis (11.1 cm is its narrowest), so no pinch across it fits,
+#    and it has to be lifted from the floor up onto the 0.79 m counter.
+#  - toilet_paper is also over 8 cm on every axis (a 9.2-9.4 cm roll, 11.5 cm tall); it is soft paper around a
+#    hollow core, so the fingers can compress it, but a rigid-width grasp does not fit.
+#  - bar_soap lies flat, so both of its horizontal axes (11.3 and 8.9 cm) exceed the opening; only a grasp that
+#    closes on its 6.1 cm height fits, which means getting fingers under a bar lying flush on a counter.
+#  - cork is the smallest object in any task description here: 1.8 cm across, 15 g, to be seen and pinched at
+#    counter height and then released over a 35 cm bin on the floor.
+#  - the soap's 11.3 x 8.9 cm footprint in an 18.1 x 13.4 cm tray leaves about 3 cm of margin per side, and the
+#    tray is loose, so a contact on release can slide the container out from under the item.
+task: tidying_bathroom
+instruction: put the bar of soap on the soap dish, the tissue dispenser on the sink, the toilet paper on the toilet and the cork in the trash can
+plan: transfer

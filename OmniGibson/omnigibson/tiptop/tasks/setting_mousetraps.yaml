@@ -1,0 +1,20 @@
+# Four mousetraps, all four standing on top of one bathroom cabinet, to be set out on that bathroom's floor with
+# two of them at the sink. Everything -- traps, cabinet, sink, floor -- is inroom bathroom, so nothing changes room.
+# The goal has two parts over the same four objects: (exists floor)(forall mousetrap) ontop floor, and
+# (exists sink)(forn 2 mousetrap) under-or-nextto that sink. "under" is not one of the runner's place predicates,
+# so of the two branches only nextto is something a pick-carry-release can act on; the demand it reads is four
+# traps onto the floor and two beside the sink, six placements for four items. Both the floor and the sink are
+# exists-bound, hence "the same" for each in the instruction: four traps split over two bathroom floors, or two
+# traps beside two different sinks, score nothing.
+# Nothing to open, nothing to press.
+# In the challenge instance (house_double_floor_upper) the bathroom holds exactly one floor and one sink, and the
+# traps start at z 0.886 spread over a 0.40 x 1.18 m cabinet top (bottom_cabinet jhymlr, scaled, top at ~0.88 m);
+# the sink (furniture_sink ojjqku, 0.50 x 1.20 x 0.71 m) is ~4.3 m away across the room. So every trap is a pick
+# at counter height, a carry the width of the bathroom, and a release at floor level.
+# Hard for a parallel jaw that opens to 8 cm: the one mousetrap model (mwfwsv) measures 10.8 x 5.0 x 1.8 cm. The
+# 10.8 cm long axis does not fit the jaw, so the only span left is the 5 cm width, and the trap is a 1.8 cm-thick
+# flat slab lying flush on the cabinet top -- little room beside or under it for a finger, the clearance problem
+# laying_tile_floors runs into. The traps also sit well in from the cabinet's front edge.
+task: setting_mousetraps
+instruction: put all four mousetraps on the same bathroom floor, two of them next to the same sink
+plan: transfer

@@ -1,0 +1,32 @@
+# Four dirty dishes -- two bowls and two plates -- off one diner booth table and into one kitchen sink. The
+# :init puts all four ontop booth.n.01_1 (inroom dining_room) and the goal is two foralls, every bowl and every
+# plate inside sink.n.01_1 (inroom kitchen): one named container takes all four, no pairing, no interchangeable
+# containers, four inside atoms. Nothing to open, nothing to press. The dirt and stain covering the dishes are
+# init-only; the goal never asks for them to be cleaned.
+#
+# From the sampled instance (datasets/2026-challenge-task-instances, scene restaurant_diner,
+# restaurant_diner_task_putting_dirty_dishes_in_sink_0_0_template.json):
+#  - sink.n.01_1 is commercial_kitchen_sink_xecfyh_0, a fixed floor-standing commercial sink whose bbox is
+#    0.71 x 1.36 x 0.99 m, so its rim sits at about z 0.99 -- higher than any placement the pipeline has done so
+#    far (store_honey's countertop top was 0.85, the bucket and boxes are at floor level). "Inside" it is a drop
+#    into an open basin, with no door and no lid, but the release has to clear a rim a metre up. A shelf
+#    (shelf_xuhsfd_1) hangs centred at z 1.91 about 0.6 m to one side of the sink, above the working area.
+#  - booth.n.01_1 is booth_xzrpar_2, a fixed booth table 0.69 x 1.31 x 0.76 m with the dishes resting on its top
+#    at z 0.77-0.78. Two bench_xwphjd seats stand 0.6 m clear of its two x sides, so the table is approachable
+#    from its ends (the y axis) and the four dishes cluster in the open half, y -8.51 to -8.91 against a table
+#    spanning y -9.76 to -8.45. label_category("booth") is not in SUPPORT_CATEGORIES (table, floor), so the
+#    planner does not get the plane the dishes stand on for free -- the same gap as store_honey's countertop.
+#  - The two ends are in different rooms and about 14.8 m apart in plan (booth at x 0.12, y -9.11; sink at
+#    x -10.78, y 0.92), the longest carry in the set; the robot starts between them at x -0.59, y -4.82.
+#
+# Jaw, which opens to 8 cm: neither dish can be spanned across its face.
+#  - plate lkomhp is 16.9 x 17.6 x 2.8 cm, a flat disc twice too wide across either face dimension; the only
+#    dimension inside the jaw is the 2.8 cm rim, and a plate lying flush on a table top leaves little clearance
+#    under it for a finger (the same shape as laying_tile_floors' tiles, one centimetre thicker).
+#  - bowl fiarri is 11.7 x 10.5 x 6.0 cm, wider than 8 cm across both horizontal axes, so there is no
+#    across-the-bowl grip either; what fits is the 6.0 cm height, i.e. pinching the wall or the rim.
+#  - Both categories are breakable in the taxonomy, and the last dishes go into the basin on top of dishes
+#    already in it.
+task: putting_dirty_dishes_in_sink
+instruction: put the bowls and the plates in the sink
+plan: transfer

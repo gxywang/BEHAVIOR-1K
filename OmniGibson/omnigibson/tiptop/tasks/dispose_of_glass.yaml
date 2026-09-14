@@ -1,0 +1,17 @@
+# Four water glasses off a bathroom sink into the trash can, which stands on a bedroom floor. All four start
+# ontop sink.n.01_1 and the goal is a single forall -- every water glass inside ashcan.n.01_1, the one bin the
+# task names, so there is nothing to split and nothing to open. The robot starts on the bathroom floor, so each
+# glass is carried out of the room it was picked up in.
+# In the challenge instance (hotel_suite_large) the sink is a wall_mounted_sink 2.57 m long standing against a
+# wall, reachable from one side only; the glasses stand on its top at z 0.87 (base about 0.80 m), spread over
+# roughly 2 m of its length, so the four picks come from more than one stance. The trash can is 0.38 m across
+# and 0.42 m tall, open-topped, and its place on the bedroom floor moves from instance to instance -- 3 to 7 m
+# from the sink -- so every release is a fresh navigation and a low reach over the rim.
+# Hard for a jaw that opens to 8 cm: the glass (model evaida) is 8.25 cm across on BOTH horizontal axes (8.4 cm
+# collision hull) and 15.5 cm tall, so it is wider than the fingers open and there is no grasp around the body;
+# what the fingers can close on is the thin rim or wall. It is open-topped and much taller than it is wide, so
+# it has to stay roughly upright on the carry and be lowered over the bin's rim to land inside. Its base link is
+# tagged "glass" -- transparent, unlike the cans and boxes of the earlier transfer tasks.
+task: dispose_of_glass
+instruction: put the water glasses in the trash can
+plan: transfer
