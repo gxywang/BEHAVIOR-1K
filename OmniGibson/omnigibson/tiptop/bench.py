@@ -23,6 +23,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
 from omnigibson.tiptop.protocol import bddl_category
@@ -43,7 +44,7 @@ log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
 STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
-BLIND_LIMIT = 3  # captures in a row that fail to see a goal object before the runner stops trying for it
+BLIND_LIMIT = 3  # DISTINCT stances a goal object must be invisible from before the runner stops trying for it
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
 UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
 FLOOR_LEVEL = 0.15  # m: a target whose bottom is lower than this stands on the floor (the workspace reaches down)
@@ -124,7 +125,7 @@ class Episode:
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
         self.rounds = args.rounds
         self.records = []  # one per round, in order
-        self.blind = {}  # goal object -> captures in a row that could not see it (BLIND_LIMIT gives up on it)
+        self.blind = {}  # goal object -> the distinct stances it could not be seen from (BLIND_LIMIT gives up)
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
         self.floor = sim.floor_name()
 
@@ -171,6 +172,13 @@ class Episode:
         except Exception:
             return False
         return bool(joints) and not any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
+
+    def stance_key(self) -> tuple:
+        """Where the robot is standing, coarsely: 10 cm and 15 degrees. Two rounds run from the same spot see the
+        same things, and two run from different spots do not, which is what the blind count has to distinguish."""
+        pos, quat = self.sim.robot.get_position_orientation()
+        yaw = float(T.quat2euler(quat)[2])
+        return (round(float(pos[0]) / 0.1), round(float(pos[1]) / 0.1), round(yaw / (np.pi / 12)))
 
     def stand_for(self, *names: str) -> dict:
         """Teleport the base to a pose from which the named objects are in the left arm's reach and in view. A
@@ -235,14 +243,14 @@ class Episode:
         # (2026-09-13). The strategy's per-item cap does not cover this: it counts transfers, and each failed
         # transfer starts put-down rounds on the same unseeable object. Giving up on the object frees the budget
         # for atoms that can still be had; seeing it once anywhere clears the count.
-        unseeable = [o for o in atom_objects(atoms) if self.blind.get(o, 0) >= BLIND_LIMIT]
+        unseeable = [o for o in atom_objects(atoms) if len(self.blind.get(o, ())) >= BLIND_LIMIT]
         if unseeable:
             record = {
                 "round": i,
                 "atoms": atoms,
                 "arm": arm,
                 "step": self.sim.n_steps,
-                "error": f"GoalNotVisible: skipped, {', '.join(unseeable)} not seen in {BLIND_LIMIT} captures",
+                "error": f"GoalNotVisible: skipped, {', '.join(unseeable)} not seen from {BLIND_LIMIT} stances",
                 "seconds": 0.0,
             }
             self.records.append(record)
@@ -271,7 +279,7 @@ class Episode:
             record["error"] = f"{type(e).__name__}: {e}"
             if isinstance(e, GoalNotVisible):
                 for name in atom_objects(atoms):
-                    self.blind[name] = self.blind.get(name, 0) + 1
+                    self.blind.setdefault(name, set()).add(self.stance_key())
         else:
             for name in atom_objects(atoms):  # the capture saw them; whatever hid them before is no longer hiding
                 self.blind.pop(name, None)

@@ -188,9 +188,19 @@ class OracleKnowledge(KnowledgeSource):
         }
         visible = [label for label in labels if any(counts[name][label] for name in counts)]
         hidden = [label for label in labels if label not in visible]
-        needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a in hidden})
+        # Every object a goal atom names has to be one the planner is given, and the planner is given exactly the
+        # visible ones. Testing against `hidden` missed the case where an atom names something that never became a
+        # label at all: the round then went out and the planner rejected it with "Goal predicate holding(
+        # toy_figure_3) references unknown object 'toy_figure_3'. Known objects: ['table', 'toy_box_1']", which
+        # cost a round and read as a planning failure rather than as the visibility failure it is (2026-09-13).
+        needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a not in visible})
         if needed:
-            raise GoalNotVisible(f"goal objects {needed} are not visible in any view {list(counts)} (empty masks)")
+            untracked = [a for a in needed if a not in labels]
+            raise GoalNotVisible(
+                f"goal objects {needed} are not visible in any view {list(counts)} (empty masks"
+                + (f"; {untracked} are not tracked at all" if untracked else "")
+                + ")"
+            )
         for name in counts:
             log.info(f"oracle masks in {name}: pixels per label { {label: counts[name][label] for label in visible} }")
         log.info(f"out of every view: {hidden or 'none'}")
