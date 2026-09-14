@@ -70,6 +70,33 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--path-soft-cost-radius",
+        type=float,
+        default=0.5,
+        help="Radius in meters for nav2py-style soft obstacle costs used to reject low-clearance generated paths.",
+    )
+    parser.add_argument(
+        "--path-soft-cost-scaling-factor",
+        type=float,
+        default=5.0,
+        help="Exponential scaling factor for nav2py-style soft obstacle costs used during generation.",
+    )
+    parser.add_argument(
+        "--max-path-soft-cost",
+        type=int,
+        default=124,
+        help=(
+            "Reject generated paths whose soft-cost cells exceed this value more often than "
+            "--max-path-soft-cost-fraction allows. Use 254 to effectively disable this filter."
+        ),
+    )
+    parser.add_argument(
+        "--max-path-soft-cost-fraction",
+        type=float,
+        default=0.0,
+        help="Allowed fraction of cells along the generated path with soft cost above --max-path-soft-cost.",
+    )
+    parser.add_argument(
         "--robot-config",
         default=str(Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"),
     )
@@ -170,6 +197,38 @@ def clearance_floor_map(env, floor_trav_map, extra_clearance):
     return th.tensor(cv2.erode(floor_trav_map.cpu().numpy(), kernel))
 
 
+def soft_cost_floor_map(trav_map, radius, cost_scaling_factor, resolution):
+    data = np.zeros(trav_map.shape, dtype=np.uint8)
+    trav_np = trav_map.detach().cpu().numpy()
+    data[trav_np != 255] = 254
+    if radius <= 0.0:
+        return data
+
+    lethal_mask = data >= 254
+    radius_cells = math.ceil(radius / resolution)
+    source = data.copy()
+    offsets = []
+    for dr in range(-radius_cells, radius_cells + 1):
+        for dc in range(-radius_cells, radius_cells + 1):
+            distance = math.hypot(dr, dc) * resolution
+            if distance > radius:
+                continue
+            cost = int(252 * math.exp(-cost_scaling_factor * distance))
+            offsets.append((dr, dc, max(1, cost)))
+
+    for dr, dc, cost in offsets:
+        if abs(dr) >= source.shape[0] or abs(dc) >= source.shape[1]:
+            continue
+        row_source = slice(max(0, -dr), min(source.shape[0], source.shape[0] - dr))
+        col_source = slice(max(0, -dc), min(source.shape[1], source.shape[1] - dc))
+        row_target = slice(max(0, dr), min(source.shape[0], source.shape[0] + dr))
+        col_target = slice(max(0, dc), min(source.shape[1], source.shape[1] + dc))
+        target = source[row_target, col_target]
+        np.maximum(target, lethal_mask[row_source, col_source] * np.uint8(cost), out=target)
+    source[data >= 254] = 254
+    return source
+
+
 def point_to_map_cell(scene, point):
     map_size = scene.trav_map.map_size
     resolution = float(scene.trav_map.map_resolution)
@@ -266,7 +325,25 @@ def path_initial_yaw(path_world, start, goal):
     return math.atan2(float(delta[1].item()), float(delta[0].item()))
 
 
-def clearance_path_info(env, trav_map, start, goal):
+def path_soft_cost_info(path, soft_cost_map):
+    cells = path.detach().cpu().numpy()
+    costs = soft_cost_map[cells[:, 0], cells[:, 1]]
+    return {
+        "max": int(np.max(costs)),
+        "mean": float(np.mean(costs)),
+        "cells": int(costs.size),
+    }
+
+
+def clearance_path_info(
+    env,
+    trav_map,
+    start,
+    goal,
+    soft_cost_map=None,
+    max_path_soft_cost=254,
+    max_path_soft_cost_fraction=0.0,
+):
     if not point_is_free(env.scene, trav_map, start) or not point_is_free(env.scene, trav_map, goal):
         return None
     start_cell = tuple(env.scene.trav_map.world_to_map(start[:2]).tolist())
@@ -274,11 +351,31 @@ def clearance_path_info(env, trav_map, start, goal):
     path = clearance_astar(trav_map, start_cell, goal_cell)
     if path is None:
         return None
+    soft_cost = None
+    if soft_cost_map is not None and max_path_soft_cost < 254:
+        cells = path.detach().cpu().numpy()
+        costs = soft_cost_map[cells[:, 0], cells[:, 1]]
+        violating_fraction = float(np.count_nonzero(costs > max_path_soft_cost) / costs.size)
+        if violating_fraction > max_path_soft_cost_fraction:
+            return None
+        soft_cost = {
+            "max": int(np.max(costs)),
+            "mean": float(np.mean(costs)),
+            "violating_fraction": violating_fraction,
+            "threshold": int(max_path_soft_cost),
+            "allowed_fraction": float(max_path_soft_cost_fraction),
+            "cells": int(costs.size),
+        }
+    elif soft_cost_map is not None:
+        soft_cost = path_soft_cost_info(path, soft_cost_map)
     path_world = env.scene.trav_map.map_to_world(path)
-    return {
+    result = {
         "distance": float(th.sum(th.norm(path_world[1:] - path_world[:-1], dim=1)).item()),
         "initial_yaw": path_initial_yaw(path_world, start, goal),
     }
+    if soft_cost is not None:
+        result["soft_cost"] = soft_cost
+    return result
 
 
 def clearance_path_distance(env, trav_map, start, goal):
@@ -293,6 +390,7 @@ def sample_episode(
     floor,
     floor_trav_map,
     clearance_trav_map,
+    soft_cost_map,
     min_distance,
     max_distance,
     max_trials,
@@ -300,6 +398,8 @@ def sample_episode(
     extra_clearance,
     safety_clearance,
     validation_clearance,
+    max_path_soft_cost,
+    max_path_soft_cost_fraction,
 ):
     robot = env.robots[0]
 
@@ -312,7 +412,15 @@ def sample_episode(
             env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms for point in (start, goal)
         ):
             continue
-        path_info = clearance_path_info(env, clearance_trav_map, start, goal)
+        path_info = clearance_path_info(
+            env,
+            clearance_trav_map,
+            start,
+            goal,
+            soft_cost_map=soft_cost_map,
+            max_path_soft_cost=max_path_soft_cost,
+            max_path_soft_cost_fraction=max_path_soft_cost_fraction,
+        )
         if path_info is None:
             continue
 
@@ -342,6 +450,7 @@ def sample_episode(
             "safety_clearance": safety_clearance,
             "validation_clearance": validation_clearance,
             "start_yaw_source": "clearance_path_initial_heading",
+            "path_soft_cost": path_info.get("soft_cost"),
         }
 
     raise RuntimeError(
@@ -350,11 +459,26 @@ def sample_episode(
     )
 
 
-def verify_episode(env, clearance_trav_map, episode):
+def verify_episode(
+    env,
+    clearance_trav_map,
+    episode,
+    soft_cost_map=None,
+    max_path_soft_cost=254,
+    max_path_soft_cost_fraction=0.0,
+):
     start = th.tensor(episode["start_position"], dtype=th.float32)
     goal = th.tensor(episode["goal_position"], dtype=th.float32)
-    distance = clearance_path_distance(env, clearance_trav_map, start, goal)
-    if distance is None:
+    path_info = clearance_path_info(
+        env,
+        clearance_trav_map,
+        start,
+        goal,
+        soft_cost_map=soft_cost_map,
+        max_path_soft_cost=max_path_soft_cost,
+        max_path_soft_cost_fraction=max_path_soft_cost_fraction,
+    )
+    if path_info is None:
         raise RuntimeError(f"Stored episode lacks a clearance-valid path on replay check: {episode['episode_id']}")
 
 
@@ -384,9 +508,21 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
     floor_trav_map = eroded_floor_map(env.scene, 0, env.robots[0])
     validation_clearance = args.extra_clearance + args.safety_clearance
     clearance_trav_map = clearance_floor_map(env, floor_trav_map, validation_clearance)
+    soft_cost_map = soft_cost_floor_map(
+        clearance_trav_map,
+        args.path_soft_cost_radius,
+        args.path_soft_cost_scaling_factor,
+        float(env.scene.trav_map.map_resolution),
+    )
     print(
         f"Validation clearance: robot erosion + {args.extra_clearance:.3f}m extra "
         f"+ {args.safety_clearance:.3f}m safety margin"
+    )
+    print(
+        f"Path soft-cost filter: radius={args.path_soft_cost_radius:.3f}m, "
+        f"scaling={args.path_soft_cost_scaling_factor:.3f}, "
+        f"max_cost={args.max_path_soft_cost}, "
+        f"allowed_fraction={args.max_path_soft_cost_fraction:.3f}"
     )
     for local_idx in range(count):
         episode = sample_episode(
@@ -396,6 +532,7 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
             floor=0,
             floor_trav_map=floor_trav_map,
             clearance_trav_map=clearance_trav_map,
+            soft_cost_map=soft_cost_map,
             min_distance=args.min_distance,
             max_distance=args.max_distance,
             max_trials=args.max_trials,
@@ -403,8 +540,17 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
             extra_clearance=args.extra_clearance,
             safety_clearance=args.safety_clearance,
             validation_clearance=validation_clearance,
+            max_path_soft_cost=args.max_path_soft_cost,
+            max_path_soft_cost_fraction=args.max_path_soft_cost_fraction,
         )
-        verify_episode(env, clearance_trav_map, episode)
+        verify_episode(
+            env,
+            clearance_trav_map,
+            episode,
+            soft_cost_map=soft_cost_map,
+            max_path_soft_cost=args.max_path_soft_cost,
+            max_path_soft_cost_fraction=args.max_path_soft_cost_fraction,
+        )
         episode["episode_id"] = f"{scene_model}_{task_name}_{local_idx:03d}"
         episode["task_name"] = task_name
         episode["scene_instance"] = scene_instance
@@ -414,6 +560,12 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
         print(f"  start = {episode['start_position']}")
         print(f"  goal = {episode['goal_position']}")
         print(f"  shortest path = {episode['geodesic_distance']:.3f} m")
+        if episode.get("path_soft_cost") is not None:
+            soft_cost = episode["path_soft_cost"]
+            print(
+                f"  path soft cost max = {soft_cost['max']} "
+                f"(threshold {soft_cost['threshold']}, violating_fraction {soft_cost['violating_fraction']:.3f})"
+            )
 
     # Clear simulation state before returning so next scene can be loaded cleanly
     og.clear()
@@ -434,6 +586,10 @@ def write_benchmark(path, args, robot_cfg, episodes):
                 "settle_steps": args.settle_steps,
                 "extra_clearance": args.extra_clearance,
                 "safety_clearance": args.safety_clearance,
+                "path_soft_cost_radius": args.path_soft_cost_radius,
+                "path_soft_cost_scaling_factor": args.path_soft_cost_scaling_factor,
+                "max_path_soft_cost": args.max_path_soft_cost,
+                "max_path_soft_cost_fraction": args.max_path_soft_cost_fraction,
                 "episodes": episodes,
             },
             f,
@@ -459,6 +615,14 @@ def main():
         raise ValueError("--extra-clearance must be non-negative")
     if args.safety_clearance < 0:
         raise ValueError("--safety-clearance must be non-negative")
+    if args.path_soft_cost_radius < 0:
+        raise ValueError("--path-soft-cost-radius must be non-negative")
+    if args.path_soft_cost_scaling_factor <= 0:
+        raise ValueError("--path-soft-cost-scaling-factor must be positive")
+    if args.max_path_soft_cost < 0 or args.max_path_soft_cost > 254:
+        raise ValueError("--max-path-soft-cost must be in [0, 254]")
+    if args.max_path_soft_cost_fraction < 0.0 or args.max_path_soft_cost_fraction > 1.0:
+        raise ValueError("--max-path-soft-cost-fraction must be in [0, 1]")
 
     seed_everything(args.seed)
 
