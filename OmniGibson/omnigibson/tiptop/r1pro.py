@@ -1448,8 +1448,11 @@ class R1ProSim(TiptopSim):
             already = any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
             return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
         usable.sort(key=lambda row: (row[1], row[0]))
-        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link")
-        joints_of = list(self.robot.arm_joint_names[arm])
+        # With the torso: this is where reach binds. A drawer 22 cm off the floor is outside a fixed-torso
+        # workspace however good the grasp point is, and bending is exactly what the challenge tells its human
+        # teleoperators to do ("move your base and torso as much as possible before trying to reach").
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
+        joints_of = self.ik_joint_names(arm, with_torso=True)
         q = self.robot.get_joint_positions()
         seed = [float(q[self.joint_index[j]]) for j in joints_of]
         base_pos = self.to_base(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
@@ -1996,10 +1999,27 @@ class R1ProSim(TiptopSim):
         return k, base_from_cam, float(self.base_pose()[0][2])
 
     # ---------------------------------------------------------------- observation
-    def arm_ik(self, arm: str, frame: str | None = None) -> ArmIK:
+    def ik_joint_names(self, arm: str, with_torso: bool = False) -> list[str]:
+        """The joints an ``arm_ik`` solves for, in the simulator's own DOF order (torso first, then the arm).
+
+        A caller that solves with the torso has to seed and read back the same list, so both come from here.
+        """
+        trunk = list(getattr(self.robot, "trunk_joint_names", []) or []) if with_torso else []
+        return [j for j in trunk if j in self.urdf_joints] + list(self.robot.arm_joint_names[arm])
+
+    def arm_ik(self, arm: str, frame: str | None = None, with_torso: bool = False) -> ArmIK:
         """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for
-        ``frame`` (its wrist camera's link by default)."""
-        joints = list(self.robot.arm_joint_names[arm])
+        ``frame`` (its wrist camera's link by default).
+
+        ``with_torso``: solve for the four torso joints as well, 11 degrees of freedom instead of 7. The torso is
+        NOT locked -- the embodiment plans all four of its joints and locks only the right arm and the fingers
+        (r1pro_left_meta.yml), so the planner bends the torso whenever it needs to. Only this IK was holding it
+        still, which is why every skill the bridge owns has the reach of a fixed torso: a drawer 22 cm off the
+        floor and a handle at 1.2 m both came back "no orientation reaches its face" while the planner would have
+        had no trouble. Off by default, because a caller that turns it on must seed and read back the longer
+        joint list (``ik_joint_names``).
+        """
+        joints = self.ik_joint_names(arm, with_torso)
         q = self.robot.get_joint_positions()
         fixed = {
             name: float(q[i]) for name, i in self.joint_index.items() if name in self.urdf_joints and name not in joints
