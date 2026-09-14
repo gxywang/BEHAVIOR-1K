@@ -124,6 +124,12 @@ LOOK_SETTLE_STEPS = 60
 # target per control step: a step change of the targets makes the position controller slam the arms, which shakes
 # the whole robot and can shift the objects the capture is about to look at. Well under the arm joints' 7 rad/s.
 CAPTURE_MAX_JOINT_VEL = 0.6
+# Folding the arms in over the base, and putting them back, moves over the robot's own footprint rather than out
+# through the room, so it is not what the capture cap is for and does not pay its price. At the capture speed a
+# fold was 91 steps each way and 47% of an episode's budget; at this speed it is about a quarter of that.
+TRAVEL_MAX_JOINT_VEL = 2.5
+TRAVEL_POSE = 0.0  # every planned <arm>_arm_joint<n> goes here for the teleport; the torso is left alone
+TRAVEL_SETTLE_STEPS = 12
 RAMP_BLOCK_TOL = 0.1  # rad: a ramped joint this far from its target is not following the ramp (blocked); logged
 RAMP_BLOCK_STEPS = 5  # consecutive steps behind that tolerance before the ramp calls it blocked and stops
 RAMP_MOVING_EPS = 1e-3  # rad: a joint whose target moves less than this over a ramp is being held, not ramped
@@ -1858,21 +1864,99 @@ class R1ProSim(TiptopSim):
         self.look_names = tuple(names)
         return pose
 
+    def fold_for_travel(self) -> list | None:
+        """Bring the arms in over the base before the base teleports; the posture to unfold back to, or None.
+
+        The robot materialises at the new stance rather than driving to it, so the posture it lands in is the whole
+        question. With the working posture the arms sit 0.41 m past the base's own rectangle; with every planned
+        arm joint at zero, 0.095 m -- four times better, and the only candidate that actually arrives (2026-09-13).
+
+        Removed for a day because it cost 47% of an episode's steps, which was the wrong half to remove: that cost
+        was in ramping it at the CAPTURE speed cap, which exists for observation swings out through a scene nobody
+        has planned. Folding in over the robot's own base is the opposite motion, so it runs at
+        TRAVEL_MAX_JOINT_VEL and costs about a quarter as much.
+        """
+        if self.q_home is None or not self.planned_joints:
+            return None
+        here = [float(v) for v in self.q_arm()]
+        folded = list(here)
+        moved = False
+        for index, joint in enumerate(self.planned_joints):
+            if "_arm_joint" in joint:
+                folded[index] = float(TRAVEL_POSE)
+                moved = True
+        if not moved:
+            return None
+        blocked = self.ramp_to(
+            folded,
+            self.posture,
+            self.last_gripper,
+            TRAVEL_SETTLE_STEPS,
+            note="fold for travel",
+            max_vel=TRAVEL_MAX_JOINT_VEL,
+        )
+        if blocked is not None:
+            log.warning(f"the fold before the teleport was stopped by {blocked[0]}; travelling as the robot stands")
+        return here
+
+    def unfold_after_travel(self, targets) -> None:
+        """Come back out of the travel fold at the new stance, checking the way out before taking it.
+
+        Folding in is safe because it moves over the robot's own base. Coming out is the opposite -- the arms go
+        into a room the robot has only just arrived in -- so the path is tested first with ``path_hits_scene``, the
+        same check the capture uses to rank its look poses, and the arms stay folded if it is not clear. A round
+        that starts folded is a worse posture to plan from; a round that starts by driving the elbow into a desk is
+        worse than that.
+        """
+        if targets is None:
+            return
+        arm = self.arm if self.arm in self.robot.arm_names else self.robot.arm_names[0]
+        try:
+            ik = self._stance_ik(arm)
+            names = self.robot.arm_joint_names[arm]
+            now = dict(zip(self.planned_joints, [float(v) for v in self.q_arm()]))
+            want = dict(zip(self.planned_joints, [float(v) for v in targets]))
+            swept = self.path_hits_scene(
+                arm, ik, [now.get(j, 0.0) for j in names], [want.get(j, 0.0) for j in names], mesh=False
+            )
+        except Exception:  # noqa: BLE001 - no description for this arm: unfold as before rather than stay folded
+            swept = []
+        if swept:
+            log.warning(
+                f"not unfolding here: the way back to the working posture goes through {swept[0]}; the arms stay "
+                "over the base, which is a worse posture to plan from but does not push the furniture about"
+            )
+            return
+        blocked = self.ramp_to(
+            targets,
+            self.posture,
+            self.last_gripper,
+            TRAVEL_SETTLE_STEPS,
+            note="unfold after travel",
+            max_vel=TRAVEL_MAX_JOINT_VEL,
+        )
+        if blocked is not None:
+            log.warning(
+                f"unfolding after the teleport was stopped by {blocked[0]}: the posture the round works from is "
+                "not the one it asked for, and something is in the way of it here"
+            )
+
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
         grasp assist along with the robot, so a carried object stays in the gripper.
 
-        Nothing is folded on the way. Folding the arms over the base and back was 91 ramp steps each way, and over
-        one episode of putting_away_toys that came to 7967 of the 16946 steps the episode is allowed -- 47% of the
-        budget spent travelling. The baseline run fitted 22 teleports into those steps and scored 0.75; with the
-        fold it managed 12 and scored 0.375, because the rounds it could no longer afford were the ones that place
-        the toys (2026-09-14).
+        The arms come in over the base for the teleport (``fold_for_travel``) and go back out only if the way back
+        is clear (``unfold_after_travel``). A teleport does not sweep -- it materialises the robot wherever it
+        lands -- so the landing posture is the whole of the question: with the working posture the arms sit 0.41 m
+        past the base's own rectangle and 0.095 m folded.
 
-        The fold was standing in for a question the stance search now answers directly: ``_footprint_free`` places
-        both arms at the posture the robot will be in, at the pose being judged, and refuses the stance if either
-        would come to rest inside something. A teleport does not sweep -- it materialises the robot wherever it
-        lands -- so the landing posture is the whole of the question, and it is checked before the robot is sent.
+        The fold was taken out for a day because it cost 7967 of an episode's 16946 steps, and that was the wrong
+        half to remove. The cost was in ramping it at the CAPTURE speed cap of 0.6 rad/s, which is there because
+        observation swings were knocking objects about -- a motion out through a scene nobody has planned. Bringing
+        the arms in over the robot's own base is the opposite motion, so it runs at its own speed and costs about a
+        quarter as much. Coming back out IS a motion into the room, so it is collision-checked first (2026-09-14).
         """
+        unfold_to = self.fold_for_travel()
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
@@ -1889,6 +1973,7 @@ class R1ProSim(TiptopSim):
             og.sim.viewer_camera.set_position_orientation(
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
+        self.unfold_after_travel(unfold_to)
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
 
@@ -2470,10 +2555,15 @@ class R1ProSim(TiptopSim):
                 return False
         return self.ramp_to(q_arm, posture, gripper, settle_steps, note) is None
 
-    def ramp_to(self, q_arm, posture: dict, gripper: float, settle_steps: int, note: str = "") -> tuple | None:
+    def ramp_to(
+        self, q_arm, posture: dict, gripper: float, settle_steps: int, note: str = "", max_vel: float | None = None
+    ) -> tuple | None:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
         than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
-        ``settle_steps`` holding the targets. ``self.posture`` follows the ramp and ends at ``posture``. ``note``
+        ``settle_steps`` holding the targets, at ``max_vel`` rad/s (default ``CAPTURE_MAX_JOINT_VEL``: the cap that
+        exists because observation swings were knocking objects about -- a motion through a scene nobody has
+        planned. A motion that stays over the robot's own base, like folding for a teleport, is not that and can
+        pass its own speed). ``self.posture`` follows the ramp and ends at ``posture``. ``note``
         names the motion in the log when it is blocked, so a run says which motion met the obstacle rather than
         only which joint did (the user watched a video of arms knocking objects about, 2026-09-13).
 
@@ -2485,7 +2575,8 @@ class R1ProSim(TiptopSim):
         names = list(self.planned_joints) + list(posture)
         start = [float(now[self.joint_index[j]]) for j in names]
         goal = [float(v) for v in q_arm] + [float(posture[j]) for j in posture]
-        path = joint_ramp(start, goal, CAPTURE_MAX_JOINT_VEL * self.dt)
+        speed = CAPTURE_MAX_JOINT_VEL if max_vel is None else float(max_vel)
+        path = joint_ramp(start, goal, speed * self.dt)
         k = len(self.planned_joints)
         idx = [self.joint_index[j] for j in names]
         # Only the joints this ramp actually MOVES can tell it it is blocked. The fingers are driven by the gripper
@@ -2540,7 +2631,7 @@ class R1ProSim(TiptopSim):
                 f"({note or 'unnamed'}): it is not holding itself, though this motion does not move it"
             )
         log.info(
-            f"joints ramped over {len(path)} steps at up to {CAPTURE_MAX_JOINT_VEL} rad/s commanded, "
+            f"joints ramped over {len(path)} steps at up to {speed} rad/s commanded, "
             f"{fastest:.2f} rad/s measured{culprit}, then {settle_steps} settle steps"
         )
         return blocked

@@ -1,5 +1,6 @@
 """The wrist-camera look pose: the pure transform helpers, and Lula IK on the R1Pro URDF (skipped without them)."""
 
+import pathlib
 from pathlib import Path
 
 import numpy as np
@@ -480,23 +481,28 @@ def test_grasp_target_jaw_is_square_to_the_approach():
         assert abs(float(jaw_world @ approach)) < 1e-9
 
 
-def test_nothing_is_folded_before_a_teleport():
-    """The travel fold is gone, and what replaced it is the stance search testing where the arm ends up.
+def test_the_travel_fold_moves_at_its_own_speed_and_the_unfold_is_checked():
+    """Folding in over the base is cheap; coming back out into the room is the part that needs checking.
 
-    The fold was adopted after measuring that straightening the arms over the base cut the overhang past the base
-    rectangle from 41.2 cm to 9.5 cm, the only candidate that both helped and actually arrived. Then it was
-    measured in an episode: 91 ramp steps each way came to 7967 of putting_away_toys' 16946 allowed steps, 47% of
-    the budget. The baseline fitted 22 teleports into those steps and scored 0.75; with the fold, 12 and 0.375.
-    The rounds it could no longer afford were the ones that place the toys. _footprint_free answers the question
-    the fold was standing in for -- would the arm come to rest inside something -- before the robot is sent
-    (2026-09-14).
+    The fold cuts the arms' overhang past the base rectangle from 0.41 m to 0.095 m, and it was the only candidate
+    that both helped and arrived. It was removed for a day because it cost 7967 of an episode's 16946 steps -- but
+    that cost came from ramping it at CAPTURE_MAX_JOINT_VEL, the cap that exists because observation swings out
+    through an unplanned scene were knocking objects about. Bringing the arms in over the robot's own base is the
+    opposite motion and runs at TRAVEL_MAX_JOINT_VEL instead, about a quarter of the steps. Coming back out IS a
+    motion into the room, so path_hits_scene checks it first (2026-09-14).
     """
     import omnigibson.tiptop.r1pro as r1pro
 
-    assert not hasattr(r1pro, "TRAVEL_POSE"), "the travel pose is gone; place_robot explains why"
-    assert not hasattr(r1pro.R1ProSim, "fold_for_travel")
-    assert not hasattr(r1pro.R1ProSim, "unfold_after_travel")
-    assert "Nothing is folded on the way" in r1pro.R1ProSim.place_robot.__doc__
+    assert r1pro.TRAVEL_MAX_JOINT_VEL > r1pro.CAPTURE_MAX_JOINT_VEL, "a fold over the base is not a capture swing"
+    assert r1pro.TRAVEL_POSE == 0.0
+    assert hasattr(r1pro.R1ProSim, "fold_for_travel") and hasattr(r1pro.R1ProSim, "unfold_after_travel")
+    fold = r1pro.R1ProSim.fold_for_travel.__doc__ or ""
+    unfold = r1pro.R1ProSim.unfold_after_travel.__doc__ or ""
+    assert "TRAVEL_MAX_JOINT_VEL" in fold, "the fold must say why it does not pay the capture cap"
+    assert "path_hits_scene" in unfold, "the unfold must say it checks the way back"
+    # the unfold refuses rather than forces: staying folded is a worse posture, not a shove
+    src = (pathlib.Path(r1pro.__file__).read_text().split("def unfold_after_travel")[1]).split("\n    def ")[0]
+    assert "not unfolding here" in src and "return" in src
 
 
 def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():
