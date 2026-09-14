@@ -168,6 +168,9 @@ ARM_SAMPLE_STEP = 0.02  # m between the points taken along the arm when it is me
 # chair and a desk both contain the hand, and the existing hand-only test (links_in_scene) calls it a collision.
 # So a box decides nothing on its own: it is the cheap prefilter, and the object's own mesh decides.
 ARM_MESH_CHECK = True
+# Lifts tried, in radians, to get the arm out of a surface before a plan is asked for from where it stands.
+# Smallest first, so the posture moves as little as it must; see clear_start_posture for why this exists.
+START_LIFTS = (0.15, 0.3, 0.5, 0.8)
 DEFAULT_LOOK_TARGET = (0.6, 0.0, 0.85)  # base frame: what the wrist cameras look at when no base pose was chosen
 # The planner's box starts this far ahead of the base frame: past the base (its front collision spheres reach x 0.25)
 # and the leaning torso, so the support plane the wrist cameras see beside the robot never runs under it. The head
@@ -2628,12 +2631,95 @@ class R1ProSim(TiptopSim):
                 back = max(abs(float(now[self.joint_index[j]]) - original[j]) for j in self.robot.arm_joint_names[arm])
                 if back > LOOK_TOL:
                     log.warning(f"{arm} arm is {back:.3f} rad from its locked posture after the capture")
-        request["q_init"] = np.asarray(q_ready, dtype=np.float32)  # the plan starts here, not at the look posture
+        # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
+        # in collision is refused before the goal is considered (``clear_start_posture``).
+        q_ready = self.clear_start_posture(self.arm, q_ready)
+        request["q_init"] = np.asarray(q_ready, dtype=np.float32)
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
         )
         return request, extras
+
+    def clear_start_posture(self, arm: str, q_ready):
+        """Lift ``arm`` out of whatever it is resting in before a plan is asked for from there; the posture to send.
+
+        The plan starts at ``q_init``, and cuRobo refuses a start state that is in collision -- without ever
+        looking at the goal. Across the planner's own saved logs that refusal, INVALID_START_STATE_WORLD_COLLISION,
+        appears 6657 times against 1355 IK_FAIL: start states in collision outnumber unreachable goals five to one.
+        Each one costs the whole round, and it costs it 32 times over, because the verdict does not depend on which
+        grasp particle is being tried, so every refinement attempt returns the same message.
+
+        The cause is a height coincidence rather than a broken perception. With the challenge torso posture the
+        elbow and forearm sit at roughly counter height, and the planner's support is a thin slab whose top is
+        sunk 2 cm under the surface it detected, with no activation distance -- so at a counter or a cabinet the
+        margin between "fine" and "the whole plan is refused" is millimetres, while at a floor or a low table it
+        is tens of centimetres. This is the same failure the workspace crop already guards for the BASE
+        (``WORKSPACE_NEAR``, "a support cuboid reaching there puts the robot's start posture in collision"); the
+        reasoning was never extended to the arm.
+
+        Lifting is the right direction: it moves away from the surface, so it is the motion least likely to be
+        blocked in turn. A posture that is already clear is returned untouched, which is every floor and low-table
+        task, so this costs nothing where nothing is wrong.
+        """
+        if arm not in self.robot.arm_names:
+            return q_ready
+        try:
+            ik = self._stance_ik(arm)
+        except Exception:  # noqa: BLE001 - no description for this arm: send the posture as it is
+            return q_ready
+        aabbs = self.scene_aabbs()
+        held = {self.objects[label] for label in self.hands() if label in self.objects}
+        names = [n for n in self.planned_joints if n.startswith(f"{arm}_arm_joint")]
+        if not names:
+            return q_ready
+
+        def arm_q(q):
+            by_name = dict(zip(self.planned_joints, [float(v) for v in q]))
+            return [by_name.get(j, 0.0) for j in self.robot.arm_joint_names[arm]]
+
+        def hits(q):
+            return [
+                n
+                for n in self.arm_hits_scene(arm, ik, arm_q(q), aabbs=aabbs, mesh=False)
+                if n not in {o.name for o in held}
+            ]
+
+        inside = hits(q_ready)
+        if not inside:
+            return q_ready
+        index = {n: self.planned_joints.index(n) for n in names}
+        shoulder, elbow = f"{arm}_arm_joint2", f"{arm}_arm_joint4"
+        best = None
+        for lift in START_LIFTS:
+            for joints in ((shoulder,), (elbow,), (shoulder, elbow)):
+                if any(j not in index for j in joints):
+                    continue
+                for sign in (-1.0, 1.0):
+                    q = [float(v) for v in q_ready]
+                    for j in joints:
+                        q[index[j]] = float(q[index[j]]) + sign * lift
+                    if hits(q):
+                        continue
+                    best = (q, joints, sign * lift)
+                    break
+                if best:
+                    break
+            if best:
+                break
+        if best is None:
+            log.warning(
+                f"the {arm} arm starts inside {inside[0]} and no lift up to {max(START_LIFTS):.2f} rad frees it; "
+                "asking for the plan from here, which the planner will probably refuse"
+            )
+            return q_ready
+        q, joints, delta = best
+        log.info(
+            f"the {arm} arm starts inside {inside[0]}, which the planner refuses before it looks at the goal; "
+            f"lifting {'+'.join(joints)} by {delta:+.2f} rad to start clear"
+        )
+        self.ramp_to(q, self.posture, self.last_gripper, LOOK_SETTLE_STEPS, note="lift clear before planning")
+        return self.q_arm()
 
     def log_blocked_sight(self) -> list[str]:
         """Say which of the robot's own arm links stand between the head camera and what this capture is about.
