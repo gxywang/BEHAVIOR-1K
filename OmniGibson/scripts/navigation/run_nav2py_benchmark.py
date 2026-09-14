@@ -312,19 +312,20 @@ def make_soft_costmap(costmap, radius, cost_scaling_factor):
     return soft_costmap
 
 
-def make_costmap_bundle(scene, floor, robot, nav2py_api, args):
+def make_costmap_bundle(scene, floor, robot, nav2py_api, args, runtime_extra_clearance):
     bundle = {
         "raw": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False),
         "og_eroded": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=True),
+        "runtime_extra_clearance": runtime_extra_clearance,
     }
-    if args.runtime_extra_clearance > 0.0:
+    if runtime_extra_clearance > 0.0:
         bundle["og_eroded_runtime_clearance"] = make_costmap(
             scene,
             floor,
             robot,
             nav2py_api,
             erode_for_robot=True,
-            extra_clearance=args.runtime_extra_clearance,
+            extra_clearance=runtime_extra_clearance,
         )
     planning_costmap = bundle.get("og_eroded_runtime_clearance", bundle["og_eroded"])
     if args.costmap_source == "og-eroded-soft":
@@ -382,6 +383,17 @@ def make_robot_profile(robot, nav2py_api, args, clearance_is_in_costmap=False):
             }
         ),
     )
+
+
+def episode_validation_clearance(episode):
+    if "validation_clearance" in episode:
+        return float(episode["validation_clearance"])
+    return float(episode.get("extra_clearance", 0.0)) + float(episode.get("safety_clearance", 0.0))
+
+
+def effective_runtime_extra_clearance(episodes, requested_runtime_extra_clearance):
+    benchmark_clearance = max((episode_validation_clearance(episode) for episode in episodes), default=0.0)
+    return max(float(requested_runtime_extra_clearance), benchmark_clearance)
 
 
 def robot_profile_diagnostics(profile):
@@ -1025,7 +1037,8 @@ def run_episode(
         "success_criterion": args.success_criterion,
         "success_criterion_value": success_criterion_diagnostics(args, robot),
         "costmap_source": args.costmap_source,
-        "runtime_extra_clearance": args.runtime_extra_clearance,
+        "runtime_extra_clearance": float(costmap_bundle.get("runtime_extra_clearance", args.runtime_extra_clearance)),
+        "requested_runtime_extra_clearance": args.runtime_extra_clearance,
         "robot_profile": robot_profile_diagnostics(profile),
         "robot_footprint": robot_footprint_diagnostics(robot),
         "controller_command_limits": command_limits_diagnostics(command_limits),
@@ -1091,6 +1104,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "soft_cost_radius": args.soft_cost_radius,
         "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
         "runtime_extra_clearance": args.runtime_extra_clearance,
+        "runtime_extra_clearance_policy": "max(cli, benchmark validation_clearance)",
         "safety_slowdown_scales": args.safety_slowdown_scales,
         "state_linear_velocity_deadband": args.state_linear_velocity_deadband,
         "state_angular_velocity_deadband": args.state_angular_velocity_deadband,
@@ -1164,11 +1178,17 @@ def main(args=None, shutdown=True):
     try:
         scene_groups = list(group_episodes_by_scene(episodes).items())
         for scene_index, ((scene_model, scene_instance, _), scene_episodes) in enumerate(scene_groups):
+            runtime_extra_clearance = effective_runtime_extra_clearance(scene_episodes, args.runtime_extra_clearance)
             print(f"\nRunning template: {scene_instance} ({len(scene_episodes)} episodes)")
             print(
                 f"Costmap: {args.costmap_source}; "
-                f"runtime extra clearance={args.runtime_extra_clearance:.3f}m"
+                f"runtime extra clearance={runtime_extra_clearance:.3f}m"
             )
+            if runtime_extra_clearance > args.runtime_extra_clearance:
+                print(
+                    f"  Using benchmark validation clearance {runtime_extra_clearance:.3f}m "
+                    f"instead of requested {args.runtime_extra_clearance:.3f}m."
+                )
             cfg = build_env_config(
                 scene_model=scene_model,
                 robot_cfg=robot_cfg,
@@ -1192,7 +1212,14 @@ def main(args=None, shutdown=True):
             for episode in scene_episodes:
                 floor = int(episode.get("floor", 0))
                 if floor not in costmap_bundles:
-                    costmap_bundles[floor] = make_costmap_bundle(env.scene, floor, robot, nav2py_api, args)
+                    costmap_bundles[floor] = make_costmap_bundle(
+                        env.scene,
+                        floor,
+                        robot,
+                        nav2py_api,
+                        args,
+                        runtime_extra_clearance,
+                    )
                 result = run_episode(
                     env,
                     robot,

@@ -61,6 +61,15 @@ def parse_args():
         help="Additional obstacle clearance in meters beyond OmniGibson's robot-base erosion.",
     )
     parser.add_argument(
+        "--safety-clearance",
+        type=float,
+        default=0.1,
+        help=(
+            "Additional generation-only clearance margin in meters. This avoids boundary cells that satisfy "
+            "--extra-clearance statically but can be rejected by nav2py's dynamic safety envelope at startup."
+        ),
+    )
+    parser.add_argument(
         "--robot-config",
         default=str(Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"),
     )
@@ -245,7 +254,19 @@ def episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settl
     return point_is_free(env.scene, floor_trav_map, settled_position[:2])
 
 
-def clearance_path_distance(env, trav_map, start, goal):
+def path_initial_yaw(path_world, start, goal):
+    start_xy = th.as_tensor(start[:2], dtype=path_world.dtype, device=path_world.device)
+    for waypoint in path_world[1:]:
+        delta = waypoint - start_xy
+        if float(th.norm(delta).item()) > 1e-4:
+            return math.atan2(float(delta[1].item()), float(delta[0].item()))
+
+    goal_xy = th.as_tensor(goal[:2], dtype=path_world.dtype, device=path_world.device)
+    delta = goal_xy - start_xy
+    return math.atan2(float(delta[1].item()), float(delta[0].item()))
+
+
+def clearance_path_info(env, trav_map, start, goal):
     if not point_is_free(env.scene, trav_map, start) or not point_is_free(env.scene, trav_map, goal):
         return None
     start_cell = tuple(env.scene.trav_map.world_to_map(start[:2]).tolist())
@@ -254,7 +275,15 @@ def clearance_path_distance(env, trav_map, start, goal):
     if path is None:
         return None
     path_world = env.scene.trav_map.map_to_world(path)
-    return float(th.sum(th.norm(path_world[1:] - path_world[:-1], dim=1)).item())
+    return {
+        "distance": float(th.sum(th.norm(path_world[1:] - path_world[:-1], dim=1)).item()),
+        "initial_yaw": path_initial_yaw(path_world, start, goal),
+    }
+
+
+def clearance_path_distance(env, trav_map, start, goal):
+    path_info = clearance_path_info(env, trav_map, start, goal)
+    return None if path_info is None else path_info["distance"]
 
 
 def sample_episode(
@@ -269,6 +298,8 @@ def sample_episode(
     max_trials,
     settle_steps,
     extra_clearance,
+    safety_clearance,
+    validation_clearance,
 ):
     robot = env.robots[0]
 
@@ -281,14 +312,15 @@ def sample_episode(
             env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms for point in (start, goal)
         ):
             continue
-        distance = clearance_path_distance(env, clearance_trav_map, start, goal)
-        if distance is None:
+        path_info = clearance_path_info(env, clearance_trav_map, start, goal)
+        if path_info is None:
             continue
 
+        distance = path_info["distance"]
         if distance < min_distance or distance > max_distance:
             continue
 
-        start_yaw = float(th.rand(1).item() * 2.0 * math.pi)
+        start_yaw = path_info["initial_yaw"]
         start_quat = T.euler2quat(th.tensor([0.0, 0.0, start_yaw]))
         if not episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
             continue
@@ -307,6 +339,9 @@ def sample_episode(
             "geodesic_distance": distance,
             "sampling_trial": trial,
             "extra_clearance": extra_clearance,
+            "safety_clearance": safety_clearance,
+            "validation_clearance": validation_clearance,
+            "start_yaw_source": "clearance_path_initial_heading",
         }
 
     raise RuntimeError(
@@ -347,7 +382,12 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
     episodes = []
     count = num_episodes if num_episodes is not None else args.num_episodes
     floor_trav_map = eroded_floor_map(env.scene, 0, env.robots[0])
-    clearance_trav_map = clearance_floor_map(env, floor_trav_map, args.extra_clearance)
+    validation_clearance = args.extra_clearance + args.safety_clearance
+    clearance_trav_map = clearance_floor_map(env, floor_trav_map, validation_clearance)
+    print(
+        f"Validation clearance: robot erosion + {args.extra_clearance:.3f}m extra "
+        f"+ {args.safety_clearance:.3f}m safety margin"
+    )
     for local_idx in range(count):
         episode = sample_episode(
             env=env,
@@ -361,6 +401,8 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
             max_trials=args.max_trials,
             settle_steps=args.settle_steps,
             extra_clearance=args.extra_clearance,
+            safety_clearance=args.safety_clearance,
+            validation_clearance=validation_clearance,
         )
         verify_episode(env, clearance_trav_map, episode)
         episode["episode_id"] = f"{scene_model}_{task_name}_{local_idx:03d}"
@@ -391,6 +433,7 @@ def write_benchmark(path, args, robot_cfg, episodes):
                 "max_distance": args.max_distance,
                 "settle_steps": args.settle_steps,
                 "extra_clearance": args.extra_clearance,
+                "safety_clearance": args.safety_clearance,
                 "episodes": episodes,
             },
             f,
@@ -414,6 +457,8 @@ def main():
         raise ValueError("--settle-steps must be non-negative")
     if args.extra_clearance < 0:
         raise ValueError("--extra-clearance must be non-negative")
+    if args.safety_clearance < 0:
+        raise ValueError("--safety-clearance must be non-negative")
 
     seed_everything(args.seed)
 
