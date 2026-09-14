@@ -242,28 +242,12 @@ OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
-# What the robot folds to before the base teleports, and back out of afterwards. The footprint the stance search
-# guards is the BASE's, but the base is not what sticks out: with the challenge torso posture the arms sit up to
-# 0.41 m beyond the base's own rectangle (x -0.39..0.24, y -0.34..0.34), so a stance whose base is clear can still
-# land an arm in the furniture. A teleport does not sweep -- it materialises the robot wherever it lands -- so the
-# posture it lands in is the whole of the question.
-#
-# Measured on 2026-09-13 by ramping to each candidate and reading back both the overhang and whether the ramp
-# finished, in store_honey's kitchen:
-#
-#     working posture                      41.2 cm   -
-#     torso_joint2 = -2.25                 29.2 cm   BLOCKED (0.29 rad short, every teleport)
-#     arm_joint2 tucked                    36.9 cm   BLOCKED
-#     every planned arm joint to zero       9.5 cm   reached, no joint error
-#     arm joints to zero + torso -2.25     25.7 cm   BLOCKED
-#
-# So the arms are what matters and the torso fold is not worth having: straightening the arms over the base is
-# four times better and is the only candidate that actually arrives. An earlier comment here claimed the torso
-# fold brought the upper body "within 0.07 m of the base"; the direct measurement above refutes that, and the
-# blocked ramp it caused was reported on every teleport of every run ("the fold before the teleport was stopped
-# by torso_joint2; travelling as the robot stands") -- the robot was travelling with its arm out the whole time,
-# which the user saw in a video before this was measured.
-TRAVEL_POSE = 0.0  # every planned <arm>_arm_joint<n> goes here for the teleport; the torso is left alone
+# The robot no longer folds before a teleport. What that fold cost, and why the stance search replaced it rather
+# than the fold being tuned, is written up in place_robot. Measured on 2026-09-13 by ramping to each candidate and
+# reading back the overhang past the base's own rectangle (x -0.39..0.24, y -0.34..0.34) and whether the ramp
+# finished: the working posture leaves 41.2 cm; a torso fold to -2.25 leaves 29.2 cm and never arrives; every
+# planned arm joint to zero leaves 9.5 cm and does arrive. That last one was adopted, and then measured to cost
+# 7967 of an episode's 16946 steps, which is what removed it.
 FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
 # Room the stance search wants between the robot and everything it is not there to touch, and what a metre short
 # of it costs in the score. Without this the score is indifferent between standing 1 mm from a cabinet and 6 cm
@@ -273,7 +257,6 @@ FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: w
 # does not. At 4.0 per metre a 5 cm shortfall costs 0.20 against the 0.05 of approach it buys.
 STANCE_CLEARANCE = 0.05
 CLEAR_WEIGHT = 4.0
-TRAVEL_SETTLE_STEPS = 20  # after folding or unfolding: one joint moved, so it settles quickly
 # Opening a container: how finely the joint's path is followed, and the holds around it. The steps matter more
 # than they look -- the hand is holding the link, so a coarse path drags it through poses its joint does not
 # allow and the grasp is what gives way.
@@ -1117,8 +1100,8 @@ class R1ProSim(TiptopSim):
                 clearance = min(clearance, gap)
             elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
                 return False, f"overlaps {obj.name}", 0.0
-        # The base's rectangle is not the robot. A teleport puts the arms over the base (TRAVEL_POSE) and then
-        # unfolds them to the working posture, where they reach 0.41 m past that rectangle -- so a stance whose
+        # The base's rectangle is not the robot: with the working posture the arms reach 0.41 m past it, so a
+        # stance whose
         # base is clear can still leave the hand inside a box on the floor. The user watched exactly that in
         # putting_away_toys: after picking up a toy the robot teleported to the table and its arm came to rest
         # INSIDE the toy box (2026-09-13). The arms are tested in 3D, at the posture they will unfold to and at
@@ -1844,51 +1827,21 @@ class R1ProSim(TiptopSim):
         self.look_names = tuple(names)
         return pose
 
-    def fold_for_travel(self) -> list | None:
-        """Fold the upper body over the base before a teleport; the joint targets to unfold back to, or None.
-
-        None when there is nothing to fold to yet (no posture applied) or when no folded joint is one this
-        embodiment plans. See ``TRAVEL_POSE`` for the measurement that chose it.
-        """
-        if self.q_home is None or not self.planned_joints:
-            return None
-        here = [float(v) for v in self.q_arm()]
-        folded = list(here)
-        moved = False
-        for index, joint in enumerate(self.planned_joints):
-            if "_arm_joint" in joint:
-                folded[index] = float(TRAVEL_POSE)
-                moved = True
-        if not moved:
-            return None
-        blocked = self.ramp_to(folded, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS, note="fold for travel")
-        if blocked is not None:
-            log.warning(f"the fold before the teleport was stopped by {blocked[0]}; travelling as the robot stands")
-        return here
-
-    def unfold_after_travel(self, targets) -> None:
-        """Come back out of the travel fold at the new base pose."""
-        if targets is None:
-            return
-        blocked = self.ramp_to(
-            targets, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS, note="unfold after travel"
-        )
-        if blocked is not None:
-            log.warning(
-                f"unfolding after the teleport was stopped by {blocked[0]}: the posture the round works from is "
-                "not the one it asked for, and something is in the way of it here"
-            )
-
     def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
         grasp assist along with the robot, so a carried object stays in the gripper.
 
-        The upper body is folded over the base first and unfolded afterwards (``fold_for_travel``): the stance
-        search guards the base's own rectangle, and with the working posture the arms sit up to 0.43 m beyond it,
-        so a stance whose base is clear can still land an arm in the furniture. A teleport does not sweep -- it
-        materialises the robot wherever it lands -- so the posture it lands in is the whole of the question.
+        Nothing is folded on the way. Folding the arms over the base and back was 91 ramp steps each way, and over
+        one episode of putting_away_toys that came to 7967 of the 16946 steps the episode is allowed -- 47% of the
+        budget spent travelling. The baseline run fitted 22 teleports into those steps and scored 0.75; with the
+        fold it managed 12 and scored 0.375, because the rounds it could no longer afford were the ones that place
+        the toys (2026-09-14).
+
+        The fold was standing in for a question the stance search now answers directly: ``_footprint_free`` places
+        both arms at the posture the robot will be in, at the pose being judged, and refuses the stance if either
+        would come to rest inside something. A teleport does not sweep -- it materialises the robot wherever it
+        lands -- so the landing posture is the whole of the question, and it is checked before the robot is sent.
         """
-        unfold_to = self.fold_for_travel()  # the base's rectangle is honest only with the upper body over it
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
         self.robot.keep_still()
@@ -1906,7 +1859,6 @@ class R1ProSim(TiptopSim):
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
-        self.unfold_after_travel(unfold_to)
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
 
     def apply_posture(self, locked: dict, q_home, settle_steps: int = 30, tol: float = 0.03, joint_names=None) -> None:
@@ -2293,7 +2245,9 @@ class R1ProSim(TiptopSim):
                 points.append(np.array([x + c * p[0] - sn * p[1], y + sn * p[0] + c * p[1], p[2]], dtype=np.float64))
         return points
 
-    def arm_hits_scene(self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None) -> list[str]:
+    def arm_hits_scene(
+        self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None, mesh: bool = True
+    ) -> list[str]:
         """Scene objects the whole arm reaches into at joints ``q``: "desk_1".
 
         The arm is the polyline through its link origins (``arm_points``) and each scene box is grown by
@@ -2313,7 +2267,7 @@ class R1ProSim(TiptopSim):
         near = [
             (obj, lo, hi) for obj, lo, hi in aabbs if obj not in held and polyline_hits_box(points, lo, hi, clearance)
         ]
-        if not (ARM_MESH_CHECK and near):
+        if not (ARM_MESH_CHECK and mesh and near):
             return [obj.name for obj, _, _ in near]
         samples = sample_polyline(points, ARM_SAMPLE_STEP)
         hits = []

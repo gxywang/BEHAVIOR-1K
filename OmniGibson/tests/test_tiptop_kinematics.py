@@ -14,7 +14,7 @@ from omnigibson.tiptop.kinematics import (
     matrix_pose,
     pose_matrix,
 )
-from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, TRAVEL_POSE, R1ProSim, turned_joints
+from omnigibson.tiptop.r1pro import HEAD_VIEWS, HEAD_YAW_JOINT, R1ProSim, turned_joints
 
 URDF = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro/urdf/r1pro.urdf"
 LEFT_ARM = [f"left_arm_joint{i}" for i in range(1, 8)]
@@ -480,26 +480,23 @@ def test_grasp_target_jaw_is_square_to_the_approach():
         assert abs(float(jaw_world @ approach)) < 1e-9
 
 
-def test_the_travel_pose_straightens_the_arms_and_leaves_the_torso():
-    """The teleport pose is the arm joints at zero, not a torso fold, and the reason is measured.
+def test_nothing_is_folded_before_a_teleport():
+    """The travel fold is gone, and what replaced it is the stance search testing where the arm ends up.
 
-    Ramping to each candidate in store_honey's kitchen and reading back both the overhang past the base's own
-    rectangle and whether the ramp finished gave: working posture 41.2 cm; torso_joint2 = -2.25 29.2 cm and
-    BLOCKED; arm_joint2 tucked 36.9 cm and BLOCKED; every planned arm joint to zero 9.5 cm, reached with no joint
-    error; arm joints to zero plus the torso fold 25.7 cm and BLOCKED (2026-09-13). The torso fold had been in the
-    pipeline and was reported blocked on every teleport of every run, so the robot travelled with its arm out.
+    The fold was adopted after measuring that straightening the arms over the base cut the overhang past the base
+    rectangle from 41.2 cm to 9.5 cm, the only candidate that both helped and actually arrived. Then it was
+    measured in an episode: 91 ramp steps each way came to 7967 of putting_away_toys' 16946 allowed steps, 47% of
+    the budget. The baseline fitted 22 teleports into those steps and scored 0.75; with the fold, 12 and 0.375.
+    The rounds it could no longer afford were the ones that place the toys. _footprint_free answers the question
+    the fold was standing in for -- would the arm come to rest inside something -- before the robot is sent
+    (2026-09-14).
     """
-    planned = ["torso_joint1", "torso_joint2", "torso_joint3", "torso_joint4"] + [
-        f"left_arm_joint{n}" for n in range(1, 8)
-    ]
-    here = [1.2, -1.7, -0.9, 0.0, -1.631, 0.264, -1.812, -1.458, -0.051, -0.373, -1.319]
-    folded = list(here)
-    for i, joint in enumerate(planned):
-        if "_arm_joint" in joint:
-            folded[i] = float(TRAVEL_POSE)
-    assert folded[:4] == here[:4], "the torso is left exactly as it was"
-    assert all(v == 0.0 for v in folded[4:]), "every arm joint goes to the travel pose"
-    assert TRAVEL_POSE == 0.0
+    import omnigibson.tiptop.r1pro as r1pro
+
+    assert not hasattr(r1pro, "TRAVEL_POSE"), "the travel pose is gone; place_robot explains why"
+    assert not hasattr(r1pro.R1ProSim, "fold_for_travel")
+    assert not hasattr(r1pro.R1ProSim, "unfold_after_travel")
+    assert "Nothing is folded on the way" in r1pro.R1ProSim.place_robot.__doc__
 
 
 def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():
