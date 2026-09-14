@@ -143,6 +143,13 @@ def eroded_floor_map(scene, floor, robot):
     return scene.trav_map._erode_trav_map(trav_map, robot=robot)
 
 
+def disk_kernel(radius_m, resolution):
+    radius_cells = int(math.ceil(radius_m / resolution))
+    offsets = np.arange(-radius_cells, radius_cells + 1)
+    yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
+    return ((xx * resolution) ** 2 + (yy * resolution) ** 2 <= radius_m**2).astype(np.uint8)
+
+
 def clearance_floor_map(env, floor_trav_map, extra_clearance):
     if extra_clearance < 0:
         raise ValueError("--extra-clearance must be non-negative")
@@ -150,9 +157,7 @@ def clearance_floor_map(env, floor_trav_map, extra_clearance):
         return floor_trav_map
 
     resolution = float(env.scene.trav_map.map_resolution)
-    radius_cells = int(math.ceil(extra_clearance / resolution))
-    kernel_size = 2 * radius_cells + 1
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    kernel = disk_kernel(extra_clearance, resolution)
     return th.tensor(cv2.erode(floor_trav_map.cpu().numpy(), kernel))
 
 

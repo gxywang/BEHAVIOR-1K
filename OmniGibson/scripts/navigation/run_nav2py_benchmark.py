@@ -263,14 +263,19 @@ def group_episodes_by_scene(episodes):
     return groups
 
 
+def disk_kernel(radius_m, resolution):
+    radius_cells = int(math.ceil(radius_m / resolution))
+    offsets = np.arange(-radius_cells, radius_cells + 1)
+    yy, xx = np.meshgrid(offsets, offsets, indexing="ij")
+    return ((xx * resolution) ** 2 + (yy * resolution) ** 2 <= radius_m**2).astype(np.uint8)
+
+
 def apply_extra_clearance(scene, trav_map, extra_clearance):
     if extra_clearance == 0.0:
         return trav_map
 
     resolution = float(scene.trav_map.map_resolution)
-    radius_cells = int(math.ceil(extra_clearance / resolution))
-    kernel_size = 2 * radius_cells + 1
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    kernel = disk_kernel(extra_clearance, resolution)
     return th.tensor(cv2.erode(trav_map.detach().cpu().numpy(), kernel), device=trav_map.device, dtype=trav_map.dtype)
 
 
