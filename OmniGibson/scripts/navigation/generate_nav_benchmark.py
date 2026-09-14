@@ -6,6 +6,7 @@ import os
 import random
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch as th
 import yaml
@@ -16,6 +17,7 @@ from omnigibson.controllers import ControllerView
 from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
 from omnigibson.macros import gm
 from omnigibson.tasks.behavior_task import BehaviorTask
+from omnigibson.utils.motion_planning_utils import astar
 
 
 CHALLENGE_SCENES = (
@@ -34,6 +36,7 @@ DEFAULT_OUTPUT = "outputs/navigation/nav_benchmark_test.json"
 def parse_args():
     parser = argparse.ArgumentParser(description="Sample R1Pro point-navigation benchmark episodes.")
     parser.add_argument("--scene", choices=CHALLENGE_SCENES, default="house_single_floor")
+    parser.add_argument("--task", action="append", default=[], help="Task name to include. Repeat as needed.")
     parser.add_argument("--num-episodes", type=int, default=5, help="Number of episodes per task template")
     parser.add_argument("--all-scenes", action="store_true", help="Generate episodes for all challenge scenes")
     parser.add_argument(
@@ -51,6 +54,12 @@ def parse_args():
     parser.add_argument("--max-distance", type=float, default=10.0)
     parser.add_argument("--max-trials", type=int, default=500)
     parser.add_argument("--settle-steps", type=int, default=10)
+    parser.add_argument(
+        "--extra-clearance",
+        type=float,
+        default=0.2,
+        help="Additional obstacle clearance in meters beyond OmniGibson's robot-base erosion.",
+    )
     parser.add_argument(
         "--robot-config",
         default=str(Path(__file__).resolve().parents[2] / "omnigibson" / "eval" / "r1pro.yaml"),
@@ -134,6 +143,18 @@ def eroded_floor_map(scene, floor, robot):
     return scene.trav_map._erode_trav_map(trav_map, robot=robot)
 
 
+def clearance_floor_map(env, floor_trav_map, extra_clearance):
+    if extra_clearance < 0:
+        raise ValueError("--extra-clearance must be non-negative")
+    if extra_clearance == 0:
+        return floor_trav_map
+
+    resolution = float(env.scene.trav_map.map_resolution)
+    kernel_size = int(math.ceil(extra_clearance / resolution))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return th.tensor(cv2.erode(floor_trav_map.cpu().numpy(), kernel))
+
+
 def point_to_map_cell(scene, point):
     map_size = scene.trav_map.map_size
     resolution = float(scene.trav_map.map_resolution)
@@ -165,16 +186,30 @@ def episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settl
     return point_is_free(env.scene, floor_trav_map, settled_position[:2])
 
 
+def clearance_path_distance(env, trav_map, start, goal):
+    if not point_is_free(env.scene, trav_map, start) or not point_is_free(env.scene, trav_map, goal):
+        return None
+    start_cell = tuple(env.scene.trav_map.world_to_map(start[:2]).tolist())
+    goal_cell = tuple(env.scene.trav_map.world_to_map(goal[:2]).tolist())
+    path = astar(trav_map, start_cell, goal_cell)
+    if path is None:
+        return None
+    path_world = env.scene.trav_map.map_to_world(path)
+    return float(th.sum(th.norm(path_world[1:] - path_world[:-1], dim=1)).item())
+
+
 def sample_episode(
     env,
     scene_model,
     episode_idx,
     floor,
     floor_trav_map,
+    clearance_trav_map,
     min_distance,
     max_distance,
     max_trials,
     settle_steps,
+    extra_clearance,
 ):
     robot = env.robots[0]
 
@@ -187,18 +222,19 @@ def sample_episode(
             env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms for point in (start, goal)
         ):
             continue
-        _, distance = env.scene.get_shortest_path(floor, start[:2], goal[:2], entire_path=False, robot=robot)
-
+        distance = clearance_path_distance(env, clearance_trav_map, start, goal)
         if distance is None:
             continue
 
-        distance = float(distance.item() if hasattr(distance, "item") else distance)
         if distance < min_distance or distance > max_distance:
             continue
 
         start_yaw = float(th.rand(1).item() * 2.0 * math.pi)
         start_quat = T.euler2quat(th.tensor([0.0, 0.0, start_yaw]))
         if not episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
+            continue
+        settled_position, _ = robot.get_position_orientation()
+        if not point_is_free(env.scene, clearance_trav_map, settled_position[:2]):
             continue
 
         return {
@@ -211,6 +247,7 @@ def sample_episode(
             "goal_position": to_float_list(goal),
             "geodesic_distance": distance,
             "sampling_trial": trial,
+            "extra_clearance": extra_clearance,
         }
 
     raise RuntimeError(
@@ -219,13 +256,12 @@ def sample_episode(
     )
 
 
-def verify_episode(env, episode):
-    robot = env.robots[0]
+def verify_episode(env, clearance_trav_map, episode):
     start = th.tensor(episode["start_position"], dtype=th.float32)
     goal = th.tensor(episode["goal_position"], dtype=th.float32)
-    _, distance = env.scene.get_shortest_path(episode["floor"], start[:2], goal[:2], entire_path=False, robot=robot)
+    distance = clearance_path_distance(env, clearance_trav_map, start, goal)
     if distance is None:
-        raise RuntimeError(f"Stored episode is unreachable on replay check: {episode['episode_id']}")
+        raise RuntimeError(f"Stored episode lacks a clearance-valid path on replay check: {episode['episode_id']}")
 
 
 def sample_scene(scene_model, task_name, scene_instance, load_room_instances, robot_cfg, args, num_episodes=None):
@@ -252,6 +288,7 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
     episodes = []
     count = num_episodes if num_episodes is not None else args.num_episodes
     floor_trav_map = eroded_floor_map(env.scene, 0, env.robots[0])
+    clearance_trav_map = clearance_floor_map(env, floor_trav_map, args.extra_clearance)
     for local_idx in range(count):
         episode = sample_episode(
             env=env,
@@ -259,12 +296,14 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
             episode_idx=local_idx,
             floor=0,
             floor_trav_map=floor_trav_map,
+            clearance_trav_map=clearance_trav_map,
             min_distance=args.min_distance,
             max_distance=args.max_distance,
             max_trials=args.max_trials,
             settle_steps=args.settle_steps,
+            extra_clearance=args.extra_clearance,
         )
-        verify_episode(env, episode)
+        verify_episode(env, clearance_trav_map, episode)
         episode["episode_id"] = f"{scene_model}_{task_name}_{local_idx:03d}"
         episode["task_name"] = task_name
         episode["scene_instance"] = scene_instance
@@ -292,6 +331,7 @@ def write_benchmark(path, args, robot_cfg, episodes):
                 "min_distance": args.min_distance,
                 "max_distance": args.max_distance,
                 "settle_steps": args.settle_steps,
+                "extra_clearance": args.extra_clearance,
                 "episodes": episodes,
             },
             f,
@@ -313,6 +353,8 @@ def main():
         raise ValueError("--min-distance must be <= --max-distance")
     if args.settle_steps < 0:
         raise ValueError("--settle-steps must be non-negative")
+    if args.extra_clearance < 0:
+        raise ValueError("--extra-clearance must be non-negative")
 
     seed_everything(args.seed)
 
@@ -324,6 +366,9 @@ def main():
     task_metadata = Path(gm.DATA_PATH) / "2026-challenge-task-instances" / "metadata" / "available_tasks.yaml"
     with open(task_metadata, "r", encoding="utf-8") as f:
         available_tasks = yaml.safe_load(f)
+    unknown_tasks = sorted(set(args.task) - set(available_tasks))
+    if unknown_tasks:
+        raise ValueError(f"Unknown competition task(s): {', '.join(unknown_tasks)}")
     try:
         # determine which scenes to generate
         if args.all_scenes:
@@ -339,9 +384,14 @@ def main():
         out_parent.mkdir(parents=True, exist_ok=True)
 
         for scene in scenes:
-            task_names = [name for name, configs in available_tasks.items() if configs[0]["scene_model"] == scene]
+            task_names = [
+                name
+                for name, configs in available_tasks.items()
+                if configs[0]["scene_model"] == scene and (not args.task or name in args.task)
+            ]
             if not task_names:
-                raise ValueError(f"No competition tasks found for scene {scene}")
+                selected = f" selected task(s) {', '.join(args.task)}" if args.task else ""
+                raise ValueError(f"No competition tasks found for scene {scene}{selected}")
             for task_name in task_names:
                 task_path = out_parent / f"{out_path.stem}_{scene}_{task_name}.json"
                 if args.skip_existing and task_path.is_file():
