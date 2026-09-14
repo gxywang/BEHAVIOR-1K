@@ -251,6 +251,7 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         overview_view=args.overview,
         look_arm=None if args.no_look else LOOK_ARM,
     )
+    sim.send_obstacles = bool(getattr(args, "obstacles", False))
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects

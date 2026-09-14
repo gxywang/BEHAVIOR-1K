@@ -497,6 +497,12 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         "base pose): the one retry policy, the same for every task",
     )
     p.add_argument(
+        "--obstacles",
+        action="store_true",
+        help="tell the planner about the furniture standing near the robot (held_labels -> cuTAMP statics), so it "
+        "plans around the room instead of through it; costs a mask per obstacle in every capture",
+    )
+    p.add_argument(
         "--summarize",
         action="store_true",
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",

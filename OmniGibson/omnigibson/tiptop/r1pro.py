@@ -236,6 +236,11 @@ YAW_WEIGHT = 0.1  # per radian of turning away from the centroid
 HIDE_DEPTH, HIDE_MARGIN = 0.05, 0.06  # m: a container nearer by less than HIDE_DEPTH hides an item behind it, as
 # seen from the camera, when their bearings are within its angular half-width plus an item margin of HIDE_MARGIN
 # _footprint_free: what an AABB in the footprint means
+# Furniture sent to the planner as static obstacles (see nearby_obstacles). Close enough to matter, big enough
+# to be a fixture, and capped because every one of them costs a mask in the capture and a hull in perception.
+OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it anyway
+OBSTACLE_LIMIT = 8
+OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
 HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings and say nothing about the floor
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
@@ -754,6 +759,7 @@ class R1ProSim(TiptopSim):
         self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
         self._hand_convention = {}  # arm -> how its hand approaches and closes (constant; measured on first use)
         self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
+        self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -2322,6 +2328,45 @@ class R1ProSim(TiptopSim):
             if bool(points_within_tol(mesh, samples, clearance).any()):
                 hits.append(obj.name)
         return hits
+
+    def nearby_obstacles(self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT) -> list[str]:
+        """Tracked names of the furniture standing close enough to get in the way of a plan, nearest first.
+
+        The planner's collision world holds the task's own objects and one fitted table plane, and nothing else in
+        the room -- so cuTAMP plans straight through the furniture it was never told about, and the bridge has
+        been second-guessing it afterwards. These labels go out in ``held_labels``, which cuTAMP takes as statics:
+        obstacles it plans around and cannot pick up. That is a change to WHAT THE PLANNER IS TOLD rather than to
+        how the bridge moves, which is the right place for it; the bridge has no business re-deciding a motion the
+        planner already planned.
+
+        Floors, ceilings and rugs are left out (they are stood on, not avoided), as are merged walls and roofs
+        (``HOUSE_AABB_AREA``), anything wholly above the robot, and anything small enough to be a task object
+        rather than a fixture. A hull is only built for a label the capture also masks, so the caller must add
+        these to the labels it segments.
+        """
+        here = (
+            self.base_pose()[0][:2].cpu().numpy()
+            if hasattr(self.base_pose()[0], "cpu")
+            else np.asarray(self.base_pose()[0][:2], dtype=np.float64)
+        )
+        spared = set(exclude) | {self.robot.name}
+        rows = []
+        for obj, lo, hi in self.scene_aabbs():
+            if obj is self.robot or obj.name in spared or obj.category in FLOOR_COVERINGS:
+                continue
+            if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
+                continue  # merged walls, roofs, ceilings
+            if lo[2] > ROBOT_HEIGHT:
+                continue  # entirely overhead
+            extent = np.asarray(hi, dtype=np.float64) - np.asarray(lo, dtype=np.float64)
+            if float(np.max(extent)) < OBSTACLE_MIN_SIZE:
+                continue  # small enough to be something to pick up, not a fixture to plan around
+            centre = (np.asarray(lo, dtype=np.float64) + np.asarray(hi, dtype=np.float64))[:2] / 2.0
+            gap = float(np.linalg.norm(centre - here))
+            if gap <= reach:
+                rows.append((gap, obj.name))
+        rows.sort()
+        return [name for _, name in rows[:limit]]
 
     def scene_mesh(self, obj):
         """World-frame trimesh of a scene object, kept until the object moves (its box is the stamp).

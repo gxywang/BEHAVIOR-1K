@@ -178,6 +178,14 @@ class OracleKnowledge(KnowledgeSource):
 
     def describe(self, atoms, request, extras, floor=False) -> SceneKnowledge:
         labels, tiptop_atoms = self.translate(atoms)
+        # The furniture standing around the robot, so the planner has a world to plan in. cuTAMP's collision world
+        # otherwise holds the task's own objects and one fitted plane, and it plans straight through everything
+        # else in the room -- which is what the bridge has been compensating for, in the wrong place. These reach
+        # cuTAMP through held_labels, which it takes as statics: obstacles to plan around, never things to pick
+        # up. They have to be segmented here too, since a label with no hull is dropped by the planner as "not an
+        # obstacle then: perception did not reconstruct it".
+        obstacles = self.sim.nearby_obstacles(exclude=labels) if getattr(self.sim, "send_obstacles", False) else []
+        labels = list(labels) + [o for o in obstacles if o not in labels]
         views = capture_views(request, extras)
         meshes = self.sim.object_meshes(labels)  # one mesh per label for every view's masks
         masks = {
@@ -217,13 +225,23 @@ class OracleKnowledge(KnowledgeSource):
         keep = [labels.index(label) for label in visible]
         primary = views[0][0]
         held, in_hand = self.hands()
+        seen_obstacles = [o for o in obstacles if o in visible]
+        if obstacles:
+            log.info(
+                f"furniture sent to the planner as obstacles: {seen_obstacles or 'none'}"
+                + (
+                    f" ({len(obstacles) - len(seen_obstacles)} had no pixels)"
+                    if len(seen_obstacles) < len(obstacles)
+                    else ""
+                )
+            )
         return SceneKnowledge(
             labels=visible,
             atoms=tiptop_atoms,
             masks=masks[primary][keep],
             view_masks={name: view_masks[keep] for name, view_masks in masks.items() if name != primary},
             buttons=self.sim.button_hints(self.goal, category_level=False),
-            held_labels=held,
+            held_labels=sorted(set(held) | set(seen_obstacles)),
             in_hand=in_hand,
             workspace=self.sim.workspace(floor),
         )
