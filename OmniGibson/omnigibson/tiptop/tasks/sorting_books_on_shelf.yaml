@@ -1,0 +1,24 @@
+# Seven books already in one bookcase in the living room, re-stacked so that each kind sits on its own kind:
+# three comic books, two notebooks, two hardbacks. The init has them piled across kinds -- notebook_2 on
+# comic_book_1, comic_book_2 on notebook_1, hardback_2 on comic_book_3, and notebook_1, comic_book_1,
+# comic_book_3 and hardback_1 standing in the bookcase. The goal keeps all seven inside the bookcase (an atom
+# most of them likely satisfy from the start, since a book resting on a book in the shelf is still in the
+# shelf's cavity) and adds the sorting: two comic books on a comic book (a stack of three), one notebook on a
+# notebook, one hardback on a hardback. So the real work is three or four re-stacks, not a move across the room.
+#
+# What is hard here, beyond the transfers the pipeline has done before:
+#  - The containers in the demand are mostly OTHER BOOKS, not furniture. The runner will be asked to place a
+#    book ontop of a named book that is itself an item it may still want to move, and a book is a small, light,
+#    slippery target that shifts when something lands on it. Every earlier transfer task placed into a bin,
+#    a basket, a box or a shelf.
+#  - Books are thin and flat. A parallel jaw that opens to 8 cm can take a book across its covers (a hardback
+#    spine is a few cm), but a book lying flat in a shelf has no gap under it for the fingers, and the shelf's
+#    vertical clearance may not leave room to come straight down on one.
+#  - Everything happens inside one shelf opening entered from the side, the same geometry as
+#    re_shelving_library_books, but with the placement target a book inside that opening rather than the
+#    opening itself.
+#  - A wrongly-typed book has to come OFF a pile before the pile it belongs on can be built; nothing in the
+#    goal says to clear it first, so the order the runner picks matters.
+task: sorting_books_on_shelf
+instruction: stack the comic books, the notebooks and the hardbacks in the bookcase, each kind on its own pile
+plan: transfer  # no toggled_on atom in the goal; every scored atom is an inside or an ontop

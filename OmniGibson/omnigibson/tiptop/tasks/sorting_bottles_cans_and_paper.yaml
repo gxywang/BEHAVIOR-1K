@@ -1,0 +1,16 @@
+# Six items into three buckets, one kind of item to a bucket: two wine bottles (one on the kitchen countertop,
+# one on the floor), two cans of soda (one on the countertop, one on the floor), and the newspaper and the
+# magazine (both on the countertop). All three buckets stand on the kitchen floor and stay there; everything
+# happens in the one room. The goal names no particular bucket -- it asks for a bucket holding both bottles and
+# neither paper nor a can, a bucket holding both cans and nothing else, and a bucket holding the newspaper and
+# the magazine and no bottle or can -- so any bucket may take any group as long as the kinds do not mix, and
+# the ground options spell out those assignments.
+# Hard for a jaw that opens to 8 cm: a can of soda is 7 to 8.3 cm across, right at the fingers' limit (the same
+# item as in picking_up_trash); a wine bottle is tall and narrow only at the neck, and once held it has to be
+# lowered into the bucket roughly upright to end up inside rather than across the rim; the newspaper and the
+# magazine are thin flat sheets lying flush on a countertop, so there is nothing to pinch unless the hand
+# catches an edge that overhangs. Nothing has to be opened -- the buckets are open-topped and at floor height,
+# so each release is a low reach over a rim.
+task: sorting_bottles_cans_and_paper
+instruction: put the wine bottles in one bucket, the soda cans in another, and the newspaper and magazine in a third
+plan: transfer

@@ -1,0 +1,10 @@
+# Six cans of soda into one bucket, all in the same bedroom: three start on top of the bed, three on the floor,
+# and the bucket already stands on that floor. Nothing has to be opened and nothing has to move rooms.
+# Two things are harder than the three-item transfers: the item count (six picks and six releases into a single
+# container, so the last cans go in on top of cans already inside, and the bucket's rim is the only opening), and
+# the can itself -- can__of__soda.n.01 is 7 to 8.3 cm across against fingers that open to 8 cm, the same limit
+# picking_up_trash runs into. The three cans on the bed are picked at mattress height off a large soft-looking
+# top surface, so they can sit well in from any edge.
+task: collecting_aluminum_cans
+instruction: put the cans of soda in the bucket
+plan: transfer

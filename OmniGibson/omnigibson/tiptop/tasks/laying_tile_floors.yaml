@@ -1,0 +1,15 @@
+# Four tiles lying on the corridor floor, to be carried next door onto the bathroom floor and left touching one
+# another: the goal is (forall tile) ontop floor.n.01_2 -- the floor inroom bathroom -- and (forall tile) nextto
+# one of the four tiles. Its 256 ground options give five targets, the bathroom floor and each tile itself (the
+# degenerate "nextto tile_1 tile_1" among them), each wanting four tiles; a tile counts as done once it has been
+# moved, so the runner moves each of the four once. Nothing to open, nothing to press.
+# Both ends of every move are at floor level, and the target is a second floor object in another room rather than
+# a container: unlike a bin or a basket it has no compact box to aim at, and the placement has to land the tile
+# beside the tiles already put down, not merely somewhere in the room.
+# Hard for a parallel jaw that opens to 8 cm: a tile is a thin flat slab (the dataset's two models measure
+# 18.5 x 18.5 x 1 cm and 9 x 30 x 0.7 cm) lying flush on the floor. The 18.5 cm face is wider than the jaw, so the
+# only dimension it can span is the ~1 cm edge, and a slab flat on the floor leaves no clearance under it for a
+# finger.
+task: laying_tile_floors
+instruction: put the tiles on the bathroom floor next to each other
+plan: transfer
