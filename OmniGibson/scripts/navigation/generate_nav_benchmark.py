@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--max-path-soft-cost-fraction",
         type=float,
-        default=0.0,
+        default=0.15,
         help="Allowed fraction of cells along the generated path with soft cost above --max-path-soft-cost.",
     )
     parser.add_argument(
@@ -245,6 +245,11 @@ def point_is_free(scene, trav_map, point):
     return int(trav_map[row, col]) == 255
 
 
+def point_from_map_cell(scene, cell):
+    point_xy = scene.trav_map.map_to_world(th.tensor(cell, dtype=th.int64))
+    return th.tensor([float(point_xy[0].item()), float(point_xy[1].item()), 0.0], dtype=th.float32)
+
+
 def cell_is_free(trav_map, cell):
     row, col = cell
     return 0 <= row < trav_map.shape[0] and 0 <= col < trav_map.shape[1] and int(trav_map[row, col]) == 255
@@ -383,6 +388,37 @@ def clearance_path_distance(env, trav_map, start, goal):
     return None if path_info is None else path_info["distance"]
 
 
+def candidate_cell_groups_for_sampling(env, clearance_trav_map, soft_cost_map, max_path_soft_cost):
+    clearance_np = clearance_trav_map.detach().cpu().numpy()
+    valid = clearance_np == 255
+    if soft_cost_map is not None and max_path_soft_cost < 254:
+        valid &= soft_cost_map <= max_path_soft_cost
+
+    _, component_labels = cv2.connectedComponents((clearance_np == 255).astype(np.uint8), connectivity=4)
+    cells = np.argwhere(valid)
+    groups = {}
+    rooms = env.scene.load_room_instances
+    for row, col in cells:
+        cell = (int(row), int(col))
+        if rooms is not None:
+            point = point_from_map_cell(env.scene, cell)
+            if env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms:
+                continue
+        label = int(component_labels[cell])
+        if label > 0:
+            groups.setdefault(label, []).append(cell)
+    return [group for group in groups.values() if len(group) >= 2]
+
+
+def sample_candidate_pair(env, candidate_cell_groups):
+    group = random.choice(candidate_cell_groups)
+    start_cell = random.choice(group)
+    goal_cell = random.choice(group)
+    while goal_cell == start_cell and len(group) > 1:
+        goal_cell = random.choice(group)
+    return point_from_map_cell(env.scene, start_cell), point_from_map_cell(env.scene, goal_cell)
+
+
 def sample_episode(
     env,
     scene_model,
@@ -391,6 +427,7 @@ def sample_episode(
     floor_trav_map,
     clearance_trav_map,
     soft_cost_map,
+    candidate_cell_groups,
     min_distance,
     max_distance,
     max_trials,
@@ -402,15 +439,12 @@ def sample_episode(
     max_path_soft_cost_fraction,
 ):
     robot = env.robots[0]
+    needs_reset = False
 
     for trial in range(1, max_trials + 1):
-        env.reset(get_obs=False)
-        _, start = env.scene.get_random_point(floor=floor, robot=robot)
-        _, goal = env.scene.get_random_point(floor=floor, reference_point=start, robot=robot)
-        rooms = env.scene.load_room_instances
-        if rooms is not None and any(
-            env.scene.seg_map.get_room_instance_by_point(point[:2]) not in rooms for point in (start, goal)
-        ):
+        start, goal = sample_candidate_pair(env, candidate_cell_groups)
+        euclidean_distance = float(th.norm(goal[:2] - start[:2]).item())
+        if euclidean_distance > max_distance:
             continue
         path_info = clearance_path_info(
             env,
@@ -430,8 +464,13 @@ def sample_episode(
 
         start_yaw = path_info["initial_yaw"]
         start_quat = T.euler2quat(th.tensor([0.0, 0.0, start_yaw]))
+        if needs_reset:
+            env.reset(get_obs=False)
+            needs_reset = False
         if not episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
+            needs_reset = True
             continue
+        needs_reset = True
         settled_position, _ = robot.get_position_orientation()
         if not point_is_free(env.scene, clearance_trav_map, settled_position[:2]):
             continue
@@ -524,6 +563,19 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
         f"max_cost={args.max_path_soft_cost}, "
         f"allowed_fraction={args.max_path_soft_cost_fraction:.3f}"
     )
+    candidate_cell_groups = candidate_cell_groups_for_sampling(
+        env,
+        clearance_trav_map,
+        soft_cost_map,
+        args.max_path_soft_cost,
+    )
+    if not candidate_cell_groups:
+        raise RuntimeError("No sampling candidates remain after clearance and soft-cost filtering.")
+    candidate_count = sum(len(group) for group in candidate_cell_groups)
+    print(
+        "Sampling candidates after clearance / endpoint soft-cost filtering: "
+        f"{candidate_count} cells across {len(candidate_cell_groups)} connected component(s)"
+    )
     for local_idx in range(count):
         episode = sample_episode(
             env=env,
@@ -533,6 +585,7 @@ def sample_scene(scene_model, task_name, scene_instance, load_room_instances, ro
             floor_trav_map=floor_trav_map,
             clearance_trav_map=clearance_trav_map,
             soft_cost_map=soft_cost_map,
+            candidate_cell_groups=candidate_cell_groups,
             min_distance=args.min_distance,
             max_distance=args.max_distance,
             max_trials=args.max_trials,
