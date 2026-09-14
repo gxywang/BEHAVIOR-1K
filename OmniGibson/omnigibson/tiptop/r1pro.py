@@ -1451,6 +1451,7 @@ class R1ProSim(TiptopSim):
         # With the torso: this is where reach binds. A drawer 22 cm off the floor is outside a fixed-torso
         # workspace however good the grasp point is, and bending is exactly what the challenge tells its human
         # teleoperators to do ("move your base and torso as much as possible before trying to reach").
+        reach_aabbs = self.scene_aabbs()  # one snapshot for every path check below; nothing moves meanwhile
         ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
         joints_of = self.ik_joint_names(arm, with_torso=True)
         q = self.robot.get_joint_positions()
@@ -1494,6 +1495,24 @@ class R1ProSim(TiptopSim):
                     if first is not None:
                         break
                 if first is not None:
+                    # Reachable is not the same as gettable-to. ramp_to is a straight line in joint space with no
+                    # collision checking, and once the torso solves too that line swings the whole upper body:
+                    # every one of the four containers in the rig found a grasp it could reach and then stopped
+                    # at step 1 of 11 with "the arm is pushing against something" (2026-09-14). A candidate whose
+                    # path sweeps through the furniture is no use, so try the next one instead of discovering it
+                    # by collision. The container being opened is excluded -- the hand is meant to arrive at it.
+                    swept = [
+                        n
+                        for n in self.path_hits_scene(arm, ik, seed, first, aabbs=reach_aabbs, mesh=False)
+                        if n != obj.name
+                    ]
+                    if swept:
+                        log.info(
+                            f"{name}.{joint['name']}: a grasp at {np.round(where, 3).tolist()} is reachable but "
+                            f"the way there sweeps through {swept[0]}; trying the next"
+                        )
+                        first = None
+                        continue
                     reached_pos, _ = ik.fk(first, f"{arm}_gripper_link")
                     log.info(
                         f"taking hold of {name}.{joint['name']} at {np.round(handle_world, 2).tolist()} "
@@ -2357,7 +2376,9 @@ class R1ProSim(TiptopSim):
                 objects.append(obj.name)
         return touched, objects
 
-    def path_hits_scene(self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES) -> list[str]:
+    def path_hits_scene(
+        self, arm: str, ik: ArmIK, q_from, q_to, aabbs=None, samples: int = PATH_SAMPLES, mesh: bool = True
+    ) -> list[str]:
         """Scene objects the arm reaches into anywhere along the straight joint-space path from ``q_from`` to
         ``q_to``, sampled at ``samples`` configurations (the ends included).
 
@@ -2370,7 +2391,7 @@ class R1ProSim(TiptopSim):
         q_to = np.asarray(q_to, dtype=np.float64)
         hits = []
         for t in np.linspace(0.0, 1.0, max(2, samples)):
-            for name in self.arm_hits_scene(arm, ik, q_from + t * (q_to - q_from), aabbs):
+            for name in self.arm_hits_scene(arm, ik, q_from + t * (q_to - q_from), aabbs, mesh=mesh):
                 if name not in hits:
                     hits.append(name)
         return hits
