@@ -1371,7 +1371,14 @@ class R1ProSim(TiptopSim):
             seed = [float(v) for v in solution]
         return seed, False
 
-    def open_container(self, arm: str, name: str, fraction: float = OPEN_FRACTION_SCORED) -> dict:
+    def open_container(
+        self,
+        arm: str,
+        name: str,
+        fraction: float = OPEN_FRACTION_SCORED,
+        joint: str | None = None,
+        height: float | None = None,
+    ) -> dict:
         """Take hold of a container's moving link and follow its joint, opening it by ``fraction`` of its range.
 
         The one motion in the pipeline where the gripper has to follow a path rather than reach a pose: a drawer
@@ -1387,6 +1394,17 @@ class R1ProSim(TiptopSim):
         joints = openable_joints(obj)
         if not joints:
             return {"opened": False, "why": f"{name} has no joint that opens"}
+        # A task may name the joint and the height for its own container, because the general skill does not
+        # reach every asset and a named drawer is worth more than a stalled one. Logged wherever it is used.
+        if joint is not None:
+            named = [j for j in joints if j["name"] == joint]
+            if not named:
+                log.warning(
+                    f"{name}: this task names joint {joint!r}, which it does not have: {[j['name'] for j in joints]}"
+                )
+            else:
+                log.info(f"{name}: this task names joint {joint!r}; opening that one")
+                joints = named
         # On a bank of drawers any one of them satisfies the atom, so take the one whose handle the hand can most
         # easily get to -- nearest where the hand already is -- rather than the first or the widest. store_honey's
         # cabinet is four identical drawers at z 0.11, 0.32, 0.53 and 0.74, and picking by range took the bottom
@@ -1412,6 +1430,12 @@ class R1ProSim(TiptopSim):
                 # that is the top edge. 0 of 9 joints at or above z 1.16 found an orientation; the two that
                 # succeeded anywhere were at z 0.66 and z 1.20 (2026-09-13). So offer the whole column, nearest
                 # the hand's own height first, and let the IK choose.
+                if height is not None:  # the task names the height to take hold at; do not search the face
+                    point = np.array([where[0], where[1], float(height)], dtype=np.float64)
+                    on_surface = self.surface_point(link_j, point, into)
+                    log.info(f"{name}.{j['name']}: this task names z {height:.3f} to take hold at")
+                    usable.append((0.0, OPEN_GRIPS.index(grip_kind), j, t, on_surface, grip_kind))
+                    continue
                 lo_z, hi_z = float(link_j.aabb[0][2]), float(link_j.aabb[1][2])
                 band = max(0.0, (hi_z - lo_z) / 2.0 - GRASP_COLUMN_INSET)
                 middle = (lo_z + hi_z) / 2.0

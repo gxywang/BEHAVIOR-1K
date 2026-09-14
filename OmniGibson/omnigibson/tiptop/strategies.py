@@ -154,6 +154,16 @@ class TaskSpec:
     press: str = "hold"
     attempts_per_item: int = 2
     phrases: dict = field(default_factory=dict)
+    # Per-container tailoring for opening, because the general skill does not reach every asset. Keyed by the
+    # container's name in the goal, e.g.
+    #     opens:
+    #       cabinet.n.01_1: {joint: j_link_4, height: 0.74, fraction: 0.8}
+    # joint: open THIS joint rather than whichever is nearest the hand. height: take hold at this world z on the
+    # panel rather than searching up its face. fraction: how much of the joint's range to pull.
+    # The user allowed this on 2026-09-13 ("open may not need to be generic to all drawer and cabinet, you can
+    # tailor to a certain task a certain drawer"). Every value used is logged, so a score is never mistaken for a
+    # general capability -- see the README's "Kept out of the pipeline" list.
+    opens: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path) -> "TaskSpec":

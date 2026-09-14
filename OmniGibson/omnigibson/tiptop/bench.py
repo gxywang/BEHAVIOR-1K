@@ -121,8 +121,9 @@ class Episode:
     source from the planner's reports. ``pick``, ``achieve`` and ``put_down`` run the rounds under the one retry
     policy every task gets (``--rounds``); there is no other recovery, in here or in a task description."""
 
-    def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path):
+    def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path, spec=None):
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
+        self.spec = spec  # the task description, for the values a task names for itself (TaskSpec.opens)
         self.rounds = args.rounds
         self.records = []  # one per round, in order
         self.blind = {}  # goal object -> the distinct stances it could not be seen from (BLIND_LIMIT gives up)
@@ -146,8 +147,15 @@ class Episode:
             self.records.append({"open": name, "error": str(e), "step": self.sim.n_steps})
             return False
         self.sim.video_caption = f"open {name}"
+        hint = dict((getattr(self.spec, "opens", None) or {}).get(name) or {})
+        if hint:
+            log.info(f"{name}: opening with the values this task names for it: {hint}")
         result = self.sim.open_container(
-            self.sim.arm, name, fraction=OPEN_FRACTION_SCORED if fraction is None else fraction
+            self.sim.arm,
+            name,
+            fraction=hint.get("fraction", OPEN_FRACTION_SCORED if fraction is None else fraction),
+            joint=hint.get("joint"),
+            height=hint.get("height"),
         )
         self.records.append({"open": name, **result, "step": self.sim.n_steps})
         if not result.get("opened"):
@@ -567,7 +575,7 @@ def main(argv=None) -> None:
                 sim.video_caption = f"{args.task_name} instance {instance_id}"
                 apply_embodiment_posture(sim, args, metadata["embodiment"])
                 sim.mark_goal_initial()
-                episode = Episode(sim, args, planners, knowledge, inst_dir)
+                episode = Episode(sim, args, planners, knowledge, inst_dir, spec=getattr(strategy, "spec", None))
                 strategy.run(episode)
                 reason = "strategy finished"
             except EpisodeOver as e:

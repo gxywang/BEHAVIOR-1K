@@ -11,3 +11,14 @@
 task: store_honey
 instruction: put the jar of honey in the cabinet
 plan: transfer
+
+# Tailored 2026-09-13, with the user's leave to hardcode ("open may not need to be generic to all drawer and
+# cabinet, you can tailor to a certain task a certain drawer"). The smoke tests opened this cabinet by taking
+# hold of j_link_4 at z 0.74 and pulling 80% of its range: the joint went 0.000 -> 0.130 of [0, 0.39], well past
+# the 5% OmniGibson flips Open at. The other three drawers sit at z 0.11, 0.32 and 0.53; the lowest is out of the
+# arm's reach with the torso locked at the challenge posture. Naming the drawer skips that search.
+opens:
+  cabinet.n.01_1:
+    joint: j_link_4
+    height: 0.74
+    fraction: 0.8
