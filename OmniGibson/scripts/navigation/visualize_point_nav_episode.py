@@ -65,6 +65,7 @@ def main(argv=None):
 
     _, episodes = runner.load_benchmark(args.benchmark)
     episode = runner.filter_episodes(episodes, args.episode_ids)[0]
+    runtime_extra_clearance = runner.effective_runtime_extra_clearance([episode], args.runtime_extra_clearance)
     with gm.unlocked():
         gm.USE_GPU_DYNAMICS = False
         gm.ENABLE_TRANSITION_RULES = False
@@ -98,9 +99,22 @@ def main(argv=None):
             args,
             clearance_is_in_costmap=args.costmap_source in {"og-eroded", "og-eroded-soft"},
         )
-        costmap_bundle = runner.make_costmap_bundle(env.scene, int(episode.get("floor", 0)), robot, nav2py_api, args)
+        costmap_bundle = runner.make_costmap_bundle(
+            env.scene,
+            int(episode.get("floor", 0)),
+            robot,
+            nav2py_api,
+            args,
+            runtime_extra_clearance,
+        )
 
         print(f"\nLoaded {episode['episode_id']}.")
+        print(f"Costmap: {args.costmap_source}; runtime extra clearance={runtime_extra_clearance:.3f}m")
+        if runtime_extra_clearance > args.runtime_extra_clearance:
+            print(
+                f"  Using benchmark validation clearance {runtime_extra_clearance:.3f}m "
+                f"instead of requested {args.runtime_extra_clearance:.3f}m."
+            )
         print(f"Success criterion: {runner.format_success_criterion(args, robot)}")
 
         def after_reset():
