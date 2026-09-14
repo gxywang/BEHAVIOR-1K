@@ -384,14 +384,22 @@ def main():
         out_parent.mkdir(parents=True, exist_ok=True)
 
         for scene in scenes:
-            task_names = [
+            scene_task_names = [
                 name
                 for name, configs in available_tasks.items()
-                if configs[0]["scene_model"] == scene and (not args.task or name in args.task)
+                if configs[0]["scene_model"] == scene
             ]
+            task_names = [name for name in scene_task_names if not args.task or name in args.task]
             if not task_names:
                 selected = f" selected task(s) {', '.join(args.task)}" if args.task else ""
                 raise ValueError(f"No competition tasks found for scene {scene}{selected}")
+            if args.task:
+                print(
+                    f"Scene {scene}: {len(scene_task_names)} task(s) available; "
+                    f"generating {len(task_names)} selected task(s)."
+                )
+            else:
+                print(f"Scene {scene}: generating benchmarks for {len(task_names)} task(s).")
             for task_name in task_names:
                 task_path = out_parent / f"{out_path.stem}_{scene}_{task_name}.json"
                 if args.skip_existing and task_path.is_file():
