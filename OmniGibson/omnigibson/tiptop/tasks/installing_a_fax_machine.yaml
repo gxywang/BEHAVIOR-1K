@@ -1,0 +1,30 @@
+# One item to carry and one button to press. The BDDL names one facsimile, ten carrels (carrel.n.02_1 plus the
+# carrel.n.02_* wildcard, which the instances expand to _1 .. _10), and two floors, one in the shared office and
+# one in the corridor. The goal is two atoms -- (toggled_on facsimile) and, under an exists over the carrels,
+# (ontop facsimile carrel) -- so the runner reads one transfer and one press: plan auto, the transfer first. The
+# fax machine starts ontop floor.n.01_1 and switched off; the carrels are fixed scene furniture. Nothing to open.
+# The exists ranges over ten interchangeable carrels, but the goal moves a single item, so nothing can be split
+# between containers and there is no "the same <container>" to name; order_containers takes whichever is nearest.
+# In the challenge scene (office_cubicles_right, 300 instances) the fax machine stands on the shared-office floor
+# at z 0.036 in every one of them, its position resampled over the aisles between the cubicles (x 9.00-11.73,
+# y -6.92..1.60): 0.61-8.44 m from the robot's start pose (median 4.12) and 1.14-1.84 m from the nearest cubicle
+# centre (median 1.36). So every episode is a drive across the shared office, a pick off the floor, a carry of
+# about a metre and a place on a cubicle.
+# All ten carrels are the same box -- cubicle/deceti (four of them) and cubicle/hzalfx (six), 1.446 x 1.440 x
+# 1.211 m, unscaled, centre at z 0.61 -- so the hull top is z ~1.21. "cubicle" is not in SUPPORT_CATEGORIES
+# (r1pro.py: table and floor only), so a carrel reaches the planner as a hull object and the placement aims at
+# that hull top: the partition tops of the cubicle at 1.21 m, not the desk surface inside it (the README's
+# 2026-09-12 gap list names this task for exactly that).
+# Hard for a parallel jaw that opens to 8 cm: the one fax machine model (facsimile/mcqqhy, scaled 2.03 x 2.00 x
+# 1.76) measures 14.0 x 26.0 x 6.0 cm. Both horizontal axes are far wider than the jaw, so the only span left is
+# the 6 cm height, and the machine lies flush on the floor with no clearance under it for a finger -- the same
+# problem setting_mousetraps and laying_tile_floors meet, here at floor level rather than on a counter.
+# The press is in_place for two reasons: a "hold" press picks the object up and never puts it back, which would
+# undo the ontop atom the transfer has just satisfied (the README names this task's family for it), and the
+# machine is too wide on both horizontal axes to lift for a hold press anyway. Its togglebutton meta link is a
+# ~1 cm sphere on the top face near one end of the 26 cm axis, about 5 cm above the floor at the start and about
+# 1.2 m up once the machine is standing on a cubicle top.
+task: installing_a_fax_machine
+instruction: put the fax machine on the office cubicle and turn it on
+plan: auto
+press: in_place

@@ -1,0 +1,46 @@
+# One desk in one bedroom, six desk objects put back where they belong. The goal is ten atoms: keyboard nextto
+# monitor and ontop desk, mouse nextto keyboard and ontop desk, folder nextto mouse, notebook ontop folder, pen
+# ontop notebook, monitor ontop desk, computer under desk, swivel chair nextto desk. Nothing is toggled and
+# nothing is closed, so no press and no open; the desk (desk_uqcmzf_0, 1.60 x 1.60 m, top at 0.72 m) is a single
+# rigid link, so there is no drawer to open either. Nothing is wrapped in an "exists": every object is a single
+# named instance, so no "the same <container>" is needed.
+#
+# Where things start (:init, and the 300 shipped states of house_double_floor_upper):
+#  - mouse (9.0 x 6.0 x 3.0 cm), monitor (24 x 82 x 48 cm) and keyboard are on the desk; the computer
+#    (43 x 18 x 36 cm) is already under it.
+#  - the keyboard (16.6 x 48.4 x 1.6 cm) lies ACROSS the notebook (20.5 x 12.6 x 1.2 cm), their centres within
+#    7 cm of each other in every state (mean 6 mm), the notebook under it on the desk top.
+#  - the folder (28.6 x 20.2 x 3.3 cm) lies on the swivel chair's seat at z about 0.52, with the pen
+#    (17.5 x 1.0 x 1.6 cm) on the folder.
+#  - the swivel chair (0.59 x 0.63 x 1.00 m) stands 0.65 m from the desk's centre in all 300 states, its own
+#    centre inside the desk's footprint; it is the only chair and the only desk in the room.
+#
+# "under" is not a predicate the runner plans for: it logs the atom and leaves it alone. It holds from :init, so
+# the computer only has to be left standing where it is.
+#
+# What the runner is left with: of the nine place slots the demand reads off the goal, four pass Episode.placed
+# in every shipped state (its geometry run here on the shipped poses; at run time on the robot's own boxes) --
+# keyboard ontop desk 300/300, mouse ontop desk 300/300, monitor ontop desk 300/300, swivel chair nextto desk
+# 300/300, and two more pass in some -- keyboard nextto monitor in 77 and mouse nextto keyboard in 37. A settled item is dropped from
+# every other slot as well, so the keyboard, the mouse, the monitor and the chair are never carried, and the
+# three transfers that always run are the folder to beside the mouse, the notebook onto the folder and the pen
+# onto the notebook. The keyboard's ontop-desk atom is false in BDDL (it rests on the notebook, not the desk) and
+# becomes true when the notebook is drawn out from under it -- a 1.2 cm drop.
+#
+# Hard for a parallel jaw that opens to 8 cm:
+#  - the notebook is a 1.2 cm slab lying on a desk top with a 48 cm keyboard across it: the only hold is a pinch
+#    on an edge, and whatever pulls it out has to slide it from under the keyboard rather than lift it clear.
+#  - the pen is a 1.0 x 1.6 cm cylinder lying flat on the folder; almost nothing stands above the surface.
+#  - the folder sits on the chair seat, inside the desk's own footprint: its top is 17 cm below the desk top on
+#    average and as little as 2.4 cm, so the pick comes in beside or under the desk's edge, not straight down.
+#  - two of the three containers are themselves small loose items that have to move first -- the folder holds the
+#    notebook and the notebook holds the pen -- so the pile is only stable built bottom up, and the runner orders
+#    containers by distance, not by that dependency.
+#  - nextto goes on the wire as the planner's "near": a release beside a target with no container to aim into,
+#    and the target here (the mouse) is a 9 cm object on the same desk top.
+#  - "desk" is not in SUPPORT_CATEGORIES ("table", "floor"), so the desk reaches the planner as a tracked object
+#    rather than as the plane its items stand on.
+task: getting_organized_for_work
+instruction: put the keyboard on the desk next to the monitor, the mouse next to the keyboard, the folder next to the mouse, the notebook on the folder and the pen on the notebook, and leave the swivel chair at the desk and the computer under the desk
+plan: transfer  # no toggled_on and no open atom in the goal; every scored atom the runner acts on is an ontop or a nextto
+attempts_per_item: 2  # at most three transfers run: six of the nine place slots belong to items settled at the start

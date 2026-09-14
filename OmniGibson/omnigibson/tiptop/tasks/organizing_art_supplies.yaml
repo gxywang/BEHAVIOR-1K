@@ -1,0 +1,29 @@
+# Four art supplies into one tote bag, and the tote itself onto the desk -- five place atoms, all in one bedroom.
+# Start (:init): glue stick, rubber eraser, paintbrush and marker all lie ontop desk.n.01_1; the tote
+# (carryall.n.01_1, the "tote" asset) stands on the bedroom floor about 1.8 m from that desk. Goal: the four
+# items inside the tote and the tote ontop the desk. None of the five atoms holds at start; nothing is toggled
+# and nothing starts shut, so there is no press and nothing to open.
+#
+# As in organizing_school_stuff and make_rose_centerpieces the container is itself an item to be moved, and here
+# the two halves interact more than usual: the items start on the very surface the tote must end on. Place the
+# tote on the desk first and all four transfers are short hops on one desk top; take the items first and each is
+# a 1.8 m carry down to a bag on the floor, after which the full bag still has to be lifted onto the desk. The
+# runner picks the order from the demand table, not from here.
+#
+# Hard for a parallel jaw that opens to 8 cm (sizes from the shipped instance):
+#  - all four items are thin and lie flat on a desk top 0.785 m high: marker 10.8 x 1.5 x 1.3 cm, glue stick
+#    9.5 x 1.9 x 1.9 cm, rubber eraser 5.0 x 2.1 x 1.1 cm, paintbrush 14.4 x 4.2 x 0.9 cm. Every one is far
+#    inside the jaw's width, but the tallest stands 1.9 cm above the surface and the paintbrush under 1 cm, so
+#    each grasp is a pinch that has to close almost on the table.
+#  - the four are spread along a 1.51 m desk, marker and glue stick at one end and paintbrush and eraser about
+#    0.9 m away, so one base pose is unlikely to reach all of them.
+#  - the tote is 34 x 24 x 47 cm, wider than the jaw on both horizontal axes, so the hold is a handle or the rim,
+#    and it has to stay upright through the carry or whatever is already in it comes out.
+#  - carryall.n.01 is annotated fillable and not openable (synsets.csv) and the asset is rigidBody, so there is
+#    no lid to lift; "inside" is a drop through the mouth, whose top edge is about 0.48 m up while the bag is on
+#    the floor and about 1.26 m up once the bag stands on the desk.
+#  - desk is not one of SUPPORT_CATEGORIES ("table", "floor"), so the plane the items start on -- and that the
+#    tote must end on -- reaches the planner as a tracked object, not as the support plane under them.
+task: organizing_art_supplies
+instruction: put the glue stick, eraser, paintbrush and marker in the tote bag and put the tote bag on the desk
+plan: transfer  # every goal atom is a place: four inside(item, tote) and one ontop(tote, desk)

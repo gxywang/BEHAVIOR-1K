@@ -1,0 +1,60 @@
+# Ten placements and one lid to shut, all in one child's room (house_single_floor, childs_room). The goal:
+# both folders and both paperback books inside bookcase.n.01_1; both pens and the pencil inside
+# pencil_box.n.01_1; the stapler, the pencil box and the laptop ontop desk.n.01_1; and not(open laptop).
+# Every container is a single named instance -- no "exists" anywhere in the goal -- so nothing is
+# interchangeable and the instruction needs no "the same bookcase".
+#
+# Start (:init): folder_1, the pencil, both pens, both paperback books and the pencil box are ontop the desk;
+# folder_2 is ontop the chair; the stapler is INSIDE the bookcase; the laptop is ontop the bed and open.
+# The pencil box already stands on the desk, so that atom holds at the start and the runner leaves it alone:
+# nine transfers to make, not ten. The pencil box is both an item and a container, but unlike
+# organizing_school_stuff's tote it never has to be carried, so the pens can go in wherever it stands.
+#
+# The bookcase is both a source and a destination: the stapler has to come OUT of it onto the desk while two
+# folders and two books go in. Over the 300 shipped instances the stapler's root sits anywhere from z 0.17 to
+# z 1.39 inside the case, i.e. any shelf from ankle height to above the chest.
+#
+# The scene objects (house_single_floor, task instance 0's inst_to_name):
+#  - desk bhkhxo_0, fixed, 0.65 x 1.80 m, top at 0.758 m. The six desk items are re-sampled over its whole
+#    1.80 m length (y 12.31 to 14.09), so they do not all fall in one stance's reach.
+#  - bookcase jaysra_0, fixed, 0.33 m deep x 1.19 m wide x 1.76 m tall, ONE rigid link: no door to open, a
+#    shelf cavity entered from the side, the geometry of re_shelving_library_books. 1.25 m from the desk.
+#  - bed rrcvaq_1, fixed, mattress top at z 0.50, 2.58 m from the desk; the laptop is sampled over it, 1.71 to
+#    3.25 m from the desk (mean 2.34).
+#  - chair.n.01_1 is the eames_chair hndxiw_0 and is NOT fixed: folder_2 rests on its seat at z ~0.55, 0.83 m
+#    from the desk, and the chair rolls if the base or the arm touches it.
+#
+# The items, at the scales the instance loads (models from the sampling whitelist):
+#  - folder lktggf x2, 21.1 x 16.4 x 4.5 cm.
+#  - paperback_book yxujzs x2, scaled to 25.0 x 19.0 x 2.0 cm.
+#  - pen gqwdor x2, 15.0 x 1.5 x 1.5 cm; pencil lamaxq, 13.0 x 1.5 x 1.5 cm.
+#  - pencil_case otcmih, scaled to 10.5 x 30.0 x 10.5 cm; fillable, not openable, so an open top to drop into.
+#  - stapler kgnsas, scaled to 18 x 4 x 10 cm.
+#  - laptop izydvb: a 31.8 x 44.4 x 2.4 cm base plus a 1.0 cm screen link on a revolute hinge, which the 300
+#    instances start at 2.08-2.40 rad. The goal's not(open laptop) reaches the runner as a CLOSE and is done
+#    before any transfer (open_up at fraction 0.0), so the lid is shut while the laptop still lies on the bed.
+#
+# Hard for a parallel jaw that opens to 8 cm:
+#  - the books are 2.0 cm thick and lie flat on the desk with no gap underneath; the only hold is across the
+#    covers. The folders are 4.5 cm thick, inside the jaw, but folder_2's support is a chair that can move.
+#  - the pens and the pencil are 1.5 cm cylinders lying flat on the desk -- almost nothing above the surface to
+#    close on -- and their target is the 10.5 cm-wide opening of a case that a 15 cm pen has to clear.
+#  - the laptop is 44 x 32 cm, over the jaw on both of those axes; only the 2.4 cm base slab (3.7 cm with the
+#    screen shut) fits, and it is lifted off a mattress -- the bed is not in SUPPORT_CATEGORIES ("table",
+#    "floor"), so it reaches the planner as a tracked object rather than the plane under the laptop.
+#  - four placements go into the bookcase cavity from the side, and the stapler pick reaches into that same
+#    cavity at whatever height the instance put it.
+#  - desk.n.01 is not in SUPPORT_CATEGORIES either (label_category is "desk"), so the three ontop-desk releases
+#    aim at a tracked object, not at the planner's support plane.
+task: clean_up_your_desk
+# Handed to the planner verbatim, so it names the kinds that are actually in :objects. "clean up the desk"
+# would name none of them, and half the work is not on the desk at all (the folder on the chair, the stapler
+# in the bookcase, the laptop on the bed). The pencil box is named twice, once as the pens' destination and once
+# as an item the goal wants ontop the desk: that atom holds at the start and costs no transfer, but the goal
+# demands it, so the instruction says where it belongs rather than leaving the planner to infer it.
+instruction: put the folders and the paperback books in the bookcase, the pens and the pencil in the pencil box, and the stapler, the pencil box and the laptop on the desk
+plan: transfer  # no toggled_on atom in the goal; the close is an open-target, run before the transfers either way
+# Ten demanded placements (nine still to make). The human demonstration is 21,418 env steps, so the timeout is
+# 32,126 at the 1.5x multiplier, and putting_away_toys spent 16,945 steps on about 13 rounds -- roughly 1,300 a
+# round, two rounds a transfer. One try each keeps all nine reachable inside that budget.
+attempts_per_item: 1
