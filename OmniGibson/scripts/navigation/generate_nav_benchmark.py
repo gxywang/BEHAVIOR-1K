@@ -246,8 +246,24 @@ def point_is_free(scene, trav_map, point):
 
 
 def point_from_map_cell(scene, cell):
-    point_xy = scene.trav_map.map_to_world(th.tensor(cell, dtype=th.int64))
-    return th.tensor([float(point_xy[0].item()), float(point_xy[1].item()), 0.0], dtype=th.float32)
+    row, col = cell
+    resolution = float(scene.trav_map.map_resolution)
+    origin = -0.5 * scene.trav_map.map_size * resolution
+    return th.tensor(
+        [
+            origin + (float(col) + 0.5) * resolution,
+            origin + (float(row) + 0.5) * resolution,
+            0.0,
+        ],
+        dtype=th.float32,
+    )
+
+
+def point_soft_cost(scene, soft_cost_map, point):
+    row, col = point_to_map_cell(scene, point)
+    if row < 0 or col < 0 or row >= soft_cost_map.shape[0] or col >= soft_cost_map.shape[1]:
+        return 254
+    return int(soft_cost_map[row, col])
 
 
 def cell_is_free(trav_map, cell):
@@ -473,6 +489,8 @@ def sample_episode(
         needs_reset = True
         settled_position, _ = robot.get_position_orientation()
         if not point_is_free(env.scene, clearance_trav_map, settled_position[:2]):
+            continue
+        if soft_cost_map is not None and point_soft_cost(env.scene, soft_cost_map, settled_position[:2]) > max_path_soft_cost:
             continue
 
         return {
