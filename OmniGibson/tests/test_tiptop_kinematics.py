@@ -500,3 +500,25 @@ def test_the_travel_pose_straightens_the_arms_and_leaves_the_torso():
     assert folded[:4] == here[:4], "the torso is left exactly as it was"
     assert all(v == 0.0 for v in folded[4:]), "every arm joint goes to the travel pose"
     assert TRAVEL_POSE == 0.0
+
+
+def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():
+    """A stance has to be judged by where the arm would END UP, which means placing it before the robot moves.
+
+    The base's rectangle is not the robot: the teleport folds the arms over the base and then unfolds them to the
+    working posture, where they reach 0.41 m past that rectangle. A stance whose base is clear can still leave the
+    hand inside a box on the floor, which is what the user saw in putting_away_toys -- after picking up a toy the
+    robot teleported to the table and its arm came to rest INSIDE the toy box (2026-09-13).
+    """
+
+    class _Stub:
+        robot = type("R", (), {"arm_link_names": {"left": ["l1"]}})()
+
+        def base_to_world(self, p):
+            raise AssertionError("`at` must not consult the robot's current pose")
+
+    ik = type("IK", (), {"fk": staticmethod(lambda q, name: (np.array([1.0, 0.0, 0.5]), None))})()
+    points = R1ProSim.arm_points(_Stub(), "left", ik, [0.0], at=(2.0, 3.0, 0.0))
+    assert np.allclose(points[0], [3.0, 3.0, 0.5]), "a point 1 m ahead of a base at (2,3) facing +x is at (3,3)"
+    turned = R1ProSim.arm_points(_Stub(), "left", ik, [0.0], at=(2.0, 3.0, np.pi / 2))
+    assert np.allclose(turned[0], [2.0, 4.0, 0.5]), "the same point with the base turned 90 deg is at (2,4)"

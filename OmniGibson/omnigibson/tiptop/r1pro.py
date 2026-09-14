@@ -767,6 +767,7 @@ class R1ProSim(TiptopSim):
         self.look_names = ()  # the objects it was chosen for: one of them in a hand is looked at there instead
         self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
         self._hand_convention = {}  # arm -> how its hand approaches and closes (constant; measured on first use)
+        self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -1046,6 +1047,12 @@ class R1ProSim(TiptopSim):
         the collision meshes on every access, ~50 ms for a house scene), to reuse across footprint checks."""
         return [(o, *[v.cpu().numpy() for v in o.aabb]) for o in self.env.scene.objects if o is not self.robot]
 
+    def _stance_ik(self, arm: str) -> ArmIK:
+        """Arm IK kept for the stance search. Building one per candidate would cost more than the search itself."""
+        if arm not in self._stance_iks:
+            self._stance_iks[arm] = self.arm_ik(arm, frame=f"{arm}_gripper_link")
+        return self._stance_iks[arm]
+
     def _footprint_free(self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None) -> tuple[bool, str]:
         """Floor under the whole footprint, inside a room, and no object's box overlapping the base.
 
@@ -1110,6 +1117,27 @@ class R1ProSim(TiptopSim):
                 clearance = min(clearance, gap)
             elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
                 return False, f"overlaps {obj.name}", 0.0
+        # The base's rectangle is not the robot. A teleport puts the arms over the base (TRAVEL_POSE) and then
+        # unfolds them to the working posture, where they reach 0.41 m past that rectangle -- so a stance whose
+        # base is clear can still leave the hand inside a box on the floor. The user watched exactly that in
+        # putting_away_toys: after picking up a toy the robot teleported to the table and its arm came to rest
+        # INSIDE the toy box (2026-09-13). The arms are tested in 3D, at the posture they will unfold to and at
+        # the pose being judged, so a stance is refused for where the arm ENDS UP rather than only for where the
+        # wheels are. Objects being stood for are in ``ignore``: the arm is meant to reach those.
+        if yaw is not None and self.q_home is not None:
+            spared = {o.name for o in ignore}
+            joints = self.robot.get_joint_positions()
+            for arm in self.robot.arm_names:
+                try:
+                    ik = self._stance_ik(arm)
+                    q = [float(joints[self.joint_index[j]]) for j in self.robot.arm_joint_names[arm]]
+                except Exception:  # noqa: BLE001 - no description for this arm; the base test still stands
+                    continue
+                inside = [
+                    n for n in self.arm_hits_scene(arm, ik, q, aabbs=aabbs, at=(x, y, float(yaw))) if n not in spared
+                ]
+                if inside:
+                    return False, f"the {arm} arm would come to rest in {inside[0]}", 0.0
         return True, "free", float(clearance)
 
     def settled_level(self, x: float, y: float, tilt_deg: float = TILT_LIMIT_DEG, shift: float = SHIFT_LIMIT) -> tuple:
@@ -2220,18 +2248,28 @@ class R1ProSim(TiptopSim):
                 hits.append(link)
         return hits
 
-    def arm_points(self, arm: str, ik: ArmIK, q) -> list[np.ndarray]:
-        """World positions of ``arm``'s link origins at joints ``q``, shoulder to fingertips, in order."""
+    def arm_points(self, arm: str, ik: ArmIK, q, at=None) -> list[np.ndarray]:
+        """World positions of ``arm``'s link origins at joints ``q``, shoulder to fingertips, in order.
+
+        ``at``: an (x, y, yaw) base pose to evaluate them at instead of the base's current one, so a stance can be
+        judged by where the arm would END UP before the robot is put there.
+        """
         points = []
         for name in list(self.robot.arm_link_names[arm]) + [f"{arm}_{suffix}" for suffix in HAND_LINKS]:
             try:
                 pos, _ = ik.fk(q, name)
             except Exception:
                 continue  # a link Lula's description does not carry
-            points.append(np.asarray(self.base_to_world(np.asarray(pos, dtype=np.float64)), dtype=np.float64))
+            p = np.asarray(pos, dtype=np.float64)
+            if at is None:
+                points.append(np.asarray(self.base_to_world(p), dtype=np.float64))
+            else:
+                x, y, yaw = at
+                c, sn = math.cos(float(yaw)), math.sin(float(yaw))
+                points.append(np.array([x + c * p[0] - sn * p[1], y + sn * p[0] + c * p[1], p[2]], dtype=np.float64))
         return points
 
-    def arm_hits_scene(self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS) -> list[str]:
+    def arm_hits_scene(self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None) -> list[str]:
         """Scene objects the whole arm reaches into at joints ``q``: "desk_1".
 
         The arm is the polyline through its link origins (``arm_points``) and each scene box is grown by
@@ -2247,7 +2285,7 @@ class R1ProSim(TiptopSim):
         """
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         held = {self.objects[label] for label in self.hands() if label in self.objects}
-        points = self.arm_points(arm, ik, q)
+        points = self.arm_points(arm, ik, q, at=at)
         near = [
             (obj, lo, hi) for obj, lo, hi in aabbs if obj not in held and polyline_hits_box(points, lo, hi, clearance)
         ]
