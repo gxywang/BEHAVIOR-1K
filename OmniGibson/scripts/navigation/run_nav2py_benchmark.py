@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch as th
 
@@ -135,6 +136,15 @@ def parse_args(argv=None):
     )
     parser.add_argument("--soft-cost-radius", type=float, default=0.75)
     parser.add_argument("--soft-cost-scaling-factor", type=float, default=3.0)
+    parser.add_argument(
+        "--runtime-extra-clearance",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard-erode the OmniGibson robot-eroded traversability map by this many meters before "
+            "planning with og-eroded / og-eroded-soft."
+        ),
+    )
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
     parser.add_argument(
         "--visual-step-sleep",
@@ -253,10 +263,17 @@ def group_episodes_by_scene(episodes):
     return groups
 
 
-def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False):
-    trav_map = th.clone(scene.trav_map.floor_map[floor])
-    if erode_for_robot:
-        trav_map = scene.trav_map._erode_trav_map(trav_map, robot=robot)
+def apply_extra_clearance(scene, trav_map, extra_clearance):
+    if extra_clearance == 0.0:
+        return trav_map
+
+    resolution = float(scene.trav_map.map_resolution)
+    kernel_size = int(math.ceil(extra_clearance / resolution))
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    return th.tensor(cv2.erode(trav_map.detach().cpu().numpy(), kernel), device=trav_map.device, dtype=trav_map.dtype)
+
+
+def trav_map_to_costmap(scene, trav_map, nav2py_api):
     trav_map = trav_map.detach().cpu().numpy()
     occupancy = np.full(trav_map.shape, 100, dtype=np.int16)
     occupancy[trav_map == 255] = 0
@@ -273,6 +290,14 @@ def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False):
     )
 
 
+def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False, extra_clearance=0.0):
+    trav_map = th.clone(scene.trav_map.floor_map[floor])
+    if erode_for_robot:
+        trav_map = scene.trav_map._erode_trav_map(trav_map, robot=robot)
+        trav_map = apply_extra_clearance(scene, trav_map, extra_clearance)
+    return trav_map_to_costmap(scene, trav_map, nav2py_api)
+
+
 def make_soft_costmap(costmap, radius, cost_scaling_factor):
     soft_costmap = costmap.copy()
     hard_obstacles = costmap.data >= 254
@@ -286,9 +311,19 @@ def make_costmap_bundle(scene, floor, robot, nav2py_api, args):
         "raw": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False),
         "og_eroded": make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=True),
     }
+    if args.runtime_extra_clearance > 0.0:
+        bundle["og_eroded_runtime_clearance"] = make_costmap(
+            scene,
+            floor,
+            robot,
+            nav2py_api,
+            erode_for_robot=True,
+            extra_clearance=args.runtime_extra_clearance,
+        )
+    planning_costmap = bundle.get("og_eroded_runtime_clearance", bundle["og_eroded"])
     if args.costmap_source == "og-eroded-soft":
         bundle["og_eroded_soft"] = make_soft_costmap(
-            bundle["og_eroded"],
+            planning_costmap,
             args.soft_cost_radius,
             args.soft_cost_scaling_factor,
         )
@@ -300,7 +335,7 @@ def select_costmap(costmap_bundle, costmap_source):
         return costmap_bundle["raw"], False
     if costmap_source == "og-eroded-soft":
         return costmap_bundle["og_eroded_soft"], True
-    return costmap_bundle["og_eroded"], True
+    return costmap_bundle.get("og_eroded_runtime_clearance", costmap_bundle["og_eroded"]), True
 
 
 def make_robot_profile(robot, nav2py_api, args, clearance_is_in_costmap=False):
@@ -680,11 +715,14 @@ def robot_state_diagnostic(robot, timestamp, costmap):
 
 def episode_costmap_diagnostics(costmap_bundle, active_costmap, episode):
     diagnostics = {}
-    for name, costmap in {
+    diagnostic_costmaps = {
         "raw": costmap_bundle["raw"],
         "og_eroded": costmap_bundle["og_eroded"],
-        "active": active_costmap,
-    }.items():
+    }
+    if "og_eroded_runtime_clearance" in costmap_bundle:
+        diagnostic_costmaps["og_eroded_runtime_clearance"] = costmap_bundle["og_eroded_runtime_clearance"]
+    diagnostic_costmaps["active"] = active_costmap
+    for name, costmap in diagnostic_costmaps.items():
         diagnostics[name] = {
             "start": point_cost_diagnostic(costmap, episode["start_position"]),
             "goal": point_cost_diagnostic(costmap, episode["goal_position"]),
@@ -981,6 +1019,7 @@ def run_episode(
         "success_criterion": args.success_criterion,
         "success_criterion_value": success_criterion_diagnostics(args, robot),
         "costmap_source": args.costmap_source,
+        "runtime_extra_clearance": args.runtime_extra_clearance,
         "robot_profile": robot_profile_diagnostics(profile),
         "robot_footprint": robot_footprint_diagnostics(robot),
         "controller_command_limits": command_limits_diagnostics(command_limits),
@@ -1045,6 +1084,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
         "trace_failures": args.trace_failures,
         "soft_cost_radius": args.soft_cost_radius,
         "soft_cost_scaling_factor": args.soft_cost_scaling_factor,
+        "runtime_extra_clearance": args.runtime_extra_clearance,
         "safety_slowdown_scales": args.safety_slowdown_scales,
         "state_linear_velocity_deadband": args.state_linear_velocity_deadband,
         "state_angular_velocity_deadband": args.state_angular_velocity_deadband,
@@ -1079,6 +1119,7 @@ def main(args=None, shutdown=True):
         "command_max_angular_velocity",
         "soft_cost_radius",
         "soft_cost_scaling_factor",
+        "runtime_extra_clearance",
         "planner_cost_penalty",
         "visual_step_sleep",
         "keep_open_seconds",
@@ -1089,7 +1130,11 @@ def main(args=None, shutdown=True):
         value = getattr(args, arg_name)
         if value is not None and value < 0.0:
             raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
-        if arg_name not in {"visual_step_sleep", "keep_open_seconds"} and value is not None and value == 0.0:
+        if (
+            arg_name not in {"runtime_extra_clearance", "visual_step_sleep", "keep_open_seconds"}
+            and value is not None
+            and value == 0.0
+        ):
             raise ValueError(f"--{arg_name.replace('_', '-')} must be positive")
 
     args.safety_slowdown_scales = parse_safety_slowdown_scales(args.safety_slowdown_scales)
@@ -1114,6 +1159,10 @@ def main(args=None, shutdown=True):
         scene_groups = list(group_episodes_by_scene(episodes).items())
         for scene_index, ((scene_model, scene_instance, _), scene_episodes) in enumerate(scene_groups):
             print(f"\nRunning template: {scene_instance} ({len(scene_episodes)} episodes)")
+            print(
+                f"Costmap: {args.costmap_source}; "
+                f"runtime extra clearance={args.runtime_extra_clearance:.3f}m"
+            )
             cfg = build_env_config(
                 scene_model=scene_model,
                 robot_cfg=robot_cfg,
