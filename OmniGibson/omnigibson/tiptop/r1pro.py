@@ -435,8 +435,18 @@ def frame_objects(
         rel = np.asarray(box, dtype=np.float64)[:, :2] - here
         pts = np.stack([rel @ fwd, rel @ left, np.asarray(box, dtype=np.float64)[:, 2] - base_z], axis=-1)
         px, z = points_to_pixels(pts, intrinsics, base_from_cam)
-        if np.any(z <= 0):
+        ahead = z > 0
+        if not np.any(ahead):
             return "behind the head camera", 0.0
+        if not np.all(ahead):
+            # Part of the box is behind the camera plane. Requiring ALL of it in front is unsatisfiable for
+            # anything taller than the camera that the robot has to stand within arm's reach of: standing to open
+            # a fridge, 4310 of the 5832 candidate stances were thrown out as "behind the head camera" and the
+            # round never happened (2026-09-13). A partly-seen box is a CUT, which is what the strict pass rejects
+            # and the fallback pass merely charges for -- the same treatment as a box cut by the image edge.
+            if strict:
+                return "cut by the head camera's near plane", 0.0
+            px, z = px[ahead], z[ahead]
         lo, hi = px.min(axis=0), px.max(axis=0)
         low = np.array([margin_px, margin_px], dtype=np.float64)
         high = np.array([width - 1 - margin_px, height - 1 - margin_px], dtype=np.float64)

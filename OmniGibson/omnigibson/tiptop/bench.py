@@ -459,7 +459,7 @@ def placed_over(item: dict, target: dict, from_bottom: bool) -> bool:
     return low <= bottom <= float(hi[2]) + 0.15
 
 
-def parse_args(argv=None) -> argparse.Namespace:
+def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common(p)
     add_planner_args(p)
@@ -494,12 +494,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",
     )
     args = p.parse_args(argv)
-    if args.task_name not in STRATEGIES:
+    # A task description is what the RUNNER needs to sequence a task; a tool that only loads the scene (the
+    # drawer rig, a probe) needs none, and refusing to parse its arguments kept those tools to the eight tasks
+    # that happen to have been written up (2026-09-13).
+    if require_strategy and args.task_name not in STRATEGIES:
         p.error(f"no task description for {args.task_name!r}; known: {sorted(STRATEGIES)}")
     # what run.py's helpers read: the challenge robot, the activity to load, the instruction the planner is given
     args.embodiment = "r1pro"
     args.activity = args.task_name
-    args.task = STRATEGIES[args.task_name].instruction
+    spec = STRATEGIES.get(args.task_name)
+    args.task = spec.instruction if spec is not None else args.task_name.replace("_", " ")
     return args
 
 
