@@ -188,12 +188,22 @@ class OracleKnowledge(KnowledgeSource):
         }
         visible = [label for label in labels if any(counts[name][label] for name in counts)]
         hidden = [label for label in labels if label not in visible]
-        # Every object a goal atom names has to be one the planner is given, and the planner is given exactly the
-        # visible ones. Testing against `hidden` missed the case where an atom names something that never became a
-        # label at all: the round then went out and the planner rejected it with "Goal predicate holding(
-        # toy_figure_3) references unknown object 'toy_figure_3'. Known objects: ['table', 'toy_box_1']", which
-        # cost a round and read as a planning failure rather than as the visibility failure it is (2026-09-13).
-        needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a not in visible})
+        # Every object a goal atom names has to be one the planner is given, and the planner is given the visible
+        # ones PLUS two kinds of label that never carry a mask. Testing against `hidden` missed an atom naming
+        # something that never became a label at all -- the round went out and the planner rejected it with "Goal
+        # predicate holding(toy_figure_3) references unknown object 'toy_figure_3'" -- but testing against
+        # `visible` alone was worse: it refuses every goal that names the support plane or a button.
+        #
+        # PLANNER_SUPPORT ("table") is the plane tiptop fits by RANSAC, a surface and never a detected object, so
+        # it is never segmented and never visible; every `ontop(item, table)` and every put-down onto the floor,
+        # which is rewritten to the same label, was being refused. A button is named by pose through button_hints
+        # rather than found as an object, so a press was refused the same way. The planner exempts both itself.
+        from omnigibson.tiptop.r1pro import PLANNER_SUPPORT  # imported here: r1pro imports this module
+
+        exempt = {PLANNER_SUPPORT} | {
+            a for atom in tiptop_atoms if atom.get("predicate") == "pressed" for a in atom["args"]
+        }
+        needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a not in visible and a not in exempt})
         if needed:
             untracked = [a for a in needed if a not in labels]
             raise GoalNotVisible(

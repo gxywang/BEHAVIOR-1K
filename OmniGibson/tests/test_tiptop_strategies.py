@@ -547,3 +547,24 @@ def test_the_gate_reads_an_open_atom_off_the_container_rather_than_the_round_run
     shut_goal = [{"predicate": "not", "args": ["open", "cabinet.n.01_1"]}]
     assert Shut(True).satisfied(shut_goal, record={"round": 1}) is True
     assert Shut(False).satisfied(shut_goal, record={"round": 1}) is False
+
+
+def test_the_support_plane_and_buttons_are_exempt_from_the_visibility_test():
+    """A goal may name two things that never carry a mask, and refusing those refuses the task.
+
+    PLANNER_SUPPORT ("table") is the plane tiptop fits by RANSAC: a surface, never a detected object, so it is
+    never segmented and never "visible". A button is named by pose through button_hints rather than found as an
+    object. A visibility test written as "every goal argument must be visible" therefore refuses every
+    ontop(item, table), every put-down onto the floor (rewritten to the same label), and every press -- which is
+    what happened between two commits on 2026-09-13/14. The planner exempts both itself.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "omnigibson" / "tiptop" / "knowledge.py"
+    text = source.read_text()
+    block = re.search(r"exempt = \{PLANNER_SUPPORT\}.*?\n        needed = .*?\n", text, re.S)
+    assert block, "the visibility test must exempt the support plane and the buttons"
+    assert "PLANNER_SUPPORT" in block.group(0)
+    assert '"pressed"' in block.group(0), "a press names a button that was never segmented"
+    assert "a not in exempt" in block.group(0), "the exemption has to reach the test itself"
