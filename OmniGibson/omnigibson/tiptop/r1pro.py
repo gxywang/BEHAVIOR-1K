@@ -296,6 +296,11 @@ OPEN_GRASP_TOLERANCE = 0.004
 # as soon as the fingers report contact. The cap keeps it inside a drawer front's thickness (15.5 mm here).
 GRASP_NUDGE = 0.008  # m deeper per attempt
 GRASP_NUDGES = 3  # attempts after the first, so at most 24 mm past where the fingertips were first sent
+# Places to try taking hold of one panel, spread up its face. A fridge door is 2 m tall and only a band of it
+# is in the arm's reach, so one point per joint is one guess; these are offered nearest the hand's own height
+# first, which is both the likeliest to solve and the least the arm has to travel.
+GRASP_COLUMN_SAMPLES = 5
+GRASP_COLUMN_INSET = 0.08  # m kept clear of the panel's top and bottom edges, so the jaw lands on the face
 GRASP_FACE_SAMPLES = 5  # rays across each direction of a face when looking for the surface to close on
 GRASP_FACE_FRACTION = 0.35  # how far across the face they spread, as a fraction of its half-extent
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
@@ -1371,19 +1376,36 @@ class R1ProSim(TiptopSim):
             # face, which is right when something protrudes there. No asset marks a handle.
             for grip_kind in OPEN_GRIPS:
                 where = handle_point(link_j, j["axis"], np.sign(t) or 1.0, grip=grip_kind)
-                # The box face is a guess at where the panel is; the mesh knows. Come at it along the approach.
                 into = -np.asarray(j["axis"], dtype=np.float64) * float(np.sign(t) or 1.0)
-                on_surface = self.surface_point(link_j, where, into)
-                if float(np.linalg.norm(on_surface - where)) > 1e-4:
-                    log.info(
-                        f"{name}.{j['name']}: its box face is at {np.round(where, 4).tolist()} but the panel is "
-                        f"{float(np.linalg.norm(on_surface - where)) * 100:.1f} cm behind it, at "
-                        f"{np.round(on_surface, 4).tolist()}; taking hold there"
-                    )
-                where = on_surface
-                usable.append(
-                    (float(np.linalg.norm(where - hand)), OPEN_GRIPS.index(grip_kind), j, t, where, grip_kind)
+                # A tall panel is a whole column of places to take hold of, and only some of them are in the arm's
+                # reach. Committing to one and giving up when the IK will not solve there was throwing away every
+                # tall container in the test scenes: a fridge door's point came out at z 2.04 and a room door's at
+                # 2.30, because the surface search takes the most protruding hit over the face and on a tall door
+                # that is the top edge. 0 of 9 joints at or above z 1.16 found an orientation; the two that
+                # succeeded anywhere were at z 0.66 and z 1.20 (2026-09-13). So offer the whole column, nearest
+                # the hand's own height first, and let the IK choose.
+                lo_z, hi_z = float(link_j.aabb[0][2]), float(link_j.aabb[1][2])
+                band = max(0.0, (hi_z - lo_z) / 2.0 - GRASP_COLUMN_INSET)
+                middle = (lo_z + hi_z) / 2.0
+                heights = sorted(
+                    {
+                        round(float(np.clip(z, lo_z + GRASP_COLUMN_INSET, hi_z - GRASP_COLUMN_INSET)), 4)
+                        for z in np.linspace(middle - band, middle + band, GRASP_COLUMN_SAMPLES)
+                    }
                 )
+                for z in heights:
+                    point = np.array([where[0], where[1], z], dtype=np.float64)
+                    on_surface = self.surface_point(link_j, point, into)
+                    usable.append(
+                        (
+                            abs(float(on_surface[2] - hand[2])),  # the hand's own height first: least travel
+                            OPEN_GRIPS.index(grip_kind),
+                            j,
+                            t,
+                            on_surface,
+                            grip_kind,
+                        )
+                    )
         if not usable:
             already = any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
             return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
