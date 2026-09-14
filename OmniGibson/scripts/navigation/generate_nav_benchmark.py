@@ -1,5 +1,6 @@
 import argparse
 import copy
+import heapq
 import json
 import math
 import os
@@ -17,7 +18,6 @@ from omnigibson.controllers import ControllerView
 from omnigibson.eval.utils.eval_utils import TASK_NAMES_TO_ROOMS
 from omnigibson.macros import gm
 from omnigibson.tasks.behavior_task import BehaviorTask
-from omnigibson.utils.motion_planning_utils import astar
 
 
 CHALLENGE_SCENES = (
@@ -177,6 +177,59 @@ def point_is_free(scene, trav_map, point):
     return int(trav_map[row, col]) == 255
 
 
+def cell_is_free(trav_map, cell):
+    row, col = cell
+    return 0 <= row < trav_map.shape[0] and 0 <= col < trav_map.shape[1] and int(trav_map[row, col]) == 255
+
+
+def clearance_astar(trav_map, start_cell, goal_cell):
+    if not cell_is_free(trav_map, start_cell) or not cell_is_free(trav_map, goal_cell):
+        return None
+
+    neighbors = [
+        (0, 1, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (-1, 0, 1.0),
+        (1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (-1, -1, math.sqrt(2.0)),
+    ]
+    frontier = [(0.0, start_cell)]
+    came_from = {}
+    g_score = {start_cell: 0.0}
+
+    while frontier:
+        _, current = heapq.heappop(frontier)
+        if current == goal_cell:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            return th.tensor(list(reversed(path)))
+
+        current_g = g_score[current]
+        for dr, dc, move_cost in neighbors:
+            neighbor = (current[0] + dr, current[1] + dc)
+            if not cell_is_free(trav_map, neighbor):
+                continue
+            if dr != 0 and dc != 0 and (
+                not cell_is_free(trav_map, (current[0] + dr, current[1]))
+                or not cell_is_free(trav_map, (current[0], current[1] + dc))
+            ):
+                continue
+            tentative_g = current_g + move_cost
+            if tentative_g >= g_score.get(neighbor, float("inf")):
+                continue
+            came_from[neighbor] = current
+            g_score[neighbor] = tentative_g
+            heuristic = math.hypot(goal_cell[0] - neighbor[0], goal_cell[1] - neighbor[1])
+            heapq.heappush(frontier, (tentative_g + heuristic, neighbor))
+
+    return None
+
+
 def episode_points_are_valid(env, floor_trav_map, start, goal, start_quat, settle_steps):
     robot = env.robots[0]
     if not point_is_free(env.scene, floor_trav_map, start):
@@ -197,7 +250,7 @@ def clearance_path_distance(env, trav_map, start, goal):
         return None
     start_cell = tuple(env.scene.trav_map.world_to_map(start[:2]).tolist())
     goal_cell = tuple(env.scene.trav_map.world_to_map(goal[:2]).tolist())
-    path = astar(trav_map, start_cell, goal_cell)
+    path = clearance_astar(trav_map, start_cell, goal_cell)
     if path is None:
         return None
     path_world = env.scene.trav_map.map_to_world(path)
