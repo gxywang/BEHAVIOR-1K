@@ -500,9 +500,13 @@ def test_the_travel_fold_moves_at_its_own_speed_and_the_unfold_is_checked():
     unfold = r1pro.R1ProSim.unfold_after_travel.__doc__ or ""
     assert "TRAVEL_MAX_JOINT_VEL" in fold, "the fold must say why it does not pay the capture cap"
     assert "path_hits_scene" in unfold, "the unfold must say it checks the way back"
-    # the unfold refuses rather than forces: staying folded is a worse posture, not a shove
+    # It unfolds even when the path looks blocked. Refusing was measured worse: the arms stayed folded over the
+    # base, which was inside the toy box the robot had come to work at, the start-state lift then fired three
+    # times, and every plan was refused anyway -- 0.000 against a 0.75 baseline (2026-09-14). The ramp stopping
+    # when a joint falls behind its target is the collision-awareness that matters.
     src = (pathlib.Path(r1pro.__file__).read_text().split("def unfold_after_travel")[1]).split("\n    def ")[0]
-    assert "not unfolding here" in src and "return" in src
+    assert "unfolding anyway" in src, "the warning must not become a refusal"
+    assert "not unfolding here" not in src
 
 
 def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():

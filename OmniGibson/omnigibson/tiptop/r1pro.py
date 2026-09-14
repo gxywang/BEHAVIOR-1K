@@ -1903,10 +1903,10 @@ class R1ProSim(TiptopSim):
         """Come back out of the travel fold at the new stance, checking the way out before taking it.
 
         Folding in is safe because it moves over the robot's own base. Coming out is the opposite -- the arms go
-        into a room the robot has only just arrived in -- so the path is tested first with ``path_hits_scene``, the
-        same check the capture uses to rank its look poses, and the arms stay folded if it is not clear. A round
-        that starts folded is a worse posture to plan from; a round that starts by driving the elbow into a desk is
-        worse than that.
+        into a room the robot has only just arrived in -- so the path is tested first with ``path_hits_scene`` and
+        a warning says what is in the way. It unfolds regardless: the ramp stops the moment a joint falls behind
+        its target, which is the collision-awareness that matters, and refusing to unfold was measured to be worse
+        than unfolding carefully (see below).
         """
         if targets is None:
             return
@@ -1922,11 +1922,17 @@ class R1ProSim(TiptopSim):
         except Exception:  # noqa: BLE001 - no description for this arm: unfold as before rather than stay folded
             swept = []
         if swept:
+            # Say so, but still go. Refusing to unfold was measured to be worse than unfolding carefully: in
+            # putting_away_toys the arms stayed folded over the base, which is INSIDE the toy box the robot had
+            # come to work at, so the start-state lift then fired three times trying to get them out and every
+            # plan was refused anyway -- 0.000 against a 0.75 baseline (2026-09-14). The ramp is already
+            # collision-aware in the way that matters: it stops the moment a joint falls behind its target
+            # instead of leaning on the obstacle. What this check is worth is the warning, and one day a choice
+            # between paths; it is not worth staying folded for.
             log.warning(
-                f"not unfolding here: the way back to the working posture goes through {swept[0]}; the arms stay "
-                "over the base, which is a worse posture to plan from but does not push the furniture about"
+                f"the way back to the working posture passes through {swept[0]}; unfolding anyway, and the ramp "
+                "will stop if a joint meets it"
             )
-            return
         blocked = self.ramp_to(
             targets,
             self.posture,
