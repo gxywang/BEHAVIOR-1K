@@ -42,9 +42,15 @@ while read -r task instances; do
   dir="runs/queue_${task}_${stamp}"
   log="runs/queue_logs/${task}_${stamp}.log"
   echo "=== JOB $task [$instances] -> $dir" >> "$OUT"
+  # A task whose goal is toggled_on(...) and whose description says press: hold needs a SECOND planner for the
+  # other arm -- one hand holds the thing, the other presses it. Without PRESS_PORT the instance crashes on
+  # "press 'hold' needs the right-arm planner", which is how turning_on_radio, a task that scored 0.9, came back
+  # as a crash on 2026-09-14. Pass PRESS_PORT=<port of an r1pro_right server> for those tasks.
+  press_args=""
+  [ -n "${PRESS_PORT:-}" ] && press_args="--press-port ${PRESS_PORT}"
   ./b1k/bin/python -m omnigibson.tiptop.bench --task-name "$task" --instances $instances \
     --knowledge "$KNOWLEDGE" --grasping-mode sticky --torso 1.2 -1.7 -0.9 0.0 \
-    --views $VIEWS --host localhost --port "$PORT" --out-dir "$dir" > "$log" 2>&1
+    --views $VIEWS --host localhost --port "$PORT" $press_args --out-dir "$dir" > "$log" 2>&1
   code=$?
   python3 OmniGibson/omnigibson/tiptop/scripts/read_run.py "$dir" "$log" >> "$OUT" 2>&1 \
     || echo "  (read_run failed; bench exited $code, log $log)" >> "$OUT"
