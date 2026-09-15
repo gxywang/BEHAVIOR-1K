@@ -192,3 +192,103 @@ def test_the_edge_grip_aims_at_the_top_of_the_panel_and_the_face_grip_at_its_mid
     assert face[2] == pytest.approx(0.575), "the face grip aims at the middle of the panel"
     assert edge[2] == pytest.approx(0.635), "the edge grip aims just below its top, where a jaw can pinch"
     assert edge[2] < 0.65, "and inside the panel, not in the air above it"
+
+
+# --------------------------------------------------------------- the handle, read off the link's own mesh
+def _box(lo, hi, n=4):
+    """Vertices on the six faces of a box, ``n`` per edge, like a coarse mesh of a panel or a bar."""
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    xs, ys, zs = (np.linspace(lo[i], hi[i], n) for i in range(3))
+    pts = []
+    for x in xs:
+        for y in ys:
+            pts += [[x, y, lo[2]], [x, y, hi[2]]]
+    for x in xs:
+        for z in zs:
+            pts += [[x, lo[1], z], [x, hi[1], z]]
+    for y in ys:
+        for z in zs:
+            pts += [[lo[0], y, z], [hi[0], y, z]]
+    return np.asarray(pts, float)
+
+
+def _drawer_with_rail():
+    """store_honey's drawer as measured (bottom_cabinet/slgzfc, asset scale): a 0.426 deep box whose front panel
+    spans 0.428 x 0.133, with a rail 0.376 wide x 0.008 tall x 0.010 deep standing 0.024 m proud, near the top."""
+    box = _box([-0.13, -0.214, 0.136], [0.273, 0.214, 0.269], n=6)
+    rail = _box([0.287, -0.188, 0.232], [0.297, 0.188, 0.240], n=5)
+    return np.concatenate([box, rail])
+
+
+def test_a_drawer_rail_is_read_as_a_bar_with_a_vertical_jaw():
+    """The survey that preceded this called store_honey's drawer front "a 9 mm knife-edge lip, nothing a jaw can
+    close around". Sliced into 4 mm layers, the front-most centimetre of that link is a 0.376 x 0.008 strip and the
+    full 0.428 x 0.133 face lies 2.4 cm behind it: a rail. The densest layer -- what the survey took as the
+    panel -- is the rail's own back face."""
+    from omnigibson.tiptop.articulation import handle_on
+
+    h = handle_on(_drawer_with_rail(), lead=[1.0, 0.0, 0.0])
+    assert h["kind"] == "bar"
+    assert h["proud"] == pytest.approx(0.024, abs=0.003)
+    assert h["panel"] == pytest.approx(0.273, abs=0.003), "the panel is the first full-face layer, not the densest"
+    assert np.allclose(np.abs(h["jaw"]), [0.0, 0.0, 1.0], atol=1e-6), "a horizontal rail is closed on from above and below"
+    assert h["span"] == pytest.approx(0.376, abs=0.005) and np.allclose(np.abs(h["along"]), [0.0, 1.0, 0.0], atol=1e-6)
+    assert h["point"][2] == pytest.approx(0.236, abs=0.003), "the grasp is on the rail, not the middle of the face"
+    assert 0.287 <= h["point"][0] <= 0.297
+
+
+def test_a_vertical_bar_on_a_door_is_read_as_a_bar_with_a_horizontal_jaw():
+    """fridge/petcxr's right door: a bar 0.035 wide x 0.986 tall standing about 6 cm out from a 0.56 x 1.98 panel."""
+    from omnigibson.tiptop.articulation import handle_on
+
+    door = _box([0.40, -0.28, -1.0], [0.44, 0.28, 0.98], n=8)
+    bar = _box([0.47, 0.20, -0.25], [0.50, 0.235, 0.736], n=6)
+    h = handle_on(np.concatenate([door, bar]), lead=[1.0, 0.0, 0.0])
+    assert h["kind"] == "bar"
+    assert np.allclose(np.abs(h["jaw"]), [0.0, 1.0, 0.0], atol=1e-6), "closed on from the sides"
+    assert np.allclose(np.abs(h["along"]), [0.0, 0.0, 1.0], atol=1e-6) and h["span"] == pytest.approx(0.986, abs=0.01)
+    assert h["proud"] == pytest.approx(0.06, abs=0.005)
+
+
+def test_a_flat_panel_offers_its_face_and_nothing_to_close_around():
+    from omnigibson.tiptop.articulation import handle_on
+
+    h = handle_on(_box([0.0, -0.2, 0.0], [0.4, 0.2, 0.15], n=6), lead=[1.0, 0.0, 0.0])
+    assert h["kind"] == "flat" and h["jaw"] is None
+    assert h["point"][0] == pytest.approx(0.4, abs=0.003), "on the front face"
+    assert h["point"][1] == pytest.approx(0.0, abs=0.01) and h["point"][2] == pytest.approx(0.075, abs=0.01)
+
+
+def test_a_shallow_step_is_a_lip_to_press_on_not_a_bar():
+    from omnigibson.tiptop.articulation import handle_on
+
+    panel = _box([0.0, -0.2, 0.0], [0.4, 0.2, 0.15], n=6)
+    step = _box([0.40, -0.19, 0.12], [0.41, 0.19, 0.13], n=5)  # 1.0 cm proud: too shallow for the pads
+    h = handle_on(np.concatenate([panel, step]), lead=[1.0, 0.0, 0.0])
+    assert h["kind"] == "lip" and h["jaw"] is None
+    assert h["point"][0] == pytest.approx(0.4, abs=0.003), "the press goes on the panel"
+
+
+def test_a_trim_strip_beside_a_bar_does_not_widen_the_bar():
+    """fridge/dszchb: a full-height trim strip 1 cm in front of the panel next to a bar 4.4 cm out. Read over the
+    whole proud set they span the door; read over its front half, only the bar is left."""
+    from omnigibson.tiptop.articulation import handle_on
+
+    door = _box([0.30, -0.30, -0.6], [0.32, 0.30, 0.8], n=8)
+    trim = _box([0.32, 0.27, -0.6], [0.33, 0.30, 0.8], n=6)  # 1 cm proud, the far edge, full height
+    bar = _box([0.35, -0.27, 0.0], [0.364, -0.255, 0.24], n=5)  # 4.4 cm proud, the near edge
+    h = handle_on(np.concatenate([door, trim, bar]), lead=[1.0, 0.0, 0.0])
+    assert h["kind"] == "bar"
+    assert h["extent"][0] < 0.03, "the bar's width, not the door's"
+    assert h["span"] == pytest.approx(0.24, abs=0.01)
+
+
+def test_leading_direction_of_a_drawer_is_its_slide_and_of_a_door_its_first_swing():
+    from omnigibson.tiptop.articulation import leading_direction
+
+    assert np.allclose(leading_direction("prismatic", [0.0, 1.0, 0.0], [0, 0, 0], [], travel=-0.3), [0.0, -1.0, 0.0])
+    # a door hinged on a vertical axis at the origin, its panel along +y: opening (+z rotation) swings it to -x
+    door = _box([-0.01, 0.0, 0.0], [0.01, 0.5, 1.0], n=5)
+    lead = leading_direction("revolute", [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], door, travel=+1.5)
+    assert np.allclose(lead, [-1.0, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(leading_direction("revolute", [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], door, travel=-1.5), [1.0, 0.0, 0.0])

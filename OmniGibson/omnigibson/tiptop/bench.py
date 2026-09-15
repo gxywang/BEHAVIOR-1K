@@ -140,12 +140,9 @@ class Episode:
         """
         from omnigibson.tiptop.articulation import OPEN_FRACTION_SCORED
 
-        try:
-            self.stand_for(name)
-        except Unreachable as e:
-            log.info(f"{name}: {e}; cannot reach it to open it")
-            self.records.append({"open": name, "error": str(e), "step": self.sim.n_steps})
-            return False
+        # open_container chooses its own stance, in front of the container's leading face where the whole pull
+        # solves (r1pro.stance_for_grasp); stand_for's stance is built for looking at things and stood 0.9 m off
+        # the drawer fronts (2026-09-14)
         self.sim.video_caption = f"open {name}"
         hint = dict((getattr(self.spec, "opens", None) or {}).get(name) or {})
         if hint:

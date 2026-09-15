@@ -234,3 +234,145 @@ def handle_point(link, axis, opening_sign: float, grip: str = "face", inset: flo
     if grip == "edge":
         point[2] = float(hi[2]) - float(inset)
     return point
+
+
+# ---------------------------------------------------------------- where the handle is, from the mesh
+# Measured off the decrypted assets (scratchpad/dump_link_verts.py + probe_handles.py, 2026-09-14), asset scale 1,
+# vertex layers 4 mm thick behind the leading face:
+#   bottom_cabinet/slgzfc (store_honey)  full-face layer (0.428 x 0.133) at 2.4 cm; in front of it a strip 0.376 wide
+#                                        x 0.008 tall x 0.010 deep near the drawer's top: a horizontal RAIL 2.4 cm proud
+#                                        (2.8 cm, 1.2 cm tall, 0.95 m wide at the instance's scale [1.15, 2.52, 1.55]).
+#                                        The survey that called it "a 9 mm lip" took the densest plane as the panel,
+#                                        and the densest plane is the rail's own BACK face.
+#   bottom_cabinet/bamfsz                the same rail, 0.376 x 0.005, 2.4 cm proud.
+#   bottom_cabinet/rhdbzv                a rail 1.061 wide x 0.008 tall along the top edge, 2.0 cm proud.
+#   bottom_cabinet/jhymlr                a tab 0.087 wide x 0.002 tall, 1.2 cm proud of the full-face layer.
+#   fridge/petcxr                        both doors: a vertical bar 0.035 wide x 0.986 tall, ~6 cm proud.
+#   fridge/dszchb                        a vertical bar 0.014 x 0.241, 4.4 cm proud.   microwave/hjjxmi: 0.014 x 0.106.
+# So every drawer and door in the test scenes has SOMETHING a parallel jaw can close around, and none of it is
+# marked anywhere: no handle link, no link tag, no meta link. It is read off the moving link's own vertices.
+HANDLE_LAYER = 0.004  # m: thickness of one vertex layer behind the leading face
+HANDLE_DEPTH_RANGE = 0.15  # m behind the front that is searched for the panel face
+HANDLE_PANEL_COVER = 0.7  # a layer spanning this fraction of the link's cross-section both ways is the panel
+HANDLE_PROUD_MIN = 0.008  # m in front of the panel before a vertex counts as standing proud of it
+HANDLE_BAR_MIN = 0.012  # m proud before a proud part can be closed around rather than merely touched
+HANDLE_JAW = 0.10  # m: the R1Pro jaw fully open (embodiment gripper.max_width_m)
+HANDLE_JAW_MARGIN = 0.02  # m the proud part must fit inside the jaw by
+
+
+def _unit(v) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    return v / max(float(np.linalg.norm(v)), 1e-9)
+
+
+def leading_direction(joint_type: str, axis, origin, vertices, travel: float) -> np.ndarray:
+    """Unit vector the moving link's opening face looks along: the way its handle sets off when the joint opens.
+
+    A drawer's is its slide, signed by the travel. A door's is the direction its centroid first moves in,
+    axis x (centroid - hinge) x sign(travel), which is the panel's outward normal to within the angle the handle
+    and the shelves inside the door pull the centroid round: 1 deg on fridge/petcxr's right door, 6 deg on its
+    left one. Estimating the normal from the vertices instead was tried and was worse on every door measured
+    (2026-09-14): a PCA normal is skewed by the shelves behind the panel (the right door's 6.0 cm bar read as 3.6
+    and 2.8 cm), the longest forward-facing hull edge tilts with the handle, and the sharpest vertex layer is the
+    door's dense BACK. And petcxr's left door has no flat front to find: its front-most vertices range over 17 cm
+    across the width, so it reads "flat" with an implausible depth whatever the direction, and the caller treats
+    that as a face to press on.
+    """
+    kind = str(joint_type).lower()
+    a = _unit(axis)
+    sign = 1.0 if float(travel) >= 0 else -1.0
+    if kind.startswith("prismatic"):
+        return a * sign
+    v = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    centroid = v.mean(axis=0) if len(v) else np.asarray(origin, dtype=np.float64)
+    return _unit(np.cross(a, centroid - np.asarray(origin, dtype=np.float64)) * sign)
+
+
+def handle_on(vertices, lead, up=(0.0, 0.0, 1.0), jaw: float = HANDLE_JAW) -> dict:
+    """What a moving link offers a parallel jaw on its leading face, read off its own vertices.
+
+    ``vertices``: the link's mesh vertices (any frame); ``lead``: the direction its face looks along
+    (``leading_direction``). The vertices are sliced into ``HANDLE_LAYER`` thick layers behind the front-most one,
+    and the PANEL is the first layer from the front that spans the link's cross-section both ways
+    (``HANDLE_PANEL_COVER``) -- not the densest layer, which on store_honey's drawers is the back of the rail
+    handle and made a 2.4 cm rail read as a 9 mm lip. Whatever stands more than ``HANDLE_PROUD_MIN`` in front of
+    the panel is the proud part, and its shape says what to do with it:
+
+      bar   narrow enough to fit in the jaw across one axis and at least ``HANDLE_BAR_MIN`` proud: close AROUND
+            it. ``point`` is its centre, ``jaw`` the unit vector across its narrow axis, ``along`` its long axis
+            with ``span`` its length and ``ends`` (lo, hi) along it, so the caller may slide the grasp along it.
+      lip   proud but too shallow to close around (a step, a bevel): the pressed-face grasp at ``point`` on the
+            panel; ``lip_point`` is the middle of the proud part.
+      flat  nothing proud, or an overlay as wide as the face: the pressed-face grasp at ``point``, on the
+            front-most surface.
+
+    Also ``panel`` and ``front`` (scalars along ``lead``), ``proud`` (front - panel), ``face_centre`` and
+    ``face_extent`` (side, up) of the panel layer, and for a bar ``bar_depth`` (its extent along ``lead``).
+    Pure numpy, so it is checked offline against the decrypted assets rather than in a simulator.
+    """
+    v = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    lead = _unit(lead)
+    side = np.cross(lead, _unit(up))
+    if float(np.linalg.norm(side)) < 1e-6:  # a lid that opens straight up: any horizontal axis will do
+        side = np.cross(lead, [1.0, 0.0, 0.0])
+    side = _unit(side)
+    up2 = _unit(np.cross(side, lead))
+    if len(v) < 3:
+        centre = v.mean(axis=0) if len(v) else np.zeros(3)
+        return {
+            "kind": "flat", "point": centre, "panel": float(centre @ lead), "front": float(centre @ lead),
+            "proud": 0.0, "face_centre": centre, "face_extent": (0.0, 0.0), "extent": (0.0, 0.0, 0.0),
+            "jaw": None, "lead": lead, "side": side, "up": up2,
+        }  # fmt: skip
+    s = v @ lead
+    front = float(s.max())
+    width, height = float(np.ptp(v @ side)), float(np.ptp(v @ up2))
+    panel, densest, densest_count = None, None, -1
+    edge = front + HANDLE_LAYER / 2.0
+    while edge - HANDLE_LAYER > front - HANDLE_DEPTH_RANGE:
+        sel = v[(s >= edge - HANDLE_LAYER) & (s < edge)]
+        edge -= HANDLE_LAYER
+        if len(sel) < 4:
+            continue
+        if len(sel) > densest_count:
+            densest, densest_count = float(np.mean(sel @ lead)), len(sel)
+        if np.ptp(sel @ side) >= HANDLE_PANEL_COVER * width and np.ptp(sel @ up2) >= HANDLE_PANEL_COVER * height:
+            panel = float(np.mean(sel @ lead))  # the layer's own mean, not its bin centre: 2 mm matter on a lip
+            break
+    if panel is None:
+        panel = densest if densest is not None else front
+    face = v[np.abs(s - panel) <= HANDLE_LAYER]
+    if not len(face):
+        face = v
+    face_centre = face.mean(axis=0)
+    face_centre = face_centre + lead * (panel - float(face_centre @ lead))
+    face_extent = (float(np.ptp(face @ side)), float(np.ptp(face @ up2)))
+    # The SHAPE of the proud part is read off its front half only: fridge/dszchb carries a full-height trim strip
+    # 1 cm in front of its panel beside a bar 4.4 cm out, and together they span the whole door (2026-09-14).
+    proud_verts = v[s > panel + max(HANDLE_PROUD_MIN, (front - panel) / 2.0)]
+    out = {
+        "panel": float(panel), "front": front, "proud": float(front - panel), "face_centre": face_centre,
+        "face_extent": face_extent, "lead": lead, "side": side, "up": up2, "jaw": None,
+    }  # fmt: skip
+    if len(proud_verts) < 3:
+        out.update(kind="flat", point=face_centre, proud=0.0, extent=(0.0, 0.0, 0.0))
+        return out
+    e_side, e_up, e_deep = (float(np.ptp(proud_verts @ d)) for d in (side, up2, lead))
+    out["extent"] = (e_side, e_up, e_deep)
+    proud_centre = proud_verts.mean(axis=0)
+    narrow_is_side = e_side <= e_up
+    narrow = e_side if narrow_is_side else e_up
+    if front - panel >= HANDLE_BAR_MIN and narrow <= jaw - HANDLE_JAW_MARGIN:
+        along = up2 if narrow_is_side else side
+        along_s = proud_verts @ along
+        out.update(
+            kind="bar", point=proud_centre, jaw=side if narrow_is_side else up2, along=along,
+            span=float(np.ptp(along_s)), ends=(float(along_s.min()), float(along_s.max())), bar_depth=e_deep,
+        )  # fmt: skip
+        return out
+    if front - panel < HANDLE_BAR_MIN:
+        out.update(kind="lip", point=face_centre, lip_point=proud_centre)
+        return out
+    # an overlay as wide as the face: the face to press on is the overlay's own front
+    out.update(kind="flat", point=face_centre + lead * (front - panel))
+    return out
