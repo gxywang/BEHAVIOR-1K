@@ -801,19 +801,24 @@ def test_the_support_plane_and_buttons_are_exempt_from_the_visibility_test():
 
     PLANNER_SUPPORT ("table") is the plane tiptop fits by RANSAC: a surface, never a detected object, so it is
     never segmented and never "visible". A button is named by pose through button_hints rather than found as an
-    object. A visibility test written as "every goal argument must be visible" therefore refuses every
-    ontop(item, table), every put-down onto the floor (rewritten to the same label), and every press -- which is
-    what happened between two commits on 2026-09-13/14. The planner exempts both itself.
+    object. An object in the ROBOT'S OWN HAND is the third: the head camera cannot see into the gripper and the
+    wrist camera is behind it, so it reaches the planner through the in_hand carry feature instead. A visibility
+    test written as "every goal argument must be visible" therefore refuses every ontop(item, table), every
+    put-down onto the floor (rewritten to the same label), every press -- which is what happened between two
+    commits on 2026-09-13/14 -- and every placement of something the robot is already carrying (2026-09-15).
     """
     import re
     from pathlib import Path
 
     source = Path(__file__).resolve().parents[1] / "omnigibson" / "tiptop" / "knowledge.py"
     text = source.read_text()
-    block = re.search(r"exempt = \{PLANNER_SUPPORT\}.*?\n        needed = .*?\n", text, re.S)
+    block = re.search(r"exempt = .*?\n        needed = .*?\n", text, re.S)
     assert block, "the visibility test must exempt the support plane and the buttons"
     assert "PLANNER_SUPPORT" in block.group(0)
     assert '"pressed"' in block.group(0), "a press names a button that was never segmented"
+    assert "carried" in block.group(0), (
+        "and a third: an object in the gripper reaches the planner through in_hand, not through the picture"
+    )
     assert "a not in exempt" in block.group(0), "the exemption has to reach the test itself"
 
 

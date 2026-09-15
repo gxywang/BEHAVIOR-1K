@@ -211,9 +211,22 @@ class OracleKnowledge(KnowledgeSource):
         # rather than found as an object, so a press was refused the same way. The planner exempts both itself.
         from omnigibson.tiptop.r1pro import PLANNER_SUPPORT  # imported here: r1pro imports this module
 
-        exempt = {PLANNER_SUPPORT} | {
-            a for atom in tiptop_atoms if atom.get("predicate") == "pressed" for a in atom["args"]
-        }
+        # An object IN THE ROBOT'S OWN HAND is the third kind of label that carries no mask, and for the same
+        # reason: it is given to the planner by the `in_hand` carry feature rather than found in the picture. The
+        # head camera cannot see into the gripper and the wrist camera is behind it, so a placement round for
+        # something the robot is already holding was refused before it was ever planned -- "goal objects
+        # ['tile_3'] are not visible in any view ['head', 'left_wrist', 'right_wrist'] (empty masks)" while
+        # tile_3 was in the gripper. It cost every placement of a carried object, which is exactly what the
+        # pressed grasp has just started producing more of (2026-09-15).
+        carried = set(sum(self.hands(), []))
+        rescued = sorted((({a for atom in tiptop_atoms for a in atom["args"]}) & carried) - set(visible))
+        if rescued:
+            log.info(f"{rescued} carry no mask because the robot is holding them; the planner is told so")
+        exempt = (
+            {PLANNER_SUPPORT}
+            | {a for atom in tiptop_atoms if atom.get("predicate") == "pressed" for a in atom["args"]}
+            | carried
+        )
         needed = sorted({a for atom in tiptop_atoms for a in atom["args"] if a not in visible and a not in exempt})
         if needed:
             untracked = [a for a in needed if a not in labels]

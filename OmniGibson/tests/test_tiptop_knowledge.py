@@ -850,3 +850,23 @@ def test_nearby_obstacles_registers_the_furniture_and_never_offers_an_object_the
     names = R1ProSim.nearby_obstacles(sim, exclude=["booth_1"])
     assert names == ["bench_xwphjd_3"]  # not the booth (already a movable), not the rug, not the far sideboard
     assert sim.obstacles == {"bench_xwphjd_3": bench}  # rebuilt per stance, and resolvable by object_meshes
+
+
+def test_an_object_in_the_robots_own_hand_does_not_need_a_mask():
+    """The visibility gate already exempts two kinds of label that never carry a mask -- the planner's RANSAC
+    support plane and a button named by pose. An object in the GRIPPER is the third, for the same reason: it
+    reaches the planner through the in_hand carry feature, not through the picture.
+
+    The head camera cannot see into the gripper and the wrist camera is behind it, so every placement round for
+    something already held was refused before it was planned: "goal objects ['tile_3'] are not visible in any
+    view ['head', 'left_wrist', 'right_wrist'] (empty masks)" with tile_3 in the hand (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.knowledge import OracleKnowledge
+
+    src = inspect.getsource(OracleKnowledge)
+    gate = src[src.index("exempt = ") : src.index("if needed:")]
+    assert "carried" in gate, "a held object must be exempt from the mask gate"
+    before = src[: src.index("exempt = ")]
+    assert "self.hands()" in before, "and the exemption has to read what the hands actually hold"
