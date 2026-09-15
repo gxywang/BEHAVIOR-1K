@@ -26,6 +26,10 @@ export OMNIGIBSON_HEADLESS=1 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="
 # steps per second with the box quiet against 0.47 with six runs going, so each run took three times as long and
 # the throughput gain from running them at once was almost nothing. OmniGibson's own evaluator has the same knob
 # (eval/evaluator.py TORCH_NUM_THREADS) and leaves it off. Override by exporting OMP_NUM_THREADS.
+# MEASURED, two runs side by side on the same box at the same moment: 2.39 steps/s with the cap against 1.09
+# without it, and the machine's load average went from 565 to 179 with the same six runs going. It does not
+# actually get the process down to 8 threads -- Omniverse runs its own pools this does not govern, and a capped
+# run still shows ~990 -- but the speed-up is real.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 mkdir -p "$(dirname "$OUT")" runs/queue_logs
 # The pipeline needs three services, not one: the planner this queue talks to, and the M2T2 grasp server the
