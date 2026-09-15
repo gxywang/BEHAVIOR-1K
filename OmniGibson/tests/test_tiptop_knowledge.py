@@ -732,6 +732,7 @@ def test_object_meshes_resolves_a_registered_obstacle_and_still_refuses_an_unkno
     sim = types.SimpleNamespace(objects={"bowl_1": bowl}, obstacles={"booth_xzrpar_2": booth})
     sim.tracked_object = types.MethodType(TiptopSim.tracked_object, sim)
     sim.object_trimesh_world = lambda label: f"mesh of {sim.tracked_object(label)!r}"
+    sim.tracked_poses_world = lambda labels=None: {}  # no poses to tag these stand-in meshes with
     meshes = TiptopSim.object_meshes(sim, ["bowl_1", "booth_xzrpar_2"])
     assert meshes["bowl_1"] == f"mesh of {bowl!r}" and meshes["booth_xzrpar_2"] == f"mesh of {booth!r}"
     with pytest.raises(ValueError, match="no tracked object for labels"):

@@ -18,6 +18,68 @@ from omnigibson.tiptop.protocol import depth_to_points
 # largest triangle, so a few huge faces (a table top) would otherwise pair every point with every triangle.
 MAX_TRIANGLE_EDGE = 0.03
 
+# A view's pose for an object counts as different from the capture's only past these: below them the mask would not
+# move by a pixel, and an object sitting still still jitters by microns between renders.
+MOVED_M = 0.001
+MOVED_RAD = 0.002  # about a tenth of a degree
+
+
+def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
+    """The capture's meshes moved to where each object was when one view was rendered.
+
+    A capture builds one mesh per object, at the pose it has when the knowledge source runs -- after every view has
+    been rendered. But a capture turns the torso between head views, and an object in the gripper travels with it,
+    so a view rendered earlier saw that object somewhere else and masking it with the later mesh gives an empty
+    mask. Each object is rigid, so the correction is the rigid motion from the pose the mesh was built at (its
+    ``metadata["world_from_obj"]``) to the pose that view saw (``poses[label]``): ``T_view @ inv(T_built)``.
+
+    Args:
+        meshes: {label: trimesh} as built for the capture, each tagged with ``metadata["world_from_obj"]``.
+        poses: {label: 4x4} world pose of each object at the moment this view rendered.
+        log: optional logger for the objects that actually moved.
+
+    Returns:
+        {label: trimesh}, the same objects. A mesh is returned untouched when it did not move, when this view
+        recorded no pose for it, or when it carries no build pose (an obstacle, or an older capture).
+    """
+    out = {}
+    for label, mesh in meshes.items():
+        built = (mesh.metadata or {}).get("world_from_obj")
+        seen = poses.get(label)
+        if built is None or seen is None:
+            out[label] = mesh
+            continue
+        try:
+            seen, built = np.asarray(seen, dtype=np.float64), np.asarray(built, dtype=np.float64)
+            square = seen.shape == (4, 4) and built.shape == (4, 4)
+        except ValueError:  # a ragged pair: numpy cannot even make an array of it
+            square = False
+        if not square:
+            raise ValueError(
+                f"{label}: poses must be 4x4 matrices (a (pos, quat) pair is a different thing -- the per-view key "
+                f"is object_pose_mats_at_render, not the capture's object_poses_world)"
+            )
+        motion = seen @ np.linalg.inv(built)
+        # A resting object jitters by a few microns between renders, which is not worth copying a mesh over (and
+        # reads as a spurious "it moved" in the log). Only a motion that could actually shift a mask counts.
+        # How far the OBJECT went, not motion[:3, 3]: that is the translation of the motion about the world
+        # origin, so a plain rotation of something standing several metres out reads as several metres.
+        shift = float(np.linalg.norm(seen[:3, 3] - built[:3, 3]))
+        turn = float(np.arccos(np.clip((np.trace(motion[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
+        if shift < MOVED_M and turn < MOVED_RAD:
+            out[label] = mesh
+            continue
+        moved = mesh.copy()
+        moved.apply_transform(motion)
+        moved.metadata = dict(mesh.metadata or {}, world_from_obj=seen)
+        out[label] = moved
+        if log is not None:
+            log.info(
+                f"{label} was {100 * shift:.1f} cm and {np.degrees(turn):.0f} deg from where the capture's mesh "
+                f"puts it when this view rendered; masking it where the view saw it"
+            )
+    return out
+
 
 def masks_from_geometry(depth, intrinsics, world_from_cam, meshes: dict, tol: float = 0.008) -> dict:
     """Per-object boolean masks (H, W) from a z-depth image and the objects' surface meshes.
