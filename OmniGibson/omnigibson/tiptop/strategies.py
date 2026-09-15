@@ -36,6 +36,8 @@ TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 # tasks name it, and expanding the goals says it lifts the vocabulary's ceiling over the whole set from a mean
 # q_score of 0.415 to 0.480 (2026-09-13).
 PLACE_PREDICATES = ("inside", "ontop", "on", "nextto")
+EXTRA_SWEEPS = 3  # further passes over the atoms still open, while the step budget has room (spend_what_is_left)
+BUDGET_FOR_ANOTHER_SWEEP = 0.6  # do not begin a sweep past this share of the episode's steps
 GOAL_OPTIONS_READ = 20000  # ground goal options read to learn the demand (assembling_gift_baskets has 331,776)
 
 
@@ -306,6 +308,7 @@ class Runner:
                 ep.open_up(name, fraction=OPEN_FRACTION_SCORED if wanted_open else 0.0)
         if self.spec.plan in ("transfer", "auto") and self.demand.total():
             self.run_transfers(ep)
+            self.spend_what_is_left(ep)
         elif self.spec.plan == "transfer" and not opens:
             raise ValueError(f"{self.spec.task}: the goal has no inside/ontop atoms for the transfer plan")
         if self.spec.plan in ("press", "auto") and presses:
@@ -324,18 +327,20 @@ class Runner:
             raise ValueError(f"{self.spec.task}: the goal has no toggled_on atoms for the press plan")
 
     # ---------------------------------------------------------------- transfers
-    def run_transfers(self, ep) -> None:
-        """Fill the demand the goal options describe. Containers nearest the items that could go in them first;
-        for each item a container wants, the items of that kind still loose, nearest the edge of whatever they
-        stand on (the reachable ones) and nearest the container. An item is tried ``attempts`` times in the whole
-        instance; one still in the hand after a failed place is put down, and a hand still full at the next
-        transfer is emptied first."""
+    def run_transfers(self, ep) -> int:
+        """Fill the demand the goal options describe, and return how many items were delivered.
+
+        Containers nearest the items that could go in them first; for each item a container wants, the items of
+        that kind still loose, nearest the edge of whatever they stand on (the reachable ones) and nearest the
+        container. An item is tried ``attempts`` times in the pass; one still in the hand after a failed place is
+        put down, and a hand still full at the next transfer is emptied first."""
         wanted = dict(self.demand.wanted)
         done = self.settled(ep, wanted)
         log.info(
             f"goal demand {sorted((f'{k} x{n} -> {c}') for (k, c), n in wanted.items() if n > 0)}"
             + (f"; already there: {sorted(done)}" if done else "")
         )
+        delivered = 0
         for container in self.order_containers(ep, wanted, done):
             for kind in self.demand.kinds_for(container):
                 for _ in range(wanted.get((kind, container), 0)):
@@ -343,6 +348,40 @@ class Runner:
                     if item is None:
                         break
                     done.add(item)
+                    delivered += 1
+        return delivered
+
+    def spend_what_is_left(self, ep) -> None:
+        """Keep sweeping the atoms still open while the step budget has room and a pass is still winning items.
+
+        A pass ends when every item has had its ``attempts_per_item`` tries, and that is usually long before the
+        episode's step limit: measured over the 70 instances on disk on 2026-09-15, the mean instance finished
+        having used 32% of its budget and only three reached the limit. The rest was simply never claimed. A
+        further pass costs steps that were not going to be spent, and it is not a repeat of the same thing -- a
+        pass chooses its stance again, and an item that could not be reached or seen from one stance is often
+        fine from the next.
+
+        Two guards. A pass that delivers nothing ends it, so an atom that cannot be done costs one pass rather
+        than the whole budget. And a pass only starts with room to finish one, so this never turns a run that
+        would have ended cleanly into one cut off mid-motion. ``self.tries`` is cleared for each pass, which is
+        what gives the item its attempts again; ``settled`` keeps the ones already delivered out of the way.
+        """
+        sim = getattr(ep, "sim", None)
+        limit = getattr(sim, "max_steps", None)
+        if not limit:  # no episode limit known: one pass is all the runner can justify
+            return
+        for sweep in range(1, EXTRA_SWEEPS + 1):
+            used = getattr(sim, "n_steps", 0)
+            if used > BUDGET_FOR_ANOTHER_SWEEP * limit:
+                log.info(f"{used}/{limit} steps used; no room for another sweep")
+                return
+            if not self.demand.total():
+                return
+            self.tries.clear()
+            log.info(f"sweep {sweep}: {used}/{limit} steps used, going round again for the atoms still open")
+            if not self.run_transfers(ep):
+                log.info(f"sweep {sweep} delivered nothing; stopping rather than spending the rest of the budget")
+                return
 
     def settled(self, ep, wanted: dict) -> set:
         """Items the goal already has where it wants them when the instance starts (a bin that stands on the floor

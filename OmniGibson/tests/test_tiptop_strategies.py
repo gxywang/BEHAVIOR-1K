@@ -283,6 +283,69 @@ def test_a_goal_atom_that_puts_something_on_the_floor_is_judged_by_how_low_it_st
     assert picks == ["battery.n.02_1"]  # the bin already stands on the floor; the battery on the desk does not
 
 
+class _Budget:
+    """The bit of the simulator the runner reads to decide whether another sweep fits."""
+
+    def __init__(self, max_steps=1000, n_steps=0):
+        self.max_steps, self.n_steps = max_steps, n_steps
+
+
+def _two_items(**kw):
+    boxes = {
+        "ashcan.n.01_1": box((2.0, 0, 0.15), half=(0.15, 0.15, 0.15)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "battery.n.02_2": box((0.6, 0, 0.77)),
+        "desk.n.01_1": box((0.5, 0, 0.7), half=(0.6, 0.4, 0.02)),
+    }
+    goal = [atom("inside", f"battery.n.02_{i}", "ashcan.n.01_1") for i in (1, 2)]
+    return boxes, goal
+
+
+def test_the_budget_left_over_is_spent_on_the_atoms_still_open():
+    """A pass ends when every item has had its tries; the measured instance then stops with two thirds of its
+    step budget unused. A second pass re-chooses the stance, so an item that could not be reached from the first
+    one gets another go."""
+    boxes, goal = _two_items()
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok={"ashcan.n.01_1", "battery.n.02_1"})
+    ep.sim = _Budget(max_steps=1000, n_steps=10)
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks.count("battery.n.02_2") > 1, "the item that did not land should be tried again on a later sweep"
+
+
+def test_a_sweep_that_wins_nothing_ends_the_sweeping():
+    """An atom that cannot be done costs one extra pass, not the whole budget."""
+    boxes, goal = _two_items()
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set())  # nothing can be placed at all
+    ep.sim = _Budget(max_steps=100000, n_steps=0)
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    first = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert len(first) < 40, f"sweeping should stop once a pass wins nothing, got {len(first)} picks"
+
+
+def _picks_of_one_run(budget=None):
+    boxes, goal = _two_items()
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok={"ashcan.n.01_1", "battery.n.02_1"})
+    if budget is not None:
+        ep.sim = budget
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    return [c[1] for c in ep.calls if c[0] == "pick"].count("battery.n.02_2")
+
+
+def test_no_sweep_begins_without_room_to_finish_one():
+    """Almost all the budget already spent: the runner must not start a pass it cannot finish."""
+    assert _picks_of_one_run(_Budget(max_steps=1000, n_steps=950)) == _picks_of_one_run()
+
+
+def test_an_episode_with_no_step_limit_gets_one_pass():
+    """Nothing to budget against, so the runner does not invent extra work."""
+    one_pass = _picks_of_one_run()
+    assert one_pass >= 1
+    assert _picks_of_one_run(_Budget(max_steps=1000, n_steps=10)) > one_pass, (
+        "with room in the budget it should sweep again, which is what makes the no-budget case meaningful"
+    )
+
+
 def test_wood_that_must_go_to_another_room_is_not_already_delivered():
     """bringing_in_wood: three sheets of plywood lie on floor.n.01_1 and the goal wants them on floor.n.01_2.
 
