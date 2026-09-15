@@ -2520,6 +2520,14 @@ class R1ProSim(TiptopSim):
         # died on "the left arm starts inside coffee_table_osroux_0, which the planner refuses before it looks at
         # the goal" (2026-09-15). Costs one ramp at travel speed, and only on the runs that were already in
         # trouble.
+        # ...but only when the obstacle was the SCENE. A third of blocked folds (209 of 657) happen with something
+        # in the hand, and then the thing in the way travels with the arm: a 30 cm floor tile folded in over the
+        # base meets the base. Retrying at the new stance cannot help, and measured over the first runs with the
+        # retry in, 27 of its 36 attempts were blocked again. Skip it and keep the steps.
+        carrying = bool(getattr(self, "held_objects", None))
+        if carrying and getattr(self, "_fold_blocked", False):
+            log.info(f"the fold is blocked and the hand holds {self.hands()}; it would be blocked here too, not retrying")
+            self._fold_blocked = False
         if getattr(self, "_fold_blocked", False) and unfold_to is not None and self.planned_joints:
             folded = travel_fold_targets(self.q_arm(), self.planned_joints) or []
             again = self.ramp_to(folded, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS,

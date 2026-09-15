@@ -926,3 +926,8 @@ def test_a_fold_stopped_by_furniture_is_tried_again_at_the_new_stance():
     assert retry < unfold, "fold again BEFORE unfolding, or the unfold starts from the jammed posture"
     teleport = stand.index("set_position_orientation")
     assert teleport < retry, "and only AFTER the teleport, since the obstacle is at the old stance"
+    # ...and not at all when the obstacle travels with the arm
+    assert "carrying" in stand and "held_objects" in stand, (
+        "a fold blocked while the hand holds something is blocked by the thing in the hand: 209 of 657 blocked "
+        "folds were carrying, and 27 of the retry's first 36 attempts were blocked again"
+    )
