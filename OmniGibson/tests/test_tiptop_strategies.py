@@ -568,3 +568,33 @@ def test_the_support_plane_and_buttons_are_exempt_from_the_visibility_test():
     assert "PLANNER_SUPPORT" in block.group(0)
     assert '"pressed"' in block.group(0), "a press names a button that was never segmented"
     assert "a not in exempt" in block.group(0), "the exemption has to reach the test itself"
+
+
+def test_a_goal_that_wants_one_container_to_take_everything_commits_to_one():
+    """ "Every toy in a bookcase" means the SAME bookcase; spreading them over two satisfies neither option.
+
+    collecting_childrens_toys scored 0.000 with six picks executed, because the demand was read across both
+    options at once -- every toy into bookcase_1 AND every toy into bookcase_2 -- so each toy went to whichever
+    was nearest it (2026-09-14). The tell is that no option uses more than one container, which is what separates
+    it from putting_away_toys, where a toy may go to either box independently and mixed options exist.
+    """
+    toys = [f"toy_figure.n.01_{i}" for i in (1, 2, 3)]
+    shelves = ["bookcase.n.01_1", "bookcase.n.01_2"]
+    # one option per bookcase: all three toys into that one
+    options = [[atom("inside", t, shelf) for t in toys] for shelf in shelves]
+    demand = place_demand(options)
+    assert demand.containers == ["bookcase.n.01_1"], "it must commit to a single bookcase"
+    assert demand.wanted == {("toy_figure", "bookcase.n.01_1"): 3}
+    assert demand.total() == 3, "three toys, not six"
+
+    # the toys case is NOT this: mixed options exist, so every box may want every toy and merging stays
+    boxes = ["toy_box.n.01_1", "toy_box.n.01_2"]
+    mixed = [
+        [atom("inside", toy, target) for toy, target in zip(toys, choice)]
+        for choice in itertools.product(boxes, repeat=3)
+    ]
+    assert place_demand(mixed).wanted == {("toy_figure", "toy_box.n.01_1"): 3, ("toy_figure", "toy_box.n.01_2"): 3}
+
+    # a single option is untouched
+    only = [[atom("inside", t, shelves[0]) for t in toys]]
+    assert place_demand(only).containers == ["bookcase.n.01_1"]

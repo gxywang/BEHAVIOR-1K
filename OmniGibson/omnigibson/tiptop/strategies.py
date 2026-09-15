@@ -90,10 +90,46 @@ class Demand:
         return sum(self.wanted.values())
 
 
+def option_containers(option: list[dict]) -> list[str]:
+    """The containers one ground option places into, in the order it names them."""
+    return list(
+        dict.fromkeys(a["args"][1] for a in option if a["predicate"] in PLACE_PREDICATES and len(a["args"]) == 2)
+    )
+
+
+def one_container_goal(options: list[list[dict]]) -> list[list[dict]]:
+    """Commit to a single option when the goal wants everything in the SAME container.
+
+    "Put every toy in a bookcase", with two bookcases in the room, grounds into one option per bookcase, and
+    satisfying either scores the task. Reading demand across both asks for every toy in bookcase_1 AND every toy
+    in bookcase_2; the runner then sends each toy to whichever container is nearest it, splits them between the
+    two, and satisfies neither option. collecting_childrens_toys is that task, and it scored 0.000 with six picks
+    executed (2026-09-14).
+
+    The tell is whether any option spreads its items over more than one container:
+
+      putting_away_toys   each toy may go to EITHER box independently, so the options include mixed ones
+                          (toy 1 here, toy 2 there). Merging is right, and it scores 0.8125 that way.
+      gift baskets        every option fills all four baskets. Merging is right.
+      the bookcase case   every option uses exactly ONE container. Merging is wrong.
+
+    So: several options, none of which uses more than one container, means the goal is asking for one container
+    to take everything. Keep the first such option, deterministically. Anything else is left exactly as it was.
+    """
+    if len(options) < 2:
+        return options
+    if any(len(option_containers(o)) > 1 for o in options):
+        return options
+    for option in options:
+        if len(option_containers(option)) == 1:
+            return [option]
+    return options
+
+
 def place_demand(options: list[list[dict]]) -> Demand:
     """Read the demand off the goal's ground options (see ``Demand``)."""
     demand = Demand()
-    for option in options:
+    for option in one_container_goal(options):
         counts = Counter()
         for a in option:
             if a["predicate"] not in PLACE_PREDICATES or len(a["args"]) != 2:
