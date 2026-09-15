@@ -284,6 +284,7 @@ class Runner:
         self.demand = place_demand(self.options)
         self.attempts = spec.attempts_per_item if attempts is None else int(attempts)
         self.tries = Counter()  # item -> transfers attempted for it, over the whole instance
+        self.moved = set()  # items delivered in the pass now running (run_transfers)
 
     @property
     def instruction(self) -> str:
@@ -335,10 +336,11 @@ class Runner:
         container. An item is tried ``attempts`` times in the pass; one still in the hand after a failed place is
         put down, and a hand still full at the next transfer is emptied first."""
         wanted = dict(self.demand.wanted)
+        self.moved = set()  # items delivered in THIS pass; a fresh pass may move them again
         done = self.settled(ep, wanted)
         log.info(
             f"goal demand {sorted((f'{k} x{n} -> {c}') for (k, c), n in wanted.items() if n > 0)}"
-            + (f"; already there: {sorted(done)}" if done else "")
+            + (f"; already there: {sorted(i for i, _ in done)}" if done else "")
         )
         delivered = 0
         for container in self.order_containers(ep, wanted, done):
@@ -347,7 +349,8 @@ class Runner:
                     item = self.transfer_one(ep, kind, container, done)
                     if item is None:
                         break
-                    done.add(item)
+                    done.add((item, container))
+                    self.moved.add(item)  # one delivery per item per pass, whatever else wants it
                     delivered += 1
         return delivered
 
@@ -392,14 +395,22 @@ class Runner:
         bringing_in_wood asks for three sheets of plywood ontop floor.n.01_2 and they start on floor.n.01_1, so
         all three were counted as delivered and the instance finished having run no rounds at all, scoring 0.000.
         laying_tile_floors failed the same way. A predicate the evaluator cannot judge leaves the item loose,
-        which is the safe direction: the worst case is work that turns out to be unnecessary."""
+        which is the safe direction: the worst case is work that turns out to be unnecessary.
+
+        Answered per (item, container), not per item. sorting_books_on_shelf wants its books BOTH inside the
+        bookcase, which they already are, AND stacked on one another, which they are not. With one set of settled
+        items the books counted as done for the bookcase and were then excluded from the stacking work as well,
+        so the instance finished in 14 seconds having never attempted a pick (2026-09-15)."""
         done = set()
         for (kind, container), n in list(wanted.items()):
             predicate = self.demand.predicate.get((kind, container), "ontop")
             for item in self.demand.items.get(kind, []):
                 if n <= 0:
                     break
-                if item in done:
+                if (item, container) in done or item == container:
+                    # A thing is trivially on, in and beside ITSELF, and counting that as the demand being met
+                    # eats the slot the real work needed: sorting_books_on_shelf asks for a book ontop another
+                    # book, and comic_book_1 "already ontop comic_book_1" satisfied it before anything moved.
                     continue
                 try:
                     there = ep.goal_already_holds(predicate, item, container)
@@ -407,7 +418,7 @@ class Runner:
                     continue
                 if not there:
                     continue
-                done.add(item)
+                done.add((item, container))
                 n -= 1
                 wanted[(kind, container)] = n
         return done
@@ -432,7 +443,7 @@ class Runner:
                 self.gap(ep, container, item)
                 for kind in self.demand.kinds_for(container)
                 for item in self.demand.items.get(kind, [])
-                if item not in done
+                if (item, container) not in done and item != container and item not in self.moved
             ]
             return min(gaps) if gaps else float("inf")
 
@@ -440,7 +451,11 @@ class Runner:
 
     def transfer_one(self, ep, kind: str, container: str, done: set) -> str | None:
         """Move one item of ``kind`` into ``container``; the item moved, or None when none could be."""
-        candidates = [i for i in self.demand.items.get(kind, []) if i not in done and self.tries[i] < self.attempts]
+        candidates = [
+            i
+            for i in self.demand.items.get(kind, [])
+            if (i, container) not in done and i != container and i not in self.moved and self.tries[i] < self.attempts
+        ]
         if not candidates:
             return None
         supports = {i: ep.support_of(i) for i in candidates}

@@ -354,6 +354,45 @@ def test_an_episode_with_no_step_limit_gets_one_pass():
     )
 
 
+def test_a_book_already_in_the_bookcase_is_still_stacked_on_the_other_books():
+    """sorting_books_on_shelf wants its books BOTH inside the bookcase, which they already are, AND stacked on
+    one another, which they are not.
+
+    With one set of settled items, being done for the bookcase excluded the books from the stacking work too, and
+    the instance finished in 14 seconds having never attempted a pick.
+    """
+    boxes = {
+        "bookcase.n.01_1": box((2.0, 0, 0.8), half=(0.4, 0.2, 0.8)),
+        "comic_book.n.01_1": box((2.0, 0, 0.9), half=(0.08, 0.05, 0.01)),
+        "comic_book.n.01_2": box((2.0, 0.1, 0.9), half=(0.08, 0.05, 0.01)),
+    }
+    goal = [
+        atom("inside", "comic_book.n.01_1", "bookcase.n.01_1"),  # already true
+        atom("inside", "comic_book.n.01_2", "bookcase.n.01_1"),  # already true
+        atom("ontop", "comic_book.n.01_2", "comic_book.n.01_1"),  # the work
+    ]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_books_on_shelf", goal).run(ep)
+    assert any(c[0] == "pick" for c in ep.calls), "the stacking half of the goal must still be attempted"
+
+
+def test_an_item_is_only_delivered_once_in_a_pass():
+    """The other side of the same coin: a toy that went into one box must not then be carried to the other."""
+    boxes = {
+        "toy_box.n.01_1": box((2.0, 0, 0.2), half=(0.3, 0.3, 0.2)),
+        "toy_box.n.01_2": box((-2.0, 0, 0.2), half=(0.3, 0.3, 0.2)),
+        "toy_figure.n.01_1": box((0.4, 0, 0.8)),
+    }
+    goal = [
+        atom("inside", "toy_figure.n.01_1", "toy_box.n.01_1"),
+        atom("inside", "toy_figure.n.01_1", "toy_box.n.01_2"),
+    ]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("putting_away_toys", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks.count("toy_figure.n.01_1") == 1, f"delivered once per pass, got {picks}"
+
+
 def test_wood_is_carried_to_the_floor_the_goal_names():
     """The runner used to drop a floor-bound item wherever the robot already stood, which for bringing_in_wood
     is the floor the plywood started on."""
