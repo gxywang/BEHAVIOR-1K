@@ -893,9 +893,18 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
 
 ## Kept out of the pipeline
 
-Nothing task-specific is written into the pipeline or a strategy: a strategy orders a task's goals and skips what
-it cannot do, and every goal of every task gets the same retry (`--rounds`). What follows was tried or proposed
-for one task and is kept here, with what it did, in case a task needs it later.
+A strategy orders a task's goals and skips what it cannot do, and every goal of every task gets the same retry
+(`--rounds`). Nothing task-specific is written into the pipeline code, but a task FILE may carry tailored values,
+which the user allowed on 2026-09-13 ("open may not need to be generic to all drawer and cabinet, you can tailor
+to a certain task a certain drawer"). Every tailored value in use is listed here and logged when it is read, so a
+score is never mistaken for a general capability. The general rule is always tried first.
+
+| task | field | value | why the general rule was not enough |
+|---|---|---|---|
+| `store_honey` | `opens` | cabinet joint, grasp height, fraction | the open skill does not find the handle on this asset |
+| `sorting_vegetables` | `container` | `mixing_bowl.n.01_3` | the goal grounds into 27 options, some of which split the vegetables between the three bowls, so `one_container_goal` declines to commit; the demand read across all 27 then asks for every vegetable in every bowl and the runner spreads them over three, satisfying none |
+
+What follows was tried or proposed for one task and is kept here, with what it did, in case a task needs it later.
 
 - **Put the radio down and pick it up again (turning_on_radio passes 3-4; removed 2026-09-09).** When the press
   found no plan twice, the strategy planned `ontop(radio, table)`, a fresh pick, and two more presses. It rescued
