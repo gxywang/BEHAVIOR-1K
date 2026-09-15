@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+# The teleoperation corpus lives outside this repository on the cluster.
+DEFAULT_DEMO_ROOT = "/projects/illinois/eng/cs/shenlong/datasets/behavior1k-20k"
 
 
 def find_template(root: Path, scene: str, task: str) -> Path:
@@ -28,6 +31,50 @@ def flatten_object_ids(value: Any) -> list[str]:
     for item in value:
         names.extend(flatten_object_ids(item))
     return names
+
+
+def join_strings(values: Any) -> str:
+    """Join annotation string lists; some entries are null in the corpus."""
+    if not isinstance(values, list):
+        return ""
+    return ", ".join(value for value in values if isinstance(value, str))
+
+
+# Scene object names are <category>[_<6-letter model>]_<index>, e.g. coffee_table_koagbh_0
+# or trash_can_66; annotations also cite instances that belong to other task instances.
+INSTANCE_NAME = re.compile(r"^(?P<category>.+?)(?:_[a-z]{6})?(?:_\d+)+$")
+
+
+def instance_name_category(name: str) -> str | None:
+    match = INSTANCE_NAME.match(name)
+    return match.group("category") if match else None
+
+
+def near_match_categories(name: str, by_category: dict[str, list[str]], limit: int = 6) -> list[str]:
+    """Template categories sharing a word with an unresolved reference (a hint, not a match)."""
+    tokens = set(name.split("_"))
+    return sorted(category for category in by_category if tokens & set(category.split("_")))[:limit]
+
+
+def resolve_reference(name: str, instances: set[str], by_category: dict[str, list[str]]):
+    """Resolve a demo annotation object_id against one task template.
+
+    Returns (status, matches, note); status is resolved, ambiguous or unresolved.
+    Demo annotations mix two namespaces: template instance names (trash_can_66) and
+    category names (trash_can), plus instance names from other task instances.
+    """
+    if name in instances:
+        return "resolved", [name], "exact instance name"
+    source = name if name in by_category else instance_name_category(name)
+    if source not in by_category:
+        hints = near_match_categories(name, by_category)
+        note = "no instance or category of this name in the template"
+        if hints:
+            note += f"; similar template categories (unverified): {', '.join(hints)}"
+        return "unresolved", [], note
+    matches = sorted(by_category[source])
+    note = f"category {source!r}" if source == name else f"category {source!r} of instance name {name!r}"
+    return ("resolved" if len(matches) == 1 else "ambiguous"), matches, note
 
 
 def task_index(demo_root: Path, task: str) -> int | None:
@@ -105,12 +152,15 @@ def annotation_references(demo_root: Path, task: str) -> dict[str, set[str]]:
     if index is None:
         return {}
     references: dict[str, set[str]] = defaultdict(set)
-    for path in sorted((demo_root / "annotations" / f"task-{index:04d}").glob("*.json")):
+    annotation_dir = demo_root / "annotations" / f"task-{index:04d}"
+    if not annotation_dir.is_dir():
+        return {}
+    for path in sorted(annotation_dir.glob("*.json")):
         with open(path, "r", encoding="utf-8") as f:
             annotation = json.load(f)
         for skill in annotation.get("skill_annotation", []):
-            description = ", ".join(skill.get("skill_description", []))
-            skill_type = ", ".join(skill.get("skill_type", []))
+            description = join_strings(skill.get("skill_description", []))
+            skill_type = join_strings(skill.get("skill_type", []))
             for name in flatten_object_ids(skill.get("object_id", [])):
                 references[name].add(f"{skill_type}: {description}")
     return references
@@ -129,7 +179,12 @@ def print_section(title: str, rows: list[tuple[str, str, str]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-instances-root", default="datasets/2026-challenge-task-instances")
-    parser.add_argument("--demo-root", default="datasets", help="Demo dataset root; annotations are optional.")
+    parser.add_argument(
+        "--demo-root",
+        default=DEFAULT_DEMO_ROOT,
+        help="Teleoperation corpus root holding meta/tasks.jsonl and annotations/task-NNNN; "
+        f"annotations are optional. Default: {DEFAULT_DEMO_ROOT}",
+    )
     parser.add_argument(
         "--bddl-root",
         default=str(Path(__file__).resolve().parents[3] / "bddl3"),
@@ -173,12 +228,31 @@ def main() -> None:
             if scene_name != "robot"
         ],
     )
+    instances = set(objects)
+    by_category: dict[str, list[str]] = defaultdict(list)
+    for name, category in categories.items():
+        by_category[category].append(name)
+
+    rank = {"resolved": 0, "ambiguous": 1, "unresolved": 2}
+    counts: Counter[str] = Counter()
+    annotation_rows = []
+    for name, skills in referenced.items():
+        status, matches, note = resolve_reference(name, instances, by_category)
+        counts[status] += 1
+        skill_detail = "; ".join(sorted(skills))
+        if status == "resolved":
+            target = matches[0]
+            detail = f"-> {target} [{categories.get(target, 'unknown')}; {rooms.get(target, '')}] ({note}) | {skill_detail}"
+        elif status == "ambiguous":
+            detail = f"-> {len(matches)} instances of {note}: {', '.join(matches)} | {skill_detail}"
+        else:
+            detail = f"-> none: {note} | {skill_detail}"
+        annotation_rows.append((name, status.upper(), detail))
+    annotation_rows.sort(key=lambda row: (rank[row[1].lower()], row[0]))
     print_section(
-        "Objects referenced by demonstration annotations",
-        [
-            (name, categories.get(name, "not in template"), "; ".join(sorted(skills)))
-            for name, skills in sorted(referenced.items())
-        ],
+        "Objects referenced by demonstration annotations, resolved against this template "
+        f"({counts['resolved']} resolved, {counts['ambiguous']} ambiguous, {counts['unresolved']} unresolved)",
+        annotation_rows,
     )
     print_section(
         "Doors in this task instance",
