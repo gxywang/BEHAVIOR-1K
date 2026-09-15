@@ -251,6 +251,7 @@ class TiptopSim:
         self.dt = og.sim.get_sim_step_dt()
         self.objects = {name: self.env.scene.object_registry("name", name) for name in self.object_names()}
         self.context = {"table": self.env.scene.object_registry("name", "table")}  # furniture shown in the mirror
+        self.obstacles = {}  # label -> furniture sent to the planner as a static obstacle (see tracked_object)
         self._init_state()
         joint_names = list(self.robot.joints.keys())
         log.info(
@@ -691,12 +692,24 @@ class TiptopSim:
         )
         return request, extras
 
+    def tracked_object(self, label: str):
+        """The simulated object a request label stands for, or None: a tracked task object, else a piece of
+        furniture registered as an obstacle for this stance (``nearby_obstacles``). Obstacles are deliberately
+        kept out of ``self.objects`` -- they are geometry for the planner to avoid, not things the episode
+        poses, checks or frames, and every capture's ``object_poses_base`` (and with it the frame-coverage
+        check) is built from ``self.objects`` alone."""
+        return self.objects.get(label) or self.obstacles.get(label)
+
     def object_meshes(self, labels: list[str]) -> dict:
         """{label: trimesh} of tracked objects at their current poses, world frame: the masks of every view of one
         capture come from the same meshes (privileged)."""
-        missing = [label for label in labels if label not in self.objects]
+        missing = [label for label in labels if self.tracked_object(label) is None]
         if missing:
-            raise ValueError(f"no tracked object for labels {missing} (tracked: {sorted(self.objects)})")
+            raise ValueError(
+                f"no tracked object for labels {missing} (tracked: {sorted(self.objects)}"
+                + (f"; obstacles: {sorted(self.obstacles)}" if self.obstacles else "")
+                + ")"
+            )
         return {label: self.object_trimesh_world(label) for label in labels}
 
     def oracle_masks(self, view: dict, view_extras: dict, labels: list[str], meshes: dict | None = None) -> np.ndarray:
@@ -709,7 +722,8 @@ class TiptopSim:
             id_to_name = view_extras["id_to_name"]
             masks = []
             for label in labels:  # tracked objects may carry a different simulator name (task objects)
-                sim_name = self.objects[label].name if label in self.objects else label
+                obj = self.tracked_object(label)
+                sim_name = obj.name if obj is not None else label
                 ids = [i for i, n in id_to_name.items() if n == sim_name]
                 masks.append(np.isin(seg, ids) if ids else np.zeros(view["depth"].shape, dtype=bool))
             return np.stack(masks)
@@ -771,7 +785,7 @@ class TiptopSim:
         return trimesh.util.concatenate(parts)
 
     def object_trimesh_world(self, name: str) -> trimesh.Trimesh:
-        return self.trimesh_world(self.objects[name])
+        return self.trimesh_world(self.tracked_object(name))
 
     def geometry_masks(
         self, depth, intrinsics, cam_pos_world, cam_quat_cv_world, labels, tol: float | None = None, meshes=None

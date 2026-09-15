@@ -55,14 +55,16 @@ class _Sim:
     """The bits of a simulator the knowledge sources read: tracked objects, goal translation, masks (per view),
     buttons, hands."""
 
-    def __init__(self, masks, held=None, arm="left", views=None):
+    def __init__(self, masks, held=None, arm="left", views=None, furniture=()):
         self.masks = masks  # label -> (H, W) bool, the primary view
         self.views = views or {}  # view name -> {label -> (H, W) bool}, the further views
-        self.objects = {label: object() for label in masks}
+        self.objects = {label: object() for label in masks if label not in furniture}
         self.held_objects = held or {}
         self.arm = arm
         self.eef = {"left": np.eye(4), "right": np.eye(4)}
         self.button_calls = []
+        self.furniture = list(furniture)  # what nearby_obstacles offers with --obstacles on
+        self.send_obstacles = False
 
     def tiptop_goal(self, atoms, category_level):
         def name(bddl):
@@ -76,10 +78,18 @@ class _Sim:
             if atom["predicate"] == "toggled_on":
                 args = [f"{a}_button" for a in args]
             out.append({"predicate": predicates[atom["predicate"]], "args": args})
-        labels = sorted({name(f"{label.rpartition('_')[0]}.n.01_{label.rpartition('_')[2]}") for label in self.masks})
+        task_labels = [label for label in self.masks if label not in self.furniture]  # furniture is not a goal label
+        labels = sorted({name(f"{label.rpartition('_')[0]}.n.01_{label.rpartition('_')[2]}") for label in task_labels})
         return labels, out
 
+    def nearby_obstacles(self, exclude=()):
+        return [name for name in self.furniture if name not in exclude]
+
     def object_meshes(self, labels):
+        # the real one (TiptopSim.object_meshes) raises on a label it cannot resolve to a simulated object
+        missing = [label for label in labels if label not in self.objects and label not in self.furniture]
+        if missing:
+            raise ValueError(f"no tracked object for labels {missing}")
         return {}
 
     def oracle_masks(self, request, extras, labels, meshes=None):
@@ -686,3 +696,68 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
     know.center = [3.0, 0.0, 0.1]
     note_hands(sim, [], Executor(), know)
     assert sim.hands() == {}
+
+
+def test_the_oracle_sends_nearby_furniture_to_the_planner_and_only_what_a_view_actually_shows():
+    """--obstacles: the room's furniture reaches cuTAMP through held_labels, which it takes as statics.
+
+    Measured 2026-09-15 on putting_dirty_dishes_in_sink: with the flag on, every round died in the capture with
+    "no tracked object for labels ['straight_chair_nntxvr_3', ...]" -- nearby_obstacles named scene objects that
+    object_meshes could not resolve, so the request was never built and the planner received nothing at all. The
+    labels the oracle adds must be ones the simulator can mask and mesh.
+    """
+    goal = [{"predicate": "holding", "args": ["bowl.n.01_1"]}]
+    masks = _masks(bowl_1=20, booth_xzrpar_2=500, bench_xwphjd_3=0)
+    sim = _Sim(masks, furniture=("booth_xzrpar_2", "bench_xwphjd_3"))
+    source = make_knowledge("oracle", sim, goal)
+    off = source.describe(goal, _request(), {})
+    assert off.labels == ["bowl_1"] and off.held_labels == []  # default: the planner hears nothing about the room
+    sim.send_obstacles = True
+    on = source.describe(goal, _request(), {})  # would raise if a furniture label reached object_meshes unresolved
+    assert on.held_labels == ["booth_xzrpar_2"]  # a static obstacle, not a movable
+    assert on.labels == ["bowl_1", "booth_xzrpar_2"]  # masked like any other label, so it gets a hull
+    assert on.masks.shape == (2, 6, 8)
+    # the bench is in the room but in none of the views: it carries no pixels, so no hull, so it is not sent --
+    # the hole this leaves in the planner's world is the "plan under occlusion" case, still unsolved
+    assert "bench_xwphjd_3" not in on.labels and "bench_xwphjd_3" not in on.held_labels
+
+
+def test_object_meshes_resolves_a_registered_obstacle_and_still_refuses_an_unknown_label():
+    """The lookup the crash above was in: furniture is registered as an obstacle, not tracked as a task object."""
+    import types
+
+    from omnigibson.tiptop.scene import TiptopSim
+
+    bowl, booth = object(), object()
+    sim = types.SimpleNamespace(objects={"bowl_1": bowl}, obstacles={"booth_xzrpar_2": booth})
+    sim.tracked_object = types.MethodType(TiptopSim.tracked_object, sim)
+    sim.object_trimesh_world = lambda label: f"mesh of {sim.tracked_object(label)!r}"
+    meshes = TiptopSim.object_meshes(sim, ["bowl_1", "booth_xzrpar_2"])
+    assert meshes["bowl_1"] == f"mesh of {bowl!r}" and meshes["booth_xzrpar_2"] == f"mesh of {booth!r}"
+    with pytest.raises(ValueError, match="no tracked object for labels"):
+        TiptopSim.object_meshes(sim, ["bowl_1", "sideboard_7"])
+
+
+def test_nearby_obstacles_registers_the_furniture_and_never_offers_an_object_the_task_already_has():
+    """The same booth was offered as an obstacle under its scene name while the task tracked it as a movable:
+    ``exclude`` carries tiptop labels ('booth_1'), which never match a scene name ('booth_xzrpar_2')."""
+    import types
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    def thing(name, category="furniture"):
+        return types.SimpleNamespace(name=name, category=category)
+
+    booth, bench, rug, robot = thing("booth_xzrpar_2"), thing("bench_xwphjd_3"), thing("rug_1", "rug"), thing("robot")
+    box = (np.array([0.0, 0.0, 0.0]), np.array([1.0, 1.0, 1.0]))
+    far = (np.array([9.0, 9.0, 0.0]), np.array([10.0, 10.0, 1.0]))
+    sim = types.SimpleNamespace(
+        robot=robot,
+        objects={"booth_1": booth},  # the task tracks the booth itself, under its tiptop label
+        obstacles={"stale_from_the_last_stance": bench},
+        base_pose=lambda: (np.array([0.0, 0.0, 0.0]), None),
+        scene_aabbs=lambda: [(booth, *box), (bench, *box), (rug, *box), (thing("sideboard_9"), *far)],
+    )
+    names = R1ProSim.nearby_obstacles(sim, exclude=["booth_1"])
+    assert names == ["bench_xwphjd_3"]  # not the booth (already a movable), not the rug, not the far sideboard
+    assert sim.obstacles == {"bench_xwphjd_3": bench}  # rebuilt per stance, and resolvable by object_meshes

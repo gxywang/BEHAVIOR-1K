@@ -774,6 +774,7 @@ class R1ProSim(TiptopSim):
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
+        self.obstacles = {}  # furniture sent to the planner as a static obstacle this stance (nearby_obstacles)
         self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
@@ -2044,7 +2045,46 @@ class R1ProSim(TiptopSim):
             )
         self.unfold_after_travel(unfold_to)
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
+        self.log_teleport_contacts()
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
+
+    def log_teleport_contacts(self) -> dict:
+        """MEASUREMENT ONLY (dev/stance, 2026-09-14): what the robot is physically touching right after a teleport
+        and its unfold, by robot link, read from the physics' contact matrix. Floors are left out (the wheels stand
+        on them). Logs one line and changes nothing; a failure inside is logged and swallowed."""
+        try:
+            from omnigibson.utils.usd_utils import RigidContactAPI
+
+            links = set(self.robot.link_prim_paths)
+            found = {}
+            for current_only in (True, False):
+                pairs = RigidContactAPI.get_contact_pairs(
+                    scene_idx=self.robot.scene.idx, query_set=links, with_set=None, current_only=current_only
+                )
+                for link, other in pairs:
+                    if other in links:
+                        continue
+                    parts = other.split("/")  # /World/scene_0/<object>/<link>
+                    name = parts[3] if len(parts) > 3 else other
+                    obj = self.env.scene.object_registry("name", name)
+                    if obj is not None and getattr(obj, "category", "") == "floors":
+                        continue
+                    found.setdefault(name, {"now": set(), "recent": set()})["now" if current_only else "recent"].add(
+                        link.rsplit("/", 1)[-1]
+                    )
+        except Exception as e:  # noqa: BLE001 - a probe must never end a run
+            log.info(f"teleport contact probe unavailable: {e!r}")
+            return {}
+        if not found:
+            log.info("after the teleport the robot touches nothing but the floor [teleport contact probe]")
+            return {}
+        parts = []
+        for name, by in sorted(found.items()):
+            now = sorted(by["now"])
+            recent = sorted(by["recent"] - by["now"])
+            parts.append(f"{name}: now {now}" + (f", during the unfold {recent}" if recent else ""))
+        log.warning(f"after the teleport the robot touches {'; '.join(parts)} [teleport contact probe]")
+        return {name: sorted(by["now"] | by["recent"]) for name, by in found.items()}
 
     def apply_posture(self, locked: dict, q_home, settle_steps: int = 30, tol: float = 0.03, joint_names=None) -> None:
         """Hold the joints the planner locks (right arm, fingers, torso if not planned) and go to q_home.
@@ -2497,16 +2537,35 @@ class R1ProSim(TiptopSim):
         (``HOUSE_AABB_AREA``), anything wholly above the robot, and anything small enough to be a task object
         rather than a fixture. A hull is only built for a label the capture also masks, so the caller must add
         these to the labels it segments.
+
+        WHAT THIS ACTUALLY DELIVERS, measured 2026-09-15 on putting_dirty_dishes_in_sink (instance 301, oracle,
+        head/head_up/head_down, the 4 rounds that reached the planner): of 32 labels offered here, 17 carried
+        pixels and were sent, 15 of those were dropped by the planner as "no hull in this frame", and TWO became
+        obstacles in cuTAMP's world -- the same bench both times ("In the other hand (obstacles):
+        ['bench_xwphjd_3']", 157813 and 284216 points). The drops happen in the planner's own reconstruction, for
+        two reasons that have nothing to do with which labels this picks: hulls_from_points drops every label with
+        no points above the fitted table top (z = 0.742 here), which is every bench, chair and seat in a diner
+        below the table; and the perception crop (``workspace``, [[0.35, -0.8, 0.25], [1.3, 0.8, 1.6]] in the base
+        frame) throws away the points of anything not directly in front of the robot, which is how walls and window
+        blinds arrive with "only 0 valid depth points". So this channel can only ever hand over furniture that
+        stands above the work surface inside the workspace box. Giving the planner the geometry the bridge already
+        has needs a channel that is not perception -- a request key cuTAMP turns into statics directly -- and that
+        is a change on the planner's side of the wire.
         """
         here = (
             self.base_pose()[0][:2].cpu().numpy()
             if hasattr(self.base_pose()[0], "cpu")
             else np.asarray(self.base_pose()[0][:2], dtype=np.float64)
         )
+        # The task's own objects are never obstacles: the planner already has them, as movables it may pick up,
+        # under their tiptop labels. ``exclude`` carries those labels ('booth_1'), which never match a scene name
+        # ('booth_xzrpar_2'), so the same booth was offered twice -- once to pick up and once to plan around.
+        # Sparing by object identity is what the caller meant; ``exclude`` still spares extra scene names.
         spared = set(exclude) | {self.robot.name}
+        tracked = set(map(id, self.objects.values()))
         rows = []
         for obj, lo, hi in self.scene_aabbs():
-            if obj is self.robot or obj.name in spared or obj.category in FLOOR_COVERINGS:
+            if obj is self.robot or obj.name in spared or id(obj) in tracked or obj.category in FLOOR_COVERINGS:
                 continue
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
                 continue  # merged walls, roofs, ceilings
@@ -2518,9 +2577,14 @@ class R1ProSim(TiptopSim):
             centre = (np.asarray(lo, dtype=np.float64) + np.asarray(hi, dtype=np.float64))[:2] / 2.0
             gap = float(np.linalg.norm(centre - here))
             if gap <= reach:
-                rows.append((gap, obj.name))
-        rows.sort()
-        return [name for _, name in rows[:limit]]
+                rows.append((gap, obj.name, obj))
+        rows.sort(key=lambda row: (row[0], row[1]))
+        # Register them so the capture can mask them and ``object_meshes`` can build their geometry: a label the
+        # oracle could not resolve to an object reached ``object_meshes`` and raised there, which killed every
+        # round the flag was on. They stay out of ``self.objects`` (see TiptopSim.tracked_object) and are rebuilt
+        # per call, because which furniture is near depends on where the base is standing.
+        self.obstacles = {name: obj for _, name, obj in rows[:limit]}
+        return list(self.obstacles)
 
     def scene_mesh(self, obj):
         """World-frame trimesh of a scene object, kept until the object moves (its box is the stamp).
