@@ -162,7 +162,7 @@ def test_an_object_behind_the_robot_is_behind_the_camera():
 
 def test_yaw_brings_an_object_to_the_side_into_frame():
     aside = cube([0.4, 0.9, 0.75])  # 66 deg to the left of a robot facing +x: outside a 99 deg frame
-    assert framing([aside])[0] == "outside the head camera's frame"
+    assert framing([aside])[0] == "out of the head camera's frame altogether"  # not a pixel of it is in the picture
     assert framing([aside], yaw=np.radians(66.0))[0] is None
 
 
@@ -240,11 +240,134 @@ def measured_framing(boxes, x=0.0, y=0.0, yaw=0.0, **kw):
 def test_the_measured_head_camera_frames_a_battery_on_a_desk_but_not_one_at_the_robots_feet():
     # the desk in dispose_of_batteries stands at z 0.78 and the head camera sees it from 0.42 m ahead
     assert measured_framing([cube([0.75, 0.0, 0.80])])[0] is None
-    assert measured_framing([cube([0.30, 0.0, 0.80])])[0] == "outside the head camera's frame"
+    assert measured_framing([cube([0.30, 0.0, 0.80])])[0] == "out of the head camera's frame altogether"
 
 
 def test_the_measured_head_camera_reaches_the_floor_close_in():
     assert measured_framing([cube([0.55, 0.0, 0.04])])[0] is None  # a toy on the floor, within reach
+
+
+# --------------------------------------------------------------- a stance that misses the object altogether
+# GoalNotVisible was the commonest failure in runs/queue_logs by a wide margin. Of the 328 times the head camera
+# was asked for a goal object and came back with an empty mask, 75 had the object off the LEFT edge of the image
+# and not one off the right -- the stance search has to put an object within the LEFT arm's reach, and for
+# anything the robot cannot stand square to that means beside its shoulder. The stances below are the ones
+# packing_meal_for_delivery actually took on 2026-09-14, and the strict pass was accepting them.
+
+
+def test_an_object_beside_the_camera_is_refused_however_big_its_projection_is():
+    """The measured failure: a hamburger 0.34 m ahead of the base and 0.61 m to its left.
+
+    It projects to pixel (-727, 951) of a 720x720 image -- nowhere near the picture -- but because it is close to
+    the lens and far off its axis, its projected BOX is wider than the frame, and the exemption for an object too
+    big to fit was letting the stance through. The round went out, the capture saw nothing of the hamburger and it
+    died on empty masks.
+    """
+    beside = cube([0.34, 0.61, 0.89], half=0.06)
+    assert measured_framing([beside])[0] == "out of the head camera's frame altogether"
+    assert measured_framing([beside], strict=False)[1] > 0.0, "the fallback pass still charges for it"
+
+
+def test_the_refusal_does_not_get_weaker_the_further_out_of_frame_the_object_goes():
+    """A stance that misses by a mile must not be accepted while one that nearly frames the object is refused.
+
+    That was the shape of the bug: the apparent size of the projected box grows with how far off-axis the object
+    is, so the "too big to fit" exemption switched on exactly where the picture was worst. Sweeping the object
+    sideways at a fixed distance, every one of these stances shows nothing of it and every one must be refused.
+    """
+    for side in (0.0, 0.15, 0.30, 0.45, 0.61, 0.75):
+        why, _ = measured_framing([cube([0.34, side, 0.89], half=0.06)])
+        assert why is not None, f"a stance with the object {side:.2f} m to the left shows none of it, but was taken"
+
+
+def test_an_object_the_camera_can_actually_see_is_still_accepted():
+    """The other half: the fix must not refuse the stances that do work.
+
+    On a 0.89 m surface the measured head camera's window starts 0.45 m ahead of the base; these are inside it.
+    """
+    for ahead in (0.75, 0.90, 1.10):
+        assert measured_framing([cube([ahead, 0.30, 0.89], half=0.06)])[0] is None, f"{ahead} m ahead was refused"
+
+
+def test_an_object_only_partly_in_the_picture_is_still_a_cut_and_not_this_refusal():
+    """The new refusal is for objects with nothing in the picture; a clipped one keeps its old treatment."""
+    desk = (np.array([0.45, -0.45, 0.0]), np.array([1.10, 0.45, 0.80]))  # too big to frame, but plainly in view
+    why, outside = measured_framing([desk])
+    assert why is None and outside > 0.0
+
+
+# --------------------------------------------------------------- turning the head to look at something
+def aim(target, cam=None, limit=None):
+    from omnigibson.tiptop.r1pro import HEAD_AIM_LIMIT, head_aim_yaw
+
+    cam = MEASURED_HEAD if cam is None else cam
+    return head_aim_yaw(cam[:3, 3], cam[:3, 2], target, HEAD_AIM_LIMIT if limit is None else limit)
+
+
+def turned_in_place(delta):
+    """The measured head camera re-aimed by ``delta`` about the base's vertical without moving.
+
+    What ``torso_joint4`` does: it rotates the link the camera sits on, so the camera turns roughly where it
+    stands (it is 9 cm off the axis, so it travels about 4 cm, which is not modelled here).
+    """
+    c, s = np.cos(delta), np.sin(delta)
+    about_z = np.array([[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    turned = about_z @ MEASURED_HEAD
+    turned[:3, 3] = MEASURED_HEAD[:3, 3]  # re-aimed from the same place
+    return turned
+
+
+def test_a_target_straight_ahead_needs_no_turn():
+    assert aim([1.0, 0.0, 0.89]) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_a_target_to_the_left_turns_the_head_left_and_one_to_the_right_turns_it_right():
+    # head_left is a POSITIVE yaw, so a target to the robot's left must come back positive
+    assert aim([0.7, 0.75, 0.89]) > 0.0
+    assert aim([0.7, -0.75, 0.89]) < 0.0
+    assert aim([0.7, 0.75, 0.89]) == pytest.approx(-aim([0.7, -0.75, 0.89]), abs=1e-6)
+
+
+def test_the_turn_is_clamped_to_what_the_joint_may_do():
+    from omnigibson.tiptop.r1pro import HEAD_AIM_LIMIT
+
+    assert aim([0.1, 2.0, 0.89]) == pytest.approx(HEAD_AIM_LIMIT)
+    assert aim([0.1, -2.0, 0.89]) == pytest.approx(-HEAD_AIM_LIMIT)
+    assert abs(aim([-1.0, 0.05, 0.89])) <= HEAD_AIM_LIMIT, "a target behind must not ask for a 180 deg turn"
+
+
+def test_the_pitch_of_the_head_does_not_confuse_the_bearing():
+    """The challenge posture pitches the camera 43 deg down; the turn is about the vertical, so only the
+    horizontal bearing may count. A target level with the camera and one on the floor below it, at the same
+    bearing, must ask for the same turn."""
+    assert aim([0.7, 0.5, 1.25]) == pytest.approx(aim([0.7, 0.5, 0.05]), abs=1e-6)
+
+
+def test_a_target_at_the_camera_itself_asks_for_no_turn():
+    assert aim(MEASURED_HEAD[:3, 3]) == 0.0
+
+
+def test_the_aimed_turn_brings_an_object_off_the_left_edge_back_into_the_picture():
+    """The point of the whole thing, on the measured camera.
+
+    An object 0.70 m ahead of the base and 0.75 m to its left is off the left edge of the head image -- the stance
+    the left arm's reach asks for. Turning the head by what ``head_aim_yaw`` says puts it back inside the frame.
+    """
+    from omnigibson.tiptop.r1pro import box_corners, frame_objects
+    from omnigibson.tiptop.protocol import points_to_pixels
+
+    target = np.array([0.70, 0.75, 0.89])
+    (u, v), ahead = points_to_pixels([target], MEASURED_K, MEASURED_HEAD)[0][0], 1.0
+    assert u < 0, f"the object should start off the LEFT edge, but projects to column {u:.0f}"
+    delta = aim(target)
+    assert delta > 0.0
+    turned = turned_in_place(delta)
+    (u2, v2), z2 = points_to_pixels([target], MEASURED_K, turned)[0][0], points_to_pixels(
+        [target], MEASURED_K, turned
+    )[1][0]
+    assert z2 > 0 and 0 <= u2 < 720, f"after the turn it projects to column {u2:.0f}, still outside the image"
+    lo, hi = target - 0.04, target + 0.04
+    assert frame_objects([box_corners(lo, hi)], MEASURED_K, turned, 0.0, 720, 720, 0.0, 0.0, 0.0)[0] is None
 
 
 # --------------------------------------------------------------- a link's box on the line of sight

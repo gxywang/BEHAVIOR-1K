@@ -75,6 +75,7 @@ CAMERA_LINKS = {
     "head_right": "zed_link",
     "head_up": "zed_link",
     "head_down": "zed_link",
+    "head_aim": "zed_link",
 }
 VIEW_OPTICS = {  # which shadow camera renders a view
     "head": "head",
@@ -84,6 +85,7 @@ VIEW_OPTICS = {  # which shadow camera renders a view
     "head_right": "head",
     "head_up": "head",
     "head_down": "head",
+    "head_aim": "head",
 }
 DEFAULT_VIEWS = ("left_wrist", "right_wrist")  # captured with the head camera and fused by the planner
 # Two ways to move the head camera, both through the torso (the base never turns) and both bringing the arms
@@ -105,6 +107,18 @@ HEAD_VIEWS = {
     "head_up": (HEAD_PITCH_JOINT, HEAD_VIEW_PITCH),
     "head_down": (HEAD_PITCH_JOINT, -HEAD_VIEW_PITCH),
 }
+# The same yaw joint, turned by however much it takes to put what the stance was chosen for in the middle of the
+# frame, instead of by a fixed amount. The head camera sees about +-50 degrees and the stance search has to put an
+# object within the LEFT arm's reach, which for anything the robot cannot stand square to means well off to one
+# side: of the 328 head-camera looks at a goal object that came back with an empty mask across runs/queue_logs,
+# 75 had the object off the LEFT edge of the image and not one off the right, and 67 of those 75 come back inside
+# the frame with a turn this joint can make. The turn is commanded from the camera's pose as it stands and the
+# resulting pose is read back from the simulator when the view is rendered, so an imperfect aim costs a little
+# centring and nothing else.
+HEAD_AIM_VIEW = "head_aim"
+HEAD_AIM_LIMIT = 0.6  # rad the torso may turn to aim (a little past the fixed +-0.5 rad views)
+HEAD_AIM_MIN = 0.12  # rad: a smaller turn is not worth a ramp and a second render
+TURNED_HEAD_VIEWS = (HEAD_AIM_VIEW,)  # head views beyond HEAD_VIEWS: same camera, same optics, computed turn
 HEAD_VIEW_SETTLE_STEPS = 30  # after a yaw ramp: only the torso moved (the arms settle for LOOK_SETTLE_STEPS)
 # The external capture sensors, one per optics: moved onto the robot camera's pose per view (_capture_obs). The
 # robot's own cameras render rgb only (video, mirror); depth and segmentation come from these.
@@ -455,7 +469,9 @@ def frame_objects(
     distance is cut by its border -- the measured cause of a lost round is a battery projecting to row 791 of a
     720-row head image (2026-09-12, dispose_of_batteries), and an item the planner has to grasp is worth nothing
     half seen. An object too big to fit is only penalised by the pixels it falls outside: no stance frames a toy
-    box and the toy beside it whole, and a clipped container is worth more than no stance at all. ``strict=False``
+    box and the toy beside it whole, and a clipped container is worth more than no stance at all -- but that
+    exemption applies only to an object some of which is in the picture, because an object close to the camera and
+    far off its axis projects to a box bigger than the frame while landing entirely outside it. ``strict=False``
     turns every cut into a penalty: what ``best_base_pose`` falls back to when no stance frames the objects whole.
     """
     fwd = np.array([math.cos(yaw), math.sin(yaw)])
@@ -482,6 +498,16 @@ def frame_objects(
         low = np.array([margin_px, margin_px], dtype=np.float64)
         high = np.array([width - 1 - margin_px, height - 1 - margin_px], dtype=np.float64)
         cut = float(np.sum(np.maximum(0.0, low - lo) + np.maximum(0.0, hi - high)))
+        # Not one pixel of it lands in the picture. This has to be judged before the "too big to fit" exemption
+        # below, because apparent size is not physical size: an object close to the camera and far off its axis
+        # projects to a HUGE box precisely because it is nearly beside the lens, so the exemption was letting
+        # through exactly the stances that see nothing. Measured against the real head camera (fixture of
+        # bench_batteries_8): a hamburger 0.34 m ahead of the base and 0.61 m to its left -- the stance
+        # packing_meal_for_delivery actually took on 2026-09-14 -- projects to pixel (-727, 951) of a 720x720
+        # image and the strict pass ACCEPTED it, while the same object 0.15 m to the left, far better framed, was
+        # rejected. The round went out, the capture saw nothing and it died on empty masks.
+        if strict and not (np.all(lo <= high) and np.all(hi >= low)):
+            return "out of the head camera's frame altogether", 0.0
         if strict and cut > 0.0 and np.all(hi - lo <= high - low):  # it would fit in the frame; this stance cuts it
             return "outside the head camera's frame", 0.0
         outside += cut
@@ -592,7 +618,7 @@ def make_r1pro_env_config(
     unknown = [v for v in (camera, *views) if v not in CAMERA_LINKS]
     if unknown:
         raise ValueError(f"unknown camera views {unknown} (known: {sorted(CAMERA_LINKS)})")
-    if camera in HEAD_VIEWS:
+    if camera in HEAD_VIEWS or camera in TURNED_HEAD_VIEWS:
         raise ValueError(f"{camera!r} is the head camera turned; the primary view is taken at torso yaw 0 ('head')")
     optics = {"head": (head_resolution, head_aperture_mm), "wrist": (wrist_resolution, WRIST_APERTURE_MM)}
     shadow_cams = [
@@ -727,6 +753,28 @@ def turned_joints(planned_joints, q_arm, joint: str, delta: float) -> list[float
     return q
 
 
+def head_aim_yaw(cam_pos_base, cam_forward_base, target_base, limit: float = HEAD_AIM_LIMIT) -> float:
+    """How far to turn the torso's yaw joint to bring ``target_base`` into the middle of the head camera's frame.
+
+    The camera's position and optical axis and the target are all in the robot base frame. The joint turns the
+    camera about the base's vertical, so only the horizontal bearing can be corrected: the answer is the angle
+    from where the camera looks now to where the target lies, wrapped to (-pi, pi] and clamped to +-``limit``.
+    Positive is to the robot's left, the same sign as ``HEAD_VIEWS["head_left"]``.
+
+    The camera's own pitch is left alone. A head camera pitched 43 degrees down (the challenge posture) still has
+    three quarters of its optical axis in the horizontal plane, which is what the bearing is taken from; a camera
+    looking straight down has no bearing to speak of and gets no turn.
+    """
+    here = np.asarray(cam_pos_base, dtype=np.float64)[:2]
+    fwd = np.asarray(cam_forward_base, dtype=np.float64)[:2]
+    to_target = np.asarray(target_base, dtype=np.float64)[:2] - here
+    if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(to_target) < 1e-6:
+        return 0.0
+    delta = math.atan2(to_target[1], to_target[0]) - math.atan2(fwd[1], fwd[0])
+    delta = (delta + math.pi) % (2 * math.pi) - math.pi
+    return float(np.clip(delta, -abs(limit), abs(limit)))
+
+
 class R1ProSim(TiptopSim):
     """R1Pro in a BEHAVIOR scene; the TiptopSim interface (capture / step / q_arm / objects) for the left arm."""
 
@@ -747,7 +795,7 @@ class R1ProSim(TiptopSim):
         environment must have been configured with the same, ``make_r1pro_env_config``); ``overview_view``: where
         ``place_robot`` puts the overview camera (``OVERVIEW_OFFSETS``); ``look_arm``: joint overrides on top of
         q_home for the capture, None to capture in the ready posture."""
-        if camera in HEAD_VIEWS:
+        if camera in HEAD_VIEWS or camera in TURNED_HEAD_VIEWS:
             raise ValueError(f"{camera!r} is the head camera turned; the primary view is taken at torso yaw 0 ('head')")
         self.config = config
         self.overview_view = overview_view
@@ -769,7 +817,8 @@ class R1ProSim(TiptopSim):
         self.gripper_idx = self.robot.gripper_control_idx[self.arm]
         self.dt = og.sim.get_sim_step_dt()
         sensor_names = {name: f"{self.robot.name}:{link}:Camera:0" for name, link in CAMERA_LINKS.items()}
-        self.robot_cam_names = {n: s for n, s in sensor_names.items() if n not in HEAD_VIEWS}  # one per camera
+        turned = set(HEAD_VIEWS) | set(TURNED_HEAD_VIEWS)  # the head camera re-aimed, not cameras of their own
+        self.robot_cam_names = {n: s for n, s in sensor_names.items() if n not in turned}  # one per camera
         self.robot_cams = {name: self.robot.sensors[sensor] for name, sensor in sensor_names.items()}  # per view
         self.cam_name = self.robot_cam_names[camera]
         self.robot_cam = self.robot_cams[camera]  # the primary view's camera: the base-pose search frames with it
@@ -3076,6 +3125,47 @@ class R1ProSim(TiptopSim):
         )
         return blocked
 
+    def look_at_point(self, hands: dict | None = None) -> np.ndarray:
+        """The base-frame point a capture aims its cameras at.
+
+        The gripper that holds what this round is about, once it has been picked up -- the held object is what the
+        next plan has to see; a held object otherwise, when nothing was stood for; else what the base pose was
+        chosen for; else straight ahead. ``hands``: a ``hands()`` snapshot to reuse.
+        """
+        hands = self.hands() if hands is None else hands
+        held_arms = set(hands.values())
+        holding_arms = sorted(hands[self.tracked_label(n)] for n in self.look_names if self.tracked_label(n) in hands)
+        if holding_arms or (held_arms and self.look_target is None):
+            return np.asarray(self.eef_pose_base((holding_arms or sorted(held_arms))[0])[:3, 3], dtype=np.float64)
+        return np.asarray(DEFAULT_LOOK_TARGET if self.look_target is None else self.look_target, dtype=np.float64)
+
+    def head_view_turn(self, name: str) -> tuple[str, float] | None:
+        """The joint a head view turns and how far, or None when this view is not worth taking.
+
+        The fixed views of ``HEAD_VIEWS`` always turn by their own constant. The aimed view works out for itself
+        how far the torso has to turn to put ``look_at_point`` in the middle of the head camera's frame, from the
+        camera's pose as it stands right now, and is skipped when the head is already pointing near enough at it
+        (a ramp and a second render cost steps, and a turn of a few degrees buys nothing).
+        """
+        if name in HEAD_VIEWS:
+            return HEAD_VIEWS[name]
+        if name != HEAD_AIM_VIEW:
+            raise ValueError(f"{name!r} is not a head view ({sorted(set(HEAD_VIEWS) | set(TURNED_HEAD_VIEWS))})")
+        _, base_from_cam, _ = self.head_camera_in_base()
+        target = self.look_at_point()
+        delta = head_aim_yaw(base_from_cam[:3, 3], base_from_cam[:3, 2], target, HEAD_AIM_LIMIT)
+        if abs(delta) < HEAD_AIM_MIN:
+            log.info(
+                f"head aim: {np.round(target, 2).tolist()} is already {math.degrees(delta):+.0f} deg off the head "
+                f"camera's axis; no turn taken"
+            )
+            return None
+        log.info(
+            f"head aim: turning {HEAD_YAW_JOINT} {math.degrees(delta):+.0f} deg to look at "
+            f"{np.round(target, 2).tolist()}"
+        )
+        return HEAD_YAW_JOINT, delta
+
     def capture(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
         (``wrist_look``: what the base pose was chosen for, at the hand that holds it once it has been picked up;
@@ -3083,8 +3173,8 @@ class R1ProSim(TiptopSim):
         frame. An arm that holds something stays where it is:
         the held object is what the next plan is about and must be seen, and the gripper keeps its command. The
         planned arm swings out of view (``look_arm``) when no look configuration exists; with ``look_arm`` None
-        nothing moves. The head views of ``HEAD_VIEWS`` come last, the torso turned to their yaw with the arms
-        as they are (``_capture_views``). The plan starts from the ready posture the arms return to."""
+        nothing moves. The head views come last, the torso turned to their yaw with the arms as they are
+        (``_capture_views``). The plan starts from the ready posture the arms return to."""
         ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
         if self.look_arm is None:
             return self._capture_views(task, ready)
@@ -3095,11 +3185,7 @@ class R1ProSim(TiptopSim):
             return self._capture_views(task, ready)
         hands = self.hands()
         held_arms = set(hands.values())
-        holding_arms = sorted(hands[self.tracked_label(n)] for n in self.look_names if self.tracked_label(n) in hands)
-        if holding_arms or (held_arms and self.look_target is None):
-            target = self.eef_pose_base((holding_arms or sorted(held_arms))[0])[:3, 3]
-        else:
-            target = np.asarray(DEFAULT_LOOK_TARGET if self.look_target is None else self.look_target, dtype=np.float64)
+        target = self.look_at_point(hands)
         look = list(ready)  # the planned joints during the capture
         posture = dict(self.posture)  # the other arm's joints during the capture
         moved = {}  # arm -> {joint: value}
@@ -3445,14 +3531,15 @@ class R1ProSim(TiptopSim):
 
     def _capture_views(self, task: str, q_arm) -> tuple[dict, dict]:
         """``TiptopSim.capture`` for the primary view and the wrist views, where the joints stand now (``q_arm``: the
-        planned joints' targets, at torso yaw 0), then each head view of ``HEAD_VIEWS`` among ``extra_views``
-        with the torso ramped to its yaw (``ramp_to``; every other joint stays where the capture found it, so a head
+        planned joints' targets, at torso yaw 0), then each head view among ``extra_views`` -- the fixed turns of
+        ``HEAD_VIEWS`` and the aimed one of ``TURNED_HEAD_VIEWS`` -- with the torso ramped to the yaw
+        ``head_view_turn`` gives it (``ramp_to``; every other joint stays where the capture found it, so a head
         view moves the torso and nothing else), and the torso ramped back. The base frame does not turn with the torso, so a view's
         camera pose, read from the simulator as it is rendered, is right as it is."""
         self.log_blocked_sight()
-        head_views = [v for v in self.extra_views if v in HEAD_VIEWS]
+        head_views = [v for v in self.extra_views if v in HEAD_VIEWS or v in TURNED_HEAD_VIEWS]
         extra_views = self.extra_views
-        self.extra_views = tuple(v for v in extra_views if v not in HEAD_VIEWS)
+        self.extra_views = tuple(v for v in extra_views if v not in head_views)
         try:
             request, extras = super().capture(task)
         finally:
@@ -3467,8 +3554,13 @@ class R1ProSim(TiptopSim):
         # and the joint that blocked was always an arm joint being dragged, never the torso. Building the view on
         # the MEASURED joints leaves the arm where it is.
         where_it_is = [float(v) for v in self.q_arm()]
-        for name in head_views:
-            joint, delta = HEAD_VIEWS[name]
+        # Each view's turn is settled before any of them is taken, so a view that turns out not to be worth taking
+        # (the aimed view when the head already points at the target) never reaches the ramp-back bookkeeping below.
+        turns = [(name, turn) for name in head_views if (turn := self.head_view_turn(name)) is not None]
+        head_views = [name for name, _ in turns]
+        if not head_views:
+            return request, extras
+        for name, (joint, delta) in turns:
             self.ramp_to(
                 turned_joints(self.planned_joints, where_it_is, joint, delta),
                 self.posture,
@@ -3493,12 +3585,11 @@ class R1ProSim(TiptopSim):
             )
         # Back the same way: the torso to where it was, every other joint left where the views found it.
         back_to = list(where_it_is)
-        for name in head_views:
-            joint = HEAD_VIEWS[name][0]
+        for _, (joint, _delta) in turns:
             if joint in self.planned_joints:
                 back_to[self.planned_joints.index(joint)] = q_arm[self.planned_joints.index(joint)]
         self.ramp_to(back_to, self.posture, self.last_gripper, HEAD_VIEW_SETTLE_STEPS, note="back from a head view")
-        moved_joints = {HEAD_VIEWS[name][0] for name in head_views}
+        moved_joints = {joint for _, (joint, _delta) in turns}
         back = max(
             abs(float(self.q_arm()[self.planned_joints.index(j)]) - q_arm[self.planned_joints.index(j)])
             for j in moved_joints

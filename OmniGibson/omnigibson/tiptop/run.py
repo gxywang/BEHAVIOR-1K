@@ -94,10 +94,11 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "--views",
         nargs="*",
         default=["left_wrist", "right_wrist"],
-        choices=["head", "left_wrist", "right_wrist", "head_left", "head_right", "head_up", "head_down"],
+        choices=["head", "left_wrist", "right_wrist", "head_left", "head_right", "head_up", "head_down", "head_aim"],
         metavar="VIEW",
         help="further cameras captured with the primary one, fused by the planner into one scene ('--views' alone: "
-        "the primary camera only)",
+        "the primary camera only). 'head_aim' is the head camera turned by however much it takes to look at what "
+        "the stance was chosen for, rather than by a fixed amount",
     )
     r1.add_argument(
         "--activity",
