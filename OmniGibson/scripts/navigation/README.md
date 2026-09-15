@@ -129,15 +129,26 @@ falls through to a farther reachable ring instead of being discarded.
 
 `--min-distance` defaults to 2.0 m rather than the generator's 1.0 m: with a 0.5 m success
 radius a 1.0 m leg is a 0.5 m drive, which is what made the point-goal suite undiscriminating.
-A task whose demonstrations never drove that far is retried at `--fallback-min-distance` (1.0 m)
-and its recipes are labelled with the floor they needed, so short episodes are visible rather
-than silent.
+Every demonstrated chain is tried at that floor first; a task still short of
+`--recipes-per-task` is then topped up at `--fallback-min-distance` (1.0 m) from the chains the
+primary floor rejected, and each recipe is labelled with the floor it was derived at. The
+summary reports each floor's travel distribution separately, so short episodes are visible
+rather than silent. A task is never padded with duplicates: recipes are deduplicated by their
+goal sequence and each comes from a different demonstrated chain, so a task short of five
+recipes reports why (usually that its demonstrations hold fewer distinct move-to chains).
 
-Nothing in the script imports omnigibson; it runs on a login node in about 40 minutes for all
+`--task-scope-disambiguation` allows the one narrowing that comes from the task definition
+rather than from us: when a demo reference resolves to several instances of a category and
+exactly one of them is in the task's own BDDL object scope, that instance is used and the leg
+records `resolution: bddl_task_scope`. Without the flag every such reference is dropped as
+ambiguous; over the 100 demo tasks the flag resolved 52 of the 1297 emitted legs.
+
+Nothing in the script imports omnigibson; it runs on a login node in about half an hour for all
 100 tasks.
 
 ```
 python OmniGibson/scripts/navigation/derive_object_nav_recipes.py \
+  --task-scope-disambiguation \
   --output-root /scratch/gxwang2/b1k/objnav/recipes \
   --report /scratch/gxwang2/b1k/objnav/derivation_report.json
 ```

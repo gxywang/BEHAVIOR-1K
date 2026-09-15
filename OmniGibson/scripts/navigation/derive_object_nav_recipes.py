@@ -345,7 +345,10 @@ class LegVerifier:
         in_range = [item for item in scored if self.min_distance <= item[1] <= self.max_distance]
         if not in_range:
             if not scored:
-                return {"ok": False, "reason": "no_reachable_approach_pose"}
+                # Every candidate is in the start's component, so a missing or infinite cost means
+                # only that no path within --max-distance reaches it: the search window is cropped
+                # to that distance and a shorter path cannot leave it.
+                return {"ok": False, "reason": "longer_than_max_distance"}
             shortest = min(item[1] for item in scored)
             reason = "shorter_than_min_distance" if shortest < self.min_distance else "longer_than_max_distance"
             return {"ok": False, "reason": reason, "nearest_distance": shortest}
@@ -477,23 +480,31 @@ def derive_task(task: str, scene: str, template_path: Path, args: argparse.Names
         return report
 
     ordered = sorted(raw.items(), key=lambda item: (-len(item[1]), -len(item[0]), item[0]))
-    # The fallback floor is only tried for a task whose demonstrations never drove far enough to
-    # clear the primary floor; its recipes stay labelled with the shorter floor they needed.
+    # Every demonstrated chain is tried at the primary floor first; a task still short of
+    # --recipes-per-task is then topped up at the fallback floor from the chains the primary floor
+    # rejected. Each recipe records the floor it was derived at and the summary reports each tier's
+    # travel distribution separately, so a short recipe is never passed off as a long one.
     floors = [args.min_distance]
     if args.fallback_min_distance and args.fallback_min_distance < args.min_distance:
         floors.append(args.fallback_min_distance)
+    seen: set[tuple[str, ...]] = set()
+    used_chains: set[tuple[str, ...]] = set()
+    # Drops are kept per demonstrated chain and overwritten when that chain is retried at the
+    # fallback floor, so a retried chain is counted once, at the floor that decided it.
+    drops_by_chain: dict[tuple[str, ...], list[str]] = {}
     for floor in floors:
-        if report["recipes"]:
+        if len(report["recipes"]) >= args.recipes_per_task:
             break
+        before = len(report["recipes"])
         verifier = LegVerifier(scene_map, args, floor)
-        seen: set[tuple[str, ...]] = set()
         for references, episodes in ordered:
             if len(report["recipes"]) >= args.recipes_per_task:
                 break
+            if references in used_chains:
+                continue
             built = build_recipe_chain(list(references), template, verifier, start_cell,
                                        args.task_scope_disambiguation)
-            for drop in built["dropped"]:
-                report["drop_reasons"][drop["reason"]] += 1
+            drops_by_chain[references] = [drop["reason"] for drop in built["dropped"]]
             if not built["legs"]:
                 continue
             legs = built["legs"][: args.max_legs]
@@ -502,6 +513,7 @@ def derive_task(task: str, scene: str, template_path: Path, args: argparse.Names
             if signature in seen:
                 continue
             seen.add(signature)
+            used_chains.add(references)
             report["recipes"].append({
                 "legs": legs,
                 "verified": verified,
@@ -512,16 +524,29 @@ def derive_task(task: str, scene: str, template_path: Path, args: argparse.Names
                 "demo_references": list(references),
                 "min_distance": floor,
             })
-        if report["recipes"] and floor < args.min_distance:
+        added = len(report["recipes"]) - before
+        if added and floor < args.min_distance:
             report["notes"].append(
-                f"no chain clears the {args.min_distance} m distance floor; emitted at the "
-                f"{floor} m fallback floor"
+                f"{added} recipe(s) needed the {floor} m fallback distance floor; their demonstrated "
+                f"chains hold no leg that drives {args.min_distance} m"
             )
+    for reasons in drops_by_chain.values():
+        report["drop_reasons"].update(reasons)
     if len(report["recipes"]) < args.recipes_per_task:
-        report["notes"].append(
+        shortfall = (
             f"only {len(report['recipes'])} distinct verified chains from {len(raw)} distinct demonstrated "
             f"chains over {len(chains)} episodes"
         )
+        if len(raw) < args.recipes_per_task:
+            shortfall += (
+                f"; the demonstrations themselves hold only {len(raw)} distinct move-to chains, fewer than "
+                f"the {args.recipes_per_task} requested"
+            )
+        elif report["drop_reasons"]:
+            reason, count = report["drop_reasons"].most_common(1)[0]
+            shortfall += f"; dominant leg-drop reason {reason} ({count})"
+        report["notes"].append(shortfall)
+        report["shortfall"] = shortfall
     return report
 
 
