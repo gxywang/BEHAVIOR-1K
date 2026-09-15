@@ -745,3 +745,61 @@ def test_the_cells_cover_the_leg_and_not_half_the_room():
     cells = footprint_cells(leg, 0.02, 0.35)
     assert 1 <= len(cells) <= 9, f"a 6 cm leg should touch a couple of 5 cm cells, got {len(cells)}"
     assert all(19 <= gx <= 22 and 19 <= gy <= 22 for gx, gy in cells), "and they should be where the leg is"
+
+
+# ------------------------------------------------- standing further back rather than accepting a clipped view
+def _ladder(at_09=None, at_wide=None, clipped=("clipped",), strict=True, has_boxes=True, reach=0.9):
+    """Drive widen_then_clip with a search that answers per (radius, strict), recording what it was asked."""
+    from omnigibson.tiptop.r1pro import REACH_WIDEN, widen_then_clip
+
+    asked = []
+
+    def search(r, is_strict):
+        asked.append((round(r, 2), is_strict))
+        if not is_strict:
+            return clipped, {}
+        return (at_wide if r >= REACH_WIDEN else at_09), {"geometry": 1}
+
+    out, _ = widen_then_clip(at_09, {"geometry": 1}, reach=reach, frame_strict=strict,
+                             has_boxes=has_boxes, search=search)
+    return out, asked
+
+
+def test_it_stands_further_back_rather_than_accept_a_clipped_view():
+    """jigsaw_puzzle_2 has 0 framing stances at 0.9 m and 88 at 1.1 m."""
+    from omnigibson.tiptop.r1pro import REACH_WIDEN
+
+    out, asked = _ladder(at_09=None, at_wide=("wider",))
+    assert out == ("wider",), "the well-framed stance further back should win"
+    assert asked[0] == (REACH_WIDEN, True), f"it must try the wider radius while still strict first, got {asked}"
+    assert (0.9, False) not in asked, "and must not settle for a clipped view when a framed one exists"
+
+
+def test_a_clipped_view_is_still_the_last_resort():
+    """When nothing frames the goal at any radius, part of the goal in view beats no stance."""
+    out, asked = _ladder(at_09=None, at_wide=None)
+    assert out == ("clipped",)
+    assert asked[-1][1] is False, "the clipped search comes last"
+
+
+def test_a_stance_that_already_frames_it_is_left_alone():
+    out, asked = _ladder(at_09=("near",), at_wide=("wider",))
+    assert out == ("near",) and asked == [], "no widening when the close stance already frames it"
+
+
+def test_a_search_that_was_never_strict_is_left_alone():
+    out, asked = _ladder(at_09=None, at_wide=("wider",), strict=False)
+    assert out is None and asked == [], "the relaxed pass must not recurse"
+
+
+def test_without_boxes_there_is_nothing_to_clip_to():
+    out, asked = _ladder(at_09=None, at_wide=None, has_boxes=False)
+    assert out is None
+    assert all(a[1] for a in asked), "never asks for a clipped view when there are no boxes to frame"
+
+
+def test_it_does_not_widen_when_already_at_the_wider_radius():
+    from omnigibson.tiptop.r1pro import REACH_WIDEN
+
+    out, asked = _ladder(at_09=None, at_wide=None, reach=REACH_WIDEN)
+    assert (REACH_WIDEN, True) not in asked, "no pointless second search at the same radius"

@@ -280,6 +280,7 @@ HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings 
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
+REACH_WIDEN = 1.1  # m: stand this far back rather than accept a stance that does not frame the goal
 FOOTPRINT_CELL = 0.05  # m: the grid the base-height geometry of a scene object is measured on
 FOOTPRINT_FACE_CELLS = 400  # a single face wider than this falls back to its corners (footprint_cells)
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
@@ -822,6 +823,42 @@ def head_aim_yaw(cam_pos_base, cam_forward_base, target_base, limit: float = HEA
     delta = math.atan2(to_target[1], to_target[0]) - math.atan2(fwd[1], fwd[0])
     delta = (delta + math.pi) % (2 * math.pi) - math.pi
     return float(np.clip(delta, -abs(limit), abs(limit)))
+
+
+def widen_then_clip(best, rejected, *, reach: float, frame_strict: bool, has_boxes: bool, search):
+    """What to do when no stance within ``reach`` frames the goal: stand further back before settling for less.
+
+    The free floor is not somewhere else -- it begins just outside the disc. Measured over 15,309 candidate
+    stances per object on picking_up_toys instance 301, counting stances that are free AND frame the goal whole:
+
+        object             R = 0.9   R = 1.1   R = 1.2   R = 1.5
+        jigsaw_puzzle_2          0        88       207       569
+        board_game_3             1        39        60       221
+        tennis_ball_1            0        49        91       358
+
+    The nearest free cell sits 0.70-0.89 m out with a median at 1.08-1.58 m: a desk is about 0.7 m deep, the disc
+    is 0.9 m, and the robot's own footprint eats the difference, so the reachable set and the standable set miss
+    each other by centimetres.
+
+    The order is the whole point. The caller widens to REACH_FAR only when this search RAISES, and it never
+    raised, because it always had a clipped stance to offer -- so a badly framed stance at 0.9 m always beat a
+    well framed one at 1.1 m, and picking_up_toys failed with GoalNotVisible rather than "no base pose". A
+    clipped view stays the last resort, since a stance that sees part of the goal still beats no stance.
+    """
+    if best is not None or not frame_strict:
+        return best, rejected
+    if reach < REACH_WIDEN:
+        wider, wider_rejected = search(REACH_WIDEN, True)
+        if wider is not None:
+            log.info(f"nothing frames it within {reach} m; standing further back, within {REACH_WIDEN} m")
+            return wider, wider_rejected
+        rejected = wider_rejected or rejected
+    if has_boxes:
+        log.info(
+            f"no stance frames every object whole ({dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:4])}); allowing a clipped one"
+        )
+        return search(reach, False)
+    return best, rejected
 
 
 class R1ProSim(TiptopSim):
@@ -2204,23 +2241,25 @@ class R1ProSim(TiptopSim):
                             score += CLEAR_WEIGHT * max(0.0, STANCE_CLEARANCE - clearance)
                             if best is None or score < best[0]:
                                 best = (score, x, y, yaw, dist, side, clearance)
-        if best is None and boxes is not None and frame_strict:
-            log.info(
-                f"no stance frames every object whole ({dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:4])}); allowing a clipped one"
-            )
-            return self.best_base_pose(
+        return widen_then_clip(
+            best,
+            rejected,
+            reach=reach,
+            frame_strict=frame_strict,
+            has_boxes=boxes is not None,
+            search=lambda r, strict: self.best_base_pose(
                 points_xy,
                 ignore=ignore,
-                reach=reach,
+                reach=r,
                 aabbs=aabbs,
                 half_widths=half_widths,
                 support_z=support_z,
                 avoid=avoid,
                 boxes=boxes,
-                frame_strict=False,
+                frame_strict=strict,
                 footprint=footprint,
-            )
-        return best, rejected
+            ),
+        )
 
     def hidden_from_here(self, names, aabbs=None) -> dict:
         """For each object named, the scene objects standing between the head camera (as it is now) and it.
