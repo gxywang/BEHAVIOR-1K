@@ -466,7 +466,15 @@ class Runner:
                 return False
         if not ep.pick(item):
             return False
-        if ep.is_floor(container):  # "on the floor": wherever the robot stands is the floor
+        if ep.is_floor(container):
+            # "Wherever the robot stands is the floor" holds only while the goal does not say WHICH floor. It
+            # does in bringing_in_wood -- three sheets of plywood on floor.n.01_1, wanted on floor.n.01_2 -- and
+            # dropping them where the robot already stands puts them back exactly where they started, which is
+            # how that task picked a sheet up and set it down again for no gain (2026-09-15).
+            if ep.goal_already_holds(predicate, item, container):
+                return True
+            if ep.walk_to_floor(container):  # travel to the named floor first, when it can be located
+                return ep.put_down(item, container, floor=True)
             return ep.put_down(item, ep.floor)
         try:
             ep.stand_for(container)  # carrying the item

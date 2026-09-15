@@ -1037,8 +1037,21 @@ class R1ProSim(TiptopSim):
         }
 
     # ---------------------------------------------------------------- scene setup
+    def scope_floor(self, name: str):
+        """The simulated object a BDDL floor name stands for, or None.
+
+        ``task_scope`` leaves floors out on purpose -- they are not things the episode poses or frames -- but a
+        goal may still name one as the place an item has to end up, and then the runner needs to know where it
+        is. bringing_in_wood asks for three sheets of plywood ontop floor.n.01_2 while they start on
+        floor.n.01_1, so "the floor" is not one place.
+        """
+        if not name.startswith("floor."):
+            return None
+        obj = getattr(self.env.task, "object_scope", {}).get(name)
+        return obj if isinstance(obj, USDObject) else None
+
     def scene_object(self, name: str):
-        obj = self.task_scope().get(name) or self.env.scene.object_registry("name", name)
+        obj = self.task_scope().get(name) or self.scope_floor(name) or self.env.scene.object_registry("name", name)
         if obj is None:
             names = sorted(o.name for o in self.env.scene.objects)
             raise ValueError(f"no object {name!r} in scene {self.config['scene']['scene_model']}; objects: {names}")

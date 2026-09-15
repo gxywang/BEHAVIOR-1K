@@ -509,6 +509,27 @@ class Episode:
             return self.floor
         return max(under, key=lambda n: float(boxes[n]["hi"][2]))
 
+    def walk_to_floor(self, name: str) -> bool:
+        """Teleport to somewhere on the floor ``name``, so a thing carried there can be set down on it.
+
+        Returns False when the floor cannot be located, and the caller keeps the old behaviour of setting the
+        item down where the robot already stands. A floor is a wide, flat object, so the stance search is given
+        its centre to aim at rather than the whole of it.
+        """
+        try:
+            obj = self.sim.scene_object(name)
+        except Exception as exc:  # noqa: BLE001 - a floor the scope does not resolve to a simulated object
+            log.info(f"cannot locate {name} ({exc}); putting the item down where the robot stands")
+            return False
+        if obj is None:
+            return False
+        try:
+            self.stand_for(name)
+            return True
+        except Unreachable as exc:
+            log.info(f"no stance reaches {name} ({exc}); putting the item down where the robot stands")
+            return False
+
     def goal_already_holds(self, predicate: str, item: str, container: str) -> bool:
         """Whether the goal's own atom for this pair holds right now, by the task's evaluator.
 

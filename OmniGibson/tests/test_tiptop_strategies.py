@@ -119,6 +119,14 @@ class FakeEpisode:
             return not self.holding(item)
         return placed_over(self.boxes[item], self.boxes[target], from_bottom=True)
 
+    def walk_to_floor(self, name):
+        """Episode.walk_to_floor: travel to the named floor, False when it cannot be located."""
+        if name in getattr(self, "unreachable_floors", set()):
+            return False
+        self.calls.append(("walk_to_floor", name))
+        self.floor = name  # the robot now stands on that floor
+        return True
+
     def goal_already_holds(self, predicate, item, container):
         """Whether the goal's atom for this pair holds (Episode.goal_already_holds, which asks the task's own
         evaluator). The fake judges it from the boxes, but a floor target names ONE floor: something lying on
@@ -344,6 +352,27 @@ def test_an_episode_with_no_step_limit_gets_one_pass():
     assert _picks_of_one_run(_Budget(max_steps=1000, n_steps=10)) > one_pass, (
         "with room in the budget it should sweep again, which is what makes the no-budget case meaningful"
     )
+
+
+def test_wood_is_carried_to_the_floor_the_goal_names():
+    """The runner used to drop a floor-bound item wherever the robot already stood, which for bringing_in_wood
+    is the floor the plywood started on."""
+    boxes = {f"plywood.n.01_{i}": box((float(i), 0, 0.05)) for i in (1, 2)}
+    goal = [atom("ontop", f"plywood.n.01_{i}", "floor.n.01_2") for i in (1, 2)]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))  # ep.floor starts as floor.n.01_1
+    strategy_for("bringing_in_wood", goal).run(ep)
+    assert ("walk_to_floor", "floor.n.01_2") in ep.calls, "it must travel to the floor the goal names"
+
+
+def test_a_floor_that_cannot_be_located_falls_back_to_putting_it_down_here():
+    """No regression for the ordinary case where the scope cannot resolve the floor at all."""
+    boxes = {"plywood.n.01_1": box((1.0, 0, 0.05))}
+    goal = [atom("ontop", "plywood.n.01_1", "floor.n.01_2")]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    ep.unreachable_floors = {"floor.n.01_2"}
+    strategy_for("bringing_in_wood", goal).run(ep)
+    assert not any(c[0] == "walk_to_floor" for c in ep.calls)
+    assert any(c[0] == "pick" for c in ep.calls), "it still tries, it just puts the sheet down where it is"
 
 
 def test_wood_that_must_go_to_another_room_is_not_already_delivered():
