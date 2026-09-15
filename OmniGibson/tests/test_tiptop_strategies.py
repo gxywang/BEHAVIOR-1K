@@ -728,6 +728,29 @@ def test_a_container_that_will_not_open_is_not_filled():
     assert "pick" not in [c[0] for c in ep.calls], "nothing should be picked up with nowhere to put it"
 
 
+def test_only_an_inside_placement_waits_for_the_container_to_open():
+    """openable() answers "does this have a joint", which is not the question.
+
+    The bar countertop is an articulated asset, so is_shut() is True of it, and gating every placement on an open
+    meant setup_a_bar never attempted one of its 14 countertop placements -- each refused because a countertop
+    would not open. installing_a_scanner does the same with a laptop. An ontop or nextto target has no inside and
+    needs nothing opened (2026-09-15).
+    """
+    boxes = {"bottle.n.01_1": box((0.0, 0.0, 0.8)), "countertop.n.01_1": box((1.0, 0.0, 0.9))}
+    ep = FakeEpisode(
+        boxes,
+        pick_ok={"bottle.n.01_1"},
+        place_ok={("bottle.n.01_1", "countertop.n.01_1")},
+        shut={"countertop.n.01_1"},
+        opens_ok=False,
+    )
+    goal = [atom("ontop", "bottle.n.01_1", "countertop.n.01_1")]
+    Runner(STRATEGIES["setup_a_bar_for_a_cocktail_party"], goal, attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert "open_up" not in kinds, "an ontop placement must not try to open its target"
+    assert "pick" in kinds, "and must not be refused because that target would not open"
+
+
 def test_an_open_goal_atom_is_acted_on_rather_than_left_alone():
     ep = FakeEpisode({"cabinet.n.01_1": box((1.0, 0.0, 0.5))}, shut={"cabinet.n.01_1"})
     goal = [atom("open", "cabinet.n.01_1")]

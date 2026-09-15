@@ -479,9 +479,18 @@ class Runner:
         # which is how store_honey put its jar ON the cabinet (2026-09-13). Open it BEFORE picking anything up --
         # the hand that pulls the drawer is the hand that would be carrying the item -- and open it far enough to
         # reach in, which is a much longer stroke than the one that scores an `open` atom.
-        if ep.is_shut(container):
+        # Only an INSIDE placement needs the container opened. An `ontop` or `nextto` target has no inside, and
+        # gating it on an open is what stopped setup_a_bar attempting any of its 14 countertop placements: the bar
+        # countertop is an articulated asset, so is_shut() is True, and every single item was refused because a
+        # countertop would not open. installing_a_scanner does the same with a laptop. openable() answers "does
+        # this have a joint", which is not the question (2026-09-15).
+        if predicate == "inside" and ep.is_shut(container):
             log.info(f"{container} is shut; opening it before fetching {item}")
             if not ep.open_up(container, fraction=OPEN_FRACTION_REACH):
+                # Still a veto, and deliberately so. A review agent argued for falling through, on the grounds
+                # that store_honey ends with 94% of its budget unspent -- true, but an item placed ON a shut
+                # cabinet scores the same zero as one never picked up, so the spending buys nothing. The veto
+                # stays until there is a reason to think the item would land somewhere that scores.
                 log.info(f"{container} would not open; {item} has nowhere to go")
                 return False
         if not ep.pick(item):
