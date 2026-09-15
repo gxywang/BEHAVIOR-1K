@@ -598,3 +598,64 @@ def test_a_goal_that_wants_one_container_to_take_everything_commits_to_one():
     # a single option is untouched
     only = [[atom("inside", t, shelves[0]) for t in toys]]
     assert place_demand(only).containers == ["bookcase.n.01_1"]
+
+
+def test_a_switch_already_where_the_goal_wants_it_is_not_pressed():
+    """Pressing a switch that is already on turns it OFF and destroys a condition already satisfied.
+
+    press_targets assumes "the switch starts in the state the goal wants changed". installing_a_modem is the
+    counter-example: its (:init) contains (toggled_on modem.n.01_1) and its goal asks for the modem ON, so one
+    of its four conditions is free and a press would lose it. Verified in the BDDL by hand (2026-09-15).
+    """
+
+    class _Ep:
+        def __init__(self, on):
+            self.on, self.pressed, self.picked = on, [], []
+
+        def switched_on(self, name):
+            return self.on
+
+        def has_arm(self, arm):
+            return True
+
+        def pick(self, obj):
+            self.picked.append(obj)
+            return True
+
+        def achieve(self, atoms, arm="left", **kw):
+            self.pressed.append(atoms[0]["args"][0])
+            return True
+
+        def is_shut(self, name):
+            return False
+
+        def open_up(self, *a, **k):
+            return True
+
+    spec = TaskSpec(task="t", instruction="i", plan="press", press="in_place")
+    goal = [atom("toggled_on", "modem.n.01_1")]
+
+    already_on = _Ep(True)
+    Runner(spec, goal).run(already_on)
+    assert already_on.pressed == [], "a switch already on must not be pressed"
+
+    off = _Ep(False)
+    Runner(spec, goal).run(off)
+    assert off.pressed == ["modem.n.01_1"], "a switch that is off is still pressed"
+
+    # a runner with no way to read the switch behaves as before rather than skipping every press
+    class _NoReading:
+        def __init__(self):
+            self.pressed = []
+
+        has_arm = _Ep.has_arm
+        pick = _Ep.pick
+        achieve = _Ep.achieve
+        is_shut = _Ep.is_shut
+        open_up = _Ep.open_up
+        picked = []
+
+    blind = _NoReading()
+    assert not hasattr(blind, "switched_on")
+    Runner(spec, goal).run(blind)
+    assert blind.pressed == ["modem.n.01_1"]

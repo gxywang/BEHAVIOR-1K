@@ -171,6 +171,24 @@ class Episode:
         except Exception:
             return False
 
+    def switched_on(self, name: str) -> bool | None:
+        """Whether ``name``'s switch is on right now; None when it has no such state.
+
+        Reading it back is privileged in exactly the way the oracle's masks are -- at evaluation this would have
+        to come from looking at the thing. It is read for one purpose only: not pressing a switch that is already
+        in the state the goal wants. installing_a_modem's (:init) contains (toggled_on modem.n.01_1), so the modem
+        starts ON and its goal asks for it ON; pressing it would turn it OFF and destroy a condition the task was
+        already being given credit for (2026-09-14).
+        """
+        from omnigibson.object_states import ToggledOn
+
+        try:
+            obj = self.sim.scene_object(name)
+            state = obj.states.get(ToggledOn)
+            return None if state is None else bool(state.get_value())
+        except Exception:  # noqa: BLE001 - no such state, or an object the scope does not name
+            return None
+
     def is_shut(self, name: str) -> bool:
         """Whether every joint of ``name`` that could open is closed."""
         from omnigibson.tiptop.articulation import is_open, openable_joints

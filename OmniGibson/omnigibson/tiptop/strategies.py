@@ -268,6 +268,15 @@ class Runner:
             raise ValueError(f"{self.spec.task}: the goal has no inside/ontop atoms for the transfer plan")
         if self.spec.plan in ("press", "auto") and presses:
             for obj in presses:
+                # Do not press a switch that is already where the goal wants it. press_targets assumes "the
+                # switch starts in the state the goal wants changed", and installing_a_modem is the
+                # counter-example: its (:init) contains (toggled_on modem.n.01_1) and its goal asks for the modem
+                # ON, so a press would turn it OFF and lose a condition the task already had (2026-09-14).
+                wanted = any(a["predicate"] == "toggled_on" and a["args"][:1] == [obj] for a in self.goal)
+                now = ep.switched_on(obj) if hasattr(ep, "switched_on") else None
+                if now is not None and now == wanted:
+                    log.info(f"{obj} is already {'on' if now else 'off'}, which is what the goal asks; not pressing it")
+                    continue
                 self.run_press(ep, obj)
         elif self.spec.plan == "press":
             raise ValueError(f"{self.spec.task}: the goal has no toggled_on atoms for the press plan")
