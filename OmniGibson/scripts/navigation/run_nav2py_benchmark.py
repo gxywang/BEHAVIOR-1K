@@ -25,6 +25,9 @@ from omnigibson.macros import gm
 DEFAULT_BENCHMARK = "outputs/navigation/nav_benchmark_test.json"
 DEFAULT_OUTPUT = "outputs/navigation/nav2py_results.json"
 PREINFLATED_COSTMAP_FOOTPRINT_RADIUS = 1e-6
+DEFAULT_B1K_MAP_ROOT = "/scratch/gxwang2/b1k/b1k_gt_out/final_v4"
+B1K_COSTMAP_SOURCES = {"b1k-gt", "b1k-gt-soft"}
+PREINFLATED_COSTMAP_SOURCES = {"og-eroded", "og-eroded-soft", "b1k-gt", "b1k-gt-soft"}
 
 
 def parse_args(argv=None):
@@ -57,12 +60,22 @@ def parse_args(argv=None):
     parser.add_argument("--settle-steps", type=int, default=10)
     parser.add_argument(
         "--costmap-source",
-        choices=("nav2py-inflated", "og-eroded", "og-eroded-soft"),
+        choices=("nav2py-inflated", "og-eroded", "og-eroded-soft", "b1k-gt", "b1k-gt-soft"),
         default="nav2py-inflated",
         help=(
             "nav2py-inflated uses the raw OmniGibson traversability map and lets nav2py inflate it. "
             "og-eroded uses OmniGibson's robot-eroded traversability map and treats that map as already inflated. "
-            "og-eroded-soft adds non-lethal costs near OG-eroded obstacles to prefer higher-clearance paths."
+            "og-eroded-soft adds non-lethal costs near OG-eroded obstacles to prefer higher-clearance paths. "
+            "b1k-gt uses the b1k ground-truth semantic navigation_2d map from --b1k-map-root, eroded here for "
+            "the robot the same way og-eroded is. b1k-gt-soft adds the same non-lethal near-obstacle costs."
+        ),
+    )
+    parser.add_argument(
+        "--b1k-map-root",
+        default=DEFAULT_B1K_MAP_ROOT,
+        help=(
+            "Root of the b1k ground-truth map artifacts; the scene map is read from "
+            "<root>/<scene_model>/navigation_2d. Used by --costmap-source b1k-gt / b1k-gt-soft."
         ),
     )
     parser.add_argument(
@@ -141,8 +154,8 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help=(
-            "Hard-erode the OmniGibson robot-eroded traversability map by this many meters before "
-            "planning with og-eroded / og-eroded-soft."
+            "Hard-erode the robot-eroded planning map by this many meters before planning with "
+            "og-eroded / og-eroded-soft / b1k-gt / b1k-gt-soft."
         ),
     )
     parser.add_argument("--planner-cost-penalty", type=float, default=None)
@@ -304,6 +317,72 @@ def make_costmap(scene, floor, robot, nav2py_api, erode_for_robot=False, extra_c
     return trav_map_to_costmap(scene, trav_map, nav2py_api)
 
 
+def b1k_map_directory(b1k_map_root, scene_model):
+    directory = Path(b1k_map_root).expanduser() / scene_model / "navigation_2d"
+    if not (directory / "navigation_2d.npz").is_file():
+        raise FileNotFoundError(f"No b1k navigation_2d artifact at {directory}")
+    return directory
+
+
+def og_robot_erosion_meters(robot, og_resolution):
+    """Metres of clearance TraversableMap._erode_trav_map actually removes.
+
+    It erodes with a ``radius_pixel`` square, whose anchor is its centre, so the
+    clearance it removes is ``radius_pixel // 2`` cells -- roughly half the radius
+    it computes, and a function of the map resolution it happens to run at.
+    """
+    radius = float(th.norm(robot.reset_joint_pos_aabb_extent[:2]).item()) / 2.0 + 0.2
+    radius_pixel = int(math.ceil(radius / og_resolution))
+    return (radius_pixel // 2) * og_resolution
+
+
+def make_b1k_costmap(
+    map_directory, robot, nav2py_api, og_resolution, erode_for_robot=False, extra_clearance=0.0
+):
+    """Build a costmap from the b1k ground-truth navigation_2d map of a scene.
+
+    The artifact is ground-truth geometry at 2 cm, not a robot-eroded map, so the
+    robot clearance OmniGibson bakes into floor_trav_*.png is applied here. It is
+    applied as the same number of METRES OmniGibson removes at its own resolution,
+    not by re-running its ``ceil(radius / resolution)`` square at 2 cm: that formula
+    is resolution-dependent and at 2 cm would remove 0.34 m where OmniGibson removes
+    0.30 m. Episodes are sampled and validated against the 0.30 m map, so any extra
+    erosion here would reject endpoints for a reason unrelated to map content. The
+    kernel side is forced odd so cv2 anchors it at the centre and the free space is
+    not shifted by half a cell.
+    """
+    from benchmarks.costmaps import load_navigation_2d
+
+    grid, resolution, origin, metadata = load_navigation_2d(map_directory)
+    cell_values = metadata["cell_values"]
+    free = np.where(grid == cell_values["traversable"], 255, 0).astype(np.uint8)
+    if erode_for_robot:
+        half_cells = int(round(og_robot_erosion_meters(robot, og_resolution) / resolution))
+        side = 2 * half_cells + 1
+        free = cv2.erode(free, np.ones((side, side), dtype=np.uint8))
+        if extra_clearance > 0.0:
+            free = cv2.erode(free, disk_kernel(extra_clearance, resolution))
+
+    # Same cell semantics as benchmarks.costmaps.costmap_from_navigation_2d: unknown
+    # -- and any value the artifact's own cell_values does not name -- keeps nav2py's
+    # no-information cost, which is above every lethal threshold and so is never
+    # planned through; obstacles are lethal; traversable is free. Traversable cells
+    # lost to erosion become lethal. Unknown is never free, and because erosion only
+    # shrinks the traversable mask, unknown also blocks erosion like an obstacle.
+    occupancy = np.full(grid.shape, -1, dtype=np.int16)
+    occupancy[grid == cell_values["obstacle"]] = 100
+    occupancy[grid == cell_values["traversable"]] = 100
+    occupancy[free == 255] = 0
+    return nav2py_api["Costmap2D"].from_occupancy(
+        occupancy,
+        resolution=resolution,
+        origin=origin,
+        occupied_threshold=65,
+        unknown_is_lethal=False,
+        frame_id="map",
+    )
+
+
 def make_soft_costmap(costmap, radius, cost_scaling_factor):
     soft_costmap = costmap.copy()
     hard_obstacles = costmap.data >= 254
@@ -334,12 +413,39 @@ def make_costmap_bundle(scene, floor, robot, nav2py_api, args, runtime_extra_cle
             args.soft_cost_radius,
             args.soft_cost_scaling_factor,
         )
+    if args.costmap_source in B1K_COSTMAP_SOURCES:
+        if floor != 0:
+            raise ValueError(
+                f"b1k navigation_2d artifacts hold a single floor, but episode floor={floor} was requested "
+                f"for scene {scene.scene_model}; multi-floor scenes ship as separate scene models."
+            )
+        map_directory = b1k_map_directory(args.b1k_map_root, scene.scene_model)
+        og_resolution = float(scene.trav_map.map_resolution)
+        bundle["b1k_gt_raw"] = make_b1k_costmap(map_directory, robot, nav2py_api, og_resolution)
+        bundle["b1k_gt_eroded"] = make_b1k_costmap(
+            map_directory,
+            robot,
+            nav2py_api,
+            og_resolution,
+            erode_for_robot=True,
+            extra_clearance=runtime_extra_clearance,
+        )
+        if args.costmap_source == "b1k-gt-soft":
+            bundle["b1k_gt_soft"] = make_soft_costmap(
+                bundle["b1k_gt_eroded"],
+                args.soft_cost_radius,
+                args.soft_cost_scaling_factor,
+            )
     return bundle
 
 
 def select_costmap(costmap_bundle, costmap_source):
     if costmap_source == "nav2py-inflated":
         return costmap_bundle["raw"], False
+    if costmap_source == "b1k-gt-soft":
+        return costmap_bundle["b1k_gt_soft"], True
+    if costmap_source == "b1k-gt":
+        return costmap_bundle["b1k_gt_eroded"], True
     if costmap_source == "og-eroded-soft":
         return costmap_bundle["og_eroded_soft"], True
     return costmap_bundle.get("og_eroded_runtime_clearance", costmap_bundle["og_eroded"]), True
@@ -739,6 +845,9 @@ def episode_costmap_diagnostics(costmap_bundle, active_costmap, episode):
     }
     if "og_eroded_runtime_clearance" in costmap_bundle:
         diagnostic_costmaps["og_eroded_runtime_clearance"] = costmap_bundle["og_eroded_runtime_clearance"]
+    for name in ("b1k_gt_raw", "b1k_gt_eroded"):
+        if name in costmap_bundle:
+            diagnostic_costmaps[name] = costmap_bundle[name]
     diagnostic_costmaps["active"] = active_costmap
     for name, costmap in diagnostic_costmaps.items():
         diagnostics[name] = {
@@ -1099,6 +1208,7 @@ def write_results(path, benchmark_path, nav2py_root, navigation_config, command_
             results[0]["success_criterion_value"] if results else {"type": args.success_criterion}
         ),
         "costmap_source": args.costmap_source,
+        "b1k_map_root": args.b1k_map_root if args.costmap_source in B1K_COSTMAP_SOURCES else None,
         "dynamic_safety_disabled": args.disable_dynamic_safety,
         "trace_failures": args.trace_failures,
         "soft_cost_radius": args.soft_cost_radius,
@@ -1205,7 +1315,7 @@ def main(args=None, shutdown=True):
                 robot,
                 nav2py_api,
                 args,
-                clearance_is_in_costmap=args.costmap_source in {"og-eroded", "og-eroded-soft"},
+                clearance_is_in_costmap=args.costmap_source in PREINFLATED_COSTMAP_SOURCES,
             )
 
             costmap_bundles = {}
