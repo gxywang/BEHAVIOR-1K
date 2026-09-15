@@ -185,6 +185,13 @@ class OracleKnowledge(KnowledgeSource):
         # up. They have to be segmented here too, since a label with no hull is dropped by the planner as "not an
         # obstacle then: perception did not reconstruct it".
         obstacles = self.sim.nearby_obstacles(exclude=labels) if getattr(self.sim, "send_obstacles", False) else []
+        if obstacles:
+            # They must be TRACKED, not merely named: object_meshes looks every label up in sim.objects and
+            # raises "no tracked object for labels [...]" otherwise. Running --obstacles for the first time died
+            # exactly there, on both of its rounds, having never been exercised since it was written
+            # (2026-09-15). Furniture is tracked here rather than in track_task_objects because it is not part of
+            # the task -- it is scenery the planner needs to know about.
+            self.sim.track(*obstacles)
         labels = list(labels) + [o for o in obstacles if o not in labels]
         views = capture_views(request, extras)
         meshes = self.sim.object_meshes(labels)  # one mesh per label for every view's masks
