@@ -434,6 +434,18 @@ class Episode:
         for attempt in range(self.rounds):
             where = self.stance_key()
             record = self.plan_and_execute(atoms, arm=arm, floor=floor)
+            # The planner fits its support plane by RANSAC and refuses the whole request when it finds no
+            # near-horizontal plane at all (segmentation.py: "No plane found with objects resting on it"). A press
+            # does not need a surface, but it does need the planner to find one: a switch on a corridor wall gives
+            # it a picture with nothing horizontal in it, and turning_out_all_lights_before_sleep lost all 10 of
+            # its rounds that way. The floor is the horizontal plane that always exists, and the press round
+            # crops it out -- `floor` is read off two-argument atoms and toggled_on(x) has one.
+            # Retried rather than defaulted, because turning_on_radio presses happily without the floor today and
+            # a wider workspace is not free (2026-09-15).
+            if not floor and "No plane found" in str(record.get("error") or ""):
+                log.info("the planner found nothing horizontal to call a table; asking again with the floor in view")
+                floor = True
+                continue
             if done() if done is not None else self.satisfied(atoms, record):
                 return True
             # A round that could not see its goal executed nothing, so the scene is unchanged and the robot has

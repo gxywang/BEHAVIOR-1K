@@ -1105,3 +1105,27 @@ def test_a_switch_the_goal_wants_OFF_still_gets_its_button_described():
     body = inspect.getsource(R1ProSim.button_hints).split('"""')[-1]
     assert '"not"' in body and '"toggled_on"' in body, "and the button hints have to read the same two forms"
     assert body.count("bddl =") >= 2, "each form names the object differently"
+
+
+def test_a_round_that_finds_nothing_horizontal_asks_again_with_the_floor_in_view():
+    """The planner fits its support plane by RANSAC and refuses the whole request when nothing near-horizontal is
+    in the picture. A press needs no surface, but it needs the planner to find one, and a switch on a corridor
+    wall gives it nothing: turning_out_all_lights_before_sleep lost all 10 of its rounds to "No plane found with
+    objects resting on it".
+
+    The floor is the horizontal plane that always exists, and a press round crops it out -- `floor` is read off
+    two-argument atoms and toggled_on(x) has one. Retried rather than defaulted, because turning_on_radio presses
+    happily without the floor today (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.bench import Episode
+
+    body = inspect.getsource(Episode.achieve).split('"""')[-1]
+    assert "No plane found" in body, "the retry has to key off the planner's own message"
+    assert "floor = True" in body, "and it has to put the floor in view"
+    # the guard LINE, not an index into the source -- the comment above it quotes the same message
+    guard = [ln for ln in body.split("\n") if "No plane found" in ln and "record.get" in ln]
+    assert guard, "the retry has to test the round's own error"
+    assert "not floor" in guard[0], "and only fire when the floor was NOT already in view"
+    assert body.index("plan_and_execute") < body.index(guard[0].strip()), "the retry follows a round"
