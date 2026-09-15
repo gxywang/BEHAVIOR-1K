@@ -508,7 +508,7 @@ class Episode:
         the fingers when nothing can localize the object. The pressed grasp goes through none of that -- it is not
         a planner round -- so its success was invisible to ``holding()``.
         """
-        from omnigibson.tiptop.run import in_hand_by_localization
+        from omnigibson.tiptop.run import DROP_STEPS, in_hand_by_localization
 
         try:
             at_hand = in_hand_by_localization(self.sim, self.knowledge, bddl, self.sim.arm) if self.knowledge else None
@@ -521,6 +521,12 @@ class Episode:
             log.info(f"hands now hold {self.sim.hands()} after the pressed grasp")
         else:
             log.info(f"{bddl}: the hand pressed onto it but it is not at the hand")
+            # The same hazard the planner path has: the fingers stopped on SOMETHING and it is not the target, so
+            # the hand is shut on whatever else was under it -- a desk, a shelf, the container. Left shut it gets
+            # carried for the rest of the episode (see run.py's note_hands, and 8c8ae6484).
+            if self.sim.grasp_sensed(self.sim.arm):
+                log.info(f"the {self.sim.arm} hand is shut on something that is not {bddl}; opening it before going on")
+                self.sim.hold(DROP_STEPS, self.sim.OPEN)
         return bool(held)
 
     def put_down(self, bddl: str, support: str, floor: bool | None = None) -> bool:

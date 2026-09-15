@@ -372,8 +372,14 @@ def test_a_pressed_grasp_that_worked_is_entered_in_the_hand_record():
     class Sim:
         arm = "left"
 
+        OPEN = 1.0
+
         def __init__(self, finger, hand=(1.0, 0.0, 0.8)):
             self.held_objects, self.finger, self.hand = {}, finger, np.array(hand)
+            self.opened = []
+
+        def hold(self, n, gripper=None):
+            self.opened.append((n, gripper))
 
         tracked_label = staticmethod(lambda n: n.replace(".n.01_", "_"))
 
@@ -411,10 +417,17 @@ def test_a_pressed_grasp_that_worked_is_entered_in_the_hand_record():
     assert ep.note_pressed_grasp("book.n.01_1") is True
     assert ep.sim.hands() == {"book_1": "left"}, "a pressed grasp that worked must reach holding()"
 
-    # localized far from the hand: not recorded, so pick reports the failure honestly
+    # localized far from the hand, fingers on SOMETHING: not recorded, and the hand is opened rather than left
+    # shut on whatever else was under it -- the same hazard the planner path has (8c8ae6484)
     ep = Ep(Sim(finger=0.04), Knowledge([3.0, 0.0, 0.1]))
     assert ep.note_pressed_grasp("book.n.01_1") is False
     assert ep.sim.hands() == {}
+    assert ep.sim.opened, "a hand shut on the wrong thing must be opened"
+
+    # fingers on nothing: nothing to drop, so do not spend the steps
+    ep = Ep(Sim(finger=0.0), Knowledge([3.0, 0.0, 0.1]))
+    assert ep.note_pressed_grasp("book.n.01_1") is False
+    assert ep.sim.opened == [], "an empty hand needs no opening"
 
     # nothing can localize it: the fingers decide, exactly as note_hands falls back
     ep = Ep(Sim(finger=0.04), Knowledge(None))
@@ -441,3 +454,21 @@ def test_the_way_down_to_a_flat_object_may_pass_through_what_it_rests_on():
         "mesh=False returns box-level hits and returns early, before the filter that drops floors and ceilings: "
         "48 refusals blamed a ceiling for blocking a downward reach"
     )
+
+
+def test_the_pressed_grasp_no_longer_refuses_a_thick_object_out_of_hand():
+    """It used to return without moving for anything thicker than FLAT_THICKNESS, 366 times across the corpus --
+    pillows 48, a tissue dispenser 21, soda cans 37, the fax machine 14.
+
+    By the time press_grasp runs the PLANNER HAS ALREADY FAILED on that object, so there is nothing else left to
+    try; and sticky grasping needs no flatness at all, since OmniGibson skips both the antipodal raycast and the
+    two-finger requirement in that mode (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
+    assert "FLAT_THICKNESS" in body, "the thickness is still worth reporting"
+    early = body[: body.index("top =")] if "top =" in body else body
+    assert "return False" not in early, "but it must not refuse the attempt before the arm moves"

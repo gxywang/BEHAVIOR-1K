@@ -3540,9 +3540,17 @@ class R1ProSim(TiptopSim):
         obj = self.scene_object(name)
         lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
         extent = hi - lo
-        if float(np.min(extent)) > FLAT_THICKNESS:
-            log.info(f"{name} is {np.round(extent, 3).tolist()} m: not flat enough to need the pressed grasp")
-            return False
+        # No thickness gate. It used to return here for anything thicker than FLAT_THICKNESS, and refused 366
+        # attempts across the corpus -- pillows 48, a tissue dispenser 21, soda cans 37, the fax machine 14. By
+        # the time this runs the PLANNER HAS ALREADY FAILED on this object, so "a fallback for the shape M2T2
+        # cannot serve, not a replacement for it" is a distinction without a difference: there is nothing else
+        # left to try. And sticky grasping needs no flatness at all -- OmniGibson skips both the antipodal
+        # raycast and the two-finger requirement in that mode, so one finger on a pillow welds exactly as one
+        # finger on a book (2026-09-15).
+        flat = float(np.min(extent)) <= FLAT_THICKNESS
+        if not flat:
+            log.info(f"{name} is {np.round(extent, 3).tolist()} m, thicker than the shape this was written for; "
+                     f"pressing anyway because the planner has already failed on it")  # fmt: skip
         top = np.array([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, float(hi[2])], dtype=np.float64)
         unit = th.tensor([0.0, 0.0, 0.0, 1.0])
         top_base = self.to_base(th.tensor(top, dtype=th.float32), unit)[0].cpu().numpy()
