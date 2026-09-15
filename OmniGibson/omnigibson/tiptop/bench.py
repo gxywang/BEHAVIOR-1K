@@ -425,6 +425,25 @@ class Episode:
             self.plan_and_execute([atom("holding", bddl)], floor=self.near_floor(bddl))
             if self.holding(bddl):
                 return True
+            # M2T2 proposes grasps from the point cloud and a flat object -- a book lying down, a board game --
+            # gives it no side a parallel jaw can get under, so the round fails before the arm moves. Press the
+            # open hand onto its top face and close instead (the user's instruction, 2026-09-14). Only for the
+            # shape the planner cannot serve: press_grasp returns False without moving for anything not flat.
+            try:
+                if self.sim.press_grasp(self.sim.arm, bddl) and self.holding(bddl):
+                    log.info(f"{bddl}: taken by pressing the hand onto it, which is how a flat object is held")
+                    self.records.append(
+                        {
+                            "round": len(self.records),
+                            "atoms": [atom("holding", bddl)],
+                            "arm": self.sim.arm,
+                            "step": self.sim.n_steps,
+                            "pressed_grasp": True,
+                        }
+                    )
+                    return True
+            except Exception as why:  # noqa: BLE001 - a fallback must not end the instance
+                log.warning(f"{bddl}: the pressed grasp failed ({type(why).__name__}: {why})")
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
         return False
 

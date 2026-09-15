@@ -297,6 +297,9 @@ GRASP_NUDGES = 3  # attempts after the first, so at most 24 mm past where the fi
 # Places to try taking hold of one panel, spread up its face. A fridge door is 2 m tall and only a band of it
 # is in the arm's reach, so one point per joint is one guess; these are offered nearest the hand's own height
 # first, which is both the likeliest to solve and the least the arm has to travel.
+# An object thinner than this on its smallest axis is flat: M2T2 has no side to propose a grasp on, so the
+# hand is pressed onto its top face instead (press_grasp). A hardback is about 3 cm, a board game about 5.
+FLAT_THICKNESS = 0.06
 GRASP_COLUMN_SAMPLES = 5
 GRASP_COLUMN_INSET = 0.08  # m kept clear of the panel's top and bottom edges, so the jaw lands on the face
 GRASP_FACE_SAMPLES = 5  # rays across each direction of a face when looking for the surface to close on
@@ -2883,6 +2886,69 @@ class R1ProSim(TiptopSim):
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
         )
         return request, extras
+
+    def press_grasp(self, arm: str, name: str) -> bool:
+        """Take hold of a flat object by pressing the open hand onto it and closing; whether the assist holds it.
+
+        M2T2 proposes grasps from the point cloud, and a book lying flat on a table gives it nothing usable --
+        there is no side a parallel jaw can get under. The round then fails before the arm moves, which reads as a
+        planning failure rather than as "this cannot be grasped that way". The user's instruction (2026-09-14):
+        close the gripper on the book and let the assisted grasp take it.
+
+        This is the drawer panel's grasp turned upwards: come straight down, put the fingertips on the top face,
+        and press in a step at a time until the assist reports it holds (``close_on``). It solves with the torso,
+        since a book on a low shelf is outside a fixed-torso workspace, and it refuses a path that sweeps the
+        furniture rather than discovering it by collision.
+
+        Returns False without moving when the object is not flat -- this is a fallback for the shape M2T2 cannot
+        serve, not a replacement for it.
+        """
+        obj = self.scene_object(name)
+        lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
+        extent = hi - lo
+        if float(np.min(extent)) > FLAT_THICKNESS:
+            log.info(f"{name} is {np.round(extent, 3).tolist()} m: not flat enough to need the pressed grasp")
+            return False
+        top = np.array([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, float(hi[2])], dtype=np.float64)
+        unit = th.tensor([0.0, 0.0, 0.0, 1.0])
+        top_base = self.to_base(th.tensor(top, dtype=th.float32), unit)[0].cpu().numpy()
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
+        joints_of = self.ik_joint_names(arm, with_torso=True)
+        q = self.robot.get_joint_positions()
+        seed = [float(q[self.joint_index[j]]) for j in joints_of]
+        aabbs = self.scene_aabbs()
+        down = np.array([0.0, 0.0, -1.0])
+        # The jaw closes across the object's narrower horizontal axis, so the fingers meet over it rather than
+        # along it; a book is gripped across its width, not its length.
+        across = np.array([1.0, 0.0, 0.0]) if extent[0] <= extent[1] else np.array([0.0, 1.0, 0.0])
+        for jaw in (across, np.array([across[1], across[0], 0.0])):
+            where, rot = self.grasp_target(arm, top_base, down, jaw)
+            quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
+            solution = None
+            for tolerance in (OPEN_GRASP_TOLERANCE, 0.02):
+                solution = ik.solve(where, quat, seed=seed, tolerance_pos=tolerance, tolerance_rad=0.5)
+                if solution is not None:
+                    break
+            if solution is None:
+                continue
+            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs, mesh=False) if n != obj.name]
+            if swept:
+                log.info(f"{name}: the way down to it sweeps through {swept[0]}; trying the other jaw direction")
+                continue
+            log.info(f"pressing the hand onto {name} at {np.round(top, 3).tolist()} to take hold of it")
+            targets = [float(v) for v in self.q_arm()]
+            for joint_name, value in zip(joints_of, solution):
+                if joint_name in self.planned_joints:
+                    targets[self.planned_joints.index(joint_name)] = float(value)
+            self.ramp_to(targets, self.posture, self.OPEN, OPEN_SETTLE_STEPS, note=f"down onto {name}")
+            pose = pose_matrix(where, quat)
+            _, held = self.close_on(
+                arm, ik, obj, obj.root_link_name, pose, down, [float(v) for v in solution], joints_of
+            )
+            if held:
+                return True
+        log.info(f"{name}: the pressed grasp found no way onto it")
+        return False
 
     def clear_start_posture(self, arm: str, q_ready):
         """Lift ``arm`` out of whatever it is resting in before a plan is asked for from there; the posture to send.
