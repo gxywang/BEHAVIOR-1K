@@ -243,3 +243,15 @@ def test_meshes_at_view_poses_applies_a_rotation_not_just_a_shift():
     moved = meshes_at_view_poses({"bar": mesh}, {"bar": seen})["bar"]
     assert moved.extents[0] < 0.1 < moved.extents[1]  # the long axis is now y, and the mesh itself is untouched
     assert mesh.extents[0] > 0.3
+
+
+def test_meshes_at_view_poses_rejects_a_pos_quat_pair_instead_of_a_matrix():
+    """The capture keeps two different things called a pose: 4x4 matrices per view, and the (pos, quat) pairs of
+    extras['object_poses_world']. Feeding the pair in here used to die inside numpy, several frames away."""
+    import pytest
+
+    mesh = _box((0.1, 0.1, 0.1), (0.0, 0.0, 0.5))
+    mesh.metadata = {"world_from_obj": _at((0.0, 0.0, 0.5))}
+    pair = [[0.0, 0.0, 0.5], [0.0, 0.0, 0.0, 1.0]]
+    with pytest.raises(ValueError, match="must be 4x4 matrices"):
+        meshes_at_view_poses({"held": mesh}, {"held": pair})

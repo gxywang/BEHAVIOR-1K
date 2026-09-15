@@ -622,10 +622,12 @@ class TiptopSim:
             "cam_quat_xyzw_world_cv": cam_quat_cv.cpu().numpy().tolist(),
             "seg_instance": seg,
             "id_to_name": id_to_name,
-            # Where every tracked object was at the moment THIS view rendered. A capture turns the torso between
-            # head views, and whatever is in the gripper travels with it, so one pose per capture is wrong for
-            # anything the robot carries; oracle_masks moves the capture's meshes here before masking this view.
-            "object_poses_world": self.tracked_poses_world(),
+            # Where every tracked object was at the moment THIS view rendered, as 4x4 world poses. A capture turns
+            # the torso between head views, and whatever is in the gripper travels with it, so one pose per capture
+            # is wrong for anything the robot carries; oracle_masks moves the capture's meshes here before masking
+            # this view. Deliberately NOT "object_poses_world": that key is the capture's own (pos, quat) pairs,
+            # which capture() writes over the primary view's extras and run.py reads back to restore a scene.
+            "object_pose_mats_at_render": self.tracked_poses_world(),
         }
         return view, view_extras
 
@@ -715,7 +717,7 @@ class TiptopSim:
 
     def posed_for_view(self, meshes: dict, view_extras: dict) -> dict:
         """``meshes`` moved to where each object was when this view rendered (``gt_masks.meshes_at_view_poses``)."""
-        return meshes_at_view_poses(meshes, view_extras.get("object_poses_world") or {}, log=log)
+        return meshes_at_view_poses(meshes, view_extras.get("object_pose_mats_at_render") or {}, log=log)
 
     def object_meshes(self, labels: list[str]) -> dict:
         """{label: trimesh} of tracked objects at their current poses, world frame: the masks of every view of one

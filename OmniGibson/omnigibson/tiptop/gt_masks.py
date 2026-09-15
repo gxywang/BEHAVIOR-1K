@@ -44,7 +44,17 @@ def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
         if built is None or seen is None:
             out[label] = mesh
             continue
-        motion = np.asarray(seen, dtype=np.float64) @ np.linalg.inv(np.asarray(built, dtype=np.float64))
+        try:
+            seen, built = np.asarray(seen, dtype=np.float64), np.asarray(built, dtype=np.float64)
+            square = seen.shape == (4, 4) and built.shape == (4, 4)
+        except ValueError:  # a ragged pair: numpy cannot even make an array of it
+            square = False
+        if not square:
+            raise ValueError(
+                f"{label}: poses must be 4x4 matrices (a (pos, quat) pair is a different thing -- the per-view key "
+                f"is object_pose_mats_at_render, not the capture's object_poses_world)"
+            )
+        motion = seen @ np.linalg.inv(built)
         if np.allclose(motion, np.eye(4), atol=1e-6):
             out[label] = mesh
             continue
