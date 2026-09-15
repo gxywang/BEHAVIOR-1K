@@ -111,6 +111,21 @@ def atom_objects(atoms: list[dict]) -> list[str]:
     return out
 
 
+def wants_home_torso(spec) -> bool:
+    """Whether this task's press needs the torso left at the planner's home posture, so --torso is ignored.
+
+    A press of "hold" uses BOTH planners, and the right-arm one plans its seven arm joints with the torso LOCKED
+    at the embodiment's home pose. --torso moves it away and every press round then dies before it plans:
+    "r1pro_right locks torso_joint3 at -0.470 rad but the simulator has it at -0.900". turning_on_radio scores
+    1.0 with the postures agreeing and 0.0 without.
+
+    ``plan`` has to be part of the test. ``TaskSpec.press`` DEFAULTS to "hold", so a rule that reads ``press``
+    alone is true of all 38 tasks, and for two hours on 2026-09-15 every pure-transfer task silently ran without
+    the lean. Only "press" and "auto" ever ask for the right-arm planner -- five tasks.
+    """
+    return getattr(spec, "plan", None) in ("press", "auto") and getattr(spec, "press", None) == "hold"
+
+
 class Episode:
     """One task instance as a strategy sees it. The base moves by teleport (``stand_for``); the planner of an arm
     plans one round at a time (``plan_and_execute``, which never raises on a failed round: the runner decides what
@@ -726,8 +741,14 @@ def main(argv=None) -> None:
                 # -0.470 rad but the simulator has it at -0.900". turning_on_radio is the only task in the set
                 # that presses this way, and it scores 1.0 with the postures agreeing against 0.0 without
                 # (2026-09-15) -- the lean is worth nothing if the hand that presses can never be planned.
+                # ``press`` DEFAULTS to "hold" in TaskSpec, so testing it alone fired this guard on all 38 tasks
+                # and silently ran every pure-transfer task without the lean for two hours. ``plan`` is what says
+                # a task presses at all: only "press" and "auto" ever ask for the right-arm planner, which is
+                # five tasks. Found by a review agent reading the code, not by a score -- the test that was
+                # supposed to pin this read the task YAML files, where only 5 of 38 set ``press`` at all, so it
+                # passed while the runtime did the opposite (2026-09-15).
                 posture_args = args
-                if getattr(getattr(strategy, "spec", None), "press", None) == "hold" and getattr(args, "torso", None):
+                if wants_home_torso(getattr(strategy, "spec", None)) and getattr(args, "torso", None):
                     posture_args = copy.copy(args)
                     posture_args.torso = None
                     log.info(

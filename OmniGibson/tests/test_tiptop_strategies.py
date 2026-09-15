@@ -922,32 +922,39 @@ def test_nothing_changes_when_no_item_rests_on_another():
 def test_a_two_handed_press_keeps_the_torso_where_both_planners_agree():
     """A press of "hold" uses both planners, and the right-arm one plans its seven arm joints with the torso
     LOCKED at the embodiment's home posture. --torso moves it away and every press round then dies before it
-    plans. turning_on_radio scores 1.0 with the postures agreeing and 0.0 without."""
-    import copy as _copy
+    plans. turning_on_radio scores 1.0 with the postures agreeing and 0.0 without.
+
+    This calls the rule bench.py actually applies. The first version of this test re-implemented the condition
+    inside the test body, so it tested a copy and went on passing while the real rule did something else.
+    """
     import types
 
-    def posture_args(spec_press, torso):
-        args = types.SimpleNamespace(task_name="turning_on_radio", torso=torso)
-        spec = types.SimpleNamespace(press=spec_press)
-        # the rule as bench.py applies it
-        if spec.press == "hold" and args.torso:
-            out = _copy.copy(args)
-            out.torso = None
-            return out
-        return args
+    from omnigibson.tiptop.bench import wants_home_torso
 
-    assert posture_args("hold", [1.2, -1.7, -0.9, 0.0]).torso is None, "a hold press must keep the home torso"
-    assert posture_args("in_place", [1.2, -1.7, -0.9, 0.0]).torso == [1.2, -1.7, -0.9, 0.0], "others keep the lean"
-    assert posture_args("hold", None).torso is None, "nothing to undo when none was asked for"
+    spec = lambda plan, press: types.SimpleNamespace(plan=plan, press=press)
+    assert wants_home_torso(spec("press", "hold")), "a two-handed press keeps the home torso"
+    assert wants_home_torso(spec("auto", "hold")), "so does an auto task that ends in one"
+    assert not wants_home_torso(spec("press", "in_place")), "a one-handed press keeps the lean"
+    assert not wants_home_torso(spec("transfer", "hold")), "a task that never presses keeps the lean, whatever press says"
+    assert not wants_home_torso(None), "no spec, no special case"
 
 
-def test_only_one_task_presses_with_the_other_hand():
-    """If this ever fails, the rule above has become load-bearing for more than one task and deserves a look."""
-    import yaml
+def test_the_torso_rule_fires_on_the_tasks_that_press_and_no_others():
+    """TaskSpec.press DEFAULTS to "hold", so the rule has to read ``plan`` too.
 
-    from omnigibson.tiptop.strategies import TASKS_DIR
+    Read from the YAML files, only 5 of 38 tasks set ``press`` at all -- which is why the first version of this
+    test, which globbed the yaml for an explicit press key, passed while the LOADED specs all said "hold" and the
+    lean was being stripped from every task in the set (2026-09-15).
+    """
+    from omnigibson.tiptop.bench import wants_home_torso
+    from omnigibson.tiptop.strategies import TASKS_DIR, TaskSpec
 
-    holds = [
-        p.stem for p in sorted(TASKS_DIR.glob("*.yaml")) if (yaml.safe_load(p.read_text()) or {}).get("press") == "hold"
-    ]
-    assert holds == ["turning_on_radio"], f"tasks pressing with the other hand: {holds}"
+    specs = {p.stem: TaskSpec.load(p) for p in sorted(TASKS_DIR.glob("*.yaml"))}
+    holds = [n for n, s in specs.items() if s.press == "hold"]
+    assert len(holds) > 30, f"the default is still hold, on {len(holds)} of {len(specs)} tasks -- that is the trap"
+    fires = sorted(name for name, s in specs.items() if wants_home_torso(s))
+    assert fires == ["turning_on_radio"], f"only the two-planner task keeps the home torso, got {fires}"
+    transfers = [n for n, s in specs.items() if s.plan == "transfer"]
+    assert len(transfers) > 25 and not any(wants_home_torso(specs[n]) for n in transfers), (
+        f"{len(transfers)} pure-transfer tasks must all keep the lean"
+    )
