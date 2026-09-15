@@ -2238,7 +2238,17 @@ class R1ProSim(TiptopSim):
             f"{clearance:.2f} m of room to the nearest obstacle"
         )
         pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
-        hidden = self.hidden_from_here(names)
+        # Only a log line comes of this, so nothing it does is worth ending an episode for. It reads the mesh of
+        # every object whose box the sight line crosses, and preparing a mesh can fail on geometry trimesh will
+        # not subdivide: on 2026-09-15 a picking_up_toys episode died here with "max_iter exceeded!" at round 4,
+        # having run two rounds of a possible six, because the stance search had put the robot somewhere new and
+        # the ray crossed a scene object no previous run had asked about. The same rule as the missing-object
+        # diagnostic in run.py: a diagnostic must never replace, or prevent, the thing it explains.
+        try:
+            hidden = self.hidden_from_here(names)
+        except Exception as why:  # noqa: BLE001 - a diagnostic must never end a run
+            log.warning(f"could not work out what stands in the head camera's way: {type(why).__name__}: {why}")
+            hidden = {}
         if hidden:
             log.warning(
                 "from this stance the head camera's line to "
