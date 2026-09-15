@@ -190,6 +190,16 @@ class OracleKnowledge(KnowledgeSource):
         obstacles = self.sim.nearby_obstacles(exclude=labels) if getattr(self.sim, "send_obstacles", False) else []
         labels = list(labels) + [o for o in obstacles if o not in labels]
         views = capture_views(request, extras)
+        # KNOWN WRONG for anything that moves with the robot, and measured (2026-09-15, not yet fixed). One set of
+        # meshes is built here, at the poses objects have NOW, and used for every view -- but a turned head view
+        # (head_up / head_down / head_aim) is rendered with the torso moved, and an object in the gripper moves
+        # with it. Its mesh is therefore in the wrong place for that view's depth and its mask comes out empty.
+        # Across runs/queue_logs, of the 72 times a goal object was in frame in a turned head view, the depth at
+        # its projected pixel showed something at least 0.25 m behind it 72 times -- every single one -- against
+        # 42% for the untouched 'head' view, and 70 of the 72 were rounds where the robot was holding the object.
+        # That is 96% of the GoalNotVisible failures in the runs that used turned head views. The fix is per-view
+        # poses (record each tracked object's pose as the view is rendered, in view_extras, and place the mesh
+        # with that) rather than one snapshot for the whole capture.
         meshes = self.sim.object_meshes(labels)  # one mesh per label for every view's masks
         masks = {
             name: self.sim.oracle_masks(view, view_extras, labels, meshes=meshes) for name, view, view_extras in views

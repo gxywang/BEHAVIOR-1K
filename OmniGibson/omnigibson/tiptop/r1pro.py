@@ -115,6 +115,9 @@ HEAD_VIEWS = {
 # the frame with a turn this joint can make. The turn is commanded from the camera's pose as it stands and the
 # resulting pose is read back from the simulator when the view is rendered, so an imperfect aim costs a little
 # centring and nothing else.
+# Caveat while the per-view pose bug in knowledge.describe is open: a turned head view's masks are wrong for
+# anything the robot is HOLDING (the torso moves, the held object moves with it, the mesh does not). Aiming the
+# head is for finding an object the robot has not picked up yet, which is what the off-the-left-edge failures are.
 HEAD_AIM_VIEW = "head_aim"
 HEAD_AIM_LIMIT = 0.6  # rad the torso may turn to aim (a little past the fixed +-0.5 rad views)
 HEAD_AIM_MIN = 0.12  # rad: a smaller turn is not worth a ramp and a second render
