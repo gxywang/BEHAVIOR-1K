@@ -47,7 +47,15 @@ while read -r task instances; do
   stamp="$(date +%m%d_%H%M%S)"
   dir="runs/queue_${task}_${stamp}"
   log="runs/queue_logs/${task}_${stamp}.log"
+  # Which code and which planner produced this number. A queue picks each job up when the one before it finishes,
+  # so a long queue spans several commits and the jobs at the end are not running what the jobs at the start ran.
+  # Without this line a result cannot be attributed to a change, which is most of what a result is for. The
+  # PYTHONPATH matters just as much: unset, python imports the MAIN tree's omnigibson no matter which worktree
+  # the command was typed in.
+  code="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  tree="${PYTHONPATH:-<main tree: no PYTHONPATH set>}"
   echo "=== JOB $task [$instances] -> $dir" >> "$OUT"
+  echo "    code $code, planner :$PORT on gpu $GPU, imports $tree" >> "$OUT"
   # A task whose goal is toggled_on(...) and whose description says press: hold needs a SECOND planner for the
   # other arm -- one hand holds the thing, the other presses it. Without PRESS_PORT the instance crashes on
   # "press 'hold' needs the right-arm planner", which is how turning_on_radio, a task that scored 0.9, came back
