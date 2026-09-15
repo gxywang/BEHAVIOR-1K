@@ -355,3 +355,83 @@ def test_a_drawer_the_opening_stance_cannot_reach_is_pulled_from_the_looking_sta
     ep.sim = SimOther(None)
     assert ep.open_up("cabinet.n.01_1") is False
     assert ep.sim.calls == [True], "only a standoff failure is worth standing again for"
+
+
+def test_a_pressed_grasp_that_worked_is_entered_in_the_hand_record():
+    """press_grasp physically takes a flat object -- close_on presses until the assist reports it holds -- but
+    nothing wrote the robot's OWN hand record, which note_hands writes only after a PLANNER round. So holding()
+    said False, Episode.pick threw the success away, and three tasks lost every flat-object pick (2026-09-15).
+
+    The record is written by note_hands' rule: the knowledge source's localization, and the fingers only when
+    nothing can localize it. Not from the simulator's grasp assist, which stays diagnostic (scene.check_hands).
+    """
+    import numpy as np
+
+    from omnigibson.tiptop.bench import Episode
+
+    class Sim:
+        arm = "left"
+
+        def __init__(self, finger, hand=(1.0, 0.0, 0.8)):
+            self.held_objects, self.finger, self.hand = {}, finger, np.array(hand)
+
+        tracked_label = staticmethod(lambda n: n.replace(".n.01_", "_"))
+
+        def eef_pose_base(self, arm):
+            m = np.eye(4)
+            m[:3, 3] = self.hand
+            return m
+
+        base_to_world = staticmethod(lambda p: np.asarray(p, float))
+
+        def grasp_sensed(self, arm):
+            return self.finger > 0.006
+
+        def hands(self):
+            return dict(self.held_objects)
+
+    class Knowledge:
+        def __init__(self, center):
+            self.center = center
+
+        def localize(self, *names):
+            if self.center is None:
+                raise KeyError(names[0])
+            c = np.asarray(self.center, float)
+            return {n: {"center": c, "lo": c - 0.03, "hi": c + 0.03} for n in names}
+
+    class Ep:
+        note_pressed_grasp = Episode.note_pressed_grasp
+
+        def __init__(self, sim, know):
+            self.sim, self.knowledge = sim, know
+
+    # localized at the hand: recorded, whatever the fingers say (sticky closes them through the object)
+    ep = Ep(Sim(finger=0.0), Knowledge([1.02, 0.0, 0.78]))
+    assert ep.note_pressed_grasp("book.n.01_1") is True
+    assert ep.sim.hands() == {"book_1": "left"}, "a pressed grasp that worked must reach holding()"
+
+    # localized far from the hand: not recorded, so pick reports the failure honestly
+    ep = Ep(Sim(finger=0.04), Knowledge([3.0, 0.0, 0.1]))
+    assert ep.note_pressed_grasp("book.n.01_1") is False
+    assert ep.sim.hands() == {}
+
+    # nothing can localize it: the fingers decide, exactly as note_hands falls back
+    ep = Ep(Sim(finger=0.04), Knowledge(None))
+    assert ep.note_pressed_grasp("book.n.01_1") is True
+    ep = Ep(Sim(finger=0.0), Knowledge(None))
+    assert ep.note_pressed_grasp("book.n.01_1") is False
+
+
+def test_the_way_down_to_a_flat_object_may_pass_through_what_it_rests_on():
+    """A bookcase's bounding box covers every shelf in it, so reaching onto a book standing in one swept the
+    bookcase and the pressed grasp refused its own approach every time."""
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    src = inspect.getsource(R1ProSim.press_grasp)
+    assert "spare" in src.split("\n")[0], "the caller has to be able to name what the object is standing on"
+    body = src.split('"""')[-1]
+    assert "ignore" in body and "spare" in body, "and the sweep check has to honour it"
+    assert "if n != obj.name]" not in body, "the old check spared only the object itself"

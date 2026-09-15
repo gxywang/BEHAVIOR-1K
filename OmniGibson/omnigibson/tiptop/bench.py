@@ -475,7 +475,16 @@ class Episode:
             # open hand onto its top face and close instead (the user's instruction, 2026-09-14). Only for the
             # shape the planner cannot serve: press_grasp returns False without moving for anything not flat.
             try:
-                if self.sim.press_grasp(self.sim.arm, bddl) and self.holding(bddl):
+                # The pressed grasp physically takes the object -- close_on presses until the assist reports it
+                # holds -- but nothing wrote the robot's OWN hand record, which is only ever written by
+                # note_hands after a planner round. So holding() was False, the branch failed, and the one grasp
+                # built for flat objects had its success thrown away. Three tasks were losing every flat-object
+                # pick this way (2026-09-15). The record is written by the same rule note_hands uses: the
+                # knowledge source's localization, and the fingers only when nothing can localize it -- not from
+                # the simulator's grasp assist, which stays diagnostic (scene.check_hands).
+                if self.sim.press_grasp(self.sim.arm, bddl, spare=(self.support_of(bddl),)):
+                    self.note_pressed_grasp(bddl)
+                if self.holding(bddl):
                     log.info(f"{bddl}: taken by pressing the hand onto it, which is how a flat object is held")
                     self.records.append(
                         {
@@ -491,6 +500,28 @@ class Episode:
                 log.warning(f"{bddl}: the pressed grasp failed ({type(why).__name__}: {why})")
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
         return False
+
+    def note_pressed_grasp(self, bddl: str) -> bool:
+        """Enter a pressed grasp in the robot's own hand record, by the same rule a planner round uses.
+
+        ``note_hands`` (run.py) decides a pick worked from the knowledge source's localization, falling back to
+        the fingers when nothing can localize the object. The pressed grasp goes through none of that -- it is not
+        a planner round -- so its success was invisible to ``holding()``.
+        """
+        from omnigibson.tiptop.run import in_hand_by_localization
+
+        try:
+            at_hand = in_hand_by_localization(self.sim, self.knowledge, bddl, self.sim.arm) if self.knowledge else None
+            held = self.sim.grasp_sensed(self.sim.arm) if at_hand is None else at_hand
+        except Exception as why:  # noqa: BLE001 - never localized: the fingers decide
+            log.info(f"{bddl}: could not localize after the pressed grasp ({type(why).__name__}); reading the fingers")
+            held = self.sim.grasp_sensed(self.sim.arm)
+        if held:
+            self.sim.held_objects[self.sim.tracked_label(bddl)] = self.sim.arm
+            log.info(f"hands now hold {self.sim.hands()} after the pressed grasp")
+        else:
+            log.info(f"{bddl}: the hand pressed onto it but it is not at the hand")
+        return bool(held)
 
     def put_down(self, bddl: str, support: str, floor: bool | None = None) -> bool:
         """Put the held object on ``support``; done when the hand is empty, wherever the object landed (the point

@@ -3521,7 +3521,7 @@ class R1ProSim(TiptopSim):
         )
         return request, extras
 
-    def press_grasp(self, arm: str, name: str) -> bool:
+    def press_grasp(self, arm: str, name: str, spare=()) -> bool:
         """Take hold of a flat object by pressing the open hand onto it and closing; whether the assist holds it.
 
         M2T2 proposes grasps from the point cloud, and a book lying flat on a table gives it nothing usable --
@@ -3565,7 +3565,13 @@ class R1ProSim(TiptopSim):
                     break
             if solution is None:
                 continue
-            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs, mesh=False) if n != obj.name]
+            # The object's own SUPPORT is not an obstacle on the way down to it. Reaching onto a plate lying on a
+            # bottom cabinet, or a book on a shelf, sweeps the box of the thing it is resting on every time, and a
+            # bookcase's box covers every shelf in it -- so the one grasp written for flat objects refused its own
+            # approach and logged "the way down to it sweeps through bottom_cabinet..." on every attempt.
+            # ``spare`` is what the caller knows the object is standing on (Episode.support_of).
+            ignore = {obj.name} | {n for n in spare if n}
+            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs, mesh=False) if n not in ignore]
             if swept:
                 log.info(f"{name}: the way down to it sweeps through {swept[0]}; trying the other jaw direction")
                 continue
