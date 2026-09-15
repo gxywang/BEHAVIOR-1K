@@ -1020,6 +1020,11 @@ class R1ProSim(TiptopSim):
             "inside": "on",
             "ontop": "on",
             "on": "on",
+            # touching(x, support) is served by putting x ON the support -- resting on a thing is touching it.
+            # putting_shoes_on_rack is 4 touching(shoe, hallstand) plus 4 not-touching(shoe, floor), and with no
+            # action behind either its ceiling was 2/10 = 0.200, which is exactly what it scores. The four
+            # not-touching atoms come free the moment a shoe leaves the floor (2026-09-15).
+            "touching": "on",
             "nextto": "near",
             "holding": "holding",
             "toggled_on": "pressed",

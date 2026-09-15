@@ -35,7 +35,10 @@ TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 # NearPlacement constraint -- and the bridge already maps nextto -> near on the wire. 16 of the 100 challenge
 # tasks name it, and expanding the goals says it lifts the vocabulary's ceiling over the whole set from a mean
 # q_score of 0.415 to 0.480 (2026-09-13).
-PLACE_PREDICATES = ("inside", "ontop", "on", "nextto")
+# "touching" is here because resting on a support IS touching it: putting_shoes_on_rack asks for 4
+# touching(shoe, hallstand) and 4 not-touching(shoe, floor), place_demand never saw either, and no shoe was ever
+# lifted -- the task scored 0.200, which was its ceiling, from its two nextto atoms alone (2026-09-15).
+PLACE_PREDICATES = ("inside", "ontop", "on", "nextto", "touching")
 EXTRA_SWEEPS = 3  # further passes over the atoms still open, while the step budget has room (spend_what_is_left)
 BUDGET_FOR_ANOTHER_SWEEP = 0.6  # do not begin a sweep past this share of the episode's steps
 GOAL_OPTIONS_READ = 20000  # ground goal options read to learn the demand (assembling_gift_baskets has 331,776)

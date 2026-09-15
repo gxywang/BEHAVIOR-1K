@@ -1013,3 +1013,34 @@ def test_the_torso_rule_fires_on_the_tasks_that_press_and_no_others():
     assert len(transfers) > 25 and not any(wants_home_torso(specs[n]) for n in transfers), (
         f"{len(transfers)} pure-transfer tasks must all keep the lean"
     )
+
+
+def test_touching_a_support_is_served_by_placing_onto_it():
+    """putting_shoes_on_rack asks for 4 touching(shoe, hallstand) and 4 not-touching(shoe, floor). Neither
+    predicate was in PLACE_PREDICATES, so place_demand never saw them and no shoe was ever lifted: the task
+    finished on its two nextto atoms alone, q=0.200, which was exactly its ceiling.
+
+    Resting on a support IS touching it, and the four not-touching atoms come free the moment a shoe leaves the
+    floor (2026-09-15).
+    """
+    from omnigibson.tiptop.r1pro import R1ProSim
+    from omnigibson.tiptop.strategies import PLACE_PREDICATES
+
+    assert "touching" in PLACE_PREDICATES, "the demand has to see a touching atom to act on it"
+
+    import inspect
+
+    src = inspect.getsource(R1ProSim.tiptop_goal)
+    assert '"touching": "on"' in src, "and the wire has to carry it as a placement onto the support"
+
+
+def test_a_touching_goal_lifts_the_item_onto_its_support():
+    boxes = {
+        "gym_shoe.n.01_1": box((0.0, 0.0, 0.05)),
+        "hallstand.n.01_1": box((1.0, 0.0, 0.4)),
+    }
+    ep = FakeEpisode(boxes, pick_ok={"gym_shoe.n.01_1"}, place_ok={("gym_shoe.n.01_1", "hallstand.n.01_1")})
+    goal = [atom("touching", "gym_shoe.n.01_1", "hallstand.n.01_1")]
+    Runner(STRATEGIES["putting_shoes_on_rack"], goal, attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert "pick" in kinds, "a touching goal must actually lift the shoe"
