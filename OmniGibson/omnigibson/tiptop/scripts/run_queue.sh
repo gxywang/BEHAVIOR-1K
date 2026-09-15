@@ -21,6 +21,12 @@ VIEWS="${VIEWS:-head left_wrist right_wrist}"
 KNOWLEDGE="${KNOWLEDGE:-oracle}"
 cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."   # repo root
 export OMNIGIBSON_HEADLESS=1 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU"
+# torch takes one CPU thread per core by default -- 128 on this box -- and every concurrent run does the same. Six
+# runs is then some 800 threads over 256 cores, and the whole machine slows down together: measured 1.37 simulator
+# steps per second with the box quiet against 0.47 with six runs going, so each run took three times as long and
+# the throughput gain from running them at once was almost nothing. OmniGibson's own evaluator has the same knob
+# (eval/evaluator.py TORCH_NUM_THREADS) and leaves it off. Override by exporting OMP_NUM_THREADS.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 mkdir -p "$(dirname "$OUT")" runs/queue_logs
 # The pipeline needs three services, not one: the planner this queue talks to, and the M2T2 grasp server the
 # planner itself calls for grasp proposals (perception.m2t2.url in the planner's config, 127.0.0.1:8123). A run
