@@ -3576,45 +3576,75 @@ class R1ProSim(TiptopSim):
         # The jaw closes across the object's narrower horizontal axis, so the fingers meet over it rather than
         # along it; a book is gripped across its width, not its length.
         across = np.array([1.0, 0.0, 0.0]) if extent[0] <= extent[1] else np.array([0.0, 1.0, 0.0])
-        for jaw in (across, np.array([across[1], across[0], 0.0])):
-            where, rot = self.grasp_target(arm, top_base, down, jaw)
-            quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
-            solution = None
-            for tolerance in (OPEN_GRASP_TOLERANCE, 0.02):
-                solution = ik.solve(where, quat, seed=seed, tolerance_pos=tolerance, tolerance_rad=0.5)
-                if solution is not None:
-                    break
-            if solution is None:
-                continue
-            # The object's own SUPPORT is not an obstacle on the way down to it. Reaching onto a plate lying on a
-            # bottom cabinet, or a book on a shelf, sweeps the box of the thing it is resting on every time, and a
-            # bookcase's box covers every shelf in it -- so the one grasp written for flat objects refused its own
-            # approach and logged "the way down to it sweeps through bottom_cabinet..." on every attempt.
-            # ``spare`` is what the caller knows the object is standing on (Episode.support_of).
-            # mesh=True, which is what every other caller uses. With mesh=False arm_hits_scene returns its
-            # BOX-level hits and returns early, before the filter that drops floors, ceilings and rugs -- which is
-            # why 48 of these refusals blamed a ceiling for being in the way of a downward reach, and 199 blamed
-            # the bookcase whose shelf the book was sitting in. A box is the wrong model for reaching INTO
-            # something; the object's real surface is the right one.
-            ignore = {obj.name} | {n for n in spare if n}
-            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs) if n not in ignore]
-            if swept:
-                log.info(f"{name}: the way down to it sweeps through {swept[0]}; trying the other jaw direction")
-                continue
-            log.info(f"pressing the hand onto {name} at {np.round(top, 3).tolist()} to take hold of it")
-            targets = [float(v) for v in self.q_arm()]
-            for joint_name, value in zip(joints_of, solution):
-                if joint_name in self.planned_joints:
-                    targets[self.planned_joints.index(joint_name)] = float(value)
-            self.ramp_to(targets, self.posture, self.OPEN, OPEN_SETTLE_STEPS, note=f"down onto {name}")
-            pose = pose_matrix(where, quat)
-            _, held = self.close_on(
-                arm, ik, obj, obj.root_link_name, pose, down, [float(v) for v in solution], joints_of
+
+        # Two ways in, tried in order. FROM ABOVE is the original, and the right one for anything lying on a
+        # surface. FROM THE FRONT is for a book standing in a shelf, where above is exactly where the next shelf
+        # is: boxing_books_up_for_storage refused every attempt with "the way down to it sweeps through
+        # bookcase_otwukr_2", and with the mesh check in place that refusal is CORRECT -- the arm really would go
+        # through the shelf. So come in horizontally at the object's mid-height, onto the face nearest the robot,
+        # which is how a person takes a book off a shelf. Sticky grasping needs one finger in contact, not a jaw
+        # around the whole width (2026-09-15).
+        middle = np.array([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0], dtype=np.float64)
+        middle_base = self.to_base(th.tensor(middle, dtype=th.float32), unit)[0].cpu().numpy()
+        ways = [("from above", top_base, down, (across, np.array([across[1], across[0], 0.0])))]
+        flat = np.array([middle_base[0], middle_base[1], 0.0], dtype=np.float64)
+        span = float(np.linalg.norm(flat))
+        if span > 1e-6:
+            into = flat / span
+            depth = (abs(float(into[0])) * float(extent[0]) + abs(float(into[1])) * float(extent[1])) / 2.0
+            ways.append(
+                (
+                    "from the front",
+                    middle_base - into * depth,  # the near face, not the middle: the fingertips stop there
+                    into,
+                    (np.array([0.0, 0.0, 1.0]), np.array([-into[1], into[0], 0.0])),
+                )
             )
-            if held:
-                return True
+
+        ignore = {obj.name} | {n for n in spare if n}
+        for how, point_base, into_dir, jaws in ways:
+            for jaw in jaws:
+                solution = self._press_solution(arm, ik, seed, point_base, into_dir, jaw)
+                if solution is None:
+                    continue
+                where, rot = self.grasp_target(arm, point_base, into_dir, jaw)
+                quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
+                # The object's own SUPPORT is not an obstacle on the way to it: reaching onto a plate lying on a
+                # cabinet sweeps the box of the thing it rests on every time (``spare``, Episode.support_of).
+                # mesh=True is what every other caller uses; with mesh=False arm_hits_scene returns BOX-level
+                # hits and returns early, before the filter that drops floors, ceilings and rugs -- which is why
+                # 48 refusals once blamed a ceiling for blocking a downward reach.
+                swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs) if n not in ignore]
+                if swept:
+                    log.info(f"{name}: the way in {how} sweeps through {swept[0]}; trying another way")
+                    continue
+                log.info(f"pressing the hand onto {name} {how} to take hold of it")
+                targets = [float(v) for v in self.q_arm()]
+                for joint_name, value in zip(joints_of, solution):
+                    if joint_name in self.planned_joints:
+                        targets[self.planned_joints.index(joint_name)] = float(value)
+                self.ramp_to(targets, self.posture, self.OPEN, OPEN_SETTLE_STEPS, note=f"in {how} onto {name}")
+                _, held = self.close_on(
+                    arm, ik, obj, obj.root_link_name, pose_matrix(where, quat), into_dir,
+                    [float(v) for v in solution], joints_of,
+                )  # fmt: skip
+                if held:
+                    return True
         log.info(f"{name}: the pressed grasp found no way onto it")
         return False
+
+    def _press_solution(self, arm: str, ik, seed, point_base, into_dir, jaw):
+        """Arm joints that put the open hand on ``point_base`` coming in along ``into_dir``, or None.
+
+        The two tolerances are the pattern the drawer pull uses: ask for the tight one, settle for 2 cm.
+        """
+        where, rot = self.grasp_target(arm, point_base, into_dir, jaw)
+        quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
+        for tolerance in (OPEN_GRASP_TOLERANCE, 0.02):
+            solution = ik.solve(where, quat, seed=seed, tolerance_pos=tolerance, tolerance_rad=0.5)
+            if solution is not None:
+                return solution
+        return None
 
     def clear_start_posture(self, arm: str, q_ready):
         """Lift ``arm`` out of whatever it is resting in before a plan is asked for from there; the posture to send.

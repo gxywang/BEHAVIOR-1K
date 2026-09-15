@@ -472,3 +472,36 @@ def test_the_pressed_grasp_no_longer_refuses_a_thick_object_out_of_hand():
     assert "FLAT_THICKNESS" in body, "the thickness is still worth reporting"
     early = body[: body.index("top =")] if "top =" in body else body
     assert "return False" not in early, "but it must not refuse the attempt before the arm moves"
+
+
+def test_the_pressed_grasp_tries_the_front_when_above_is_a_shelf():
+    """A book standing in a shelf cannot be reached from above -- above it is the next shelf.
+
+    boxing_books_up_for_storage refused every attempt with "the way down to it sweeps through
+    bookcase_otwukr_2", and once the collision check reads the real mesh that refusal is CORRECT: the arm really
+    would pass through the shelf. So the press tries a horizontal approach onto the face nearest the robot, which
+    is how a person takes a book off a shelf. Sticky grasping needs one finger in contact, not a jaw around the
+    whole width (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
+    assert "from above" in body and "from the front" in body, "both ways in have to be tried"
+    assert body.index("from above") < body.index("from the front"), "above first: it is right for anything lying flat"
+    assert "into_dir" in body, "the press direction has to follow the approach, not stay hardcoded down"
+    assert "close_on(" in body and "down," not in body.split("close_on(")[1][:80], (
+        "close_on must press along the approach it actually took"
+    )
+
+
+def test_the_front_approach_aims_at_the_near_face_not_the_middle():
+    """The fingertips stop at the surface; aiming at the centre would drive them half the object deep."""
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
+    assert "middle_base - into * depth" in body, "back off half the object's depth along the approach"
+    assert "_press_solution" in body, "the IK-with-two-tolerances is shared between the two ways in"
