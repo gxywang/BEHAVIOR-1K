@@ -2187,9 +2187,15 @@ class R1ProSim(TiptopSim):
                     ahead = [float(r @ fwd) for r in rel]
                     side = [float(r @ left) for r in rel]
                     dist = [float(np.linalg.norm(r)) for r in rel]
-                    # the torso can turn, so a little to the right is acceptable; well to the left is preferred;
-                    # all must be inside the head camera's view (about +-45 deg of forward; the camera sees +-50)
-                    if min(ahead) < MIN_AHEAD or min(side) < MIN_SIDE or max(dist) > reach:
+                    # Reach is to the NEAREST part of the target, not to its centre. A point is an object with a
+                    # width: to put something on a bed the arm has to reach the bed, not the middle of the bed,
+                    # and a bed is 2 m across. Measuring to the centre means the only accepted stances are the
+                    # ones standing ON it, and the footprint test then refuses every one -- 30,718 candidates
+                    # refused for "overlaps bed" while standing FOR that bed, 24,505 for a bookcase, 7,598 for a
+                    # coffee table, across four tasks (2026-09-15). half_widths is each target's xy radius and was
+                    # already computed here; it only fed the framing penalty.
+                    near = [max(0.0, d - hw) for d, hw in zip(dist, half_widths)]
+                    if min(ahead) < MIN_AHEAD or min(side) < MIN_SIDE or max(near) > reach:
                         rejected["geometry"] = rejected.get("geometry", 0) + 1
                         continue
                     # cut by the bottom of the head camera's frame. The measure is how far AHEAD the object is,

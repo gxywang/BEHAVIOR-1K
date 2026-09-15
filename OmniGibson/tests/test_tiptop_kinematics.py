@@ -838,3 +838,33 @@ def test_the_base_still_refuses_to_stand_inside_it():
     loop = src.split("for obj, lo, hi in aabbs:")[1].split("if yaw is not None and self.q_home is not None")[0]
     assert "reaching" not in loop, "the base overlap loop must not spare what is being reached for"
     assert "obj in ignore" in loop, "it still honours the explicit ignore list"
+
+
+# --------------------------------------------------- reach is to the nearest part of a target, not its centre
+def _reach_ok(dist, half_width, reach=0.9):
+    """The test as best_base_pose applies it."""
+    return max(0.0, dist - half_width) <= reach
+
+
+def test_a_wide_target_is_reachable_from_beside_it():
+    """A bed is 2 m across. Putting something on it means reaching the bed, not the middle of the bed -- and the
+    only stances within 0.9 m of a bed's CENTRE are the ones standing on it, which the footprint test then
+    refuses. 30,718 candidates were refused for "overlaps bed" while standing for that same bed."""
+    bed_half = 1.0
+    assert _reach_ok(dist=1.5, half_width=bed_half), "standing 0.5 m from the bed's edge is in reach"
+    assert not _reach_ok(dist=1.5, half_width=0.0), "measuring to the centre refuses it, which was the bug"
+
+
+def test_a_small_object_is_unaffected():
+    """A battery's radius is a couple of centimetres; nothing about this changes for it."""
+    for d in (0.5, 0.88, 0.92, 1.4):
+        assert _reach_ok(d, 0.02) == (d - 0.02 <= 0.9)
+
+
+def test_standing_inside_a_target_is_still_in_reach_not_negative():
+    assert _reach_ok(dist=0.2, half_width=1.0), "no negative distances"
+
+
+def test_a_target_further_than_reach_plus_its_radius_is_still_refused():
+    """The change must not make everything reachable."""
+    assert not _reach_ok(dist=2.5, half_width=1.0), "0.9 m past a bed's edge is still too far"
