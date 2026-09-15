@@ -3661,10 +3661,20 @@ class R1ProSim(TiptopSim):
         """Lift ``arm`` out of whatever it is resting in before a plan is asked for from there; the posture to send.
 
         The plan starts at ``q_init``, and cuRobo refuses a start state that is in collision -- without ever
-        looking at the goal. Across the planner's own saved logs that refusal, INVALID_START_STATE_WORLD_COLLISION,
-        appears 6657 times against 1355 IK_FAIL: start states in collision outnumber unreachable goals five to one.
-        Each one costs the whole round, and it costs it 32 times over, because the verdict does not depend on which
-        grasp particle is being tried, so every refinement attempt returns the same message.
+        looking at the goal. Each one costs the whole round, and the message repeats once per refinement attempt,
+        because the verdict does not depend on which grasp particle is being tried.
+
+        CORRECTION (2026-09-15). This docstring used to read "6657 times against 1355 IK_FAIL: start states in
+        collision outnumber unreachable goals five to one", and that five-to-one was an artefact of counting raw
+        log lines -- a single refused round writes the message 32 or 96 times, once per attempt. Counted per
+        PLANNER CALL over the 4,974 saved, the order reverses:
+
+            13%  a call with an IK failure
+             8%  a call with a start state in world collision
+             5%  a call with a trajopt timeout (Status: None)
+
+        So this guard is worth having and is not the largest planner loss. Keep the ratio in mind before spending
+        on it again.
 
         The cause is a height coincidence rather than a broken perception. With the challenge torso posture the
         elbow and forearm sit at roughly counter height, and the planner's support is a thin slab whose top is
