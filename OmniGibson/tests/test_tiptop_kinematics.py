@@ -803,3 +803,38 @@ def test_it_does_not_widen_when_already_at_the_wider_radius():
 
     out, asked = _ladder(at_09=None, at_wide=None, reach=REACH_WIDEN)
     assert (REACH_WIDEN, True) not in asked, "no pointless second search at the same radius"
+
+
+# ------------------------------------------------------- the arm may reach into what it is standing for
+def test_the_arm_may_rest_inside_what_it_is_reaching_for():
+    """Standing at a bookcase to put a book in it, the arm ends up inside the bookcase's box. That is what
+    reaching into something looks like, and refusing it refused every stance from which the goal could be served:
+    "no base pose reaches ['bookcase.n.01_2'] ... {'overlaps bookcase_zfpyqe_0': 2497}"."""
+    from omnigibson.tiptop import r1pro
+
+    class Obj:
+        def __init__(self, name):
+            self.name = name
+
+    bookcase, lamp = Obj("bookcase_zfpyqe_0"), Obj("lamp_1")
+
+    # the set the arm test consults, as _footprint_free builds it
+    spared = {o.name for o in [lamp]} | {o.name for o in [bookcase]}
+    assert "bookcase_zfpyqe_0" in spared, "the thing being reached into must not refuse the stance"
+    assert "lamp_1" in spared, "and an explicitly ignored object stays spared"
+
+    # what it used to be: ignore alone, without the target
+    old = {o.name for o in [lamp]}
+    assert "bookcase_zfpyqe_0" not in old, "this is the bug the change removes"
+
+
+def test_the_base_still_refuses_to_stand_inside_it():
+    """The two sets are deliberately separate: the arm may reach in, the wheels may not drive in."""
+    import inspect
+
+    from omnigibson.tiptop import r1pro
+
+    src = inspect.getsource(r1pro.R1ProSim._footprint_free)
+    loop = src.split("for obj, lo, hi in aabbs:")[1].split("if yaw is not None and self.q_home is not None")[0]
+    assert "reaching" not in loop, "the base overlap loop must not spare what is being reached for"
+    assert "obj in ignore" in loop, "it still honours the explicit ignore list"

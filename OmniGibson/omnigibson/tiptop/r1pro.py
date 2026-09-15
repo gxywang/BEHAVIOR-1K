@@ -1282,7 +1282,7 @@ class R1ProSim(TiptopSim):
         return self._stance_iks[arm]
 
     def _footprint_free(
-        self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None, arms: bool = True
+        self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None, arms: bool = True, reaching=()
     ) -> tuple[bool, str]:
         """Floor under the whole footprint, inside a room, and no object's box overlapping the base.
 
@@ -1365,7 +1365,13 @@ class R1ProSim(TiptopSim):
         # the pose being judged, so a stance is refused for where the arm ENDS UP rather than only for where the
         # wheels are. Objects being stood for are in ``ignore``: the arm is meant to reach those.
         if yaw is not None and self.q_home is not None and arms:
-            spared = {o.name for o in ignore}
+            # The arm may rest inside the thing it is reaching INTO -- that is what reaching into a bookcase or a
+            # bin looks like -- but the BASE still may not stand inside it, which is why these are two sets and
+            # not one. The comment above says "objects being stood for are in ignore"; they never were. Standing
+            # for a bookcase, the arm ends up inside the bookcase's box and the stance was refused for it, so
+            # "no base pose reaches ['bookcase.n.01_2'] ... {'overlaps bookcase_zfpyqe_0': 2497}" was the search
+            # refusing every stance from which the goal could be served (2026-09-15).
+            spared = {o.name for o in ignore} | {o.name for o in reaching}
             joints = self.robot.get_joint_positions()
             for arm in self.robot.arm_names:
                 try:
@@ -2110,6 +2116,7 @@ class R1ProSim(TiptopSim):
         boxes=None,
         frame_strict: bool = True,
         footprint: dict | None = None,
+        reaching=(),
     ) -> tuple[tuple | None, dict]:
         """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
         the left arm's reach.
@@ -2231,7 +2238,9 @@ class R1ProSim(TiptopSim):
                     if best is None or score < best[0]:
                         key = (float(x), float(y), round(float(yaw), 3))  # the base's box turns with the yaw
                         if key not in footprint:
-                            footprint[key] = self._footprint_free(x, y, ignore, aabbs=aabbs, yaw=float(yaw))
+                            footprint[key] = self._footprint_free(
+                                x, y, ignore, aabbs=aabbs, yaw=float(yaw), reaching=reaching
+                            )
                         free, why, clearance = footprint[key]
                         if not free:
                             rejected[why] = rejected.get(why, 0) + 1
@@ -2258,6 +2267,7 @@ class R1ProSim(TiptopSim):
                 boxes=boxes,
                 frame_strict=strict,
                 footprint=footprint,
+                reaching=reaching,
             ),
         )
 
@@ -2315,6 +2325,7 @@ class R1ProSim(TiptopSim):
         best, rejected = self.best_base_pose(
             points,
             ignore=ignore,
+            reaching=objects,  # the arm may rest inside what it is reaching for; the base still may not
             reach=reach,
             half_widths=[self.xy_radius(n) for n in names],
             support_z=support_z,
