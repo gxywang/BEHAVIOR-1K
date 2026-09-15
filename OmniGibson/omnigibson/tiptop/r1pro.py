@@ -2015,6 +2015,7 @@ class R1ProSim(TiptopSim):
         avoid=(),
         boxes=None,
         frame_strict: bool = True,
+        footprint: dict | None = None,
     ) -> tuple[tuple | None, dict]:
         """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
         the left arm's reach.
@@ -2030,6 +2031,10 @@ class R1ProSim(TiptopSim):
         rather than by the angle measures below -- the same projection the masks use, so the test is exact. A
         candidate that cuts an object the frame could hold whole is rejected; when no candidate frames them all,
         the search runs again with ``frame_strict=False``, where a cut only costs score.
+
+        ``footprint``: a {(x, y, yaw): _footprint_free result} cache to fill and reuse. The fallback pass is given
+        the strict pass's own, so the second search does not repeat the first's mesh work; nothing moves between
+        them, so the answers are the same.
 
         ``half_widths``, ``support_z``: the angle measures used when no boxes are passed. Each point's xy radius, so
         the view test can keep the object's *edges* in frame and not just its centre (None reproduces the point
@@ -2063,7 +2068,11 @@ class R1ProSim(TiptopSim):
         t = len(pts) - 1  # the target (container) is last
         mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
-        best, rejected, footprint = None, {}, {}  # footprint: (x, y, yaw) -> _footprint_free result
+        best, rejected = None, {}
+        # (x, y, yaw) -> _footprint_free result. Handed to the fallback pass below so the second search does not
+        # redo the mesh work of the first: nothing moves between them, and the strict pass now fails more often
+        # (a stance that shows nothing of the object is refused), so the fallback is entered more often too.
+        footprint = {} if footprint is None else footprint
         for radius in np.arange(RING_START, reach + RING_STEP, RING_STEP):  # rings out to the reach itself
             for angle in np.arange(0.0, 2 * np.pi, RING_ANGLE_STEP):
                 x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
@@ -2152,6 +2161,7 @@ class R1ProSim(TiptopSim):
                 avoid=avoid,
                 boxes=boxes,
                 frame_strict=False,
+                footprint=footprint,
             )
         return best, rejected
 
