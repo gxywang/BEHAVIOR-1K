@@ -104,3 +104,63 @@ python OmniGibson/scripts/navigation/run_nav2py_benchmark.py \
   --command-max-linear-velocity 0.75 --command-max-angular-velocity 1.0 \
   --success-distance 0.5 --runtime-extra-clearance 0.2 --seed 0
 ```
+
+
+# Object Goal
+
+## Deriving recipes from the teleoperation demonstrations
+
+`derive_object_nav_recipes.py` turns the BEHAVIOR-1K 20k demo corpus into object-navigation
+recipes. The demonstrated `navigation: move to` skills are the source of truth: their
+`object_id` values are resolved against the task's `0_0` template by
+`list_object_nav_references.resolve_reference`, kept in demonstrated order, and chained. A
+reference that is ambiguous (a category with several instances) or unresolved is skipped, never
+guessed, and every drop is counted by reason.
+
+Each leg is then verified for **reachability**, not merely traversability, on the ground-truth
+`navigation_2d` map: the map is eroded exactly as `run_nav2py_benchmark.make_b1k_costmap` erodes
+it for `--costmap-source b1k-gt` (OmniGibson's own 0.30 m robot erosion, then a 0.2 m clearance
+disk), and a leg survives only if the chosen approach pose and the leg's start are in the same
+connected component of that eroded map, with a geodesic distance inside the distance bounds.
+The approach pose is chosen the way `generate_object_nav_benchmark.project_goal_near_object`
+chooses it -- rings around the goal object, `min` by projection radius then geodesic distance --
+but only over reachable candidates, so when the closest ring is cut off by inflation the leg
+falls through to a farther reachable ring instead of being discarded.
+
+`--min-distance` defaults to 2.0 m rather than the generator's 1.0 m: with a 0.5 m success
+radius a 1.0 m leg is a 0.5 m drive, which is what made the point-goal suite undiscriminating.
+A task whose demonstrations never drove that far is retried at `--fallback-min-distance` (1.0 m)
+and its recipes are labelled with the floor they needed, so short episodes are visible rather
+than silent.
+
+Nothing in the script imports omnigibson; it runs on a login node in about 40 minutes for all
+100 tasks.
+
+```
+python OmniGibson/scripts/navigation/derive_object_nav_recipes.py \
+  --output-root /scratch/gxwang2/b1k/objnav/recipes \
+  --report /scratch/gxwang2/b1k/objnav/derivation_report.json
+```
+
+Each recipe carries, besides the `scene` / `task` / `navigation_chain` the generator requires,
+a `derivation` block (which demo episodes back the chain, what was dropped and why), a
+`reachability_check` block (map, erosion, per-leg approach pose and geodesic distance) and a
+`generator_invocation` block naming the arguments the recipe was verified under.
+
+## Generating episodes from a recipe
+
+The `0_0` template is the only instance `find_templates` matches, so `--num-instances` must be 1.
+The template copy it resolves under the default root exposes only the generic `robot` start pose,
+so `--robot-pose-key robot` is required (each recipe records the key it was verified with).
+
+```
+python OmniGibson/scripts/navigation/generate_object_nav_benchmark_from_recipe.py \
+  --recipe /scratch/gxwang2/b1k/objnav/recipes/house_double_floor_lower/picking_up_trash_1.json \
+  --task-instances-root datasets/2026-challenge-task-instances \
+  --scene house_double_floor_lower \
+  --robot-pose-key robot \
+  --num-instances 1 \
+  --min-distance 2.0 \
+  --extra-clearance 0.2 \
+  --output outputs/navigation/objnav/house_double_floor_lower_picking_up_trash_1.json
+```
