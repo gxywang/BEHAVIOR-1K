@@ -550,6 +550,16 @@ class Runner:
             if ep.pick(obj):
                 ep.achieve([atom("toggled_on", obj)], arm="right")
         else:
+            # Stand for the thing before pressing it. This branch used to press from wherever the previous action
+            # happened to leave the robot, which for turning_out_all_lights_before_sleep means it never moves at
+            # all -- "teleports 0" in the RESULT line, with the lights in other rooms -- and for
+            # installing_a_fax_machine means the press is planned with the button 1.00 m away and inside the
+            # cubicle's collision box, 0 of 8 presses reaching it. Every other skill in the runner stands for its
+            # target first; this one was simply never given the same treatment (2026-09-15).
+            try:
+                ep.stand_for(obj)
+            except Unreachable as why:
+                log.info(f"no stance reaches {obj} to press it ({why}); pressing from where the robot stands")
             ep.achieve([atom("toggled_on", obj)])
 
 

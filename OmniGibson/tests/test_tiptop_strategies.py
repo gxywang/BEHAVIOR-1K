@@ -751,6 +751,27 @@ def test_only_an_inside_placement_waits_for_the_container_to_open():
     assert "pick" in kinds, "and must not be refused because that target would not open"
 
 
+def test_a_one_handed_press_stands_for_the_thing_it_presses():
+    """The in_place branch used to press from wherever the previous action left the robot.
+
+    turning_out_all_lights_before_sleep then never moves at all -- "teleports 0" in the RESULT line, with the
+    lights in other rooms -- and installing_a_fax_machine plans its press with the button 1.00 m away, 0 of 8
+    presses reaching it (2026-09-15).
+    """
+    ep = FakeEpisode({"lamp.n.02_1": box((4.0, 2.0, 1.1))})
+    Runner(STRATEGIES["turning_out_all_lights_before_sleep"], [atom("toggled_on", "lamp.n.02_1")], attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert "stand_for" in kinds, "the robot has to go to the switch before it presses it"
+    assert kinds.index("stand_for") < kinds.index("achieve"), "and go there first"
+
+
+def test_a_press_with_nowhere_to_stand_is_still_attempted():
+    """Unreachable must not lose the press: pressing from here may still work, and refusing certainly does not."""
+    ep = FakeEpisode({"lamp.n.02_1": box((4.0, 2.0, 1.1))}, unreachable={"lamp.n.02_1"})
+    Runner(STRATEGIES["turning_out_all_lights_before_sleep"], [atom("toggled_on", "lamp.n.02_1")], attempts=1).run(ep)
+    assert "achieve" in [c[0] for c in ep.calls], "a stance failure must not swallow the press"
+
+
 def test_an_open_goal_atom_is_acted_on_rather_than_left_alone():
     ep = FakeEpisode({"cabinet.n.01_1": box((1.0, 0.0, 0.5))}, shut={"cabinet.n.01_1"})
     goal = [atom("open", "cabinet.n.01_1")]
@@ -836,13 +857,17 @@ def test_a_switch_already_where_the_goal_wants_it_is_not_pressed():
 
     class _Ep:
         def __init__(self, on):
-            self.on, self.pressed, self.picked = on, [], []
+            self.on, self.pressed, self.picked, self.stood = on, [], [], []
 
         def switched_on(self, name):
             return self.on
 
         def has_arm(self, arm):
             return True
+
+        def stand_for(self, *names):
+            self.stood = list(names)
+            return {}
 
         def pick(self, obj):
             self.picked.append(obj)
@@ -875,11 +900,13 @@ def test_a_switch_already_where_the_goal_wants_it_is_not_pressed():
             self.pressed = []
 
         has_arm = _Ep.has_arm
+        stand_for = _Ep.stand_for
         pick = _Ep.pick
         achieve = _Ep.achieve
         is_shut = _Ep.is_shut
         open_up = _Ep.open_up
         picked = []
+        stood = []
 
     blind = _NoReading()
     assert not hasattr(blind, "switched_on")
