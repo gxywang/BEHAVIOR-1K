@@ -115,9 +115,18 @@ HEAD_VIEWS = {
 # the frame with a turn this joint can make. The turn is commanded from the camera's pose as it stands and the
 # resulting pose is read back from the simulator when the view is rendered, so an imperfect aim costs a little
 # centring and nothing else.
-# Caveat while the per-view pose bug in knowledge.describe is open: a turned head view's masks are wrong for
-# anything the robot is HOLDING (the torso moves, the held object moves with it, the mesh does not). Aiming the
-# head is for finding an object the robot has not picked up yet, which is what the off-the-left-edge failures are.
+# DO NOT USE THIS VIEW YET -- measured broken on 2026-09-15, in picking_up_toys 301 (runs/vis_toys_aim).
+# The turn itself is right: the log says torso_joint4 moved +34 deg to look at [0.64, 0.64, 0.79], which is the
+# object, and the camera came back 4 cm from where it started, which is what a yaw of a camera 9 cm off its axis
+# should do. What comes back is a BLACK frame whose depth is 3 mm to 35 mm across all 720x720 pixels: at this
+# torso posture the turn buries the head camera in geometry. Two black frames then satisfy the capture's
+# convergence test after 4 renders (a real head view takes 20), every mask in the view is empty, and -- worst --
+# the view is NOT dropped by the "nothing but the robot in this view" guard, because a uniform 3 cm of depth
+# counts as valid. So the planner is handed a view of a wall 3 cm away. It is opt-in (`--views ... head_aim`) and
+# off by default, so nothing uses it unless asked; leave it that way until the collision is understood.
+#
+# Also true, and separate: a turned head view's masks are wrong for anything the robot is HOLDING (the torso
+# moves, the held object moves with it, the mesh does not) -- the per-view pose bug, which is someone else's.
 HEAD_AIM_VIEW = "head_aim"
 HEAD_AIM_LIMIT = 0.6  # rad the torso may turn to aim (a little past the fixed +-0.5 rad views)
 HEAD_AIM_MIN = 0.12  # rad: a smaller turn is not worth a ramp and a second render

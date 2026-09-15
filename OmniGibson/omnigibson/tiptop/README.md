@@ -872,9 +872,12 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   within the LEFT arm's reach, which for anything the robot cannot stand square to means beside its shoulder: of
   the 328 head-camera looks at a goal object that came back with an empty mask across `runs/queue_logs`, 75 had
   the object off the LEFT edge of the image and none off the right, and 67 of those 75 come back inside the frame
-  with a turn this joint can make. Its masks share the flaw noted below for every turned view: they are wrong for
-  anything the robot is HOLDING, because the meshes are placed once per capture and a held object travels with
-  the torso.
+  with a turn this joint can make. **It does not work yet and must not be used**: measured on 2026-09-15 in
+  picking_up_toys 301, the turn is correct but the camera ends up inside geometry, the view renders black
+  with 3-35 mm of depth everywhere, and that counts as valid depth so the view is sent to the planner rather
+  than dropped. It is opt-in and off by default. Its masks also share the flaw noted below for every turned
+  view: they are wrong for anything the robot is HOLDING, because the meshes are placed once per capture and
+  a held object travels with the torso.
   0.5 rad is about 29°, so the three yaw views span roughly 150° with the
   99° head camera; the base does not turn, so each view's camera pose (read from the simulator as it is rendered)
   is right in the base frame as it is, and the oracle masks come from that pose per view. The joint's axis is
