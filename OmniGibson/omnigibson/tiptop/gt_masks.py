@@ -19,6 +19,47 @@ from omnigibson.tiptop.protocol import depth_to_points
 MAX_TRIANGLE_EDGE = 0.03
 
 
+def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
+    """The capture's meshes moved to where each object was when one view was rendered.
+
+    A capture builds one mesh per object, at the pose it has when the knowledge source runs -- after every view has
+    been rendered. But a capture turns the torso between head views, and an object in the gripper travels with it,
+    so a view rendered earlier saw that object somewhere else and masking it with the later mesh gives an empty
+    mask. Each object is rigid, so the correction is the rigid motion from the pose the mesh was built at (its
+    ``metadata["world_from_obj"]``) to the pose that view saw (``poses[label]``): ``T_view @ inv(T_built)``.
+
+    Args:
+        meshes: {label: trimesh} as built for the capture, each tagged with ``metadata["world_from_obj"]``.
+        poses: {label: 4x4} world pose of each object at the moment this view rendered.
+        log: optional logger for the objects that actually moved.
+
+    Returns:
+        {label: trimesh}, the same objects. A mesh is returned untouched when it did not move, when this view
+        recorded no pose for it, or when it carries no build pose (an obstacle, or an older capture).
+    """
+    out = {}
+    for label, mesh in meshes.items():
+        built = (mesh.metadata or {}).get("world_from_obj")
+        seen = poses.get(label)
+        if built is None or seen is None:
+            out[label] = mesh
+            continue
+        motion = np.asarray(seen, dtype=np.float64) @ np.linalg.inv(np.asarray(built, dtype=np.float64))
+        if np.allclose(motion, np.eye(4), atol=1e-6):
+            out[label] = mesh
+            continue
+        moved = mesh.copy()
+        moved.apply_transform(motion)
+        moved.metadata = dict(mesh.metadata or {}, world_from_obj=seen)
+        out[label] = moved
+        if log is not None:
+            log.info(
+                f"{label} was {100 * float(np.linalg.norm(motion[:3, 3])):.1f} cm from where the capture's mesh "
+                f"puts it when this view rendered; masking it where the view saw it"
+            )
+    return out
+
+
 def masks_from_geometry(depth, intrinsics, world_from_cam, meshes: dict, tol: float = 0.008) -> dict:
     """Per-object boolean masks (H, W) from a z-depth image and the objects' surface meshes.
 

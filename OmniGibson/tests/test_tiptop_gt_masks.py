@@ -8,7 +8,12 @@ import numpy as np
 import trimesh
 from trimesh.ray.ray_triangle import RayMeshIntersector
 
-from omnigibson.tiptop.gt_masks import masks_from_geometry, points_within_tol, surface_distances
+from omnigibson.tiptop.gt_masks import (
+    masks_from_geometry,
+    meshes_at_view_poses,
+    points_within_tol,
+    surface_distances,
+)
 
 H = W = 96
 K = np.array([[120.0, 0.0, 48.0], [0.0, 120.0, 48.0], [0.0, 0.0, 1.0]])
@@ -188,3 +193,53 @@ def test_preparing_a_mesh_is_cached_so_a_repeated_query_does_not_subdivide_it_ag
     warm = (time.perf_counter() - second) / 5
     assert _prepare(mesh) is _prepare(mesh), "the same prepared mesh comes back"
     assert warm < cold, f"a repeated query should reuse the preparation (cold {cold:.3f}s, warm {warm:.3f}s)"
+
+
+def _at(center):
+    return trimesh.transformations.translation_matrix(center)
+
+
+def test_a_view_that_saw_the_object_elsewhere_masks_it_where_it_was():
+    """The held-object bug: a capture builds one mesh per object, at the pose it has after every view has been
+    rendered, but the torso turns between head views and whatever is in the gripper travels with it. Masking a
+    turned view with the later mesh finds nothing; moving the mesh back to where that view saw it finds the object.
+    """
+    seen_at, built_at = (0.0, 0.0, 0.50), (0.28, 0.0, 0.50)  # the view saw it here; the capture's mesh is 28 cm away
+    boxes = {"held": _box((0.10, 0.10, 0.10), seen_at), "ground": _box((2.0, 2.0, 0.02), (0.0, 0.0, -0.01))}
+    depth, expected = _render(boxes)
+    assert expected["held"].sum() > 300
+
+    stale = {"held": _box((0.10, 0.10, 0.10), built_at)}
+    stale["held"].metadata = {"world_from_obj": _at(built_at)}
+    assert masks_from_geometry(depth, K, WORLD_FROM_CAM, stale)["held"].sum() == 0  # the bug: an empty mask
+
+    fixed = meshes_at_view_poses(stale, {"held": _at(seen_at)})
+    assert _iou(masks_from_geometry(depth, K, WORLD_FROM_CAM, fixed)["held"], expected["held"]) > 0.95
+
+
+def test_meshes_at_view_poses_leaves_alone_what_did_not_move():
+    """Identity for everything the robot is not carrying, and the mesh object itself is passed straight through."""
+    mesh = _box((0.1, 0.1, 0.1), (0.2, 0.0, 0.5))
+    mesh.metadata = {"world_from_obj": _at((0.2, 0.0, 0.5))}
+    out = meshes_at_view_poses({"still": mesh}, {"still": _at((0.2, 0.0, 0.5))})
+    assert out["still"] is mesh
+
+
+def test_meshes_at_view_poses_passes_through_what_it_cannot_correct():
+    """A label this view recorded no pose for, and a mesh with no build pose (an obstacle), are both left alone."""
+    tagged = _box((0.1, 0.1, 0.1), (0.0, 0.0, 0.5))
+    tagged.metadata = {"world_from_obj": _at((0.0, 0.0, 0.5))}
+    untagged = _box((0.1, 0.1, 0.1), (1.0, 0.0, 0.5))
+    out = meshes_at_view_poses({"a": tagged, "b": untagged}, {"b": _at((2.0, 0.0, 0.5))})
+    assert out["a"] is tagged and out["b"] is untagged
+
+
+def test_meshes_at_view_poses_applies_a_rotation_not_just_a_shift():
+    """The correction is a rigid motion: an object turned in the gripper is masked turned, not merely moved."""
+    built = _at((0.0, 0.0, 0.5))
+    seen = trimesh.transformations.rotation_matrix(np.pi / 2, (0, 0, 1), (0.0, 0.0, 0.5)) @ built
+    mesh = _box((0.40, 0.05, 0.05), (0.0, 0.0, 0.5))
+    mesh.metadata = {"world_from_obj": built}
+    moved = meshes_at_view_poses({"bar": mesh}, {"bar": seen})["bar"]
+    assert moved.extents[0] < 0.1 < moved.extents[1]  # the long axis is now y, and the mesh itself is untouched
+    assert mesh.extents[0] > 0.3

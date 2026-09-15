@@ -23,7 +23,7 @@ import trimesh
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
-from omnigibson.tiptop.gt_masks import masks_from_geometry
+from omnigibson.tiptop.gt_masks import masks_from_geometry, meshes_at_view_poses
 from omnigibson.tiptop.kinematics import look_at_quat_xyzw as _look_at_quat_xyzw
 from omnigibson.tiptop.protocol import (
     DROID_CAMERA_KWARGS,
@@ -622,6 +622,10 @@ class TiptopSim:
             "cam_quat_xyzw_world_cv": cam_quat_cv.cpu().numpy().tolist(),
             "seg_instance": seg,
             "id_to_name": id_to_name,
+            # Where every tracked object was at the moment THIS view rendered. A capture turns the torso between
+            # head views, and whatever is in the gripper travels with it, so one pose per capture is wrong for
+            # anything the robot carries; oracle_masks moves the capture's meshes here before masking this view.
+            "object_poses_world": self.tracked_poses_world(),
         }
         return view, view_extras
 
@@ -700,9 +704,23 @@ class TiptopSim:
         check) is built from ``self.objects`` alone."""
         return self.objects.get(label) or self.obstacles.get(label)
 
+    def tracked_poses_world(self, labels=None) -> dict:
+        """{label: 4x4 world pose} of the tracked task objects (all of them, or ``labels``). Obstacles are left out
+        on purpose: they are furniture, they do not move, and they are not registered until after the capture."""
+        names = list(self.objects) if labels is None else [l for l in labels if l in self.objects]
+        return {
+            name: T.pose2mat(self.objects[name].get_position_orientation()).cpu().numpy().astype(np.float64).tolist()
+            for name in names
+        }
+
+    def posed_for_view(self, meshes: dict, view_extras: dict) -> dict:
+        """``meshes`` moved to where each object was when this view rendered (``gt_masks.meshes_at_view_poses``)."""
+        return meshes_at_view_poses(meshes, view_extras.get("object_poses_world") or {}, log=log)
+
     def object_meshes(self, labels: list[str]) -> dict:
         """{label: trimesh} of tracked objects at their current poses, world frame: the masks of every view of one
-        capture come from the same meshes (privileged)."""
+        capture come from the same meshes (privileged), each tagged with the pose it was built at so a view that
+        saw the object somewhere else can move it back (``posed_for_view``)."""
         missing = [label for label in labels if self.tracked_object(label) is None]
         if missing:
             raise ValueError(
@@ -710,7 +728,14 @@ class TiptopSim:
                 + (f"; obstacles: {sorted(self.obstacles)}" if self.obstacles else "")
                 + ")"
             )
-        return {label: self.object_trimesh_world(label) for label in labels}
+        built = self.tracked_poses_world(labels)
+        meshes = {}
+        for label in labels:
+            mesh = self.object_trimesh_world(label)
+            if label in built:
+                mesh.metadata = dict(mesh.metadata or {}, world_from_obj=built[label])
+            meshes[label] = mesh
+        return meshes
 
     def oracle_masks(self, view: dict, view_extras: dict, labels: list[str], meshes: dict | None = None) -> np.ndarray:
         """(N, H, W) bool masks of tracked objects for one view of a capture (the request itself with the capture's
@@ -729,6 +754,7 @@ class TiptopSim:
             return np.stack(masks)
         cam_pos = th.tensor(view_extras["cam_pos_world"], dtype=th.float32)
         cam_quat_cv = th.tensor(view_extras["cam_quat_xyzw_world_cv"], dtype=th.float32)
+        meshes = self.posed_for_view(self.object_meshes(labels) if meshes is None else meshes, view_extras)
         return self.geometry_masks(view["depth"], view["intrinsics"], cam_pos, cam_quat_cv, labels, meshes=meshes)
 
     def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
