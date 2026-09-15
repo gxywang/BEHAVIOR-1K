@@ -97,6 +97,34 @@ def option_containers(option: list[dict]) -> list[str]:
     )
 
 
+def commit_to_container(options: list[list[dict]], container: str) -> list[list[dict]]:
+    """Keep only the options whose place atoms all name ``container`` (TaskSpec.container).
+
+    A task whose goal grounds into "any of these containers will do" gives a demand, read across the options,
+    that asks for every item in every container. The runner then sends each item to whichever is nearest it and
+    satisfies none of them. Naming one container keeps the options that use it alone.
+
+    Atoms that are not placements (a press, an open) are kept exactly as they are, and if nothing matches the
+    options are returned untouched rather than emptied -- a name that does not occur in this task must not
+    silently delete its goal.
+    """
+    kept = [
+        option
+        for option in options
+        if all(
+            a["args"][1] == container
+            for a in option
+            if a["predicate"] in PLACE_PREDICATES and len(a["args"]) == 2
+        )
+        and any(a["predicate"] in PLACE_PREDICATES and a["args"][1:2] == [container] for a in option)
+    ]
+    if not kept:
+        log.warning(f"container {container!r} names no goal option of this task; the goal is left as it is")
+        return options
+    log.info(f"committing the goal to {container}: {len(kept)} of {len(options)} options use it alone")
+    return kept[:1]
+
+
 def one_container_goal(options: list[list[dict]]) -> list[list[dict]]:
     """Commit to a single option when the goal wants everything in the SAME container.
 
@@ -206,6 +234,12 @@ class TaskSpec:
     # tailor to a certain task a certain drawer"). Every value used is logged, so a score is never mistaken for a
     # general capability -- see the README's "Kept out of the pipeline" list.
     opens: dict = field(default_factory=dict)
+    # The one container this goal's items should all go to, when the goal grounds into options the runner cannot
+    # choose between. sorting_vegetables asks for thirteen vegetables in a mixing bowl and grounds into 27
+    # options; read across all of them the demand asks for every vegetable in EVERY bowl, so the runner sends
+    # each one to whichever bowl is nearest it, spreads them over three, and satisfies no option. Naming the
+    # container collapses the demand onto it. Only ever narrows the demand -- it cannot invent work.
+    container: str = ""
 
     @classmethod
     def load(cls, path) -> "TaskSpec":
@@ -243,6 +277,8 @@ class Runner:
         self.spec = spec
         self.goal = list(goal)
         self.options = [list(o) for o in options] if options else [list(goal)]
+        if spec.container:
+            self.options = commit_to_container(self.options, spec.container)
         self.demand = place_demand(self.options)
         self.attempts = spec.attempts_per_item if attempts is None else int(attempts)
         self.tries = Counter()  # item -> transfers attempted for it, over the whole instance

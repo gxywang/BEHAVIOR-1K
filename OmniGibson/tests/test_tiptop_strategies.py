@@ -15,6 +15,7 @@ from omnigibson.tiptop.strategies import (
     TaskSpec,
     Unreachable,
     atom,
+    commit_to_container,
     place_demand,
     press_targets,
     strategy_for,
@@ -294,6 +295,38 @@ def test_wood_that_must_go_to_another_room_is_not_already_delivered():
     ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))  # ep.floor is floor.n.01_1
     strategy_for("bringing_in_wood", goal).run(ep)
     assert sorted(c[1] for c in ep.calls if c[0] == "pick") == [f"plywood.n.01_{i}" for i in (1, 2, 3)]
+
+
+def test_naming_a_container_keeps_only_the_options_that_use_it():
+    """sorting_vegetables asks for thirteen vegetables in a mixing bowl and grounds into 27 options.
+
+    Some of those options split the vegetables between bowls, which is what stops ``one_container_goal`` from
+    committing on its own. Read across all of them the demand then asks for every vegetable in every bowl, so the
+    runner sends each to whichever bowl is nearest it, spreads them over three, and satisfies none.
+    """
+    def all_in(bowl):
+        return [atom("inside", f"leek.n.02_{i}", bowl) for i in (1, 2)]
+
+    split = [atom("inside", "leek.n.02_1", "mixing_bowl.n.01_1"), atom("inside", "leek.n.02_2", "mixing_bowl.n.01_2")]
+    options = [all_in("mixing_bowl.n.01_3"), all_in("mixing_bowl.n.01_1"), split]
+    assert len(place_demand(options).wanted) == 3, "read across the options, all three bowls are asked for"
+
+    kept = commit_to_container(options, "mixing_bowl.n.01_3")
+    demand = place_demand(kept)
+    assert list(demand.wanted) == [("leek", "mixing_bowl.n.01_3")]
+    assert demand.wanted[("leek", "mixing_bowl.n.01_3")] == 2
+
+
+def test_a_container_name_that_is_not_in_the_goal_leaves_it_alone():
+    """A stale name in a task file must not silently delete the task's goal."""
+    options = [[atom("inside", "leek.n.02_1", "mixing_bowl.n.01_1")]]
+    assert commit_to_container(options, "sink.n.01_1") == options
+
+
+def test_committing_keeps_the_presses_and_opens_of_the_option():
+    options = [[atom("inside", "leek.n.02_1", "mixing_bowl.n.01_3"), atom("toggled_on", "oven.n.01_1")]]
+    kept = commit_to_container(options, "mixing_bowl.n.01_3")
+    assert press_targets(kept[0]) == ["oven.n.01_1"]
 
 
 def test_a_thing_is_never_asked_to_be_carried_to_itself():

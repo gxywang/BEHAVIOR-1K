@@ -22,3 +22,4 @@ task: sorting_vegetables
 instruction: put the bok choy and vidalia onions in the same mixing bowl, the leeks and broccoli together in a second mixing bowl, and the sweet corn in a third mixing bowl
 plan: transfer
 attempts_per_item: 1  # thirteen items; two tries each would not fit the step budget
+container: mixing_bowl.n.01_3  # the goal grounds into 27 options and the demand read across them asks for every vegetable in all three bowls
