@@ -155,6 +155,38 @@ class Episode:
             joint=hint.get("joint"),
             height=hint.get("height"),
         )
+        # The opening stance is chosen because the PULL solves from it (stance_for_grasp), and nothing checks that
+        # the arm can get to where the pull starts. store_honey's drawer is the case: the stance reports "15 of 15
+        # pull waypoints solve (80% of the range)" and then the hand stops 40 cm short of the standoff. It fails
+        # that way every time -- 4 attempts over two builds -- while the generic looking stance this replaced
+        # opened the same drawer 3 times out of 3 (13.0, 12.9 and 30.1 cm of travel, 2026-09-13/14). So when the
+        # approach is what failed, stand the old way and pull again from there. A fallback, not a replacement:
+        # the pull-solving stance is still tried first and still wins wherever it works.
+        if not result.get("opened") and "on the way to the standoff" in str(result.get("why") or ""):
+            self.records.append({"open": name, **result, "step": self.sim.n_steps})  # the first attempt's verdict
+            log.info(
+                f"{name}: the opening stance solves the pull but the arm cannot reach its start "
+                f"({result.get('why')}); standing the way the runner stands to look, and pulling from there"
+            )
+            try:
+                self.stand_for(name)
+                retry = self.sim.open_container(
+                    self.sim.arm,
+                    name,
+                    fraction=hint.get("fraction", OPEN_FRACTION_SCORED if fraction is None else fraction),
+                    joint=hint.get("joint"),
+                    height=hint.get("height"),
+                    stand=False,
+                )
+                self.records.append({"open": name, **retry, "step": self.sim.n_steps, "after_standoff_failed": True})
+                if retry.get("opened"):
+                    log.info(f"{name} opened from the looking stance after the opening stance could not reach it")
+                else:
+                    log.info(f"{name} did not open from either stance: {retry.get('why') or 'the joint did not move'}")
+                return bool(retry.get("opened"))
+            except Exception as why:  # noqa: BLE001 - Unreachable, or no stance at all: the first verdict stands
+                log.info(f"{name}: no looking stance to fall back to ({type(why).__name__}: {why})")
+            return False  # the first attempt failed at the standoff and the fallback did not rescue it
         self.records.append({"open": name, **result, "step": self.sim.n_steps})
         if not result.get("opened"):
             log.info(f"{name} did not open: {result.get('why') or 'the joint did not move'}")

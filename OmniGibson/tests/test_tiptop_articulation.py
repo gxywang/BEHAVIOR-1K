@@ -292,3 +292,66 @@ def test_leading_direction_of_a_drawer_is_its_slide_and_of_a_door_its_first_swin
     lead = leading_direction("revolute", [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], door, travel=+1.5)
     assert np.allclose(lead, [-1.0, 0.0, 0.0], atol=1e-6)
     assert np.allclose(leading_direction("revolute", [0.0, 0.0, 1.0], [0.0, 0.0, 0.0], door, travel=-1.5), [1.0, 0.0, 0.0])
+
+
+def test_a_drawer_the_opening_stance_cannot_reach_is_pulled_from_the_looking_stance():
+    """open_container picks its stance because the PULL solves from it, and never checks the arm can get to
+    where the pull starts.
+
+    store_honey is the case: "15 of 15 pull waypoints solve (80% of the range)" and then "left_arm_joint4 stopped
+    following on the way to the standoff (leg 1 of 1, hand 40.1 cm short)" -- 4 attempts over two builds, every
+    one of them. The generic looking stance that this replaced opened the same drawer 3 times out of 3, pulling
+    13.0, 12.9 and 30.1 cm (2026-09-13/14). So a standoff failure falls back to standing the old way.
+    """
+    from omnigibson.tiptop.bench import Episode
+
+    class Spec:
+        opens = {}
+
+    class Sim:
+        arm = "left"
+        n_steps = 0
+        video_caption = ""
+
+        def __init__(self, second):
+            self.second, self.calls, self.stood = second, [], 0
+
+        def open_container(self, arm, name, fraction=None, joint=None, height=None, stand=True):
+            self.calls.append(stand)
+            if stand:
+                return {"opened": False, "why": "left_arm_joint4 stopped following on the way to the standoff "
+                                                "(leg 1 of 1, hand 40.1 cm short)"}
+            return self.second
+
+    class Ep:
+        open_up = Episode.open_up
+
+        def __init__(self, second):
+            self.sim, self.spec, self.records = Sim(second), Spec(), []
+
+        def stand_for(self, *names):
+            self.sim.stood += 1
+            return {}
+
+    # the fallback rescues it
+    ep = Ep({"opened": True, "position": 0.30})
+    assert ep.open_up("cabinet.n.01_1") is True
+    assert ep.sim.calls == [True, False], "try the pull-solving stance first, then the looking one"
+    assert ep.sim.stood == 1, "the fallback has to stand again before it pulls"
+    assert len(ep.records) == 2 and ep.records[1]["after_standoff_failed"], "both attempts are recorded, once each"
+
+    # the fallback fails too: one record each, no double entry, and the verdict is False
+    ep = Ep({"opened": False, "why": "no grasp on cabinet.n.01_1 solves from here"})
+    assert ep.open_up("cabinet.n.01_1") is False
+    assert len(ep.records) == 2, "each attempt recorded exactly once"
+
+    # a failure that is NOT the standoff does not trigger a second pull
+    class SimOther(Sim):
+        def open_container(self, arm, name, fraction=None, joint=None, height=None, stand=True):
+            self.calls.append(stand)
+            return {"opened": False, "why": "no joint of cabinet.n.01_1 has a handle this arm can reach"}
+
+    ep = Ep(None)
+    ep.sim = SimOther(None)
+    assert ep.open_up("cabinet.n.01_1") is False
+    assert ep.sim.calls == [True], "only a standoff failure is worth standing again for"
