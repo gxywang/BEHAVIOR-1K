@@ -62,7 +62,9 @@ def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
         motion = seen @ np.linalg.inv(built)
         # A resting object jitters by a few microns between renders, which is not worth copying a mesh over (and
         # reads as a spurious "it moved" in the log). Only a motion that could actually shift a mask counts.
-        shift = float(np.linalg.norm(motion[:3, 3]))
+        # How far the OBJECT went, not motion[:3, 3]: that is the translation of the motion about the world
+        # origin, so a plain rotation of something standing several metres out reads as several metres.
+        shift = float(np.linalg.norm(seen[:3, 3] - built[:3, 3]))
         turn = float(np.arccos(np.clip((np.trace(motion[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
         if shift < MOVED_M and turn < MOVED_RAD:
             out[label] = mesh

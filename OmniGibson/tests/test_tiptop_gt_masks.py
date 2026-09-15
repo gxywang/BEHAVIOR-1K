@@ -255,3 +255,16 @@ def test_meshes_at_view_poses_rejects_a_pos_quat_pair_instead_of_a_matrix():
     pair = [[0.0, 0.0, 0.5], [0.0, 0.0, 0.0, 1.0]]
     with pytest.raises(ValueError, match="must be 4x4 matrices"):
         meshes_at_view_poses({"held": mesh}, {"held": pair})
+
+
+def test_a_turn_far_from_the_world_origin_is_not_reported_as_a_huge_move():
+    """motion[:3, 3] is the motion's translation about the world origin, so a pure rotation of an object standing
+    9 m out has a metres-long translation component. What decides 'it moved' has to be the object's own travel."""
+    built = _at((9.0, 0.0, 0.5))
+    seen = trimesh.transformations.rotation_matrix(np.pi / 4, (0, 0, 1), (9.0, 0.0, 0.5)) @ built
+    mesh = _box((0.30, 0.05, 0.05), (9.0, 0.0, 0.5))
+    mesh.metadata = {"world_from_obj": built}
+    moved = meshes_at_view_poses({"bar": mesh}, {"bar": seen})["bar"]
+    motion = np.asarray(seen) @ np.linalg.inv(np.asarray(built))
+    assert np.linalg.norm(motion[:3, 3]) > 3.0  # the misleading number
+    assert np.linalg.norm(moved.bounds.mean(axis=0) - np.array([9.0, 0.0, 0.5])) < 0.02  # it stayed put and turned
