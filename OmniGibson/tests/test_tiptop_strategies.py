@@ -118,6 +118,14 @@ class FakeEpisode:
             return not self.holding(item)
         return placed_over(self.boxes[item], self.boxes[target], from_bottom=True)
 
+    def goal_already_holds(self, predicate, item, container):
+        """Whether the goal's atom for this pair holds (Episode.goal_already_holds, which asks the task's own
+        evaluator). The fake judges it from the boxes, but a floor target names ONE floor: something lying on
+        floor.n.01_1 does not satisfy a goal that asks for it ontop floor.n.01_2."""
+        if self.is_floor(container):
+            return container == self.floor and self.near_floor(item) and not self.holding(item)
+        return self.placed(item, container)
+
     def near_floor(self, name):
         from omnigibson.tiptop.bench import FLOOR_LEVEL
 
@@ -272,6 +280,33 @@ def test_a_goal_atom_that_puts_something_on_the_floor_is_judged_by_how_low_it_st
     strategy_for("dispose_of_batteries", goal).run(ep)
     picks = [c[1] for c in ep.calls if c[0] == "pick"]
     assert picks == ["battery.n.02_1"]  # the bin already stands on the floor; the battery on the desk does not
+
+
+def test_wood_that_must_go_to_another_room_is_not_already_delivered():
+    """bringing_in_wood: three sheets of plywood lie on floor.n.01_1 and the goal wants them on floor.n.01_2.
+
+    The test the runner used before asked only how LOW a thing stands, which every sheet already satisfied, so all
+    three were counted as delivered and the instance finished having run no rounds at all. A floor target names
+    one floor.
+    """
+    boxes = {f"plywood.n.01_{i}": box((float(i), 0, 0.05)) for i in (1, 2, 3)}
+    goal = [atom("ontop", f"plywood.n.01_{i}", "floor.n.01_2") for i in (1, 2, 3)]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))  # ep.floor is floor.n.01_1
+    strategy_for("bringing_in_wood", goal).run(ep)
+    assert sorted(c[1] for c in ep.calls if c[0] == "pick") == [f"plywood.n.01_{i}" for i in (1, 2, 3)]
+
+
+def test_a_thing_is_never_asked_to_be_carried_to_itself():
+    """setup_a_bar_for_a_cocktail_party's goal grounds nextto over every pair, the reflexive one included."""
+    boxes = {f"can__of__soda.n.01_{i}": box((float(i), 0, 0.8)) for i in (1, 2)}
+    boxes["countertop.n.01_1"] = box((0, 2, 0.9), half=(0.8, 0.3, 0.02))
+    goal = [
+        atom("nextto", "can__of__soda.n.01_1", "can__of__soda.n.01_1"),  # a can beside itself
+        atom("nextto", "can__of__soda.n.01_2", "can__of__soda.n.01_1"),
+    ]
+    demand = place_demand([goal])
+    assert ("can__of__soda", "can__of__soda.n.01_1") in demand.wanted
+    assert demand.wanted[("can__of__soda", "can__of__soda.n.01_1")] == 1, "only the real pairing is work"
 
 
 def test_a_goal_atom_that_already_holds_is_never_worked_on():

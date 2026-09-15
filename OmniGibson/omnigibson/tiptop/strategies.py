@@ -135,6 +135,12 @@ def place_demand(options: list[list[dict]]) -> Demand:
             if a["predicate"] not in PLACE_PREDICATES or len(a["args"]) != 2:
                 continue
             item, container = a["args"]
+            if item == container:
+                # "nextto(can_of_soda_1, can_of_soda_1)" -- a thing beside itself. bddl grounds the pairing
+                # predicate over every pair including the reflexive one; it is true from the start and there is
+                # nothing to carry. Counting it made setup_a_bar_for_a_cocktail_party and laying_tile_floors ask
+                # for items to be delivered to themselves.
+                continue
             kind = bddl_category(item)
             counts[(kind, container)] += 1
             demand.items.setdefault(kind, [])
@@ -304,18 +310,24 @@ class Runner:
 
     def settled(self, ep, wanted: dict) -> set:
         """Items the goal already has where it wants them when the instance starts (a bin that stands on the floor
-        already, an item in its container): they cost nothing and are never worked on."""
+        already, an item in its container): they cost nothing and are never worked on.
+
+        Judged by the goal's OWN predicate on the pair, not by a geometric stand-in. The stand-in read a floor
+        target as "the item is low and the hand let go of it", which cannot tell one room's floor from another's:
+        bringing_in_wood asks for three sheets of plywood ontop floor.n.01_2 and they start on floor.n.01_1, so
+        all three were counted as delivered and the instance finished having run no rounds at all, scoring 0.000.
+        laying_tile_floors failed the same way. A predicate the evaluator cannot judge leaves the item loose,
+        which is the safe direction: the worst case is work that turns out to be unnecessary."""
         done = set()
         for (kind, container), n in list(wanted.items()):
+            predicate = self.demand.predicate.get((kind, container), "ontop")
             for item in self.demand.items.get(kind, []):
                 if n <= 0:
                     break
                 if item in done:
                     continue
                 try:
-                    # "on the floor" has no box to test against, so ask how low the item stands; Episode.placed
-                    # reads a floor target as "the hand let go of it", which every loose item satisfies.
-                    there = ep.near_floor(item) if ep.is_floor(container) else ep.placed(item, container)
+                    there = ep.goal_already_holds(predicate, item, container)
                 except (KeyError, NotImplementedError):  # not localized yet: treat it as loose
                     continue
                 if not there:

@@ -509,6 +509,24 @@ class Episode:
             return self.floor
         return max(under, key=lambda n: float(boxes[n]["hi"][2]))
 
+    def goal_already_holds(self, predicate: str, item: str, container: str) -> bool:
+        """Whether the goal's own atom for this pair holds right now, by the task's evaluator.
+
+        Privileged in the same way ``switched_on`` is, and used for the same narrow purpose: not spending a
+        transfer on something the goal already has. The geometric stand-in it replaces could not tell one floor
+        from another -- ``near_floor`` asks only how low a thing stands and ``placed`` reads a floor target as
+        "the hand let go of it" -- so a task that asks for things to be carried to a DIFFERENT room's floor was
+        read as already finished. bringing_in_wood is that task and it ran no rounds at all.
+
+        At evaluation this verdict would have to come from the robot's own localization. It is only ever used to
+        skip work, never to claim credit: the score comes from the simulator's own check either way.
+        """
+        try:
+            return bool(self.sim.holds(predicate, item, container))
+        except Exception as exc:  # noqa: BLE001 - an unknown predicate or an object the scope does not name
+            log.debug(f"cannot judge {predicate}({item}, {container}) yet ({exc}); treating it as still to do")
+            return False
+
     def near_floor(self, name: str) -> bool:
         """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor."""
         if self.is_floor(name):
