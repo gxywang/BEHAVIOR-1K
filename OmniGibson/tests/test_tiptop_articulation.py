@@ -505,3 +505,27 @@ def test_the_front_approach_aims_at_the_near_face_not_the_middle():
     body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
     assert "middle_base - into * depth" in body, "back off half the object's depth along the approach"
     assert "_press_solution" in body, "the IK-with-two-tolerances is shared between the two ways in"
+
+
+def test_the_press_chooses_its_way_in_the_way_the_drawer_pull_does():
+    """A pose being reachable is not the same as the arm being able to get to it.
+
+    sorting_books_on_shelf: the front approach SOLVED, and the straight joint-space line to it swept
+    bookcase_otwukr_1 -- a different bookcase from the one holding the book. reach_plan offers five ways in
+    (straight, via the ready posture, torso first, arm first, elbow first) and the drawer pull has used it since
+    2026-09-14.
+
+    It is used here WITHOUT its fallback. reach_plan returns its least-sweeping plan rather than refusing, which
+    is right for a drawer; sorting_books_on_shelf is a stacking-order task where an arm swung through a bookcase
+    knocks the order about, so a dirty plan is still refused (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
+    assert "reach_plan(" in body, "five ways in, not one straight line"
+    after = body[body.index("reach_plan(") :]
+    assert "path_hits_scene" in after, "and the chosen plan is still checked"
+    assert "continue" in after[: after.index("pressing the hand onto")], "a dirty plan is still refused"
+    assert "_targets_from" in after, "every leg of the chosen plan is ramped, not just the last"

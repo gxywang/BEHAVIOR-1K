@@ -3614,16 +3614,27 @@ class R1ProSim(TiptopSim):
                 # mesh=True is what every other caller uses; with mesh=False arm_hits_scene returns BOX-level
                 # hits and returns early, before the filter that drops floors, ceilings and rugs -- which is why
                 # 48 refusals once blamed a ceiling for blocking a downward reach.
-                swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs) if n not in ignore]
+                # Not a single straight line from wherever the arm happens to be. reach_plan offers five ways --
+                # straight, via the ready posture, torso first, arm first, elbow first -- and the drawer pull has
+                # used it since 2026-09-14. sorting_books_on_shelf is why it is needed here: the front approach
+                # solved, and the straight path to it swept bookcase_otwukr_1, a DIFFERENT bookcase from the one
+                # holding the book. The pose was reachable; the way the arm took to it was not.
+                legs = self.reach_plan(arm, ik, joints_of, solution, exclude=ignore, aabbs=aabbs)
+                swept, start = [], seed
+                for leg in legs:
+                    swept += [n for n in self.path_hits_scene(arm, ik, start, leg, aabbs=aabbs) if n not in ignore]
+                    start = leg
                 if swept:
-                    log.info(f"{name}: the way in {how} sweeps through {swept[0]}; trying another way")
+                    # reach_plan returns its least-sweeping plan rather than refusing, which is right for a drawer
+                    # -- "refusing to move at all was measured to be worse than moving through a box". It is NOT
+                    # right here: sorting_books_on_shelf is a stacking-ORDER task and an arm swung through a
+                    # bookcase knocks the order about. So five ways are tried and a dirty one is still refused.
+                    log.info(f"{name}: every way in {how} sweeps through {swept[0]}; trying another way")
                     continue
                 log.info(f"pressing the hand onto {name} {how} to take hold of it")
-                targets = [float(v) for v in self.q_arm()]
-                for joint_name, value in zip(joints_of, solution):
-                    if joint_name in self.planned_joints:
-                        targets[self.planned_joints.index(joint_name)] = float(value)
-                self.ramp_to(targets, self.posture, self.OPEN, OPEN_SETTLE_STEPS, note=f"in {how} onto {name}")
+                for leg in legs:
+                    self.ramp_to(self._targets_from(joints_of, leg), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
+                                 note=f"in {how} onto {name}")  # fmt: skip
                 _, held = self.close_on(
                     arm, ik, obj, obj.root_link_name, pose_matrix(where, quat), into_dir,
                     [float(v) for v in solution], joints_of,
