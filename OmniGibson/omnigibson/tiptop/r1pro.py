@@ -253,6 +253,7 @@ HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings 
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
+FOOTPRINT_CELL = 0.05  # m: the grid the base-height geometry of a scene object is measured on
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
@@ -765,6 +766,7 @@ class R1ProSim(TiptopSim):
         self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
         self._hand_convention = {}  # arm -> how its hand approaches and closes (constant; measured on first use)
         self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
+        self._base_cells = {}  # object name -> the floor squares it really occupies at base height
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
@@ -1045,6 +1047,59 @@ class R1ProSim(TiptopSim):
         the collision meshes on every access, ~50 ms for a house scene), to reuse across footprint checks."""
         return [(o, *[v.cpu().numpy() for v in o.aabb]) for o in self.env.scene.objects if o is not self.robot]
 
+    def base_height_cells(self, obj) -> set | None:
+        """Which ``FOOTPRINT_CELL`` squares of floor this object actually occupies at the height the BASE sweeps.
+
+        A bounding box is not the object. A desk is legs and a top, and at the height the robot's base occupies
+        there is almost nothing in between -- measured in picking_up_toys' scene, where the desk that turned the
+        robot away has a 1.83 m2 box footprint and 0.08 m2 of solid geometry in that slab, 96% air; the breakfast
+        table and the coffee table are 100% air, so the base could roll clean underneath them. Testing the base
+        against the box refuses positions where there is nothing at all, which is why every task whose objects sit
+        on a desk failed with "no base pose ... overlaps desk" before a single round ran (2026-09-14).
+
+        It is NOT true of everything: a bed is 59-62% air, so this has to come from each object's own geometry
+        rather than a rule about tables. Returns None when the object has no mesh, and the caller then keeps the
+        box's word.
+
+        Computed once per object -- the mesh is cached and nothing moves during a stance search -- because doing
+        it per candidate is what took an earlier version of this search from a median of 1.0 s to 48.8 s.
+        """
+        if obj.name in self._base_cells:
+            return self._base_cells[obj.name]
+        cells = None
+        try:
+            mesh = self.scene_mesh(obj)
+            points = np.asarray(mesh.vertices, dtype=np.float64)
+            lo_b, hi_b = self.base_box()
+            floor = float(self.base_pose()[0][2])
+            slab = points[(points[:, 2] >= floor + float(lo_b[2])) & (points[:, 2] <= floor + float(hi_b[2]))]
+            cells = {(int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in slab[:, :2]}
+        except Exception as why:  # noqa: BLE001 - no mesh, or an unreadable one: the box stands
+            log.debug(f"no base-height geometry for {obj.name} ({type(why).__name__}); keeping its box")
+            cells = None
+        self._base_cells[obj.name] = cells
+        return cells
+
+    def base_meets(self, obj, centre, yaw, rect_lo, rect_hi) -> bool:
+        """Whether the base's rectangle actually meets ``obj``, rather than merely meeting its bounding box."""
+        cells = self.base_height_cells(obj)
+        if cells is None:
+            return True  # nothing better to go on than the box, which the caller has already found overlapping
+        if not cells:
+            return False  # the object has no geometry at all in the slab the base sweeps: it passes under it
+        cx, cy = float(centre[0]), float(centre[1])
+        c, sn = math.cos(float(yaw)), math.sin(float(yaw))
+        reach = float(max(abs(rect_lo[0]), abs(rect_hi[0]), abs(rect_lo[1]), abs(rect_hi[1]))) + FOOTPRINT_CELL
+        for gx, gy in cells:
+            x = (gx + 0.5) * FOOTPRINT_CELL - cx
+            y = (gy + 0.5) * FOOTPRINT_CELL - cy
+            if abs(x) > reach or abs(y) > reach:
+                continue
+            fx, fy = x * c + y * sn, -x * sn + y * c  # the cell in the base's own frame
+            if rect_lo[0] <= fx <= rect_hi[0] and rect_lo[1] <= fy <= rect_hi[1]:
+                return True
+        return False
+
     def _stance_ik(self, arm: str) -> ArmIK:
         """Arm IK kept for the stance search. Building one per candidate would cost more than the search itself."""
         if arm not in self._stance_iks:
@@ -1111,6 +1166,11 @@ class R1ProSim(TiptopSim):
             if rect is not None:
                 gap = rect_box_gap((x, y), yaw, rect[0], rect[1], lo, hi)
                 if gap <= 0.0:
+                    # The box says they meet; ask the object itself. A desk is legs and a top, and at the height
+                    # the base sweeps it is 96% air -- a coffee table is 100% air, so the base can roll right
+                    # under it. Refusing on the box turned the robot away from every desk in the house.
+                    if not self.base_meets(obj, (x, y), yaw, rect[0], rect[1]):
+                        continue
                     return False, f"overlaps {obj.name}", 0.0
                 clearance = min(clearance, gap)
             elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:

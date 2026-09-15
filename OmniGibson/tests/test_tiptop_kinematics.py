@@ -529,3 +529,43 @@ def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():
     assert np.allclose(points[0], [3.0, 3.0, 0.5]), "a point 1 m ahead of a base at (2,3) facing +x is at (3,3)"
     turned = R1ProSim.arm_points(_Stub(), "left", ik, [0.0], at=(2.0, 3.0, np.pi / 2))
     assert np.allclose(turned[0], [2.0, 4.0, 0.5]), "the same point with the base turned 90 deg is at (2,4)"
+
+
+def test_the_base_is_tested_against_geometry_not_a_bounding_box():
+    """A desk is legs and a top; at the height the base sweeps, its bounding box is almost all air.
+
+    Measured in picking_up_toys' scene, over the slab the base occupies (z 0.042 to 0.405 m): the desk that
+    turned the robot away has a 1.83 m2 box footprint and 0.08 m2 of solid geometry in that slab, 96% air; the
+    breakfast table and the coffee table are 100% air, so the base could roll clean underneath. Refusing a
+    position on the box alone is why every task whose objects sit on a desk failed with "no base pose ...
+    overlaps desk" before a single round ran. A bed is only 59-62% air, so this has to come from each object's
+    own geometry rather than a rule about tables (2026-09-14).
+    """
+    from omnigibson.tiptop.r1pro import FOOTPRINT_CELL, R1ProSim
+
+    class _Stub:
+        _base_cells = {}
+
+        def base_height_cells(self, obj):
+            return self._base_cells.get(obj)
+
+        base_meets = R1ProSim.base_meets
+
+    stub = _Stub()
+    rect_lo, rect_hi = np.array([-0.39, -0.34]), np.array([0.23, 0.34])
+
+    # nothing at base height: the base passes under it, whatever the box says
+    stub._base_cells["coffee_table"] = set()
+    assert not stub.base_meets("coffee_table", (0.0, 0.0), 0.0, rect_lo, rect_hi)
+
+    # a leg inside the rectangle: a real meeting
+    leg = (int(0.1 / FOOTPRINT_CELL), int(0.1 / FOOTPRINT_CELL))
+    stub._base_cells["desk"] = {leg}
+    assert stub.base_meets("desk", (0.0, 0.0), 0.0, rect_lo, rect_hi)
+
+    # the same leg, with the base standing a metre away: no meeting
+    assert not stub.base_meets("desk", (1.5, 0.0), 0.0, rect_lo, rect_hi)
+
+    # no mesh to go on: keep the box's word rather than inventing clearance
+    stub._base_cells["mystery"] = None
+    assert stub.base_meets("mystery", (0.0, 0.0), 0.0, rect_lo, rect_hi)
