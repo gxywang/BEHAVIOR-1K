@@ -866,6 +866,18 @@ python -m omnigibson.tiptop.run replay --plan <run>/tiptop_plan.json --scene run
   `torso_joint3` ±0.3 rad, added 2026-09-12) leans the 0.48 m mast the camera stands on, so the camera moves
   about 15 cm as well as tilting: that is what shows the inside of a container or the top of a low object from
   two angles. Neither has a benchmark pass yet; the yaw pair has one instance (0.8125, see Results).
+  **Aim** (`head_aim`, `HEAD_AIM_VIEW`, added 2026-09-15) is the same yaw joint turned by however much it takes
+  to look at what the stance was chosen for (`head_aim_yaw`, `head_view_turn`), clamped to ±0.6 rad and skipped
+  when the head already points within 0.12 rad of it. It exists because the stance search has to put an object
+  within the LEFT arm's reach, which for anything the robot cannot stand square to means beside its shoulder: of
+  the 328 head-camera looks at a goal object that came back with an empty mask across `runs/queue_logs`, 75 had
+  the object off the LEFT edge of the image and none off the right, and 67 of those 75 come back inside the frame
+  with a turn this joint can make. **It does not work yet and must not be used**: measured on 2026-09-15 in
+  picking_up_toys 301, the turn is correct but the camera ends up inside geometry, the view renders black
+  with 3-35 mm of depth everywhere, and that counts as valid depth so the view is sent to the planner rather
+  than dropped. It is opt-in and off by default. Its masks also share the flaw noted below for every turned
+  view: they are wrong for anything the robot is HOLDING, because the meshes are placed once per capture and
+  a held object travels with the torso.
   0.5 rad is about 29°, so the three yaw views span roughly 150° with the
   99° head camera; the base does not turn, so each view's camera pose (read from the simulator as it is rendered)
   is right in the base frame as it is, and the oracle masks come from that pose per view. The joint's axis is
