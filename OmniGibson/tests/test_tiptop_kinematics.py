@@ -569,3 +569,56 @@ def test_the_base_is_tested_against_geometry_not_a_bounding_box():
     # no mesh to go on: keep the box's word rather than inventing clearance
     stub._base_cells["mystery"] = None
     assert stub.base_meets("mystery", (0.0, 0.0), 0.0, rect_lo, rect_hi)
+
+
+# --------------------------------------------------------------- the floor a piece of furniture really occupies
+def _box_mesh(lo, hi):
+    """A closed box as a trimesh, the shape of a desk leg or a table top."""
+    import trimesh
+
+    return trimesh.creation.box(
+        extents=[hi[i] - lo[i] for i in range(3)],
+        transform=trimesh.transformations.translation_matrix([(lo[i] + hi[i]) / 2 for i in range(3)]),
+    )
+
+
+def test_a_leg_that_passes_straight_through_the_slab_is_found():
+    """A desk leg runs from the floor to the underside of the top, so NONE of its vertices lie in the slab the
+    robot's base sweeps. Reading the vertices alone reported the leg as empty floor and the search stood the
+    robot inside it."""
+    from omnigibson.tiptop.r1pro import footprint_cells
+
+    leg = _box_mesh((1.00, 1.00, 0.0), (1.06, 1.06, 0.73))  # 6 cm square, floor to 73 cm
+    slab_lo, slab_hi = 0.02, 0.35
+
+    vertices_only = {
+        (int(np.floor(x / 0.05)), int(np.floor(y / 0.05)))
+        for x, y, z in np.asarray(leg.vertices)
+        if slab_lo <= z <= slab_hi
+    }
+    assert vertices_only == set(), "the old test finds nothing, which is the bug"
+    assert footprint_cells(leg, slab_lo, slab_hi), "the leg occupies floor and must be found"
+
+
+def test_a_table_top_above_the_base_is_still_air_underneath():
+    """The reason the face test is not simply 'use the bounding box': the base rolls under a table top."""
+    from omnigibson.tiptop.r1pro import footprint_cells
+
+    top = _box_mesh((0.0, 0.0, 0.70), (1.60, 0.80, 0.74))
+    assert footprint_cells(top, 0.02, 0.35) == set(), "nothing of the top is in the slab"
+
+
+def test_a_thing_lying_flat_on_the_floor_is_found():
+    from omnigibson.tiptop.r1pro import footprint_cells
+
+    toy = _box_mesh((2.0, 2.0, 0.0), (2.08, 2.08, 0.06))
+    assert footprint_cells(toy, 0.02, 0.35), "it stands taller than the base's underside, so it is an obstacle"
+
+
+def test_the_cells_cover_the_leg_and_not_half_the_room():
+    from omnigibson.tiptop.r1pro import footprint_cells
+
+    leg = _box_mesh((1.00, 1.00, 0.0), (1.06, 1.06, 0.73))
+    cells = footprint_cells(leg, 0.02, 0.35)
+    assert 1 <= len(cells) <= 9, f"a 6 cm leg should touch a couple of 5 cm cells, got {len(cells)}"
+    assert all(19 <= gx <= 22 and 19 <= gy <= 22 for gx, gy in cells), "and they should be where the leg is"

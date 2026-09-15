@@ -255,6 +255,7 @@ HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings 
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 FOOTPRINT_CELL = 0.05  # m: the grid the base-height geometry of a scene object is measured on
+FOOTPRINT_FACE_CELLS = 400  # a single face wider than this falls back to its corners (footprint_cells)
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
@@ -727,6 +728,42 @@ def turned_joints(planned_joints, q_arm, joint: str, delta: float) -> list[float
     return q
 
 
+def footprint_cells(mesh, z_lo: float, z_hi: float) -> set:
+    """Which ``FOOTPRINT_CELL`` squares of floor a mesh occupies between ``z_lo`` and ``z_hi``.
+
+    Read from the mesh's FACES, not its vertices. A desk leg is a box running from the floor to the underside of
+    the top: its vertices sit at z = 0 and z = 0.73 and NONE of them fall inside the slab the robot's base sweeps,
+    so a vertex test reports the leg as empty floor and the stance search happily stands the robot inside it. That
+    is what "the base slid 4 cm: the pose is occupied by something the footprint test missed" means in the logs,
+    and it cost a well-framed stance (0.22 m offset, 0.31 m clearance) on picking_up_toys on 2026-09-15 -- the
+    only stance in that round that had the goal object properly in frame.
+
+    A face counts when its own z range meets the slab at all, which is what catches a leg that passes straight
+    through. The cells are the face's xy extent, so the result is slightly generous at the edges; that is the safe
+    direction, since being generous refuses a stance and being mean puts the robot inside the furniture. Faces
+    spanning an implausible area (a floor or a merged wall) fall back to their corners rather than filling
+    thousands of cells -- those objects are filtered out before this is ever asked, and the guard is only so that
+    one odd mesh cannot cost the whole search its time.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces)
+    if not len(faces):
+        return {(int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in verts[:, :2]}
+    tri = verts[faces]  # (faces, 3, 3)
+    meets = (tri[:, :, 2].max(axis=1) >= z_lo) & (tri[:, :, 2].min(axis=1) <= z_hi)
+    cells = set()
+    for face in tri[meets]:
+        gx0, gx1 = np.floor(face[:, 0].min() / FOOTPRINT_CELL), np.floor(face[:, 0].max() / FOOTPRINT_CELL)
+        gy0, gy1 = np.floor(face[:, 1].min() / FOOTPRINT_CELL), np.floor(face[:, 1].max() / FOOTPRINT_CELL)
+        if (gx1 - gx0 + 1) * (gy1 - gy0 + 1) > FOOTPRINT_FACE_CELLS:
+            cells.update((int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in face[:, :2])
+            continue
+        for gx in range(int(gx0), int(gx1) + 1):
+            for gy in range(int(gy0), int(gy1) + 1):
+                cells.add((gx, gy))
+    return cells
+
+
 class R1ProSim(TiptopSim):
     """R1Pro in a BEHAVIOR scene; the TiptopSim interface (capture / step / q_arm / objects) for the left arm."""
 
@@ -1111,11 +1148,9 @@ class R1ProSim(TiptopSim):
         cells = None
         try:
             mesh = self.scene_mesh(obj)
-            points = np.asarray(mesh.vertices, dtype=np.float64)
             lo_b, hi_b = self.base_box()
             floor = float(self.base_pose()[0][2])
-            slab = points[(points[:, 2] >= floor + float(lo_b[2])) & (points[:, 2] <= floor + float(hi_b[2]))]
-            cells = {(int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in slab[:, :2]}
+            cells = footprint_cells(mesh, floor + float(lo_b[2]), floor + float(hi_b[2]))
         except Exception as why:  # noqa: BLE001 - no mesh, or an unreadable one: the box stands
             log.debug(f"no base-height geometry for {obj.name} ({type(why).__name__}); keeping its box")
             cells = None
