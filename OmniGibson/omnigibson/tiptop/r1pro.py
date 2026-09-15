@@ -1119,9 +1119,19 @@ class R1ProSim(TiptopSim):
         position, outward normal of the face it sits on, and the radius within which ToggledOn counts a finger."""
         out = {}
         for atom in atoms:
-            if atom["predicate"] != "toggled_on":
+            # A goal asking for a switch to be OFF reaches here as not(toggled_on, x) -- a HEAD's flat tokens,
+            # because bddl compiles the negation into the ground atom. It is still a press, and it still needs its
+            # button described. strategies.press_targets has read both forms since it was written; this read only
+            # the positive one, so turning_out_all_lights_before_sleep -- whose goal is five `not toggled_on`
+            # atoms and nothing else -- produced ZERO button hints and every round died on "goal objects
+            # ['switch_1_button'] were not found in any of the 3 view(s)". The button is named by pose, never
+            # segmented, so no hint means no press (2026-09-15).
+            if atom["predicate"] == "toggled_on" and atom["args"]:
+                bddl = atom["args"][0]
+            elif atom["predicate"] == "not" and atom["args"][:1] == ["toggled_on"] and len(atom["args"]) > 1:
+                bddl = atom["args"][1]
+            else:
                 continue
-            (bddl,) = atom["args"]
             pos_w, n_world, radius = self.button_world(bddl)
             identity = th.tensor([0.0, 0.0, 0.0, 1.0])
             pos_b, _ = self.to_base(th.tensor(pos_w, dtype=th.float32), identity)

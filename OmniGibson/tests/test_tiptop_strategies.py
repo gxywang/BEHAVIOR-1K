@@ -1082,3 +1082,26 @@ def test_a_touching_goal_lifts_the_item_onto_its_support():
     Runner(STRATEGIES["putting_shoes_on_rack"], goal, attempts=1).run(ep)
     kinds = [c[0] for c in ep.calls]
     assert "pick" in kinds, "a touching goal must actually lift the shoe"
+
+
+def test_a_switch_the_goal_wants_OFF_still_gets_its_button_described():
+    """A goal asking for a switch to be off arrives as not(toggled_on, x) -- bddl compiles the negation into the
+    ground atom. press_targets has read both forms since it was written; button_hints read only the positive one.
+
+    turning_out_all_lights_before_sleep's goal is five `not toggled_on` atoms and nothing else, so it produced
+    ZERO button hints and every round died on "goal objects ['switch_1_button'] were not found in any of the 3
+    view(s)". A button is named by pose and never segmented, so no hint means no press (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+    from omnigibson.tiptop.strategies import press_targets
+
+    off = [atom("not", "toggled_on", "light_bulb.n.01_1")]
+    on = [atom("toggled_on", "radio_receiver.n.01_1")]
+    assert press_targets(off) == ["light_bulb.n.01_1"], "the runner already reads the negated form"
+    assert press_targets(on) == ["radio_receiver.n.01_1"]
+
+    body = inspect.getsource(R1ProSim.button_hints).split('"""')[-1]
+    assert '"not"' in body and '"toggled_on"' in body, "and the button hints have to read the same two forms"
+    assert body.count("bddl =") >= 2, "each form names the object differently"
