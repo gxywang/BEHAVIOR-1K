@@ -529,3 +529,22 @@ def test_the_press_chooses_its_way_in_the_way_the_drawer_pull_does():
     assert "path_hits_scene" in after, "and the chosen plan is still checked"
     assert "continue" in after[: after.index("pressing the hand onto")], "a dirty plan is still refused"
     assert "_targets_from" in after, "every leg of the chosen plan is ramped, not just the last"
+
+
+def test_the_thing_a_book_sits_inside_is_not_an_obstacle_on_the_way_to_it():
+    """press_grasp takes a ``spare`` from the caller, but Episode.support_of only searches TASK objects and a
+    bookcase is not one -- so for a book on a shelf it returns the floor and the bookcase went on being counted.
+
+    sorting_books_on_shelf named bookcase_otwukr_3, the bookcase the books are in and must stay in, in 10 of its
+    15 refusals. A book inside a bookcase is inside its bounding box by construction, so containment is the test
+    that catches it without the caller having to know (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
+    assert "around" in body and "centre" in body, "what the object sits inside has to be worked out here"
+    assert "HOUSE_AABB_AREA" in body, "and merged walls and roofs excluded by area, as every other scene test does"
+    ignore_line = [ln for ln in body.split("\n") if ln.strip().startswith("ignore =")]
+    assert ignore_line and "around" in ignore_line[0], "and it has to reach the set the sweep test consults"

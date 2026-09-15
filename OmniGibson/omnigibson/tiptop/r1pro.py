@@ -3611,7 +3611,22 @@ class R1ProSim(TiptopSim):
                 )
             )
 
-        ignore = {obj.name} | {n for n in spare if n}
+        # Anything the object is INSIDE is not an obstacle on the way to it. ``spare`` carries what the caller
+        # knows it stands on, but Episode.support_of only searches TASK objects, and a bookcase is not one -- so
+        # for a book on a shelf it returns the floor and the bookcase went on being counted. sorting_books_on_shelf
+        # named bookcase_otwukr_3, the bookcase the books are in and must stay in, in 10 of its 15 refusals.
+        # A book inside a bookcase is inside its box by construction, so containment is the test. Merged walls and
+        # roofs are excluded by area, the way every other scene test here excludes them (2026-09-15).
+        centre = (lo + hi) / 2.0
+        around = {
+            row[0].name
+            for row in aabbs
+            if all(row[1][k] <= centre[k] <= row[2][k] for k in range(3))
+            and (row[2][0] - row[1][0]) * (row[2][1] - row[1][1]) <= HOUSE_AABB_AREA
+        }
+        if around - {obj.name}:
+            log.info(f"{name} sits inside {sorted(around - {obj.name})}; not counting them on the way to it")
+        ignore = {obj.name} | {n for n in spare if n} | around
         for how, point_base, into_dir, jaws in ways:
             for jaw in jaws:
                 solution = self._press_solution(arm, ik, seed, point_base, into_dir, jaw)
