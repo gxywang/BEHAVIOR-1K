@@ -49,6 +49,7 @@ from omnigibson.tiptop.protocol import (
     face_normal_local,
     joint_ramp,
     points_to_pixels,
+    reach_candidates,
     via_configuration,
 )
 from omnigibson.tiptop.scene import (
@@ -288,12 +289,18 @@ OPEN_FOLLOW_TOL = 0.02  # m the hand may get ahead of a drawer by before the pul
 OPEN_FOLLOW_TOL_RAD = 0.05  # the same for a door, in radians of the hinge
 OPEN_MIN_FRACTION = 0.20  # of the joint's range: the shortest pull worth making when the arm cannot follow it all
 OPEN_STANCE_TRIES = 120  # (stance, grasp) pairs solved for before a container is given up on
+# A reach ramp that reports a joint behind its target at its LAST step is not a collision on the way: the baseline
+# stopped 'left_arm_joint1 0.12 rad behind at step 121 of 122' and this code 'left_arm_joint2 0.13 rad behind at
+# step 153 of 154' (2026-09-14), a shoulder settling short of a stretched configuration. What matters is where the
+# HAND ended up, so the reach goes on when it is within this of the standoff, and the approach re-targets from there.
+OPEN_REACH_SLACK = 0.06  # m
 OPEN_GRASP_TOLERANCE_RAD = 0.15  # rad the grasp pose may be off in orientation: the fingertips are 7.8 cm from the
 # IK frame, so 0.5 rad (the tolerance the rest of the pipeline uses) lets them wander 3.7 cm, and a rail is 1.2 cm tall
 BAR_TIP_CLEARANCE = 0.005  # m the fingertips stop short of the panel behind a bar
 BAR_TIP_DEPTH = 0.03  # m behind a bar's front the fingertips go at most, so the pads hold it and the assist's ray
 # between them crosses it (fridge/petcxr's bar stands 6 cm out; the pads are 1.8 cm long)
 BAR_END_INSET = 0.03  # m kept clear of a bar's ends
+HAND_BODY_CLEARANCE = 0.01  # m the hand's link origins keep from the container's own body (the hand works at it)
 STANCE_AHEAD = (0.55, 0.65, 0.45, 0.75, 0.85)  # m the handle is ahead of the base, first choice first
 STANCE_SIDE = (0.15, 0.25, 0.05, 0.35, -0.05)  # m the handle is to the LEFT of the base (the left arm opens)
 STANCE_YAWS = (0.0, 0.26, -0.26)  # rad off square to the face
@@ -1069,8 +1076,15 @@ class R1ProSim(TiptopSim):
             self._stance_iks[arm] = self.arm_ik(arm, frame=f"{arm}_gripper_link")
         return self._stance_iks[arm]
 
-    def _footprint_free(self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None) -> tuple[bool, str]:
+    def _footprint_free(
+        self, x: float, y: float, ignore, aabbs=None, yaw: float | None = None, arms: bool = True
+    ) -> tuple[bool, str]:
         """Floor under the whole footprint, inside a room, and no object's box overlapping the base.
+
+        ``arms``: also refuse a stance where an arm at its CURRENT posture would rest inside something (below).
+        Off for an opening stance, whose arms stay folded over the base after the teleport and go from there
+        to the handle by a checked path: with the working posture they would sit 0.41 m past the base, i.e.
+        inside the very drawer front the stance is chosen to reach, and every stance near it was refused.
 
         With ``yaw``, the base is tested as the rectangle it actually is, turned to face that way
         (``base_box``/``rect_hits_box``); without one, as the ``ROBOT_FOOTPRINT`` square, which is what callers
@@ -1140,7 +1154,7 @@ class R1ProSim(TiptopSim):
         # INSIDE the toy box (2026-09-13). The arms are tested in 3D, at the posture they will unfold to and at
         # the pose being judged, so a stance is refused for where the arm ENDS UP rather than only for where the
         # wheels are. Objects being stood for are in ``ignore``: the arm is meant to reach those.
-        if yaw is not None and self.q_home is not None:
+        if yaw is not None and self.q_home is not None and arms:
             spared = {o.name for o in ignore}
             joints = self.robot.get_joint_positions()
             for arm in self.robot.arm_names:
@@ -1532,6 +1546,7 @@ class R1ProSim(TiptopSim):
         at = None if base_pose is None else tuple(float(v) for v in base_pose)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         clear = [row for row in aabbs if obj is None or row[0] is not obj]
+        body = self.container_body(obj, j["link"]) if obj is not None else None
         solutions, poses = [], [standoff, grasp_pose]
         pull, _, _ = self._pull_poses(grasp, grasp_pose, base_pose)
         poses += pull[1:]
@@ -1551,6 +1566,8 @@ class R1ProSim(TiptopSim):
                 why = f"the arm would flip {float(np.max(np.abs(np.asarray(solution) - np.asarray(solutions[-1])))):.2f} rad between waypoints at {i}"
                 break
             hits = self.arm_hits_scene(arm, ik, solution, aabbs=clear, at=at, mesh=True)
+            if not hits and self.body_hits(arm, ik, solution, body, at=at):
+                hits = [f"{obj.name}'s body"]
             if hits:
                 why = f"the arm at {'the standoff' if i == 0 else 'the grasp' if i == 1 else f'pull waypoint {i - 1}'} would be in {hits[0]}"
                 break
@@ -1601,7 +1618,9 @@ class R1ProSim(TiptopSim):
                         xy = tips[:2] - f2 * ahead - l2 * side
                         key = (round(float(xy[0]), 3), round(float(xy[1]), 3), round(yaw, 3))
                         if key not in footprints:
-                            footprints[key] = self._footprint_free(float(xy[0]), float(xy[1]), [], aabbs=aabbs, yaw=yaw)
+                            footprints[key] = self._footprint_free(
+                                float(xy[0]), float(xy[1]), [], aabbs=aabbs, yaw=yaw, arms=False
+                            )
                         free, why, _ = footprints[key]
                         if not free:
                             refused[why] = refused.get(why, 0) + 1
@@ -1626,7 +1645,7 @@ class R1ProSim(TiptopSim):
         log.info(f"no stance for {obj.name} after {tried} tries: {dict(sorted(refused.items(), key=lambda kv: -kv[1])[:5])}")
         return None, None, None
 
-    def reach_plan(self, arm: str, ik, joints_of, q_to, exclude=(), aabbs=None) -> list:
+    def reach_plan(self, arm: str, ik, joints_of, q_to, exclude=(), aabbs=None, body=None) -> list:
         """Legs (each a full solution over ``joints_of``) that take the arm from where it is to ``q_to`` without
         sweeping through the scene, chosen among: straight; via the ready posture; torso first then the arm; the
         arm first then the torso; elbow first. Each leg is a straight ramp in joint space, which is what
@@ -1638,34 +1657,22 @@ class R1ProSim(TiptopSim):
         clear = [row for row in aabbs if row[0].name not in exclude]
         q = self.robot.get_joint_positions()
         q_from = [float(q[self.joint_index[j]]) for j in joints_of]
-        q_to = [float(v) for v in q_to]
         home = [float(self.q_home[self.planned_joints.index(j)]) if j in self.planned_joints else q_from[i]
                 for i, j in enumerate(joints_of)]  # fmt: skip
-        torso = [i for i, j in enumerate(joints_of) if j.startswith("torso")]
-        arm_ix = [i for i, j in enumerate(joints_of) if i not in torso]
-        torso_first = list(q_from)
-        for i in torso:
-            torso_first[i] = q_to[i]
-        arm_first = list(q_from)
-        for i in arm_ix:
-            arm_first[i] = q_to[i]
-        elbow = list(q_from)
-        if len(arm_ix) > ELBOW:
-            elbow[arm_ix[ELBOW]] = q_to[arm_ix[ELBOW]]
-        plans = [
-            ("straight", [q_to]),
-            ("torso first", [torso_first, q_to]),
-            ("elbow first", [elbow, q_to]),
-            ("via the ready posture", [home, q_to]),
-            ("arm first", [arm_first, q_to]),
-        ]
+        # An arm still in its travel fold hangs beside the base with the hand low, and a straight joint-space line
+        # from there to a standoff swings the forearm through whatever the robot is standing at (the other
+        # drawer fronts of jhymlr's cabinet, 2026-09-14). Unfolding to the ready posture first is the motion every
+        # teleport already makes, so from the fold it is the first plan offered.
+        folded = all(abs(q_from[i]) < 0.05 for i, j in enumerate(joints_of) if "_arm_joint" in j)
         best = None
-        for name, legs in plans:
+        for name, legs in reach_candidates(joints_of, q_from, q_to, home, elbow=ELBOW, prefer_home=folded):
             swept, start = [], q_from
             for leg in legs:
                 for hit in self.path_hits_scene(arm, ik, start, leg, aabbs=clear, mesh=True):
                     if hit not in swept:
                         swept.append(hit)
+                if self.path_hits_body(arm, ik, start, leg, body) and "the container's body" not in swept:
+                    swept.append("the container's body")
                 start = leg
             if not swept:
                 log.info(f"reach: {name} is clear")
@@ -1768,11 +1775,16 @@ class R1ProSim(TiptopSim):
             pose, chosen, jaw_world = self.stance_for_grasp(obj, grasps, arm=arm)
             if pose is None:
                 return {"opened": False, "why": f"no stance in front of {name} lets the arm reach its handle and pull"}
-            self.place_robot(*pose, note=f"stand to open {name}")
+            self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
             self.hold(OPEN_SETTLE_STEPS, self.OPEN)
-        # solve from where the robot actually stands (a teleport settles a little off the pose asked for)
+        # solve from where the robot actually stands (a teleport settles a little off the pose asked for), seeded
+        # from the ready posture as the stance search was, not from the travel fold the arms are in now
         q = self.robot.get_joint_positions()
-        seed = [float(q[self.joint_index[j]]) for j in joints_of]
+        seed = [
+            float(self.q_home[self.planned_joints.index(j)]) if self.q_home and j in self.planned_joints
+            else float(q[self.joint_index[j]])
+            for j in joints_of
+        ]  # fmt: skip
         aabbs = self.scene_aabbs()
         candidates = [(chosen, jaw_world)] if chosen is not None else []
         candidates += [(g, jaw) for g in grasps for jaw in g["jaws"] if g is not chosen]
@@ -1791,14 +1803,22 @@ class R1ProSim(TiptopSim):
             f"pull waypoints solve" + (f" ({plan['why']})" if plan["why"] else "")
         )
         # 3. reach the standoff, collision-checked, then come straight in
-        legs = self.reach_plan(arm, ik, joints_of, plan["solutions"][0], exclude=(obj.name,), aabbs=aabbs)
+        legs = self.reach_plan(
+            arm, ik, joints_of, plan["solutions"][0], exclude=(obj.name,), aabbs=aabbs, body=self.container_body(obj, j["link"])
+        )
         for k, leg in enumerate(legs):
             stopped = self.ramp_to(self._targets_from(joints_of, leg), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
                                    note=f"reach the standoff of {name} (leg {k + 1} of {len(legs)})", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
             if stopped is not None:
-                self.hold(OPEN_SETTLE_STEPS, self.OPEN)
-                return {"opened": False, "why": f"{stopped[0]} stopped following on the way to the standoff (leg {k + 1})",
-                        "joint": j["name"], "position": j["position"]}  # fmt: skip
+                q_now = self.robot.get_joint_positions()
+                measured = [float(q_now[self.joint_index[jn]]) for jn in joints_of]
+                off = float(np.linalg.norm(ik.fk(measured, f"{arm}_gripper_link")[0] - ik.fk(leg, f"{arm}_gripper_link")[0]))
+                if off > OPEN_REACH_SLACK or k + 1 < len(legs):
+                    self.hold(OPEN_SETTLE_STEPS, self.OPEN)
+                    return {"opened": False, "joint": j["name"], "position": j["position"],
+                            "why": f"{stopped[0]} stopped following on the way to the standoff (leg {k + 1} of {len(legs)}, "
+                                   f"hand {off * 100:.1f} cm short)"}  # fmt: skip
+                log.info(f"{stopped[0]} settled {stopped[2]:.2f} rad short at the end of the reach; the hand is {off * 100:.1f} cm off the standoff, going on")
         stopped = self.ramp_to(self._targets_from(joints_of, plan["solutions"][1]), self.posture, self.OPEN,
                                OPEN_SETTLE_STEPS, note=f"approach the handle of {name}", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
         if stopped is not None:
@@ -2187,7 +2207,7 @@ class R1ProSim(TiptopSim):
                 "not the one it asked for, and something is in the way of it here"
             )
 
-    def place_robot(self, x: float, y: float, yaw: float, note: str = "") -> dict:
+    def place_robot(self, x: float, y: float, yaw: float, note: str = "", unfold: bool = True) -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
         grasp assist along with the robot, so a carried object stays in the gripper.
 
@@ -2219,7 +2239,8 @@ class R1ProSim(TiptopSim):
             og.sim.viewer_camera.set_position_orientation(
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
-        self.unfold_after_travel(unfold_to)
+        if unfold:  # an opening stance keeps the arms folded: reach_plan chooses the way out to the handle
+            self.unfold_after_travel(unfold_to)
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
 
@@ -2609,8 +2630,54 @@ class R1ProSim(TiptopSim):
         ``at``: an (x, y, yaw) base pose to evaluate them at instead of the base's current one, so a stance can be
         judged by where the arm would END UP before the robot is put there.
         """
+        names = list(self.robot.arm_link_names[arm]) + [f"{arm}_{suffix}" for suffix in HAND_LINKS]
+        return R1ProSim._link_points(self, ik, q, names, at)
+
+    def container_body(self, obj, moving: str):
+        """World mesh of ``obj``'s links other than ``moving``: the cabinet around the drawer being opened, the
+        fridge around its door. Kept until the object moves (its box is the stamp), like ``scene_mesh``.
+
+        Every check of the opening motion has to exempt the moving link -- the hand is meant to reach it and it
+        travels with the hand -- but exempting the whole container with it left the cabinet's body out of every
+        check, and the first reach that ``path_hits_scene`` called clear stopped 82 steps in with the elbow 0.17
+        rad behind its target on the way to a drawer front (2026-09-14).
+        """
+        lo, hi = (v.cpu().numpy() for v in obj.aabb)
+        key = f"{obj.name}#body-{moving}"
+        stamp = (tuple(np.round(lo, 4)), tuple(np.round(hi, 4)))
+        cached = self._scene_meshes.get(key)
+        if cached is None or cached[0] != stamp:
+            parts = [
+                mesh
+                for name, link in obj.links.items()
+                if name != moving and (mesh := self.link_trimesh_world(link)) is not None and len(mesh.faces)
+            ]
+            self._scene_meshes[key] = (stamp, trimesh.util.concatenate(parts) if parts else None)
+        return self._scene_meshes[key][1]
+
+    def body_hits(self, arm: str, ik: ArmIK, q, body, at=None) -> bool:
+        """Whether the arm at joints ``q`` reaches into ``body`` (a container's mesh less its moving link): the
+        arm's own links as a polyline within ``ARM_RADIUS`` of it, the hand's link origins within
+        ``HAND_BODY_CLEARANCE`` -- the hand is working at the container, so it is allowed close."""
+        if body is None:
+            return False
+        limbs = self._link_points(ik, q, list(self.robot.arm_link_names[arm]), at)
+        if len(limbs) >= 2 and bool(points_within_tol(body, sample_polyline(limbs, ARM_SAMPLE_STEP), ARM_RADIUS).any()):
+            return True
+        hand = self._link_points(ik, q, [f"{arm}_{suffix}" for suffix in HAND_LINKS], at)
+        return bool(hand) and bool(points_within_tol(body, np.asarray(hand), HAND_BODY_CLEARANCE).any())
+
+    def path_hits_body(self, arm: str, ik: ArmIK, q_from, q_to, body, samples: int = PATH_SAMPLES) -> bool:
+        """``body_hits`` anywhere along the straight joint-space path, sampled like ``path_hits_scene``."""
+        if body is None:
+            return False
+        q_from, q_to = np.asarray(q_from, dtype=np.float64), np.asarray(q_to, dtype=np.float64)
+        return any(self.body_hits(arm, ik, q_from + t * (q_to - q_from), body) for t in np.linspace(0.0, 1.0, max(2, samples)))
+
+    def _link_points(self, ik: ArmIK, q, names, at=None) -> list[np.ndarray]:
+        """World positions of the named links' origins at joints ``q`` (``arm_points`` for any link list)."""
         points = []
-        for name in list(self.robot.arm_link_names[arm]) + [f"{arm}_{suffix}" for suffix in HAND_LINKS]:
+        for name in names:
             try:
                 pos, _ = ik.fk(q, name)
             except Exception:

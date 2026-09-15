@@ -538,6 +538,37 @@ def via_configuration(names, now, goal, arms: dict, elbow: int, elbow_first: boo
     return via
 
 
+def reach_candidates(names, q_from, q_to, home, elbow: int = 3, prefer_home: bool = False) -> list:
+    """Joint-space plans for taking an arm (with its torso) from ``q_from`` to ``q_to``, each a list of legs to
+    ramp straight through in turn, best guess first: straight; the torso first and the arm after it; the elbow
+    alone first (the hand rises before it travels); via the ready posture ``home``; the arm first and the torso
+    after it. ``names`` are the joint names in the vectors' order; torso joints are those named ``torso*``, the
+    elbow is the ``elbow``-th arm joint. The caller checks each plan's legs against the scene and takes the first
+    clean one -- these are the candidates, not the choice. ``prefer_home`` puts the ready-posture plan first (an
+    arm starting from its travel fold, whose straight line to anything sweeps low past the base).
+    """
+    q_from = [float(v) for v in q_from]
+    q_to = [float(v) for v in q_to]
+    torso = [i for i, j in enumerate(names) if str(j).startswith("torso")]
+    arm = [i for i in range(len(names)) if i not in torso]
+    torso_first = list(q_from)
+    for i in torso:
+        torso_first[i] = q_to[i]
+    arm_first = list(q_from)
+    for i in arm:
+        arm_first[i] = q_to[i]
+    plans = [("straight", [q_to]), ("torso first", [torso_first, q_to])]
+    if len(arm) > elbow:
+        elbow_first = list(q_from)
+        elbow_first[arm[elbow]] = q_to[arm[elbow]]
+        plans.append(("elbow first", [elbow_first, q_to]))
+    if home is not None:
+        via_home = ("via the ready posture", [[float(v) for v in home], q_to])
+        plans.insert(0, via_home) if prefer_home else plans.append(via_home)
+    plans.append(("arm first", [arm_first, q_to]))
+    return plans
+
+
 def joint_ramp(start, goal, max_step: float) -> np.ndarray:
     """Joint targets from ``start`` to ``goal`` (dof,) in equal steps of at most ``max_step`` per joint, the last one
     ``goal`` itself: (n, dof), n >= 1. A target that jumps makes a position controller slam the joints; commanding

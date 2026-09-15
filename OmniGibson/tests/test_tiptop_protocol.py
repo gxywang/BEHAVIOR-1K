@@ -654,3 +654,27 @@ def test_joint_ramp_bounds_every_step_and_ends_on_the_goal():
     assert np.abs(steps).max() <= 0.02 + 1e-6 and np.allclose(steps[:, 1], 0.0)
     assert joint_ramp([0.3], [0.3], 0.02).shape == (1, 1)  # already there: one step, the goal itself
     assert np.allclose(joint_ramp([0.0], [0.05], 0.1), [[0.05]])  # a small move is one step
+
+
+def test_reach_candidates_offer_the_torso_and_the_arm_separately_and_the_ready_posture():
+    """Opening a drawer takes the arm from the travel fold to a standoff by one of several joint-space plans, each
+    a chain of straight ramps the scene check judges leg by leg (r1pro.reach_plan). The plans are pure."""
+    from omnigibson.tiptop.protocol import reach_candidates
+
+    names = ["torso_joint1", "torso_joint2", "left_arm_joint1", "left_arm_joint2", "left_arm_joint3", "left_arm_joint4"]
+    q_from = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    q_to = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    home = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    plans = dict(reach_candidates(names, q_from, q_to, home, elbow=3))
+    assert list(plans) == ["straight", "torso first", "elbow first", "via the ready posture", "arm first"]
+    assert plans["straight"] == [q_to]
+    assert plans["torso first"][0] == [1.0, 2.0, 0.0, 0.0, 0.0, 0.0], "the torso moves, the arm waits"
+    assert plans["arm first"][0] == [0.0, 0.0, 3.0, 4.0, 5.0, 6.0], "the arm moves, the torso waits"
+    assert plans["elbow first"][0] == [0.0, 0.0, 0.0, 0.0, 0.0, 6.0], "the 4th arm joint alone"
+    assert plans["via the ready posture"][0] == home
+    assert all(legs[-1] == q_to for legs in plans.values()), "every plan ends at the target"
+    first = reach_candidates(names, q_from, q_to, home, elbow=3, prefer_home=True)[0]
+    assert first[0] == "via the ready posture" and first[1][0] == home, "from the travel fold, unfold first"
+    # no elbow index into a short arm, no ready posture when there is none
+    short = dict(reach_candidates(["torso_joint1", "left_arm_joint1"], [0.0, 0.0], [1.0, 1.0], None, elbow=3))
+    assert list(short) == ["straight", "torso first", "arm first"]
