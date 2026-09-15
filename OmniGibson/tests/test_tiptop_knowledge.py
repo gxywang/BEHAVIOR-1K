@@ -613,6 +613,87 @@ def test_what_failed_names_the_unsatisfied_atoms_the_unreachable_objects_and_the
     assert what_failed({"success": True, "bench": {}}) == ""
 
 
+def test_a_pick_that_closed_on_the_wrong_thing_opens_the_hand_again():
+    """A pick that missed its target but stopped the fingers on SOMETHING leaves the hand shut on whatever else
+    was there, and nothing later in a run opens it.
+
+    collecting_aluminum_cans round 1 closed on the goal's own ice bucket and carried it for the rest of the
+    episode: six of eight teleports reported the gripper touching it at stances 1.2 m apart, two later rounds
+    died on "the left arm starts inside ice_bucket_42, which the planner refuses before it looks at the goal",
+    and the bucket filled 82% of the wrist camera. 0.833 -> 0.000 (2026-09-15).
+
+    The reading is proprioception -- the gripper command and how far apart the fingers stopped. The simulator's
+    grasp assist knows exactly what is in the hand and is deliberately not asked (scene.check_hands logs the
+    disagreement and steers nothing).
+    """
+    from omnigibson.tiptop.run import HOLD_RADIUS, note_hands
+
+    class Sim:
+        arm = "left"
+        OPEN = 1.0
+
+        def __init__(self, finger):
+            self.held_objects, self.bddl_names = {}, {"can_4": "can.n.01_4"}
+            self.finger, self.hand, self.opened = finger, np.array([1.0, 0.0, 0.8]), []
+
+        tracked_label = staticmethod(lambda name: name.replace(".n.01_", "_"))
+
+        def eef_pose_base(self, arm):
+            m = np.eye(4)
+            m[:3, 3] = self.hand
+            return m
+
+        base_to_world = staticmethod(lambda p: np.asarray(p, float))
+
+        def grasp_sensed(self, arm):
+            return self.finger > 0.006
+
+        def finger_width(self, arm):
+            return self.finger
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def check_hands(self):
+            pass
+
+        def hold(self, n_steps, gripper=None):
+            self.opened.append((n_steps, gripper))
+
+    class Knowledge:
+        def __init__(self, center):
+            self.center = center
+
+        def localize(self, *names):
+            c = np.asarray(self.center, float)
+            return {n: {"center": c, "lo": c - 0.03, "hi": c + 0.03} for n in names}
+
+        def picked(self, *a):
+            pass
+
+    class Executor:
+        close_eef = np.eye(4)
+
+    pick = [{"predicate": "holding", "args": ["can.n.01_4"]}]
+    far = [1.0 + HOLD_RADIUS + 0.5, 0.0, 0.78]  # the can is across the floor, where round 1 threw it
+
+    # the bucket case: target elsewhere, fingers 4.6 cm apart -- the hand has something and must let go
+    sim = Sim(finger=0.046)
+    note_hands(sim, pick, Executor(), Knowledge(far))
+    assert sim.hands() == {}, "the can is not in the hand and must not be recorded as held"
+    assert len(sim.opened) == 1 and sim.opened[0][1] == Sim.OPEN, "the hand must be opened"
+
+    # closed on nothing at all: there is nothing to drop, so do not spend the steps
+    sim = Sim(finger=0.0)
+    note_hands(sim, pick, Executor(), Knowledge(far))
+    assert sim.hands() == {} and sim.opened == [], "an empty hand needs no opening"
+
+    # a pick that worked is left alone
+    sim = Sim(finger=0.046)
+    note_hands(sim, pick, Executor(), Knowledge([1.02, 0.0, 0.78]))
+    assert sim.hands() == {"can_4": "left"} and sim.opened == [], "do not drop what the pick actually got"
+
+
 def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as_fallback():
     """After a pick the object counts as held when the knowledge source localizes it within HOLD_RADIUS of the
     hand; with sticky grasping the fingers close through the object, so their width is only the fallback when
@@ -621,6 +702,7 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
 
     class Sim:
         arm = "left"
+        OPEN = 1.0
 
         def __init__(self):
             self.held_objects = {}
@@ -628,6 +710,10 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
             self.finger = 0.0
             self.hand = np.array([1.0, 0.0, 0.8])
             self.warnings = []
+            self.opened = []  # (steps, gripper) of every hand-opening this run asked for
+
+        def hold(self, n_steps, gripper=None):
+            self.opened.append((n_steps, gripper))
 
         def tracked_label(self, name):
             return name.replace(".n.01_", "_")
@@ -677,11 +763,13 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
     # a placement clears it
     note_hands(sim, place, Executor(), know)
     assert sim.hands() == {}
-    # localized far from the hand: not held, even with the fingers on something
+    # localized far from the hand: not held, even with the fingers on something -- and because the fingers ARE
+    # on something, the hand is opened rather than left shut on whatever else it caught (see below)
     sim, know = Sim(), Knowledge([1.0 + HOLD_RADIUS + 0.05, 0.0, 0.78])
     sim.finger = 0.03
     note_hands(sim, pick, Executor(), know)
     assert sim.hands() == {}
+    assert sim.opened, "the fingers stopped on something that is not the target: open the hand"
     # nothing can localize it: the fingers decide
     sim, know = Sim(), Knowledge(None)
     sim.finger = 0.03

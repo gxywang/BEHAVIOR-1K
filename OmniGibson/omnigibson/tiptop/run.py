@@ -670,6 +670,7 @@ def do_execute(
 
 
 HOLD_RADIUS = 0.15  # m: an object localized within this distance of the hand after a pick is in it
+DROP_STEPS = 45  # env steps the hand is held open after a pick that closed on the wrong thing (Episode.release)
 
 
 def in_hand_by_localization(sim, knowledge, bddl: str, arm: str) -> bool | None:
@@ -704,6 +705,22 @@ def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
                 log.info(
                     f"{label}: the hand closed but the object {how} ({sim.finger_width(sim.arm):.3f} m between the fingers)"
                 )
+                # The pick missed its target and the fingers stopped on SOMETHING anyway: the hand is shut on
+                # whatever else was in the way, and nothing later in the run opens it. collecting_aluminum_cans
+                # round 1 closed on the goal's own ice bucket ("hand record empty differs from the grasp assist's
+                # {'bucket_1': 'left'}"), then carried it for the whole episode -- six of eight teleports report
+                # the gripper touching it at stances 1.2 m apart, two rounds died on "the left arm starts inside
+                # ice_bucket_42, which the planner refuses before it looks at the goal", and the bucket filled 82%
+                # of the wrist camera. 0.833 -> 0.000 (2026-09-15). Opening the hand costs 45 steps of a budget
+                # that run left 78% unspent.
+                # Proprioception only: the gripper command and how far apart the fingers stopped. Whether the
+                # TARGET arrived is the knowledge source's word, as everywhere else; what is in the hand is never
+                # read from the simulator's grasp assist, which stays diagnostic (scene.check_hands).
+                if at_hand is False and sim.grasp_sensed(sim.arm):
+                    log.info(
+                        f"the {sim.arm} hand is shut on something that is not {label}; opening it before going on"
+                    )
+                    sim.hold(DROP_STEPS, sim.OPEN)
         elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
             sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
     for label, holder in list(sim.held_objects.items()):  # an object that left the hand (fell, was released)
