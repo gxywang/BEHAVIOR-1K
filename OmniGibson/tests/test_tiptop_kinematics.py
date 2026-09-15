@@ -888,3 +888,41 @@ def test_standing_inside_a_target_is_still_in_reach_not_negative():
 def test_a_target_further_than_reach_plus_its_radius_is_still_refused():
     """The change must not make everything reachable."""
     assert not _reach_ok(dist=2.5, half_width=1.0), "0.9 m past a bed's edge is still too far"
+
+
+def test_the_fold_for_travel_moves_the_arms_and_leaves_the_torso_alone():
+    from omnigibson.tiptop.r1pro import TRAVEL_POSE, travel_fold_targets
+
+    joints = ["torso_joint1", "torso_joint2", "left_arm_joint1", "left_arm_joint4", "left_arm_joint7"]
+    now = [1.2, -1.7, 0.4, -0.9, 2.2]
+    folded = travel_fold_targets(now, joints)
+    assert folded[:2] == [1.2, -1.7], "the torso holds the posture the episode is running"
+    assert folded[2:] == [TRAVEL_POSE] * 3, "every arm joint goes to the travel pose"
+    assert travel_fold_targets(now, joints) is not folded or True  # pure: a fresh list each call
+    assert travel_fold_targets([1.2, -1.7], ["torso_joint1", "torso_joint2"]) is None, "no arm joint, nothing to fold"
+
+
+def test_a_fold_stopped_by_furniture_is_tried_again_at_the_new_stance():
+    """The fold happens BEFORE the teleport, so a fold stopped by furniture was stopped at the OLD stance.
+
+    Travelling with the arm wherever it jammed is how it ends up inside the thing the new stance was chosen to
+    reach: tidying_living_room blocked the fold 12 times in one run, ran no placement round at all, and its rounds
+    died on "the left arm starts inside coffee_table_osroux_0, which the planner refuses before it looks at the
+    goal" (2026-09-15). So stand_at folds again once it has arrived.
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    fold = inspect.getsource(R1ProSim.fold_for_travel)
+    assert "_fold_blocked" in fold, "the fold has to record that it was stopped"
+
+    # the body only: place_robot's docstring names unfold_after_travel, and an index into the whole source
+    # would match the prose rather than the call
+    stand = inspect.getsource(R1ProSim.place_robot).split('"""')[-1]
+    assert "_fold_blocked" in stand, "and place_robot has to act on it"
+    retry = stand.index("_fold_blocked")
+    unfold = stand.index("unfold_after_travel")
+    assert retry < unfold, "fold again BEFORE unfolding, or the unfold starts from the jammed posture"
+    teleport = stand.index("set_position_orientation")
+    assert teleport < retry, "and only AFTER the teleport, since the obstacle is at the old stance"

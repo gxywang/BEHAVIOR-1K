@@ -767,6 +767,23 @@ def turned_joints(planned_joints, q_arm, joint: str, delta: float) -> list[float
     return q
 
 
+def travel_fold_targets(q_now, planned_joints) -> list | None:
+    """``q_now`` with every ARM joint driven to ``TRAVEL_POSE`` and everything else (the torso) left alone.
+
+    The fold for travel brings the arms in over the robot's own base. It is computed in two places -- once before
+    the teleport and once after it, when the first was stopped by something at the old stance -- so it lives here
+    rather than being written twice. Returns None when there is no arm joint to fold, which is what a torso-only
+    planned set looks like.
+    """
+    folded = [float(v) for v in q_now]
+    moved = False
+    for index, joint in enumerate(planned_joints):
+        if "_arm_joint" in joint:
+            folded[index] = float(TRAVEL_POSE)
+            moved = True
+    return folded if moved else None
+
+
 def footprint_cells(mesh, z_lo: float, z_hi: float) -> set:
     """Which ``FOOTPRINT_CELL`` squares of floor a mesh occupies between ``z_lo`` and ``z_hi``.
 
@@ -2400,13 +2417,8 @@ class R1ProSim(TiptopSim):
         if self.q_home is None or not self.planned_joints:
             return None
         here = [float(v) for v in self.q_arm()]
-        folded = list(here)
-        moved = False
-        for index, joint in enumerate(self.planned_joints):
-            if "_arm_joint" in joint:
-                folded[index] = float(TRAVEL_POSE)
-                moved = True
-        if not moved:
+        folded = travel_fold_targets(here, self.planned_joints)
+        if folded is None:
             return None
         blocked = self.ramp_to(
             folded,
@@ -2416,6 +2428,7 @@ class R1ProSim(TiptopSim):
             note="fold for travel",
             max_vel=TRAVEL_MAX_JOINT_VEL,
         )
+        self._fold_blocked = blocked is not None
         if blocked is not None:
             log.warning(f"the fold before the teleport was stopped by {blocked[0]}; travelling as the robot stands")
         return here
@@ -2500,6 +2513,22 @@ class R1ProSim(TiptopSim):
             og.sim.viewer_camera.set_position_orientation(
                 position=th.tensor(eye), orientation=th.tensor(look_at_quat_xyzw(eye, target))
             )
+        # A fold stopped by furniture was stopped by furniture AT THE OLD STANCE. The robot has since moved, so
+        # try again here before unfolding: otherwise it arrives with the arm wherever it jammed, which is how the
+        # arm ends up inside the thing the new stance was chosen to reach and in front of the head camera.
+        # tidying_living_room blocked the fold 12 times in one run and ran no placement round at all; its rounds
+        # died on "the left arm starts inside coffee_table_osroux_0, which the planner refuses before it looks at
+        # the goal" (2026-09-15). Costs one ramp at travel speed, and only on the runs that were already in
+        # trouble.
+        if getattr(self, "_fold_blocked", False) and unfold_to is not None and self.planned_joints:
+            folded = travel_fold_targets(self.q_arm(), self.planned_joints) or []
+            again = self.ramp_to(folded, self.posture, self.last_gripper, TRAVEL_SETTLE_STEPS,
+                                 note="fold again after the teleport", max_vel=TRAVEL_MAX_JOINT_VEL)  # fmt: skip
+            log.info(
+                "the fold was blocked at the old stance; "
+                + (f"it is blocked here too ({again[0]})" if again is not None else "it folded here")
+            )
+            self._fold_blocked = False
         if unfold:  # an opening stance keeps the arms folded: reach_plan chooses the way out to the handle
             self.unfold_after_travel(unfold_to)
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
