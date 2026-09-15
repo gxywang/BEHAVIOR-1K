@@ -459,7 +459,12 @@ class Runner:
         if not candidates:
             return None
         supports = {i: ep.support_of(i) for i in candidates}
-        candidates.sort(key=lambda i: (ep.edge_gap(i, supports[i]), self.gap(ep, i, container)))
+        # Take the top of a stack first. An item with another of the goal's own items resting on it cannot be
+        # picked until that one is moved, and trying it first spends the attempt and leaves both where they were.
+        # Measured on sorting_books_on_shelf: 23 of its 38 books have another task book on top of them, which
+        # reads as a gripper problem in the logs and is a sequencing one (2026-09-15).
+        buried = {supports[i] for i in candidates} & set(candidates)
+        candidates.sort(key=lambda i: (i in buried, ep.edge_gap(i, supports[i]), self.gap(ep, i, container)))
         predicate = self.demand.predicate.get((kind, container), "inside")
         for item in candidates[: self.attempts]:
             self.tries[item] += 1

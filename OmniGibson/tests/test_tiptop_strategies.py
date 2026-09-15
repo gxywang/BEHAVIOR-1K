@@ -884,3 +884,36 @@ def test_any_floor_is_recognised_as_a_floor():
     goal = [atom("ontop", "tile.n.01_1", "floor.n.01_2")]
     runner = Runner(spec, goal)
     assert runner.demand.containers == ["floor.n.01_2"]
+
+
+def test_the_top_of_a_stack_is_taken_first():
+    """23 of 38 books in sorting_books_on_shelf have another task book resting on them. An item with something
+    of the goal's own on top cannot be picked until that one moves, and trying it first wastes the attempt."""
+    boxes = {
+        "bookcase.n.01_1": box((3.0, 0, 0.8), half=(0.4, 0.2, 0.8)),
+        "comic_book.n.01_1": box((0.30, 0, 0.90), half=(0.14, 0.14, 0.014)),  # under
+        "comic_book.n.01_2": box((0.30, 0, 0.93), half=(0.14, 0.14, 0.014)),  # resting on top of _1
+    }
+    goal = [atom("inside", f"comic_book.n.01_{i}", "bookcase.n.01_1") for i in (1, 2)]
+
+    class Stacked(FakeEpisode):
+        def support_of(self, item):
+            return "comic_book.n.01_1" if item == "comic_book.n.01_2" else self.floor
+
+    ep = Stacked(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_books_on_shelf", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks, "it should try something"
+    assert picks[0] == "comic_book.n.01_2", f"the top of the stack comes first, got {picks}"
+
+
+def test_nothing_changes_when_no_item_rests_on_another():
+    boxes = {
+        "ashcan.n.01_1": box((3.0, 0, 0.15), half=(0.15, 0.15, 0.15)),
+        "battery.n.02_1": box((0.4, 0, 0.77)),
+        "battery.n.02_2": box((0.6, 0, 0.77)),
+    }
+    goal = [atom("inside", f"battery.n.02_{i}", "ashcan.n.01_1") for i in (1, 2)]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("dispose_of_batteries", goal).run(ep)
+    assert [c[1] for c in ep.calls if c[0] == "pick"], "the ordinary case still runs"
