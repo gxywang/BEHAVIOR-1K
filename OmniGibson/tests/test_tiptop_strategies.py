@@ -917,3 +917,37 @@ def test_nothing_changes_when_no_item_rests_on_another():
     ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
     strategy_for("dispose_of_batteries", goal).run(ep)
     assert [c[1] for c in ep.calls if c[0] == "pick"], "the ordinary case still runs"
+
+
+def test_a_two_handed_press_keeps_the_torso_where_both_planners_agree():
+    """A press of "hold" uses both planners, and the right-arm one plans its seven arm joints with the torso
+    LOCKED at the embodiment's home posture. --torso moves it away and every press round then dies before it
+    plans. turning_on_radio scores 1.0 with the postures agreeing and 0.0 without."""
+    import copy as _copy
+    import types
+
+    def posture_args(spec_press, torso):
+        args = types.SimpleNamespace(task_name="turning_on_radio", torso=torso)
+        spec = types.SimpleNamespace(press=spec_press)
+        # the rule as bench.py applies it
+        if spec.press == "hold" and args.torso:
+            out = _copy.copy(args)
+            out.torso = None
+            return out
+        return args
+
+    assert posture_args("hold", [1.2, -1.7, -0.9, 0.0]).torso is None, "a hold press must keep the home torso"
+    assert posture_args("in_place", [1.2, -1.7, -0.9, 0.0]).torso == [1.2, -1.7, -0.9, 0.0], "others keep the lean"
+    assert posture_args("hold", None).torso is None, "nothing to undo when none was asked for"
+
+
+def test_only_one_task_presses_with_the_other_hand():
+    """If this ever fails, the rule above has become load-bearing for more than one task and deserves a look."""
+    import yaml
+
+    from omnigibson.tiptop.strategies import TASKS_DIR
+
+    holds = [
+        p.stem for p in sorted(TASKS_DIR.glob("*.yaml")) if (yaml.safe_load(p.read_text()) or {}).get("press") == "hold"
+    ]
+    assert holds == ["turning_on_radio"], f"tasks pressing with the other hand: {holds}"

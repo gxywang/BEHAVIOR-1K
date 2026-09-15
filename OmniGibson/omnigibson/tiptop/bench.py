@@ -14,6 +14,7 @@ not a challenge score.
 """
 
 import argparse
+import copy
 import json
 import logging
 import re
@@ -687,7 +688,21 @@ def main(argv=None) -> None:
             episode, reason = None, None
             try:
                 sim.video_caption = f"{args.task_name} instance {instance_id}"
-                apply_embodiment_posture(sim, args, metadata["embodiment"])
+                # A task whose press is "hold" uses BOTH planners, and the right-arm one plans its seven arm
+                # joints with the torso LOCKED at the embodiment's home posture. --torso moves the torso away
+                # from there, so every press round dies before it plans: "r1pro_right locks torso_joint3 at
+                # -0.470 rad but the simulator has it at -0.900". turning_on_radio is the only task in the set
+                # that presses this way, and it scores 1.0 with the postures agreeing against 0.0 without
+                # (2026-09-15) -- the lean is worth nothing if the hand that presses can never be planned.
+                posture_args = args
+                if getattr(getattr(strategy, "spec", None), "press", None) == "hold" and getattr(args, "torso", None):
+                    posture_args = copy.copy(args)
+                    posture_args.torso = None
+                    log.info(
+                        f"{args.task_name} presses with the other hand, whose planner locks the torso at its home "
+                        f"posture; ignoring --torso {list(args.torso)} so both planners agree"
+                    )
+                apply_embodiment_posture(sim, posture_args, metadata["embodiment"])
                 sim.mark_goal_initial()
                 episode = Episode(sim, args, planners, knowledge, inst_dir, spec=getattr(strategy, "spec", None))
                 strategy.run(episode)
