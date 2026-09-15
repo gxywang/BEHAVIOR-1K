@@ -669,7 +669,7 @@ def test_the_base_is_tested_against_geometry_not_a_bounding_box():
     class _Stub:
         _base_cells = {}
 
-        def base_height_cells(self, obj):
+        def robot_height_cells(self, obj):
             return self._base_cells.get(obj)
 
         base_meets = R1ProSim.base_meets
@@ -677,9 +677,9 @@ def test_the_base_is_tested_against_geometry_not_a_bounding_box():
     stub = _Stub()
     rect_lo, rect_hi = np.array([-0.39, -0.34]), np.array([0.23, 0.34])
 
-    # nothing at base height: the base passes under it, whatever the box says
-    stub._base_cells["coffee_table"] = set()
-    assert not stub.base_meets("coffee_table", (0.0, 0.0), 0.0, rect_lo, rect_hi)
+    # empty at every height the robot occupies -- the notch of an L -- so the box is overstating it
+    stub._base_cells["desk_notch"] = set()
+    assert not stub.base_meets("desk_notch", (0.0, 0.0), 0.0, rect_lo, rect_hi)
 
     # a leg inside the rectangle: a real meeting
     leg = (int(0.1 / FOOTPRINT_CELL), int(0.1 / FOOTPRINT_CELL))
@@ -729,6 +729,26 @@ def test_a_table_top_above_the_base_is_still_air_underneath():
 
     top = _box_mesh((0.0, 0.0, 0.70), (1.60, 0.80, 0.74))
     assert footprint_cells(top, 0.02, 0.35) == set(), "nothing of the top is in the slab"
+
+
+def test_the_slab_the_stance_search_uses_reaches_the_whole_robot_not_just_the_wheels():
+    """A table top is air at wheel height and solid where the arms are, so the slab has to include the arms.
+
+    Run with the slab set to the base's own height (0.04-0.41 m), tidying_living_room parked the robot under the
+    coffee table at 0.25-0.60 m, the arm could not fold for travel, never came back to ready, and ended up in
+    front of the head camera: every look returned an empty mask and the task went 0.250 -> 0.000 (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.r1pro import R1ProSim, footprint_cells
+
+    top = _box_mesh((0.0, 0.0, 0.45), (1.20, 0.60, 0.49))  # a table top clear above the base, nothing below it
+    assert footprint_cells(top, 0.04, 0.41) == set(), "at wheel height a table top is air -- that part was right"
+    assert footprint_cells(top, 0.04, 1.6), "at arm height it is solid, and that is what the stance search must see"
+
+    body = inspect.getsource(R1ProSim.robot_height_cells).split('"""')[-1]
+    assert "ROBOT_HEIGHT" in body, "the slab must run to the top of the robot"
+    assert "hi_b" not in body, "and must not stop at the top of the base"
 
 
 def test_a_thing_lying_flat_on_the_floor_is_found():

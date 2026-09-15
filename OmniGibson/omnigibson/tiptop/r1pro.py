@@ -1224,19 +1224,27 @@ class R1ProSim(TiptopSim):
         the collision meshes on every access, ~50 ms for a house scene), to reuse across footprint checks."""
         return [(o, *[v.cpu().numpy() for v in o.aabb]) for o in self.env.scene.objects if o is not self.robot]
 
-    def base_height_cells(self, obj) -> set | None:
-        """Which ``FOOTPRINT_CELL`` squares of floor this object actually occupies at the height the BASE sweeps.
+    def robot_height_cells(self, obj) -> set | None:
+        """Which ``FOOTPRINT_CELL`` squares of floor this object occupies anywhere the ROBOT is, floor to head.
 
-        A bounding box is not the object. A desk is legs and a top, and at the height the robot's base occupies
-        there is almost nothing in between -- measured in picking_up_toys' scene, where the desk that turned the
-        robot away has a 1.83 m2 box footprint and 0.08 m2 of solid geometry in that slab, 96% air; the breakfast
-        table and the coffee table are 100% air, so the base could roll clean underneath them. Testing the base
-        against the box refuses positions where there is nothing at all, which is why every task whose objects sit
-        on a desk failed with "no base pose ... overlaps desk" before a single round ran (2026-09-14).
+        A bounding box is not the object. A box drawn round an L-shaped desk covers the notch the robot can stand
+        in, and refusing that notch is what made every task whose objects sit on a desk fail with "no base pose
+        ... overlaps desk" before a single round ran (2026-09-14).
 
-        It is NOT true of everything: a bed is 59-62% air, so this has to come from each object's own geometry
-        rather than a rule about tables. Returns None when the object has no mesh, and the caller then keeps the
-        box's word.
+        The slab was once the base's own height, on the reasoning that a coffee table is all air where the wheels
+        go, so the base could roll underneath it. The wheels can; the robot cannot. Above the base sit the torso
+        and the arms, and a tabletop at 0.40 m is exactly where they are. Run that way, tidying_living_room parked
+        the robot under the coffee table at 0.25-0.60 m: the arm could no longer fold for travel (18 blocked ramps
+        against 0 before), never returned to the ready posture, came to rest in front of the head camera, and
+        every look at the notebook returned an empty mask. 0.250 -> 0.000 (2026-09-15). The commit that made the
+        slab the base's own height said in its own message that it was "a regression risk for tasks that currently
+        work by standing close to furniture", and was merged without a run; this is that risk arriving.
+
+        So the slab runs from the base's underside to the top of the robot. What that still buys over the box is
+        every gap empty at EVERY height -- the notch of an L, the hollow inside a horseshoe of furniture -- which
+        is the half of the original measurement that was about shape rather than about height.
+
+        Returns None when the object has no mesh, and the caller then keeps the box's word.
 
         Computed once per object -- the mesh is cached and nothing moves during a stance search -- because doing
         it per candidate is what took an earlier version of this search from a median of 1.0 s to 48.8 s.
@@ -1246,22 +1254,26 @@ class R1ProSim(TiptopSim):
         cells = None
         try:
             mesh = self.scene_mesh(obj)
-            lo_b, hi_b = self.base_box()
+            lo_b, _ = self.base_box()
             floor = float(self.base_pose()[0][2])
-            cells = footprint_cells(mesh, floor + float(lo_b[2]), floor + float(hi_b[2]))
+            cells = footprint_cells(mesh, floor + float(lo_b[2]), floor + ROBOT_HEIGHT)
         except Exception as why:  # noqa: BLE001 - no mesh, or an unreadable one: the box stands
-            log.debug(f"no base-height geometry for {obj.name} ({type(why).__name__}); keeping its box")
+            log.debug(f"no robot-height geometry for {obj.name} ({type(why).__name__}); keeping its box")
             cells = None
         self._base_cells[obj.name] = cells
         return cells
 
     def base_meets(self, obj, centre, yaw, rect_lo, rect_hi) -> bool:
-        """Whether the base's rectangle actually meets ``obj``, rather than merely meeting its bounding box."""
-        cells = self.base_height_cells(obj)
+        """Whether the robot standing here actually meets ``obj``, rather than merely meeting its bounding box.
+
+        The rectangle is the base's, because that is the widest the robot gets; the heights tested are the
+        whole robot's (``robot_height_cells``), because the torso and arms ride above the wheels.
+        """
+        cells = self.robot_height_cells(obj)
         if cells is None:
             return True  # nothing better to go on than the box, which the caller has already found overlapping
         if not cells:
-            return False  # the object has no geometry at all in the slab the base sweeps: it passes under it
+            return False  # no geometry anywhere in the robot's height: this part of the box is empty air
         cx, cy = float(centre[0]), float(centre[1])
         c, sn = math.cos(float(yaw)), math.sin(float(yaw))
         reach = float(max(abs(rect_lo[0]), abs(rect_hi[0]), abs(rect_lo[1]), abs(rect_hi[1]))) + FOOTPRINT_CELL
