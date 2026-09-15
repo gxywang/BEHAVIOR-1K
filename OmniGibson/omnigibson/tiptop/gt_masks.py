@@ -18,6 +18,11 @@ from omnigibson.tiptop.protocol import depth_to_points
 # largest triangle, so a few huge faces (a table top) would otherwise pair every point with every triangle.
 MAX_TRIANGLE_EDGE = 0.03
 
+# A view's pose for an object counts as different from the capture's only past these: below them the mask would not
+# move by a pixel, and an object sitting still still jitters by microns between renders.
+MOVED_M = 0.001
+MOVED_RAD = 0.002  # about a tenth of a degree
+
 
 def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
     """The capture's meshes moved to where each object was when one view was rendered.
@@ -55,7 +60,11 @@ def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
                 f"is object_pose_mats_at_render, not the capture's object_poses_world)"
             )
         motion = seen @ np.linalg.inv(built)
-        if np.allclose(motion, np.eye(4), atol=1e-6):
+        # A resting object jitters by a few microns between renders, which is not worth copying a mesh over (and
+        # reads as a spurious "it moved" in the log). Only a motion that could actually shift a mask counts.
+        shift = float(np.linalg.norm(motion[:3, 3]))
+        turn = float(np.arccos(np.clip((np.trace(motion[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
+        if shift < MOVED_M and turn < MOVED_RAD:
             out[label] = mesh
             continue
         moved = mesh.copy()
@@ -64,7 +73,7 @@ def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
         out[label] = moved
         if log is not None:
             log.info(
-                f"{label} was {100 * float(np.linalg.norm(motion[:3, 3])):.1f} cm from where the capture's mesh "
+                f"{label} was {100 * shift:.1f} cm and {np.degrees(turn):.0f} deg from where the capture's mesh "
                 f"puts it when this view rendered; masking it where the view saw it"
             )
     return out
