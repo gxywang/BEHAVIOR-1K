@@ -3570,8 +3570,13 @@ class R1ProSim(TiptopSim):
             # bookcase's box covers every shelf in it -- so the one grasp written for flat objects refused its own
             # approach and logged "the way down to it sweeps through bottom_cabinet..." on every attempt.
             # ``spare`` is what the caller knows the object is standing on (Episode.support_of).
+            # mesh=True, which is what every other caller uses. With mesh=False arm_hits_scene returns its
+            # BOX-level hits and returns early, before the filter that drops floors, ceilings and rugs -- which is
+            # why 48 of these refusals blamed a ceiling for being in the way of a downward reach, and 199 blamed
+            # the bookcase whose shelf the book was sitting in. A box is the wrong model for reaching INTO
+            # something; the object's real surface is the right one.
             ignore = {obj.name} | {n for n in spare if n}
-            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs, mesh=False) if n not in ignore]
+            swept = [n for n in self.path_hits_scene(arm, ik, seed, solution, aabbs=aabbs) if n not in ignore]
             if swept:
                 log.info(f"{name}: the way down to it sweeps through {swept[0]}; trying the other jaw direction")
                 continue

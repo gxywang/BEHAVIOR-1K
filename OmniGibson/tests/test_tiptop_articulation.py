@@ -435,3 +435,9 @@ def test_the_way_down_to_a_flat_object_may_pass_through_what_it_rests_on():
     body = src.split('"""')[-1]
     assert "ignore" in body and "spare" in body, "and the sweep check has to honour it"
     assert "if n != obj.name]" not in body, "the old check spared only the object itself"
+    # the CALL, not the prose -- the comment above it explains what mesh=False used to do
+    call = [ln for ln in body.split("\n") if "path_hits_scene(" in ln]
+    assert call and not any("mesh=False" in ln for ln in call), (
+        "mesh=False returns box-level hits and returns early, before the filter that drops floors and ceilings: "
+        "48 refusals blamed a ceiling for blocking a downward reach"
+    )
