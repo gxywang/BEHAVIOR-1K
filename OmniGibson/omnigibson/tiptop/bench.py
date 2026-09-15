@@ -171,6 +171,18 @@ class Episode:
         except Exception:
             return False
 
+    def is_floor(self, name: str) -> bool:
+        """Whether ``name`` is a floor -- ANY floor, not just the first one in the task's scope.
+
+        ``sim.floor_name()`` returns the first floor it finds and ``self.floor`` holds that one, so comparing a
+        goal's container against it by name breaks the moment a task names a different floor. laying_tile_floors
+        asks for tiles ontop floor.n.01_2 and crashed with "no object 'floor.n.01_2' in scene
+        office_cubicles_right", because the runner did not recognise it as a floor and went looking for a piece
+        of furniture to stand at; bringing_in_wood targets the same floor and scored 0.000 with no rounds run
+        (2026-09-15). A floor is a floor by category, not by being listed first.
+        """
+        return bool(name) and bddl_category(name) == "floor"
+
     def switched_on(self, name: str) -> bool | None:
         """Whether ``name``'s switch is on right now; None when it has no such state.
 
@@ -445,7 +457,7 @@ class Episode:
     # ---------------------------------------------------------------- localization (the knowledge source's)
     def boxes(self, *bddl_names: str) -> dict:
         """name -> {center, lo, hi} (world frame) from the knowledge source; the floor has no box."""
-        return self.knowledge.localize(*[n for n in bddl_names if n != self.floor])
+        return self.knowledge.localize(*[n for n in bddl_names if not self.is_floor(n)])
 
     def position(self, bddl: str) -> np.ndarray:
         return self.boxes(bddl)[bddl]["center"]
@@ -457,7 +469,7 @@ class Episode:
     def on_support(self, bddl: str, support: str) -> bool:
         """Whether the object stands on the support, by geometry: its centre inside the support's footprint and
         its bottom within 15 cm above the top."""
-        if support == self.floor:
+        if self.is_floor(support):
             return True
         boxes = self.boxes(bddl, support)
         return placed_over(boxes[bddl], boxes[support], from_bottom=False)
@@ -466,7 +478,7 @@ class Episode:
         """Whether the item ended on or in the target, by geometry: its centre inside the target's footprint and
         its bottom anywhere from 2 cm under the target's bottom (inside a container) to 15 cm above its top (on a
         surface). Onto the floor: the hand let go of it."""
-        if target == self.floor:
+        if self.is_floor(target):
             return not self.holding(item)
         boxes = self.boxes(item, target)
         return placed_over(boxes[item], boxes[target], from_bottom=True)
@@ -474,7 +486,7 @@ class Episode:
     def support_of(self, bddl: str) -> str:
         """The BDDL name of the task object the item stands on (the highest one whose footprint holds it, any
         category), else the task's floor."""
-        names = [n for n in self.sim.task_scope() if n not in (bddl, self.floor) and bddl_category(n) != "agent"]
+        names = [n for n in self.sim.task_scope() if n != bddl and not self.is_floor(n) and bddl_category(n) != "agent"]
         boxes = self.boxes(bddl, *names)
         under = [n for n in names if placed_over(boxes[bddl], boxes[n], from_bottom=False)]
         if not under:
@@ -483,13 +495,13 @@ class Episode:
 
     def near_floor(self, name: str) -> bool:
         """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor."""
-        if name == self.floor:
+        if self.is_floor(name):
             return True
         return float(self.boxes(name)[name]["lo"][2]) < FLOOR_LEVEL
 
     def edge_gap(self, item: str, support: str) -> float:
         """How far the item's centre is from the nearest edge of the support's footprint (small: reachable)."""
-        if support == self.floor:
+        if self.is_floor(support):
             return 0.0
         boxes = self.boxes(item, support)
         lo, hi, c = boxes[support]["lo"], boxes[support]["hi"], boxes[item]["center"]

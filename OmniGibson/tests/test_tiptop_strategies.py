@@ -38,6 +38,10 @@ class FakeEpisode:
         self.calls = []
         self.shut, self.opens_ok = set(shut), opens_ok
 
+    def is_floor(self, name):
+        """Any floor is a floor, not only the one the scope happened to list first (Episode.is_floor)."""
+        return bool(name) and str(name).startswith("floor.")
+
     # articulated containers
     def is_shut(self, name):
         return name in self.shut
@@ -105,12 +109,12 @@ class FakeEpisode:
     def on_support(self, item, support):
         from omnigibson.tiptop.bench import placed_over
 
-        return support == self.floor or placed_over(self.boxes[item], self.boxes[support], from_bottom=False)
+        return self.is_floor(support) or placed_over(self.boxes[item], self.boxes[support], from_bottom=False)
 
     def placed(self, item, target):
         from omnigibson.tiptop.bench import placed_over
 
-        if target == self.floor:
+        if self.is_floor(target):
             return not self.holding(item)
         return placed_over(self.boxes[item], self.boxes[target], from_bottom=True)
 
@@ -659,3 +663,25 @@ def test_a_switch_already_where_the_goal_wants_it_is_not_pressed():
     assert not hasattr(blind, "switched_on")
     Runner(spec, goal).run(blind)
     assert blind.pressed == ["modem.n.01_1"]
+
+
+def test_any_floor_is_recognised_as_a_floor():
+    """A goal may name a floor that is not the first one in the task's scope.
+
+    laying_tile_floors asks for tiles ontop floor.n.01_2 and crashed with "no object 'floor.n.01_2' in scene
+    office_cubicles_right": the runner compared the container against sim.floor_name(), which returns whichever
+    floor is listed first, decided it was not a floor, and went looking for furniture to stand at.
+    bringing_in_wood targets the same floor and scored 0.000 with no rounds run (2026-09-15).
+    """
+    ep = FakeEpisode({"tile.n.01_1": ((0, 0, 0), (0.2, 0.2, 0.02))})
+    assert ep.floor == "floor.n.01_1"
+    assert ep.is_floor("floor.n.01_1")
+    assert ep.is_floor("floor.n.01_2"), "the second floor is still a floor"
+    assert not ep.is_floor("table.n.02_1")
+    assert not ep.is_floor("")
+
+    # and the runner puts an item down on it rather than trying to stand at a piece of furniture
+    spec = TaskSpec(task="t", instruction="i", plan="transfer")
+    goal = [atom("ontop", "tile.n.01_1", "floor.n.01_2")]
+    runner = Runner(spec, goal)
+    assert runner.demand.containers == ["floor.n.01_2"]

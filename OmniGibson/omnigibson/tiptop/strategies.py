@@ -315,7 +315,7 @@ class Runner:
                 try:
                     # "on the floor" has no box to test against, so ask how low the item stands; Episode.placed
                     # reads a floor target as "the hand let go of it", which every loose item satisfies.
-                    there = ep.near_floor(item) if container == ep.floor else ep.placed(item, container)
+                    there = ep.near_floor(item) if ep.is_floor(container) else ep.placed(item, container)
                 except (KeyError, NotImplementedError):  # not localized yet: treat it as loose
                     continue
                 if not there:
@@ -379,7 +379,7 @@ class Runner:
                 return False
         if not ep.pick(item):
             return False
-        if container == ep.floor:  # "on the floor": wherever the robot stands is the floor
+        if ep.is_floor(container):  # "on the floor": wherever the robot stands is the floor
             return ep.put_down(item, ep.floor)
         try:
             ep.stand_for(container)  # carrying the item
