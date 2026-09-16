@@ -135,7 +135,6 @@ HEAD_VIEW_SETTLE_STEPS = 30  # after a yaw ramp: only the torso moved (the arms 
 # The external capture sensors, one per optics: moved onto the robot camera's pose per view (_capture_obs). The
 # robot's own cameras render rgb only (video, mirror); depth and segmentation come from these.
 SHADOW_CAMS = {"head": CAMERA_NAME, "wrist": "tiptop_wrist_cam"}
-SHADOW_CAM = SHADOW_CAMS["head"]
 # Capture posture: the ready posture with the left shoulder abducted so the arm swings out to the robot's left, out of
 # the head camera's view. In the ready posture the gripper sits in front of the table objects and hides most of them
 # (a detector then segments the gripper); probed in Rs_int: mug 3881 px instead of 2005, bowl 8523 instead of 4994,
@@ -286,12 +285,15 @@ FOOTPRINT_FACE_CELLS = 400  # a single face wider than this falls back to its co
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
-# The robot no longer folds before a teleport. What that fold cost, and why the stance search replaced it rather
-# than the fold being tuned, is written up in place_robot. Measured on 2026-09-13 by ramping to each candidate and
-# reading back the overhang past the base's own rectangle (x -0.39..0.24, y -0.34..0.34) and whether the ramp
-# finished: the working posture leaves 41.2 cm; a torso fold to -2.25 leaves 29.2 cm and never arrives; every
-# planned arm joint to zero leaves 9.5 cm and does arrive. That last one was adopted, and then measured to cost
-# 7967 of an episode's 16946 steps, which is what removed it.
+# The robot DOES fold before a teleport: place_robot calls fold_for_travel, and the way back out is
+# collision-checked (0dfdc9955). An earlier comment here said it no longer did, which was true only for the day
+# between 39023d80f removing the fold and 0dfdc9955 restoring it -- do not act on that reading. Measured on
+# 2026-09-13 by ramping to each candidate and reading back the overhang past the base's own rectangle
+# (x -0.39..0.24, y -0.34..0.34) and whether the ramp finished: the working posture leaves 41.2 cm; a torso fold
+# to -2.25 leaves 29.2 cm and never arrives; every planned arm joint to zero leaves 9.5 cm and does arrive. That
+# last one was adopted. It was then measured at 7967 of an episode's 16946 steps and removed for a day, but the
+# cost was ramping it at the CAPTURE cap of 0.6 rad/s; folding in over the robot's own base is the opposite
+# motion, runs at travel speed and costs about a quarter as much. See place_robot for the full write-up.
 FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
 # Room the stance search wants between the robot and everything it is not there to touch, and what a metre short
 # of it costs in the score. Without this the score is indifferent between standing 1 mm from a cabinet and 6 cm
@@ -355,8 +357,6 @@ GRASP_NUDGES = 3  # attempts after the first, so at most 24 mm past where the fi
 FLAT_THICKNESS = 0.06
 GRASP_COLUMN_SAMPLES = 5
 GRASP_COLUMN_INSET = 0.08  # m kept clear of the panel's top and bottom edges, so the jaw lands on the face
-GRASP_FACE_SAMPLES = 5  # rays across each direction of a face when looking for the surface to close on
-GRASP_FACE_FRACTION = 0.35  # how far across the face they spread, as a fraction of its half-extent
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
 PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
@@ -1534,58 +1534,6 @@ class R1ProSim(TiptopSim):
         )
         return out
 
-    def grasp_point_on(self, link, aim_world, approach_world, back_off: float = 0.35) -> tuple:
-        """Where a link's surface actually is along the line the hand comes in on, and how far it stands proud.
-
-        A bounding box is not a surface. store_honey's drawer link measures x[1.3301, 1.8221] and the hand aimed at
-        1.3301 as the front of the panel -- but a ray down the approach at the middle of that drawer first meets it
-        at 1.3599, so the fingertips stopped 2.6 cm short, in clear air, and the assist had nothing to hold: "the
-        fingers touch nothing at all" (2026-09-13). Whatever stands 3 cm proud of the panel sets the box and is not
-        where the hand was going.
-
-        Rays are cast over a patch of the face and the most protruding hit wins, so a handle is taken hold of when
-        the asset has one and the flat panel when it does not -- without either being named anywhere.
-
-        Returns (point, hits, proud): the world point to close on, how many rays found the link, and how far the
-        chosen point stands in front of the flattest one. Falls back to ``aim_world`` when no ray finds it.
-        """
-        mesh = self.link_trimesh_world(link)
-        aim = np.asarray(aim_world, dtype=np.float64)
-        direction = np.asarray(approach_world, dtype=np.float64)
-        direction = direction / max(float(np.linalg.norm(direction)), 1e-9)
-        if mesh is None or not len(mesh.faces):
-            return aim, 0, 0.0
-        # Two directions across the face, and how far the link reaches along each, so the patch scales to the part
-        up = np.array([0.0, 0.0, 1.0])
-        side = np.cross(direction, up)
-        if float(np.linalg.norm(side)) < 1e-6:
-            side = np.cross(direction, [1.0, 0.0, 0.0])
-        side = side / max(float(np.linalg.norm(side)), 1e-9)
-        up = np.cross(side, direction)
-        lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.aabb)
-        half = (hi - lo) / 2.0
-        reach_side = float(np.abs(half @ side)) * GRASP_FACE_FRACTION
-        reach_up = float(np.abs(half @ up)) * GRASP_FACE_FRACTION
-        best = None
-        hits = 0
-        for a in np.linspace(-reach_side, reach_side, GRASP_FACE_SAMPLES):
-            for b in np.linspace(-reach_up, reach_up, GRASP_FACE_SAMPLES):
-                start = aim + side * a + up * b - direction * back_off
-                where, _, _ = mesh.ray.intersects_location([start], [direction])
-                if not len(where):
-                    continue
-                hits += 1
-                travel = [(float((w - start) @ direction), np.asarray(w, dtype=np.float64)) for w in where]
-                travel.sort(key=lambda row: row[0])
-                # nearest along the approach, and nearest the middle of the patch when two stand equally proud
-                key = (round(travel[0][0], 3), abs(a) + abs(b))
-                if best is None or key < best[0]:
-                    best = (key, travel[0][0], travel[0][1])
-        if best is None:
-            return aim, 0, 0.0
-        aim_travel = float((aim - (aim - direction * back_off)) @ direction)
-        return best[2], hits, aim_travel - best[1]
-
     def grasp_target(self, arm: str, point, approach_dir, jaw_dir=None, press: float = GRASP_PRESS):
         """Pose for the arm IK that closes this hand on ``point``, coming in along ``approach_dir``.
 
@@ -2512,10 +2460,7 @@ class R1ProSim(TiptopSim):
         quarter as much. Coming back out IS a motion into the room, so it is collision-checked first (2026-09-14).
         """
         unfold_to = self.fold_for_travel()
-        quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
-        self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
-        self.robot.keep_still()
-        self.teleports += 1
+        self.move_base(x, y, yaw)
         self.look_target, self.look_names = None, ()  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
@@ -2557,6 +2502,30 @@ class R1ProSim(TiptopSim):
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
         self.log_teleport_contacts()
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
+
+    def move_base(self, x: float, y: float, yaw: float) -> None:
+        """Put the base at a floor pose. THE ONLY PLACE IN THE BRIDGE THAT MOVES THE BASE.
+
+        Today this teleports, which is the navigation stand-in the whole bench rests on. Everything else in
+        ``place_robot`` -- the travel fold, the overview camera, the blocked-fold retry, the unfold, the contact
+        probe -- is what ARRIVING costs and a drive needs all of it too, so a navigation stack replaces this body
+        and nothing else. The challenge's own policy contract cannot teleport at all: omnigibson/eval/r1pro.yaml
+        gives the base a HolonomicBaseJointController at motor_type velocity, capped +-0.75 m/s in x and y and
+        +-1.0 rad/s in yaw, so a stance can only ever be driven to. ``best_base_pose`` still chooses WHERE, and is
+        pose-invariant, so it survives that change untouched.
+
+        Three things a teleport gives callers for free that a drive does not, all of which are assumptions
+        somewhere else in this file rather than here:
+          * it is EXACT -- ``place_robot`` returns the requested pose, and the avoid list, ``settled_level`` and
+            ``last_level`` all read it as where the robot is. A drive arrives near, not at; those four readers
+            want the measured pose (``base_pose``) once that is true.
+          * it is INSTANT -- no steps pass, so nothing in the scene moves while the robot travels.
+          * it ALWAYS ARRIVES -- there is no "could not get there", so no caller handles one.
+        """
+        quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
+        self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
+        self.robot.keep_still()
+        self.teleports += 1
 
     def log_teleport_contacts(self) -> dict:
         """MEASUREMENT ONLY (dev/stance, 2026-09-14): what the robot is physically touching right after a teleport
