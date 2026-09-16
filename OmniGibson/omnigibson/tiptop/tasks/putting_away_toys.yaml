@@ -1,12 +1,15 @@
 # Eight toys off two floors into either toy box (one stands on the floor, one on a table): the goal is
-# "forall toy, EXISTS a toy box", so any box takes any toy and the boxes are interchangeable.
-# The runner filled whichever was nearest, which sent the dining-room toys to toy_box_2 on the table. Measured
-# over three runs (0915_045032, 0915_082053, 0915_124450), rounds aimed at each box:
-#   toy_box.n.01_1  (bottom z 0.00, on the floor)   17 of 23 executed
-#   toy_box.n.01_2  (on a table)                     0 of  7 executed  -- not one, ever
-# Naming the floor box collapses the demand onto the reachable one. It can only narrow the demand: every toy in
-# toy_box_1 satisfies the goal outright, so nothing is given up (2026-09-15).
+# "forall toy, EXISTS a toy box", so any box takes any toy.
+#
+# A `container: toy_box.n.01_1` was tried on 2026-09-15 and WITHDRAWN the same evening. The reasoning was that
+# rounds aimed at the floor box executed 17 of 23 while the table-top box managed 0 of 7, so naming the floor box
+# could only narrow the demand. That is true of the GOAL and false of the GEOMETRY: the box is 0.62 x 0.88 m with
+# its rim at z 0.46, and eight toys do not fit. The run that committed to it placed all 8 with zero planning
+# failures and still left 3 atoms open -- toy_figure_5, _7 and _8 all came to rest with their bottoms at z 0.46,
+# exactly the rim, sitting on the pile rather than in the box. 0.625 against 0.875 for the nearest-box routing.
+#
+# The two boxes exist so the toys can be SPLIT. What would actually help is filling the reachable box until it is
+# full and then using the other, which is a skill the runner does not have.
 task: putting_away_toys
 instruction: put the toys in the toy boxes
 plan: transfer
-container: toy_box.n.01_1  # the table-top box has never had a single round execute

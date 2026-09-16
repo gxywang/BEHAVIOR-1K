@@ -512,36 +512,20 @@ def test_any_container_the_goal_allows_takes_the_item():
     assert all(a[1] == "toy_box.n.01_2" for a in achieved)  # the nearer box took all three
 
 
-def test_putting_away_toys_commits_to_the_box_it_can_actually_reach():
-    """Its goal is "forall toy, EXISTS a toy box", so the boxes are interchangeable and the runner filled the
-    nearest -- which sent the dining-room toys to the box standing on a TABLE.
+def test_putting_away_toys_does_not_commit_to_one_box():
+    """A `container: toy_box.n.01_1` was tried and withdrawn on 2026-09-15.
 
-    Measured over three runs, rounds aimed at each box: toy_box_1 (on the floor) 17 of 23 executed, toy_box_2 (on
-    the table) 0 of 7 -- not one, ever. Naming the floor box can only narrow the demand, since every toy in
-    toy_box_1 satisfies the goal outright (2026-09-15).
+    Rounds aimed at the floor box executed 17 of 23 while the table-top box managed 0 of 7, so naming the floor
+    box looked like it could only narrow the demand. True of the GOAL, false of the GEOMETRY: the box is
+    0.62 x 0.88 m with its rim at z 0.46 and eight toys do not fit. The committed run placed all 8 with zero
+    planning failures and still left 3 atoms open -- toy_figure_5, _7 and _8 all resting with their bottoms at
+    z 0.46, exactly the rim. 0.625 against 0.875 for the nearest-box routing.
     """
-    from omnigibson.tiptop.strategies import TASKS_DIR
+    from omnigibson.tiptop.strategies import TASKS_DIR, TaskSpec
 
     spec = TaskSpec.load(TASKS_DIR / "putting_away_toys.yaml")
-    assert spec.container == "toy_box.n.01_1"
-
-    boxes = {
-        "toy_box.n.01_1": box((4.0, 0, 0.2), half=(0.3, 0.3, 0.2)),
-        "toy_box.n.01_2": box((1.0, 0, 0.2), half=(0.3, 0.3, 0.2)),  # nearer, and the one to avoid
-    }
-    toys = [f"toy_figure.n.01_{i}" for i in (1, 2)]
-    for i, toy in enumerate(toys):
-        boxes[toy] = box((0.2 * i, 0.5, 0.05))
-    options = [
-        [atom("inside", toy, target) for toy, target in zip(toys, choice)]
-        for choice in itertools.product(["toy_box.n.01_1", "toy_box.n.01_2"], repeat=2)
-    ]
-    ep = FakeEpisode(boxes, pick_ok=set(toys), place_ok=set(toys))
-    Runner(spec, options[0], options=options).run(ep)
-    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
-    assert achieved, "the toys still have to be moved"
-    assert all(a[1] == "toy_box.n.01_1" for a in achieved), (
-        f"every toy goes to the reachable box, got {sorted({a[1] for a in achieved})}"
+    assert not spec.container, (
+        "the two boxes exist so the toys can be SPLIT; one box does not hold eight of them"
     )
 
 
