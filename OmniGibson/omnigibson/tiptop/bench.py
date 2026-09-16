@@ -133,7 +133,7 @@ class Episode:
     to do next); and judges each round without asking the simulator whether it worked: ``holding`` is the robot's
     own hand record (a plan closed the hand and the fingers stopped on something), a placement is a geometric test
     on where the knowledge source localizes the objects (``placed``: the item's box over the target's), a press
-    counts once its planned stroke ran. Positions, distances and supports (``on_support``, ``support_of``,
+    counts once its planned stroke ran. Positions, distances and supports (``support_of``,
     ``edge_gap``) come from the same localization, which the oracle source reads from the simulator and the onboard
     source from the planner's reports. ``pick``, ``achieve`` and ``put_down`` run the rounds under the one retry
     policy every task gets (``--rounds``); there is no other recovery, in here or in a task description."""
@@ -207,15 +207,6 @@ class Episode:
         if not result.get("opened"):
             log.info(f"{name} did not open: {result.get('why') or 'the joint did not move'}")
         return bool(result.get("opened"))
-
-    def openable(self, name: str) -> bool:
-        """Whether ``name`` has a joint that opens at all (a bin and a basket do not)."""
-        from omnigibson.tiptop.articulation import openable_joints
-
-        try:
-            return bool(openable_joints(self.sim.scene_object(name)))
-        except Exception:
-            return False
 
     def is_floor(self, name: str) -> bool:
         """Whether ``name`` is a floor -- ANY floor, not just the first one in the task's scope.
@@ -624,14 +615,6 @@ class Episode:
     def distance(self, a: str, b: str) -> float:
         boxes = self.boxes(a, b)
         return float(np.linalg.norm(boxes[a]["center"][:2] - boxes[b]["center"][:2]))
-
-    def on_support(self, bddl: str, support: str) -> bool:
-        """Whether the object stands on the support, by geometry: its centre inside the support's footprint and
-        its bottom within 15 cm above the top."""
-        if self.is_floor(support):
-            return True
-        boxes = self.boxes(bddl, support)
-        return placed_over(boxes[bddl], boxes[support], from_bottom=False)
 
     def placed(self, item: str, target: str) -> bool:
         """Whether the item ended on or in the target, by geometry: its centre inside the target's footprint and

@@ -653,7 +653,6 @@ def test_the_episode_judges_rounds_without_the_simulator():
         }
     )
     assert ep.support_of("candle.n.01_1") == "table.n.02_1"
-    assert ep.on_support("candle.n.01_1", "table.n.02_1")
     assert ep.near_floor("basket.n.01_1") and not ep.near_floor("table.n.02_1")
     assert not ep.placed("candle.n.01_1", "basket.n.01_1")
     ep.knowledge.boxes["candle.n.01_1"] = box((1.02, 0, 0.05))
