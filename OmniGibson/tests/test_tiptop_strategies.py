@@ -1151,3 +1151,10 @@ def test_a_toppled_base_is_stood_back_up_rather_than_worked_from():
     assert "Unreachable" in body[body.index("TOPPLED_DEG"):], "and reported as unreachable, not worked from"
     assert "place_robot" in body[body.index("TOPPLED_DEG"):], "and the robot stood back where it came from"
     assert "going on from here" in body, "a workable tilt still carries on, as it always has"
+
+    # ...and the check has to happen on the way IN as well. clean_up_your_desk topples on its FIRST teleport and
+    # the next search raises Unreachable before the attempt loop is exhausted, so the exit path never runs and the
+    # robot stays on its back for the rest of the episode -- 24 failed stance searches, zero rounds.
+    entry = body[: body.index("for attempt in range")]
+    assert "TOPPLED_DEG" in entry, "a robot already toppled cannot search: stand it up before trying"
+    assert "last_level" in body, "and the pose to return to is the last one that settled level"

@@ -285,6 +285,25 @@ class Episode:
             was = (float(was_pos[0]), float(was_pos[1]), float(T.quat2euler(was_quat)[2]))
         except Exception:  # noqa: BLE001 - no simulator (the strategy tests): nothing to stand back at
             was = None
+        # A topple poisons everything after it, not just the round it happened in. base_box and every footprint
+        # test are computed in the BASE FRAME, so once the robot is on its back no stance is ever free: 
+        # clean_up_your_desk topples on its first teleport at 179.3 deg and then fails all 24 of its stance
+        # searches and runs zero rounds. The exit below only stands it up after STANCE_ATTEMPTS are exhausted, and
+        # this task never gets that far -- the next search raises Unreachable first. So check on the way IN too,
+        # and put it back at the last pose that was known level (2026-09-15).
+        upright = self.last_level if getattr(self, "last_level", None) else was
+        if upright is not None:
+            level_now, why_now = self.sim.settled_level(float(was[0]), float(was[1])) if was else (True, "")
+            tilt_now = float(re.search(r"([\d.]+) deg off level", why_now).group(1)) if why_now and "deg off level" in why_now else 0.0
+            if not level_now and tilt_now >= TOPPLED_DEG:
+                log.warning(
+                    f"the base is {tilt_now:.0f} deg off level before the search even starts; standing it back at "
+                    f"({upright[0]:.2f}, {upright[1]:.2f}) -- every footprint test is computed in the base frame"
+                )
+                try:
+                    self.sim.place_robot(upright[0], upright[1], upright[2], note="upright again before searching")
+                except Exception as why_up:  # noqa: BLE001 - best effort; the search still runs
+                    log.info(f"could not stand it back up ({type(why_up).__name__}: {why_up})")
         for attempt in range(STANCE_ATTEMPTS):
             try:
                 pose = self.sim.place_robot_for(*names, avoid=avoid)
@@ -302,6 +321,7 @@ class Episode:
                 {"stand_for": list(names), "pose": pose, "step": self.sim.n_steps, "level": level, "why": why}
             )
             if level:
+                self.last_level = (float(pose["x"]), float(pose["y"]), float(pose["yaw"]))
                 return pose
             log.warning(
                 f"{why} at ({pose['x']:.2f}, {pose['y']:.2f}): the pose is occupied by something the footprint "
