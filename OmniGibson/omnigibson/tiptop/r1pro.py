@@ -2460,10 +2460,7 @@ class R1ProSim(TiptopSim):
         quarter as much. Coming back out IS a motion into the room, so it is collision-checked first (2026-09-14).
         """
         unfold_to = self.fold_for_travel()
-        quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
-        self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
-        self.robot.keep_still()
-        self.teleports += 1
+        self.move_base(x, y, yaw)
         self.look_target, self.look_names = None, ()  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
@@ -2505,6 +2502,30 @@ class R1ProSim(TiptopSim):
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
         self.log_teleport_contacts()
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
+
+    def move_base(self, x: float, y: float, yaw: float) -> None:
+        """Put the base at a floor pose. THE ONLY PLACE IN THE BRIDGE THAT MOVES THE BASE.
+
+        Today this teleports, which is the navigation stand-in the whole bench rests on. Everything else in
+        ``place_robot`` -- the travel fold, the overview camera, the blocked-fold retry, the unfold, the contact
+        probe -- is what ARRIVING costs and a drive needs all of it too, so a navigation stack replaces this body
+        and nothing else. The challenge's own policy contract cannot teleport at all: omnigibson/eval/r1pro.yaml
+        gives the base a HolonomicBaseJointController at motor_type velocity, capped +-0.75 m/s in x and y and
+        +-1.0 rad/s in yaw, so a stance can only ever be driven to. ``best_base_pose`` still chooses WHERE, and is
+        pose-invariant, so it survives that change untouched.
+
+        Three things a teleport gives callers for free that a drive does not, all of which are assumptions
+        somewhere else in this file rather than here:
+          * it is EXACT -- ``place_robot`` returns the requested pose, and the avoid list, ``settled_level`` and
+            ``last_level`` all read it as where the robot is. A drive arrives near, not at; those four readers
+            want the measured pose (``base_pose``) once that is true.
+          * it is INSTANT -- no steps pass, so nothing in the scene moves while the robot travels.
+          * it ALWAYS ARRIVES -- there is no "could not get there", so no caller handles one.
+        """
+        quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
+        self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
+        self.robot.keep_still()
+        self.teleports += 1
 
     def log_teleport_contacts(self) -> dict:
         """MEASUREMENT ONLY (dev/stance, 2026-09-14): what the robot is physically touching right after a teleport
