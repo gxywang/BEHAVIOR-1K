@@ -1129,3 +1129,25 @@ def test_a_round_that_finds_nothing_horizontal_asks_again_with_the_floor_in_view
     assert guard, "the retry has to test the round's own error"
     assert "not floor" in guard[0], "and only fire when the floor was NOT already in view"
     assert body.index("plan_and_execute") < body.index(guard[0].strip()), "the retry follows a round"
+
+
+def test_a_toppled_base_is_stood_back_up_rather_than_worked_from():
+    """A pose that intersects furniture is resolved by the physics lifting and rolling the whole robot. A small
+    tilt is workable and the runner has always carried on from one -- 66 of 151 settles across every run are
+    under 5 deg off level, and 43 more under 15. But 23 are 45 deg or worse and 12 of those are 120+, which is
+    the robot on its back.
+
+    clean_up_your_desk settles at 178.6 deg and then runs ZERO rounds, in every run it has ever had, because
+    every field of a request is expressed in a base frame that is upside down (2026-09-15).
+    """
+    import inspect
+
+    from omnigibson.tiptop.bench import TOPPLED_DEG, Episode
+
+    assert 15 < TOPPLED_DEG < 90, f"the threshold has to separate a workable tilt from a topple, got {TOPPLED_DEG}"
+
+    body = inspect.getsource(Episode.stand_for).split('"""')[-1]
+    assert "TOPPLED_DEG" in body, "the topple case has to be distinguished from a workable tilt"
+    assert "Unreachable" in body[body.index("TOPPLED_DEG"):], "and reported as unreachable, not worked from"
+    assert "place_robot" in body[body.index("TOPPLED_DEG"):], "and the robot stood back where it came from"
+    assert "going on from here" in body, "a workable tilt still carries on, as it always has"

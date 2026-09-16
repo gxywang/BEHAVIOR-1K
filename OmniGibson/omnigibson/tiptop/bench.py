@@ -44,6 +44,7 @@ from omnigibson.tiptop.run import (
 log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
+TOPPLED_DEG = 45.0  # at or past this the base is not tilted, it is toppled: 23 of 151 settles, 12 of them 120+
 STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
 BLIND_LIMIT = 3  # DISTINCT stances a goal object must be invisible from before the runner stops trying for it
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
@@ -279,6 +280,11 @@ class Episode:
         """
         avoid = self.stood.setdefault(names, [])
         self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
+        try:  # where the robot stood before the search, which it was working from
+            was_pos, was_quat = self.sim.robot.get_position_orientation()
+            was = (float(was_pos[0]), float(was_pos[1]), float(T.quat2euler(was_quat)[2]))
+        except Exception:  # noqa: BLE001 - no simulator (the strategy tests): nothing to stand back at
+            was = None
         for attempt in range(STANCE_ATTEMPTS):
             try:
                 pose = self.sim.place_robot_for(*names, avoid=avoid)
@@ -303,9 +309,29 @@ class Episode:
                 + (
                     f"; standing somewhere else ({attempt + 1}/{STANCE_ATTEMPTS})"
                     if attempt + 1 < STANCE_ATTEMPTS
-                    else "; out of attempts, working from here"
+                    else "; out of attempts"
                 )
             )
+        # Out of attempts. A small tilt is workable and the runner has always carried on from one -- measured over
+        # every run, 66 of 151 settles are under 5 deg off level and 43 more under 15. But 23 are 45 deg or worse
+        # and 12 of those are 120+, which is the robot on its back: clean_up_your_desk settles at 178.6 deg and
+        # then runs ZERO rounds, in every run it has ever had, because every field of a request is expressed in a
+        # base frame that is upside down. Standing the robot back where it came from and reporting the objects
+        # unreachable is the honest outcome; working from a toppled base is not (2026-09-15).
+        tilt = float(re.search(r"([\d.]+) deg off level", why).group(1)) if why and "deg off level" in why else 0.0
+        if tilt >= TOPPLED_DEG:
+            log.warning(
+                f"the base is {tilt:.0f} deg off level after {STANCE_ATTEMPTS} attempts; "
+                + (f"standing it back at ({was[0]:.2f}, {was[1]:.2f})" if was else "no earlier pose to return to")
+                + " rather than working from a toppled base"
+            )
+            if was is not None:
+                try:
+                    self.sim.place_robot(was[0], was[1], was[2], note="upright again after a toppled stance")
+                except Exception as why_up:  # noqa: BLE001 - the raise below is the point; this is a courtesy
+                    log.info(f"could not stand it back up ({type(why_up).__name__}: {why_up})")
+            raise Unreachable(f"no pose for {list(names)} leaves the base level (last was {tilt:.0f} deg off)")
+        log.info(f"out of attempts at {tilt:.0f} deg off level, which is workable; going on from here")
         return pose
 
     def has_arm(self, arm: str) -> bool:
