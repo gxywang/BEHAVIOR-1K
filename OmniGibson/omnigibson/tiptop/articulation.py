@@ -16,6 +16,12 @@ import math
 
 import numpy as np
 
+# One quaternion-to-matrix in the tree. This module had a hand-rolled copy; it agreed with
+# kinematics.pose_matrix to 1e-15 on unit quaternions but returned a non-rotation matrix for a
+# non-unit one, where scipy's normalises. Re-exported rather than moved so r1pro.py and
+# test_tiptop_articulation.py keep importing it from here.
+from omnigibson.tiptop.kinematics import pose_matrix  # noqa: F401
+
 # OmniGibson's Open state (object_states/open_state.py) calls a joint open at 5% of its range, for both revolute
 # and prismatic joints. So the SCORED atom is cheap -- a drawer 2-3 cm out already satisfies it -- while reaching
 # INTO the container needs the full stroke. The two are different targets and the caller says which it wants.
@@ -29,19 +35,6 @@ OPEN_FRACTION_SCORED = 0.80  # measured: a short stroke does not move the drawer
 OPEN_FRACTION_REACH = 0.80  # enough of the range to put something in
 
 
-def pose_matrix(position, quat_xyzw) -> np.ndarray:
-    """A 4x4 from a position and an (x, y, z, w) quaternion."""
-    x, y, z, w = np.asarray(quat_xyzw, dtype=np.float64)
-    m = np.eye(4)
-    m[:3, :3] = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ]
-    )
-    m[:3, 3] = np.asarray(position, dtype=np.float64)
-    return m
 
 
 def rotation_about(axis, angle: float) -> np.ndarray:
