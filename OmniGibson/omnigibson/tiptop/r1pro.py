@@ -36,13 +36,37 @@ from b1k.bridge.articulation import (
     pose_matrix,
 )
 from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
+from b1k.bridge.geometry import (
+    FOOTPRINT_CELL,
+    FOOTPRINT_FACE_CELLS,
+    FRAME_MARGIN_PX,
+    HEAD_AIM_LIMIT,
+    REACH_WIDEN,
+    TRAVEL_POSE,
+    blocks_ray,
+    box_corners,
+    footprint_cells,
+    frame_objects,
+    head_aim_yaw,
+    polyline_hits_box,
+    rect_box_gap,
+    rect_hits_box,
+    sample_polyline,
+    segment_hits_box,
+    travel_fold_targets,
+    turned_joints,
+    widen_then_clip,
+)
 from b1k.bridge.protocol import (
     PLANNER_SUPPORT,
     SUPPORT_CATEGORIES,
     add_view,
     bddl_category,
+    bddl_label,
+    detector_phrase,
     face_normal_local,
     joint_ramp,
+    label_category,
     points_to_pixels,
     reach_candidates,
     via_configuration,
@@ -132,7 +156,6 @@ HEAD_VIEWS = {
 # Also true, and separate: a turned head view's masks are wrong for anything the robot is HOLDING (the torso
 # moves, the held object moves with it, the mesh does not) -- the per-view pose bug, which is someone else's.
 HEAD_AIM_VIEW = "head_aim"
-HEAD_AIM_LIMIT = 0.6  # rad the torso may turn to aim (a little past the fixed +-0.5 rad views)
 HEAD_AIM_MIN = 0.12  # rad: a smaller turn is not worth a ramp and a second render
 TURNED_HEAD_VIEWS = (HEAD_AIM_VIEW,)  # head views beyond HEAD_VIEWS: same camera, same optics, computed turn
 HEAD_VIEW_SETTLE_STEPS = 30  # after a yaw ramp: only the torso moved (the arms settle for LOOK_SETTLE_STEPS)
@@ -158,7 +181,6 @@ CAPTURE_MAX_JOINT_VEL = 0.6
 # through the room, so it is not what the capture cap is for and does not pay its price. At the capture speed a
 # fold was 91 steps each way and 47% of an episode's budget; at this speed it is about a quarter of that.
 TRAVEL_MAX_JOINT_VEL = 2.5
-TRAVEL_POSE = 0.0  # every planned <arm>_arm_joint<n> goes here for the teleport; the torso is left alone
 TRAVEL_SETTLE_STEPS = 12
 RAMP_BLOCK_TOL = 0.1  # rad: a ramped joint this far from its target is not following the ramp (blocked); logged
 RAMP_BLOCK_STEPS = 5  # consecutive steps behind that tolerance before the ramp calls it blocked and stops
@@ -254,12 +276,11 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 
 TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
 FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
-# best_base_pose projects the objects themselves into the head camera a candidate stance would have (see
-# frame_objects). The image border is taken FRAME_MARGIN_PX pixels in, so an object counted as framed has a little
-# room either side rather than touching the edge, and every pixel an object still falls outside costs
-# FRAMING_PENALTY_PX: 0.006 is FRAMING_PENALTY per radian divided by the head camera's focal length in pixels
-# (308 at 99 deg over 720), so a clipped object keeps about the weight the angle measure gave it.
-FRAME_MARGIN_PX = 12
+# best_base_pose projects the objects themselves into the head camera a candidate stance would have
+# (geometry.frame_objects, whose FRAME_MARGIN_PX takes the image border a little way in). Every pixel an
+# object still falls outside costs FRAMING_PENALTY_PX: 0.006 is FRAMING_PENALTY per radian divided by the
+# head camera's focal length in pixels (308 at 99 deg over 720), so a clipped object keeps about the weight
+# the angle measure gave it.
 FRAMING_PENALTY_PX = 0.006
 # best_base_pose: the candidate grid around the objects' centroid and the score terms (lower is better)
 RING_START, RING_STEP = 0.25, 0.05  # m, rings out to the arm's reach
@@ -283,9 +304,6 @@ HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings 
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
-REACH_WIDEN = 1.1  # m: stand this far back rather than accept a stance that does not frame the goal
-FOOTPRINT_CELL = 0.05  # m: the grid the base-height geometry of a scene object is measured on
-FOOTPRINT_FACE_CELLS = 400  # a single face wider than this falls back to its corners (footprint_cells)
 AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
@@ -364,172 +382,6 @@ GRASP_COLUMN_INSET = 0.08  # m kept clear of the panel's top and bottom edges, s
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
 
 
-def blocks_ray(eye, target, point, radius: float) -> bool:
-    """Whether ``point`` sits within ``radius`` of the segment from ``eye`` to ``target`` (all in one frame).
-
-    A point beside the line, behind the eye or past the target does not block the view of the target.
-    """
-    eye = np.asarray(eye, dtype=np.float64).reshape(3)
-    ray = np.asarray(target, dtype=np.float64).reshape(3) - eye
-    length = float(np.linalg.norm(ray))
-    if length < 1e-6:
-        return False
-    rel = np.asarray(point, dtype=np.float64).reshape(3) - eye
-    along = float(rel @ (ray / length))
-    return 0.0 < along < length and float(np.linalg.norm(rel - along * ray / length)) < radius
-
-
-def segment_hits_box(eye, target, lo, hi) -> bool:
-    """Whether the segment from ``eye`` to ``target`` passes through the axis-aligned box (slab method).
-
-    Exact for a box, and a link's box is what the camera actually sees of it -- unlike a link origin, which is a
-    point and misses a gripper whose fingers reach well past it.
-    """
-    eye = np.asarray(eye, dtype=np.float64).reshape(3)
-    ray = np.asarray(target, dtype=np.float64).reshape(3) - eye
-    lo = np.asarray(lo, dtype=np.float64).reshape(3)
-    hi = np.asarray(hi, dtype=np.float64).reshape(3)
-    near, far = 0.0, 1.0  # the segment as a fraction of ray
-    for axis in range(3):
-        if abs(ray[axis]) < 1e-12:
-            if eye[axis] < lo[axis] or eye[axis] > hi[axis]:
-                return False  # parallel to this slab and outside it
-            continue
-        t1 = (lo[axis] - eye[axis]) / ray[axis]
-        t2 = (hi[axis] - eye[axis]) / ray[axis]
-        near, far = max(near, min(t1, t2)), min(far, max(t1, t2))
-        if near > far:
-            return False
-    return True
-
-
-def polyline_hits_box(points, lo, hi, clearance: float = 0.0) -> bool:
-    """Whether a polyline (a list of points, in order) enters the axis-aligned box grown by ``clearance``.
-
-    The arm modelled as the chain through its link origins: a limb is a segment, and growing the box stands in for
-    the limb's own thickness.
-    """
-    low = np.asarray(lo, dtype=np.float64).reshape(3) - clearance
-    high = np.asarray(hi, dtype=np.float64).reshape(3) + clearance
-    return any(segment_hits_box(a, b, low, high) for a, b in zip(points, points[1:]))
-
-
-def sample_polyline(points, step: float) -> np.ndarray:
-    """Points along a polyline at no more than ``step`` apart, the corners included; (N, 3)."""
-    points = [np.asarray(p, dtype=np.float64).reshape(3) for p in points]
-    if not points:
-        return np.zeros((0, 3), dtype=np.float64)
-    out = [points[0]]
-    for a, b in zip(points, points[1:]):
-        n = max(1, int(np.ceil(float(np.linalg.norm(b - a)) / max(step, 1e-6))))
-        out += [a + (b - a) * (i / n) for i in range(1, n + 1)]
-    return np.asarray(out, dtype=np.float64)
-
-
-def rect_box_gap(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> float:
-    """How much room there is between a rectangle at ``centre`` turned by ``yaw`` and an axis-aligned box, in xy.
-
-    Positive is clearance in metres; zero or less means they overlap. ``rect_lo``/``rect_hi``: the rectangle's own
-    extent in its frame, which for the robot's base is NOT centred on the origin -- it reaches further behind the
-    base frame than in front of it. Separating-axis test over the four axes (the two world axes and the two the
-    rectangle turns to); the widest separation is the clearance, and no separation at all means overlap.
-
-    The number matters as much as the verdict. Swapping the old centred 0.36 m square for this rectangle tightens
-    the robot's rear by up to 16 cm and LOOSENS its front by 12 cm (the base reaches only 0.24 m forward), and the
-    front is the side that faces the furniture -- so with nothing in the score to want clearance, an honest shape
-    alone would just let the search stand 12 cm closer (measured over the 61 stances of runs/bench_batteries_ten).
-    """
-    c = np.asarray(centre, dtype=np.float64).reshape(2)
-    lo = np.asarray(rect_lo, dtype=np.float64).reshape(2)
-    hi = np.asarray(rect_hi, dtype=np.float64).reshape(2)
-    rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
-    rect = np.array([[x, y] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])]) @ rot.T + c
-    box_lo = np.asarray(box_lo, dtype=np.float64).reshape(-1)[:2]
-    box_hi = np.asarray(box_hi, dtype=np.float64).reshape(-1)[:2]
-    box = np.array([[x, y] for x in (box_lo[0], box_hi[0]) for y in (box_lo[1], box_hi[1])])
-    gap = -np.inf
-    for axis in (np.array([1.0, 0.0]), np.array([0.0, 1.0]), rot[:, 0], rot[:, 1]):
-        a, b = rect @ axis, box @ axis
-        gap = max(gap, float(b.min() - a.max()), float(a.min() - b.max()))
-    return gap
-
-
-def rect_hits_box(centre, yaw: float, rect_lo, rect_hi, box_lo, box_hi) -> bool:
-    """Whether a turned rectangle overlaps an axis-aligned box (``rect_box_gap`` at or below zero)."""
-    return rect_box_gap(centre, yaw, rect_lo, rect_hi, box_lo, box_hi) <= 0.0
-
-
-def box_corners(lo, hi) -> np.ndarray:
-    """The 8 corners of an axis-aligned box given as its low and high xyz, as (8, 3)."""
-    lo = np.asarray(lo, dtype=np.float64).reshape(3)
-    hi = np.asarray(hi, dtype=np.float64).reshape(3)
-    return np.array(
-        [[hi[0] if i & 1 else lo[0], hi[1] if i & 2 else lo[1], hi[2] if i & 4 else lo[2]] for i in range(8)],
-        dtype=np.float64,
-    )
-
-
-def frame_objects(
-    corners, intrinsics, base_from_cam, base_z, width, height, x, y, yaw, strict=True, margin_px=FRAME_MARGIN_PX
-):
-    """Project the objects into the head camera a stance at (``x``, ``y``, ``yaw``) would have.
-
-    The head camera is rigid with the base for a given torso posture, so its pose in the base frame
-    (``base_from_cam``, OpenCV axes, from ``R1ProSim.head_camera_in_base``) is the same wherever the robot stands:
-    putting each object's world box into the candidate's base frame and projecting through it is exactly the
-    picture the capture will take. ``corners``: one (8, 3) world box per object (``box_corners``). ``base_z``: the
-    world height of the base frame, so a world z becomes a base z.
-
-    Returns (reason to reject the stance or None, pixels an object's corners fall outside the image). A stance is
-    rejected when an object is behind the camera, or when an object small enough to fit inside the frame at that
-    distance is cut by its border -- the measured cause of a lost round is a battery projecting to row 791 of a
-    720-row head image (2026-09-12, dispose_of_batteries), and an item the planner has to grasp is worth nothing
-    half seen. An object too big to fit is only penalised by the pixels it falls outside: no stance frames a toy
-    box and the toy beside it whole, and a clipped container is worth more than no stance at all -- but that
-    exemption applies only to an object some of which is in the picture, because an object close to the camera and
-    far off its axis projects to a box bigger than the frame while landing entirely outside it. ``strict=False``
-    turns every cut into a penalty: what ``best_base_pose`` falls back to when no stance frames the objects whole.
-    """
-    fwd = np.array([math.cos(yaw), math.sin(yaw)])
-    left = np.array([-math.sin(yaw), math.cos(yaw)])
-    here = np.array([x, y], dtype=np.float64)
-    outside = 0.0
-    for box in corners:
-        rel = np.asarray(box, dtype=np.float64)[:, :2] - here
-        pts = np.stack([rel @ fwd, rel @ left, np.asarray(box, dtype=np.float64)[:, 2] - base_z], axis=-1)
-        px, z = points_to_pixels(pts, intrinsics, base_from_cam)
-        ahead = z > 0
-        if not np.any(ahead):
-            return "behind the head camera", 0.0
-        if not np.all(ahead):
-            # Part of the box is behind the camera plane. Requiring ALL of it in front is unsatisfiable for
-            # anything taller than the camera that the robot has to stand within arm's reach of: standing to open
-            # a fridge, 4310 of the 5832 candidate stances were thrown out as "behind the head camera" and the
-            # round never happened (2026-09-13). A partly-seen box is a CUT, which is what the strict pass rejects
-            # and the fallback pass merely charges for -- the same treatment as a box cut by the image edge.
-            if strict:
-                return "cut by the head camera's near plane", 0.0
-            px, z = px[ahead], z[ahead]
-        lo, hi = px.min(axis=0), px.max(axis=0)
-        low = np.array([margin_px, margin_px], dtype=np.float64)
-        high = np.array([width - 1 - margin_px, height - 1 - margin_px], dtype=np.float64)
-        cut = float(np.sum(np.maximum(0.0, low - lo) + np.maximum(0.0, hi - high)))
-        # Not one pixel of it lands in the picture. This has to be judged before the "too big to fit" exemption
-        # below, because apparent size is not physical size: an object close to the camera and far off its axis
-        # projects to a HUGE box precisely because it is nearly beside the lens, so the exemption was letting
-        # through exactly the stances that see nothing. Measured against the real head camera (fixture of
-        # bench_batteries_8): a hamburger 0.34 m ahead of the base and 0.61 m to its left -- the stance
-        # packing_meal_for_delivery actually took on 2026-09-14 -- projects to pixel (-727, 951) of a 720x720
-        # image and the strict pass ACCEPTED it, while the same object 0.15 m to the left, far better framed, was
-        # rejected. The round went out, the capture saw nothing and it died on empty masks.
-        if strict and not (np.all(lo <= high) and np.all(hi >= low)):
-            return "out of the head camera's frame altogether", 0.0
-        if strict and cut > 0.0 and np.all(hi - lo <= high - low):  # it would fit in the frame; this stance cuts it
-            return "outside the head camera's frame", 0.0
-        outside += cut
-    return None, outside
-
-
 def embodiment_meta_path(robot_type: str = ROBOT_TYPE) -> Path:
     """Generated meta file of the tiptop embodiment (tiptop submodule), the offline source of the locked posture."""
     repo = Path(og.__file__).resolve().parents[2]
@@ -565,23 +417,6 @@ def bddl_predicate_class(name: str):
         if cls.__name__.lower() == key:
             return cls
     raise ValueError(f"unknown BDDL predicate {name!r}; known: {sorted(c.__name__ for c in PREDICATE_TO_STATE)}")
-
-
-def detector_phrase(bddl_name: str) -> str:
-    """'butter_cookie.n.01_2' -> 'butter cookie', 'can__of__soda.n.01_1' -> 'can of soda' (what a detector is asked for)."""
-    return bddl_category(bddl_name).replace("__", "_").replace("_", " ")
-
-
-def label_category(bddl_name: str) -> str:
-    """'butter_cookie.n.01_2' -> 'butter_cookie', 'can__of__soda.n.01_1' -> 'can_of_soda': the category as it appears
-    in request labels (single underscores)."""
-    return detector_phrase(bddl_name).replace(" ", "_")
-
-
-def bddl_label(bddl_name: str) -> str:
-    """'butter_cookie.n.01_2' -> 'butter_cookie_2': the per-instance name used in requests and plans."""
-    category, _, index = bddl_name.rpartition("_")
-    return f"{label_category(category)}_{index}"
 
 
 def make_r1pro_env_config(
@@ -753,131 +588,6 @@ def _intrinsics(sensor, tries: int = 10) -> np.ndarray:
             log.warning(f"{sensor.name}: no camera parameters yet (render {i + 1}/{tries})")
             og.sim.render()
     return sensor.intrinsic_matrix.cpu().numpy()
-
-
-def turned_joints(planned_joints, q_arm, joint: str, delta: float) -> list[float]:
-    """``q_arm`` (the planned joints' targets, in ``planned_joints`` order) with ``joint`` moved by ``delta``: the
-    torso turned or leaned for a head view, every other joint where it is. The joint must be planned
-    (``r1pro_left`` plans the torso); a locked joint's value lives in the posture instead."""
-    planned_joints = list(planned_joints)
-    if joint not in planned_joints:
-        raise ValueError(f"{joint} is not a planned joint ({planned_joints}); a turned head view needs it")
-    if len(q_arm) != len(planned_joints):
-        raise ValueError(f"{len(q_arm)} joint targets for {len(planned_joints)} planned joints")
-    q = [float(v) for v in q_arm]
-    q[planned_joints.index(joint)] += float(delta)
-    return q
-
-
-def travel_fold_targets(q_now, planned_joints) -> list | None:
-    """``q_now`` with every ARM joint driven to ``TRAVEL_POSE`` and everything else (the torso) left alone.
-
-    The fold for travel brings the arms in over the robot's own base. It is computed in two places -- once before
-    the teleport and once after it, when the first was stopped by something at the old stance -- so it lives here
-    rather than being written twice. Returns None when there is no arm joint to fold, which is what a torso-only
-    planned set looks like.
-    """
-    folded = [float(v) for v in q_now]
-    moved = False
-    for index, joint in enumerate(planned_joints):
-        if "_arm_joint" in joint:
-            folded[index] = float(TRAVEL_POSE)
-            moved = True
-    return folded if moved else None
-
-
-def footprint_cells(mesh, z_lo: float, z_hi: float) -> set:
-    """Which ``FOOTPRINT_CELL`` squares of floor a mesh occupies between ``z_lo`` and ``z_hi``.
-
-    Read from the mesh's FACES, not its vertices. A desk leg is a box running from the floor to the underside of
-    the top: its vertices sit at z = 0 and z = 0.73 and NONE of them fall inside the slab the robot's base sweeps,
-    so a vertex test reports the leg as empty floor and the stance search happily stands the robot inside it. That
-    is what "the base slid 4 cm: the pose is occupied by something the footprint test missed" means in the logs,
-    and it cost a well-framed stance (0.22 m offset, 0.31 m clearance) on picking_up_toys on 2026-09-15 -- the
-    only stance in that round that had the goal object properly in frame.
-
-    A face counts when its own z range meets the slab at all, which is what catches a leg that passes straight
-    through. The cells are the face's xy extent, so the result is slightly generous at the edges; that is the safe
-    direction, since being generous refuses a stance and being mean puts the robot inside the furniture. Faces
-    spanning an implausible area (a floor or a merged wall) fall back to their corners rather than filling
-    thousands of cells -- those objects are filtered out before this is ever asked, and the guard is only so that
-    one odd mesh cannot cost the whole search its time.
-    """
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    faces = np.asarray(mesh.faces)
-    if not len(faces):
-        return {(int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in verts[:, :2]}
-    tri = verts[faces]  # (faces, 3, 3)
-    meets = (tri[:, :, 2].max(axis=1) >= z_lo) & (tri[:, :, 2].min(axis=1) <= z_hi)
-    cells = set()
-    for face in tri[meets]:
-        gx0, gx1 = np.floor(face[:, 0].min() / FOOTPRINT_CELL), np.floor(face[:, 0].max() / FOOTPRINT_CELL)
-        gy0, gy1 = np.floor(face[:, 1].min() / FOOTPRINT_CELL), np.floor(face[:, 1].max() / FOOTPRINT_CELL)
-        if (gx1 - gx0 + 1) * (gy1 - gy0 + 1) > FOOTPRINT_FACE_CELLS:
-            cells.update((int(np.floor(x / FOOTPRINT_CELL)), int(np.floor(y / FOOTPRINT_CELL))) for x, y in face[:, :2])
-            continue
-        for gx in range(int(gx0), int(gx1) + 1):
-            for gy in range(int(gy0), int(gy1) + 1):
-                cells.add((gx, gy))
-    return cells
-
-
-def head_aim_yaw(cam_pos_base, cam_forward_base, target_base, limit: float = HEAD_AIM_LIMIT) -> float:
-    """How far to turn the torso's yaw joint to bring ``target_base`` into the middle of the head camera's frame.
-
-    The camera's position and optical axis and the target are all in the robot base frame. The joint turns the
-    camera about the base's vertical, so only the horizontal bearing can be corrected: the answer is the angle
-    from where the camera looks now to where the target lies, wrapped to (-pi, pi] and clamped to +-``limit``.
-    Positive is to the robot's left, the same sign as ``HEAD_VIEWS["head_left"]``.
-
-    The camera's own pitch is left alone. A head camera pitched 43 degrees down (the challenge posture) still has
-    three quarters of its optical axis in the horizontal plane, which is what the bearing is taken from; a camera
-    looking straight down has no bearing to speak of and gets no turn.
-    """
-    here = np.asarray(cam_pos_base, dtype=np.float64)[:2]
-    fwd = np.asarray(cam_forward_base, dtype=np.float64)[:2]
-    to_target = np.asarray(target_base, dtype=np.float64)[:2] - here
-    if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(to_target) < 1e-6:
-        return 0.0
-    delta = math.atan2(to_target[1], to_target[0]) - math.atan2(fwd[1], fwd[0])
-    delta = (delta + math.pi) % (2 * math.pi) - math.pi
-    return float(np.clip(delta, -abs(limit), abs(limit)))
-
-
-def widen_then_clip(best, rejected, *, reach: float, frame_strict: bool, has_boxes: bool, search):
-    """What to do when no stance within ``reach`` frames the goal: stand further back before settling for less.
-
-    The free floor is not somewhere else -- it begins just outside the disc. Measured over 15,309 candidate
-    stances per object on picking_up_toys instance 301, counting stances that are free AND frame the goal whole:
-
-        object             R = 0.9   R = 1.1   R = 1.2   R = 1.5
-        jigsaw_puzzle_2          0        88       207       569
-        board_game_3             1        39        60       221
-        tennis_ball_1            0        49        91       358
-
-    The nearest free cell sits 0.70-0.89 m out with a median at 1.08-1.58 m: a desk is about 0.7 m deep, the disc
-    is 0.9 m, and the robot's own footprint eats the difference, so the reachable set and the standable set miss
-    each other by centimetres.
-
-    The order is the whole point. The caller widens to REACH_FAR only when this search RAISES, and it never
-    raised, because it always had a clipped stance to offer -- so a badly framed stance at 0.9 m always beat a
-    well framed one at 1.1 m, and picking_up_toys failed with GoalNotVisible rather than "no base pose". A
-    clipped view stays the last resort, since a stance that sees part of the goal still beats no stance.
-    """
-    if best is not None or not frame_strict:
-        return best, rejected
-    if reach < REACH_WIDEN:
-        wider, wider_rejected = search(REACH_WIDEN, True)
-        if wider is not None:
-            log.info(f"nothing frames it within {reach} m; standing further back, within {REACH_WIDEN} m")
-            return wider, wider_rejected
-        rejected = wider_rejected or rejected
-    if has_boxes:
-        log.info(
-            f"no stance frames every object whole ({dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:4])}); allowing a clipped one"
-        )
-        return search(reach, False)
-    return best, rejected
 
 
 class R1ProSim(TiptopSim):
