@@ -28,7 +28,27 @@ import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
 from b1k.bridge.protocol import bddl_category
-from b1k.bridge.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
+from b1k.bridge.judgement import (  # FLOOR_LEVEL and UNSATISFIED_SHOWN moved with the geometry and the
+    FLOOR_LEVEL,  # verdict they parameterize; both are re-exported here, where callers still read them
+    UNSATISFIED_SHOWN,  # noqa: F401
+    box_distance,
+    box_edge_gap,
+    boxes_beside,
+    highest_support,
+    on_the_floor,
+    placed_over,
+    short_atom,
+    verdict_caption,
+    what_failed,
+)
+from b1k.bridge.strategies import (
+    PLACE_PREDICATES,
+    STRATEGIES,
+    Unreachable,
+    atom,
+    atom_objects,
+    wants_home_torso,
+)
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -48,83 +68,6 @@ TOPPLED_DEG = 45.0  # at or past this the base is not tilted, it is toppled: 23 
 STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
 BLIND_LIMIT = 3  # DISTINCT stances a goal object must be invisible from before the runner stops trying for it
 EPILOGUE_STEPS = 90  # env steps the final state and the verdict stay on screen after the episode (3 s of video)
-UNSATISFIED_SHOWN = 3  # goal atoms listed in the verdict; the gift-basket goal has 16
-FLOOR_LEVEL = 0.15  # m: a target whose bottom is lower than this stands on the floor (the workspace reaches down)
-
-
-def short_atom(atom: str) -> str:
-    """'inside(bow.n.08_4, wicker_basket.n.01_3)' -> 'inside(bow_4, wicker_basket_3)'."""
-    return re.sub(r"\.n\.\d+", "", atom)
-
-
-def what_failed(result: dict) -> str:
-    """One line on why an instance fell short, from its own records: the goal atoms left unsatisfied, the objects no
-    base pose reached, the rounds that failed by kind, the rounds that ran (by predicate), releases. Empty on success."""
-    if result["success"]:
-        return ""
-    bench, goal = result["bench"], result["bench"]["goal"]
-    rounds = bench["rounds"]
-    missing = goal["unsatisfied"]
-    parts = [
-        f"{len(missing)}/{goal['total']} unsatisfied: "
-        + ", ".join(short_atom(a) for a in missing[:UNSATISFIED_SHOWN])
-        + (" ..." if len(missing) > UNSATISFIED_SHOWN else "")
-    ]
-    if bench["reason"] not in ("strategy finished", "success"):
-        parts.append(bench["reason"])
-    unreachable = Counter(
-        ", ".join(short_atom(n) for n in x["stand_for"]) for x in rounds if "stand_for" in x and "error" in x
-    )
-    if unreachable:
-        parts.append("no base pose for " + ", ".join(f"{name} x{n}" for name, n in unreachable.items()))
-    failed = Counter(
-        x["error"].split(":")[0] for x in rounds if "round" in x and "error" in x and x["error"] != "episode over"
-    )
-    if failed:
-        parts.append("failed rounds: " + ", ".join(f"{kind} x{n}" for kind, n in failed.items()))
-    ran = Counter(f"{x['atoms'][0]['predicate']} [{x['arm']}]" for x in rounds if "round" in x and "error" not in x)
-    parts.append("rounds run: " + (", ".join(f"{k} x{n}" for k, n in ran.items()) if ran else "none"))
-    releases = sum(1 for x in rounds if x.get("release"))
-    if releases:
-        parts.append(f"released an item x{releases}")
-    return "; ".join(parts)
-
-
-def verdict_caption(reason: str, success: bool, goal: dict) -> str:
-    """What the video's tail says (``goal`` as ``goal_status`` reports it): outcome, score, satisfied count, then the
-    first unsatisfied atoms, so success and failure can be told apart on screen."""
-    head = "RESULT: SUCCESS" if success else f"RESULT: FAILED ({reason})"
-    head += f"  q_score {goal['q_score']:.3g}  {len(goal['satisfied'])}/{goal['total']} satisfied"
-    missing = goal["unsatisfied"]
-    if not missing:
-        return head
-    more = f" +{len(missing) - UNSATISFIED_SHOWN} more" if len(missing) > UNSATISFIED_SHOWN else ""
-    return f"{head}\nunsatisfied: {', '.join(missing[:UNSATISFIED_SHOWN])}{more}"
-
-
-def atom_objects(atoms: list[dict]) -> list[str]:
-    """Every object an atom names, in order, without repeats -- what a capture of it has to be able to see."""
-    out = []
-    for a in atoms:
-        for name in a.get("args", ()):
-            if name not in out:
-                out.append(name)
-    return out
-
-
-def wants_home_torso(spec) -> bool:
-    """Whether this task's press needs the torso left at the planner's home posture, so --torso is ignored.
-
-    A press of "hold" uses BOTH planners, and the right-arm one plans its seven arm joints with the torso LOCKED
-    at the embodiment's home pose. --torso moves it away and every press round then dies before it plans:
-    "r1pro_right locks torso_joint3 at -0.470 rad but the simulator has it at -0.900". turning_on_radio scores
-    1.0 with the postures agreeing and 0.0 without.
-
-    ``plan`` has to be part of the test. ``TaskSpec.press`` DEFAULTS to "hold", so a rule that reads ``press``
-    alone is true of all 38 tasks, and for two hours on 2026-09-15 every pure-transfer task silently ran without
-    the lean. Only "press" and "auto" ever ask for the right-arm planner -- five tasks.
-    """
-    return getattr(spec, "plan", None) in ("press", "auto") and getattr(spec, "press", None) == "hold"
 
 
 class Episode:
@@ -449,18 +392,9 @@ class Episode:
         return True
 
     def beside(self, item: str, other: str) -> bool:
-        """OmniGibson's own NextTo measure, on the boxes the knowledge source localizes.
-
-        ``object_states/next_to.py``: the per-axis gap between the two boxes, as a norm, within a sixth of the mean
-        of their extents. The simulator's version also asks for horizontal adjacency (a raycast test that the thing
-        beside you is not behind something else); this half is the geometry, and the adjacency half is not
-        available without the simulator, so a placement that satisfies this can still fail the evaluator's test.
-        """
+        """``judgement.boxes_beside`` on the boxes the knowledge source localizes."""
         boxes = self.boxes(item, other)
-        a, b = boxes[item], boxes[other]
-        gap = np.array([max(0.0, max(a["lo"][d], b["lo"][d]) - min(a["hi"][d], b["hi"][d])) for d in range(3)])
-        extents = (np.asarray(a["hi"]) - np.asarray(a["lo"])) + (np.asarray(b["hi"]) - np.asarray(b["lo"]))
-        return bool(np.linalg.norm(gap) <= float(np.mean(extents)) / 6.0)
+        return boxes_beside(boxes[item], boxes[other])
 
     def achieve(self, atoms: list[dict], arm: str = "left", floor: bool | None = None, done=None) -> bool:
         """Up to ``--rounds`` planning rounds for ``atoms`` with the planner of ``arm``, stopping as soon as
@@ -615,7 +549,7 @@ class Episode:
 
     def distance(self, a: str, b: str) -> float:
         boxes = self.boxes(a, b)
-        return float(np.linalg.norm(boxes[a]["center"][:2] - boxes[b]["center"][:2]))
+        return box_distance(boxes[a], boxes[b])
 
     def placed(self, item: str, target: str) -> bool:
         """Whether the item ended on or in the target, by geometry: its centre inside the target's footprint and
@@ -631,10 +565,7 @@ class Episode:
         category), else the task's floor."""
         names = [n for n in self.sim.task_scope() if n != bddl and not self.is_floor(n) and bddl_category(n) != "agent"]
         boxes = self.boxes(bddl, *names)
-        under = [n for n in names if placed_over(boxes[bddl], boxes[n], from_bottom=False)]
-        if not under:
-            return self.floor
-        return max(under, key=lambda n: float(boxes[n]["hi"][2]))
+        return highest_support(boxes[bddl], {n: boxes[n] for n in names}) or self.floor
 
     def walk_to_floor(self, name: str) -> bool:
         """Teleport to somewhere on the floor ``name``, so a thing carried there can be set down on it.
@@ -677,29 +608,14 @@ class Episode:
 
     def near_floor(self, name: str) -> bool:
         """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor."""
-        if self.is_floor(name):
-            return True
-        return float(self.boxes(name)[name]["lo"][2]) < FLOOR_LEVEL
+        return True if self.is_floor(name) else on_the_floor(self.boxes(name)[name])
 
     def edge_gap(self, item: str, support: str) -> float:
         """How far the item's centre is from the nearest edge of the support's footprint (small: reachable)."""
         if self.is_floor(support):
             return 0.0
         boxes = self.boxes(item, support)
-        lo, hi, c = boxes[support]["lo"], boxes[support]["hi"], boxes[item]["center"]
-        return float(min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1]))
-
-
-def placed_over(item: dict, target: dict, from_bottom: bool) -> bool:
-    """Geometric "on" (``from_bottom`` False: the item's bottom within -2 cm .. +15 cm of the target's top) or
-    "on or in" (True: from 2 cm under the target's bottom to 15 cm over its top), with the item's centre inside
-    the target's footprint. Boxes are {center, lo, hi}."""
-    c, bottom = item["center"], float(item["lo"][2])
-    lo, hi = target["lo"], target["hi"]
-    if not (lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1]):
-        return False
-    low = float(lo[2]) - 0.02 if from_bottom else float(hi[2]) - 0.02
-    return low <= bottom <= float(hi[2]) + 0.15
+        return box_edge_gap(boxes[item], boxes[support])
 
 
 def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
