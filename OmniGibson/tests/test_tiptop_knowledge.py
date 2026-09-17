@@ -201,6 +201,29 @@ def test_onboard_knowledge_asks_for_buttons_and_carries_detections():
     assert np.allclose(known.buttons["radio_button"]["position"], [0.6, 0.1, 0.9])
 
 
+def test_onboard_knowledge_asks_for_the_task_objects_by_the_datasets_names():
+    """The request's labels stay the BDDL categories; where the dataset calls one something else the request says
+    which words to ask the detector for, and the task description's own words go over that."""
+    from b1k.bridge.strategies import TaskSpec
+
+    goal = [{"predicate": "inside", "args": ["can_of_soda.n.01_1", "ashcan.n.01_1"]}]
+    sim = _Sim(_masks(ashcan_1=20, can_of_soda_1=20))
+    spec = TaskSpec(task="picking_up_trash", instruction="put the cans in the trash can")
+    known = OnboardKnowledge(sim, goal, spec).describe(goal, _request(), {})
+    assert known.labels == ["ashcan", "can_of_soda"]
+    assert known.phrases == {"ashcan": "trash can"}, "a can of soda is a can_of_soda in the dataset: nothing to say"
+    req = known.attach(_request())
+    assert req["phrases"] == {"ashcan": "trash can"} and req["gt_labels"] == ["ashcan", "can_of_soda"]
+    assert known.summary()["phrases"] == {"ashcan": "trash can"}
+
+    spec.phrases = {"ashcan": "kitchen bin", "can_of_soda": "soda can"}
+    assert OnboardKnowledge(sim, goal, spec).describe(goal, _request(), {}).phrases == spec.phrases
+    assert "phrases" not in OnboardKnowledge(sim, goal).describe(goal, _request(), {}).attach(_request()), (
+        "no task description: the labels' own words, and the key stays off the wire"
+    )
+    assert make_knowledge("onboard", sim, goal, spec=spec).spec is spec
+
+
 def test_make_knowledge_rejects_unknown_sources():
     with pytest.raises(ValueError):
         make_knowledge("gemini", _Sim({}), [])

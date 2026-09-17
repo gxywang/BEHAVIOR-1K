@@ -785,7 +785,7 @@ def main(argv=None) -> None:
             load_task_instance(sim.env, sim.robot, instance_id, mode=args.mode)
             sim.env.reset()  # episode_steps = 0, as the evaluator does before a rollout
             sim.reset_embodiment(metadata["embodiment"])
-            knowledge = make_knowledge(args.knowledge, sim, strategy.goal)
+            knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             metrics = [AgentMetric(human), TaskMetric(human)]
             sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps)  # from here on every step counts
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")

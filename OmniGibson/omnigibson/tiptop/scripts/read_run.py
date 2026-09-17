@@ -30,11 +30,12 @@ def detected(run: Path) -> None:
     for capture in sorted(run.glob("*/r*/capture.json")):
         meta = json.loads(capture.read_text())
         asked = list(meta.get("knowledge", {}).get("labels") or [])
+        phrases = meta.get("knowledge", {}).get("phrases") or {}  # the words the detector was asked for instead
         goal = sorted({a for atom in meta.get("goal_atoms") or [] for a in atom.get("args", [])})
         goal = [g for g in goal if g in asked]  # the support plane and a button are named, never detected
         response = capture.with_name("server_response.json")
         if not response.exists():
-            rows.append((capture.parent.name, asked, goal, None, "no response saved"))
+            rows.append((capture.parent.name, asked, goal, None, "no response saved", phrases))
             continue
         resp = json.loads(response.read_text())
         found = sorted((resp.get("objects") or {}).keys())
@@ -46,12 +47,12 @@ def detected(run: Path) -> None:
             m = re.search(r"\(found: \[([^\]]*)\]\)", error)
             if m and not found:
                 found = sorted(x.strip().strip("'") for x in m.group(1).split(",") if x.strip())
-        rows.append((capture.parent.name, asked, goal, found, note))
+        rows.append((capture.parent.name, asked, goal, found, note, phrases))
     if not rows:
         return
     print("\n  what the planner's perception reported, per round (asked -> found; goal objects marked *):")
     hits = misses = 0
-    for name, asked, goal, found, note in rows:
+    for name, asked, goal, found, note, phrases in rows:
         if found is None:
             print(f"    {name:22s} asked {asked}: {note}")
             continue
@@ -60,7 +61,7 @@ def detected(run: Path) -> None:
         lost = [g for g in goal if g not in got]
         hits += not lost
         misses += bool(lost)
-        shown = ", ".join(("*" if a in goal else "") + a for a in asked)
+        shown = ", ".join(("*" if a in goal else "") + a + (f"={phrases[a]!r}" if a in phrases else "") for a in asked)
         print(f"    {name:22s} asked [{shown}] -> found {found}" + (f"   MISSING {lost}" if lost else "") + (f"  ({note})" if note else ""))
     if hits + misses:
         print(f"    goal objects all found in {hits} of {hits + misses} rounds with a response ({100 * hits / (hits + misses):.0f}%)")

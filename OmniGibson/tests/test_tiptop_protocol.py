@@ -127,11 +127,12 @@ def test_saved_observation_is_the_whole_request(tmp_path):
         held=["bowl"],
         in_hand=["mug"],
         workspace=[[0.05, -0.8, -0.05], [1.3, 0.8, 1.6]],
+        phrases={"mug": "coffee mug"},
     )
     save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
     again = request_from_observation(load_observation_h5(tmp_path / "obs.h5"))
     assert set(again) == set(req)
-    for key in ("gt_labels", "gt_atoms", "gt_buttons", "held_labels", "in_hand", "workspace_bounds", "task"):
+    for key in ("gt_labels", "gt_atoms", "gt_buttons", "held_labels", "in_hand", "workspace_bounds", "phrases", "task"):
         assert again[key] == req[key], key
     assert np.array_equal(again["gt_masks"], req["gt_masks"]) and np.array_equal(again["q_init"], req["q_init"])
 
@@ -566,10 +567,11 @@ def test_grasped_labels_come_from_the_grasp_assist_and_not_from_physical_graspin
 
 
 def test_bddl_category():
-    from omnigibson.tiptop.protocol import bddl_category
+    from omnigibson.tiptop.protocol import bddl_category, detector_phrase
 
     assert bddl_category("wicker_basket.n.01_2") == "wicker_basket"
     assert bddl_category("candle") == "candle"
+    assert detector_phrase("can__of__soda.n.01_1") == "can of soda" and detector_phrase("trash_can") == "trash can"
 
 
 def test_recording_registers_a_recorder_for_the_block_and_closes_it(tmp_path):
