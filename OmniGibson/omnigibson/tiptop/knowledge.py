@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from omnigibson.tiptop.protocol import attach_knowledge, canonical_object_name, capture_views
+from b1k.bridge.protocol import attach_knowledge, canonical_object_name, capture_views
 
 log = logging.getLogger(__name__)
 

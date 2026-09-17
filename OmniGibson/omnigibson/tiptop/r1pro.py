@@ -26,24 +26,18 @@ import torch as th
 import yaml
 from bddl.condition_evaluation import HEAD
 
-import omnigibson as og
-import omnigibson.utils.transform_utils as T
-from omnigibson.macros import gm
-from omnigibson.objects.usd_object import USDObject
-from omnigibson.tasks.behavior_task import BehaviorTask
-from omnigibson.tiptop.articulation import (
+from b1k.bridge.articulation import (
     OPEN_FRACTION_SCORED,
     follow_joint,
     handle_on,
     is_open,
     leading_direction,
-    openable_joints,
     opening_travel,
     pose_matrix,
 )
-from omnigibson.tiptop.gt_masks import masks_from_geometry, points_within_tol
-from omnigibson.tiptop.kinematics import ArmIK, link_from_camera, link_pose_for_camera, look_pose
-from omnigibson.tiptop.protocol import (
+from b1k.bridge.gt_masks import masks_from_geometry, points_within_tol
+from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
+from b1k.bridge.protocol import (
     add_view,
     bddl_category,
     face_normal_local,
@@ -52,6 +46,14 @@ from omnigibson.tiptop.protocol import (
     reach_candidates,
     via_configuration,
 )
+
+import omnigibson as og
+import omnigibson.utils.transform_utils as T
+from omnigibson.macros import gm
+from omnigibson.objects.usd_object import USDObject
+from omnigibson.tasks.behavior_task import BehaviorTask
+from omnigibson.tiptop.articulation import openable_joints
+from omnigibson.tiptop.kinematics import ArmIK
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,
     OBJECT_PRESETS,

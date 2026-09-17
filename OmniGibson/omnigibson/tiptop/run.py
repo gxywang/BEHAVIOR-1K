@@ -341,7 +341,7 @@ def log_missing_objects(sim, request: dict, extras: dict, atoms: list[dict]) -> 
     """Where each goal object was when a capture could not see it: its pixel in every view, whether that pixel is
     inside the image, and what the view's own depth says is in front of it there (nearer than the object means
     something is in the way). Read with ``rgb_failed.png``."""
-    from omnigibson.tiptop.protocol import capture_views, points_to_pixels
+    from b1k.bridge.protocol import capture_views, points_to_pixels
 
     poses = extras.get("object_poses_base") or {}
     names = {sim.tracked_label(a) for atom in atoms for a in atom["args"]}
@@ -390,7 +390,7 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bo
     import imageio
 
     from omnigibson.tiptop.knowledge import GoalNotVisible
-    from omnigibson.tiptop.protocol import capture_views, save_observation_h5
+    from b1k.bridge.protocol import capture_views, save_observation_h5
 
     request, extras = sim.capture(args.task)
     try:
@@ -449,20 +449,26 @@ def do_capture(sim, args, out_dir: Path, atoms: list[dict], knowledge, floor: bo
 
 
 def setup_logging() -> None:
-    """Give the bridge's logger its own INFO stream: OmniGibson's handler on the "omnigibson" logger hides INFO."""
-    tiptop_log = logging.getLogger("omnigibson.tiptop")
-    tiptop_log.setLevel(logging.INFO)
-    tiptop_log.propagate = False
+    """Give the bridge's logger its own INFO stream: OmniGibson's handler on the "omnigibson" logger hides INFO.
+
+    Both halves of the bridge: "omnigibson.tiptop" is what is still here, "b1k" is the policy package the rest
+    moved to (b1k.bridge.client logs the planning round). Without the second, the moved modules' INFO lines fall
+    through to the root logger and are lost.
+    """
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
-    tiptop_log.addHandler(handler)
+    for name in ("omnigibson.tiptop", "b1k"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
 
 
 def open_state_stream(hostport: str | None, sim):
     """Mirror the simulator into the server's Rerun view for the rest of the session; None if disabled."""
     if not hostport:
         return None
-    from omnigibson.tiptop.client import SimStateStream
+    from b1k.bridge.client import SimStateStream
 
     host, _, port = hostport.rpartition(":")
     stream = SimStateStream(host or "localhost", int(port) if port else 8765)
@@ -473,7 +479,7 @@ def open_state_stream(hostport: str | None, sim):
 def connect_planners(args):
     """The planning server(s) of a live run, checked against the embodiments this client executes on, before Isaac
     Sim starts: (client, its metadata, press client or None, its metadata or None)."""
-    from omnigibson.tiptop.client import TiptopClient
+    from b1k.bridge.client import TiptopClient
 
     client = TiptopClient(
         args.host,
@@ -502,7 +508,7 @@ def perception_report(request: dict, extras: dict, response: dict) -> dict:
     chance (2026-09-04: the server's "candle_2" was the simulator's candle_1, one candle over). Logged per round and
     saved with the result; a goal object without a simulated partner is the first thing to look at.
     """
-    from omnigibson.tiptop.protocol import MATCH_MAX_DIST, match_objects
+    from b1k.bridge.protocol import MATCH_MAX_DIST, match_objects
 
     perceived = response.get("objects") or {}
     simulated = {name: pose["aabb_center"] for name, pose in extras["object_poses_base"].items()}
@@ -553,7 +559,7 @@ def live_round(
     """Capture, ask the server for a plan for these atoms, save it and execute it (``score``: evaluate the task's
     goal afterwards; a benchmark scores once at the end instead, the whole goal costs 46 s on the gift-basket task;
     ``record``: write this round's own clip, ``<out_dir>/live.mp4``; a driver recording the whole run passes False)."""
-    from omnigibson.tiptop.client import TiptopPlanningError
+    from b1k.bridge.client import TiptopPlanningError
 
     request, extras = do_capture(sim, args, out_dir, atoms, knowledge, floor=floor)
     try:
@@ -620,7 +626,7 @@ def do_execute(
     reports the goal objects' poses only. ``record`` writes the execution as ``<out_dir>/<tag>.mp4`` (unless
     --no-video). ``extra`` is saved with the result."""
     from omnigibson.tiptop.executor import PlanExecutor, check_success
-    from omnigibson.tiptop.protocol import plan_summary
+    from b1k.bridge.protocol import plan_summary
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
     log.info(f"executing plan: {plan_summary(plan)}")
@@ -764,7 +770,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     import omnigibson as og
     from omnigibson.tiptop.knowledge import make_knowledge
-    from omnigibson.tiptop.protocol import load_plan_json
+    from b1k.bridge.protocol import load_plan_json
 
     exit_code = 0
     stream = None
