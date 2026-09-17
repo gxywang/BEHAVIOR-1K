@@ -855,7 +855,8 @@ def test_the_base_still_refuses_to_stand_inside_it():
     from omnigibson.tiptop import r1pro
 
     src = inspect.getsource(r1pro.R1ProSim._footprint_free)
-    loop = src.split("for obj, lo, hi in aabbs:")[1].split("if yaw is not None and self.q_home is not None")[0]
+    # the base-overlap filter: which boxes footprint_blockers is given, and what is done with the ones it names
+    loop = src.split("near = [")[1].split("if yaw is not None and self.q_home is not None")[0]
     assert "reaching" not in loop, "the base overlap loop must not spare what is being reached for"
     assert "obj in ignore" in loop, "it still honours the explicit ignore list"
 

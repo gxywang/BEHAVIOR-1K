@@ -39,10 +39,15 @@ from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_p
 from b1k.bridge.geometry import (
     FOOTPRINT_CELL,
     HEAD_AIM_LIMIT,
+    ROBOT_FOOTPRINT,
+    ROBOT_HEIGHT,
     HeadCamera,
     best_base_pose as search_base_poses,
     blocks_ray,
+    corner_off_floor,
+    footprint_blockers,
     footprint_cells,
+    footprint_corners,
     head_aim_yaw,
     polyline_hits_box,
     rect_box_gap,
@@ -57,10 +62,12 @@ from b1k.bridge.geometry import (
 from b1k.bridge.geometry import (  # noqa: F401
     AVOID_RADIUS,
     CLEAR_WEIGHT,
+    FLOOR_COVERINGS,
     FOOTPRINT_FACE_CELLS,
     FRAMING_PENALTY,
     FRAMING_PENALTY_PX,
     FRAME_MARGIN_PX,
+    HOUSE_AABB_AREA,
     HIDE_DEPTH,
     HIDE_MARGIN,
     MIN_AHEAD,
@@ -290,9 +297,6 @@ CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (tempor
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
 WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so the shadow camera matches exactly
-FLOOR_COVERINGS = ("floors", "ceilings", "paver", "carpet", "rug", "mat", "doormat", "tile")  # stood on, not avoided
-ROBOT_HEIGHT = 1.6  # m, top of the head camera with the challenge torso posture is ~1.4
-ROBOT_FOOTPRINT = 0.36  # half extent (m) used for free-space checks; base bbox is 0.64 x 0.68
 CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole.
 # Raised to 0.15 m on 2026-09-12 on the theory that a battery kept coming out of the capture with an empty mask
 # because it sat just past the frame's bottom edge, and put back: the wider margin moved the stance from 0.55 m
@@ -306,7 +310,6 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it anyway
 OBSTACLE_LIMIT = 8
 OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
-HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings and say nothing about the floor
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
@@ -995,91 +998,59 @@ class R1ProSim(TiptopSim):
     ) -> tuple[bool, str]:
         """Floor under the whole footprint, inside a room, and no object's box overlapping the base.
 
+        The geometry of all three is in ``b1k.bridge.geometry`` (``footprint_corners``, ``corner_off_floor``,
+        ``footprint_blockers``) and takes plain boxes. What is left here is what only the simulator can answer:
+        where the base and its underside actually are, which room a point is in, whether an object the base's
+        rectangle meets is solid there or is 96% air (``base_meets``), and where the arms would come to rest.
+
         ``arms``: also refuse a stance where an arm at its CURRENT posture would rest inside something (below).
         Off for an opening stance, whose arms stay folded over the base after the teleport and go from there
         to the handle by a checked path: with the working posture they would sit 0.41 m past the base, i.e.
         inside the very drawer front the stance is chosen to reach, and every stance near it was refused.
 
-        With ``yaw``, the base is tested as the rectangle it actually is, turned to face that way
-        (``base_box``/``rect_hits_box``); without one, as the ``ROBOT_FOOTPRINT`` square, which is what callers
-        that have no yaw yet get. The square is centred and yaw-independent, and the base is neither: it reaches
-        0.40 m behind the base frame and 0.24 m ahead, so a turned base puts its rear corner 0.52 m out where the
-        square guards 0.36. Measured over runs/bench_batteries_ten: **23 of the 60 stances taken overlapped a
-        piece of furniture**, up to 0.15 m into a cabinet and 0.05 m into a desk, which is what the user saw in
-        the videos as the robot standing too close and clipping the cabinet (2026-09-13).
-
         ``aabbs``: a scene_aabbs() snapshot to test against (taken here otherwise; nothing moves during a search).
         """
-        r = ROBOT_FOOTPRINT
         rect = (
             self.base_box()[:, :2] + np.array([[-FOLD_OVERHANG] * 2, [FOLD_OVERHANG] * 2]) if yaw is not None else None
         )
-        corners = [(x + sx * r, y + sy * r) for sx in (-1, 1) for sy in (-1, 1)] + [(x, y)]
-        if rect is not None:  # the floor test wants the real corners too
-            rot = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
-            corners = [
-                tuple(np.array([cx, cy]) @ rot.T + np.array([x, y]))
-                for cx in (rect[0][0], rect[1][0])
-                for cy in (rect[0][1], rect[1][1])
-            ] + [(x, y)]
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         underside = float(self.base_pose()[0][2]) + float(self.base_box()[0][2])  # world z the base clears
-        clearance = float("inf")  # the least room to any obstacle, so the score can prefer a stance with some
-        floors = [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
-        for cx, cy in corners:
-            on_floor = False
-            for lo, hi in floors:
-                if lo[0] <= cx <= hi[0] and lo[1] <= cy <= hi[1]:
-                    on_floor = True
-                    break
-            if not on_floor:
-                return False, f"no floor under ({cx:.2f}, {cy:.2f})", 0.0
+        off = corner_off_floor(
+            footprint_corners(x, y, yaw, rect), [(lo, hi) for o, lo, hi in aabbs if o.category == "floors"]
+        )
+        if off is not None:
+            return False, f"no floor under ({off[0]:.2f}, {off[1]:.2f})", 0.0
         try:
             room = self.env.scene.seg_map.get_room_instance_by_point(th.tensor([x, y]))
         except Exception:  # noqa: BLE001 - a point off the map's raster raises inside the lookup; it is a filter only
             room = "unknown"
         if room is None:
             return False, "outside every room", 0.0
-        for obj, lo, hi in aabbs:
-            if obj is self.robot or obj in ignore or obj.category in FLOOR_COVERINGS:
-                continue
-            if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
-                continue  # merged walls, roof, ceilings say nothing; the floor test handles walls
-            if lo[2] > ROBOT_HEIGHT:
-                continue  # entirely above the robot (roof, lamps)
-            if hi[2] <= underside:
-                continue  # it passes under the base: a rug, a threshold, a cable. Anything standing taller than
-                # the base's underside is an obstacle, however thin. The old test exempted everything under 8 cm
-                # lying on the floor, which is written for pavers and mats and matches the task's own objects: 7
-                # of the 8 toy figures of runs/bench_toys_7 are 0.043-0.079 m thick and were exempt in 32 to 40 of
-                # the 41 captures each, and the base ended up 28 cm inside toy_figure_6's box, riding on it at
-                # -4.5 deg of roll (2026-09-13).
-            if rect is not None:
-                gap = rect_box_gap((x, y), yaw, rect[0], rect[1], lo, hi)
-                if gap <= 0.0:
-                    # The box says they meet; ask the object itself. A desk is legs and a top, and at the height
-                    # the base sweeps it is 96% air -- a coffee table is 100% air, so the base can roll right
-                    # under it. Refusing on the box turned the robot away from every desk in the house.
-                    if not self.base_meets(obj, (x, y), yaw, rect[0], rect[1]):
-                        continue
-                    return False, f"overlaps {obj.name}", 0.0
-                clearance = min(clearance, gap)
-            elif lo[0] < x + r and hi[0] > x - r and lo[1] < y + r and hi[1] > y - r:
+        near = [
+            (obj, lo, hi)
+            for obj, lo, hi in aabbs
+            if not (obj is self.robot or obj in ignore or obj.category in FLOOR_COVERINGS)
+        ]
+        blocked, clearance = footprint_blockers(x, y, yaw, rect, [(lo, hi) for _, lo, hi in near], underside)
+        for i in blocked:
+            obj = near[i][0]
+            # The box says they meet; ask the object itself, which may be legs and air at the height the base
+            # sweeps. With no yaw there is no rectangle to ask about and the square's word is final.
+            if rect is None or self.base_meets(obj, (x, y), yaw, rect[0], rect[1]):
                 return False, f"overlaps {obj.name}", 0.0
         # The base's rectangle is not the robot: with the working posture the arms reach 0.41 m past it, so a
-        # stance whose
-        # base is clear can still leave the hand inside a box on the floor. The user watched exactly that in
-        # putting_away_toys: after picking up a toy the robot teleported to the table and its arm came to rest
-        # INSIDE the toy box (2026-09-13). The arms are tested in 3D, at the posture they will unfold to and at
-        # the pose being judged, so a stance is refused for where the arm ENDS UP rather than only for where the
-        # wheels are. Objects being stood for are in ``ignore``: the arm is meant to reach those.
+        # stance whose base is clear can still leave the hand inside a box on the floor. The user watched exactly
+        # that in putting_away_toys: after picking up a toy the robot teleported to the table and its arm came to
+        # rest INSIDE the toy box (2026-09-13). The arms are tested in 3D, at the posture they will unfold to and
+        # at the pose being judged, so a stance is refused for where the arm ENDS UP rather than only for where
+        # the wheels are.
         if yaw is not None and self.q_home is not None and arms:
             # The arm may rest inside the thing it is reaching INTO -- that is what reaching into a bookcase or a
             # bin looks like -- but the BASE still may not stand inside it, which is why these are two sets and
-            # not one. The comment above says "objects being stood for are in ignore"; they never were. Standing
-            # for a bookcase, the arm ends up inside the bookcase's box and the stance was refused for it, so
-            # "no base pose reaches ['bookcase.n.01_2'] ... {'overlaps bookcase_zfpyqe_0': 2497}" was the search
-            # refusing every stance from which the goal could be served (2026-09-15).
+            # not one. An earlier comment claimed objects being stood for were in ``ignore``; they never were.
+            # Standing for a bookcase, the arm ends up inside the bookcase's box and the stance was refused for
+            # it, so "no base pose reaches ['bookcase.n.01_2'] ... {'overlaps bookcase_zfpyqe_0': 2497}" was the
+            # search refusing every stance from which the goal could be served (2026-09-15).
             spared = {o.name for o in ignore} | {o.name for o in reaching}
             joints = self.robot.get_joint_positions()
             for arm in self.robot.arm_names:
