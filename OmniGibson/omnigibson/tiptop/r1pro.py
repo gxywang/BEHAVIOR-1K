@@ -37,6 +37,8 @@ from b1k.bridge.articulation import (
 )
 from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
 from b1k.bridge.protocol import (
+    PLANNER_SUPPORT,
+    SUPPORT_CATEGORIES,
     add_view,
     bddl_category,
     face_normal_local,
@@ -360,8 +362,6 @@ FLAT_THICKNESS = 0.06
 GRASP_COLUMN_SAMPLES = 5
 GRASP_COLUMN_INSET = 0.08  # m kept clear of the panel's top and bottom edges, so the jaw lands on the face
 BASE_MASS_KG = 250.0  # omnigibson/eval/evaluator.py sets this for r1/r1pro; keeps the robot upright
-SUPPORT_CATEGORIES = ("table", "floor")  # BDDL supports a goal may name; the planner knows the plane under the objects
-PLANNER_SUPPORT = "table"  # the planner's label for that plane (tiptop's RANSAC "table", a floor when standing at one)
 
 
 def blocks_ray(eye, target, point, radius: float) -> bool:
