@@ -1,6 +1,0 @@
-# What the runner cannot read from the task's BDDL definition (strategies.py). The goal itself, and how many
-# items of each kind every basket wants, come from the definition's ground options at run time.
-task: assembling_gift_baskets
-instruction: put one candle, one cheese, one cookie and one bow into each wicker basket
-plan: transfer  # every inside/ontop goal atom is a pick at the item, a carry to its container, a place
-attempts_per_item: 2  # transfers an item gets before the runner leaves it

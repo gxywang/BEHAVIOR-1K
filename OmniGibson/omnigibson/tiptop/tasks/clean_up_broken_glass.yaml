@@ -1,4 +1,0 @@
-# Three glass shards off the floor into the trash can, which stands on a floor in another room.
-task: clean_up_broken_glass
-instruction: put the broken glass in the trash can
-plan: transfer

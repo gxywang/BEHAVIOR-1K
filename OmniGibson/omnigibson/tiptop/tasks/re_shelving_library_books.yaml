@@ -1,6 +1,0 @@
-# Three books off a table into either of the bookcases (the goal says "exists a bookcase", so its ground options
-# name both and the runner reads the demand from them, as it does for the two toy boxes of putting_away_toys).
-# New ground: placing INTO a shelf rather than a bin or a basket -- an opening entered from the side, not the top.
-task: re_shelving_library_books
-instruction: put the books in the bookcase
-plan: transfer

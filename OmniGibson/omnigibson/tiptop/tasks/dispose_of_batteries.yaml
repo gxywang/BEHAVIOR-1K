@@ -1,5 +1,0 @@
-# Three batteries into the bin: two stand on a desk, the third on a cabinet in another room, and the goal's
-# "the bin is on the floor" is already true when the instance starts (the runner drops atoms that hold).
-task: dispose_of_batteries
-instruction: put the batteries in the trash can
-plan: transfer

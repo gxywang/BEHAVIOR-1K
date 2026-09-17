@@ -28,7 +28,7 @@ import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
 from b1k.bridge.protocol import bddl_category
-from omnigibson.tiptop.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
+from b1k.bridge.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -772,7 +772,7 @@ def main(argv=None) -> None:
     from omnigibson.tiptop.executor import VideoRecorder
     from omnigibson.tiptop.knowledge import make_knowledge
     from omnigibson.tiptop.scene import EpisodeOver
-    from omnigibson.tiptop.strategies import strategy_for, task_goal_atoms, task_goal_options
+    from b1k.bridge.strategies import strategy_for, task_goal_atoms, task_goal_options
 
     human = load_human_stats(args.task_name)
     max_steps = args.max_steps or int(human["length"] * EVAL_TIMEOUT_MULTIPLIER)
