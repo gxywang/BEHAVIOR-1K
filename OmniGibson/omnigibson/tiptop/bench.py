@@ -336,6 +336,8 @@ class Episode:
                 self.sim, self.args, client, round_dir, atoms, self.knowledge, floor=floor, score=False, record=False
             )
             record["env_steps"] = result.get("execution", {}).get("env_steps")
+            # the step the plan began executing from: knowledge older than this predates what the plan did
+            record["executed_from"] = result.get("execution", {}).get("start_step")
         except EpisodeOver:
             record["error"] = "episode over"
             record["seconds"] = round(time.time() - t0, 1)
@@ -368,16 +370,22 @@ class Episode:
         A predicate the runner does not know is NOT taken to hold because a round ran. That is what this did, and
         it would score every new predicate satisfied the moment a round was attempted -- the first task to name one
         would be reported as solved without anything having been achieved.
+
+        A placement is judged only on knowledge from AFTER the round's plan ran (``record["executed_from"]``). The
+        oracle reads the scene live, so this costs it nothing; the onboard source remembers its last look, which
+        was the capture the plan was made from, and where the item was before the plan is no evidence of where it
+        is now. Older knowledge counts as unknown, and unknown is unfinished: the retry is the fresh look.
         """
         ran = record is not None and not record.get("error")
+        after = (record or {}).get("executed_from")
         for a in atoms:
             predicate, args = a["predicate"], a["args"]
             if predicate == "holding":
                 ok = self.holding(args[0])
             elif predicate == "nextto" and len(args) == 2:
-                ok = self.beside(args[0], args[1])
+                ok = self.beside(args[0], args[1], after=after)
             elif predicate in PLACE_PREDICATES and len(args) == 2:
-                ok = self.placed(args[0], args[1])
+                ok = self.placed(args[0], args[1], after=after)
             elif predicate == "open" and args:
                 ok = not self.is_shut(args[0])
             elif predicate == "not" and len(args) >= 2 and args[0] == "open":
@@ -391,9 +399,12 @@ class Episode:
                 return False
         return True
 
-    def beside(self, item: str, other: str) -> bool:
-        """``judgement.boxes_beside`` on the boxes the knowledge source localizes."""
-        boxes = self.boxes(item, other)
+    def beside(self, item: str, other: str, after=None) -> bool:
+        """``judgement.boxes_beside`` on the boxes the knowledge source localizes; False when either is unknown."""
+        boxes = self.boxes(item, other, after=after)
+        if item not in boxes or other not in boxes:
+            log.info(f"cannot judge nextto({item}, {other}): {self.unknown(boxes, item, other)} not localized")
+            return False
         return boxes_beside(boxes[item], boxes[other])
 
     def achieve(self, atoms: list[dict], arm: str = "left", floor: bool | None = None, done=None) -> bool:
@@ -402,7 +413,7 @@ class Episode:
         (the planner's workspace reaches the floor) is read off the target when not given: a container or support
         that stands on the floor."""
         if floor is None:
-            floor = any(self.near_floor(a["args"][1]) for a in atoms if len(a["args"]) == 2)
+            floor = self.reaches_floor(*[a["args"][1] for a in atoms if len(a["args"]) == 2])
         for attempt in range(self.rounds):
             where = self.stance_key()
             record = self.plan_and_execute(atoms, arm=arm, floor=floor)
@@ -451,7 +462,7 @@ class Episode:
                 log.warning(f"{bddl}: {e}")
                 return False
             # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
-            self.plan_and_execute([atom("holding", bddl)], floor=self.near_floor(bddl))
+            self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
             if self.holding(bddl):
                 return True
             # M2T2 proposes grasps from the point cloud and a flat object -- a book lying down, a board game --
@@ -466,8 +477,10 @@ class Episode:
                 # pick this way (2026-09-15). The record is written by the same rule note_hands uses: the
                 # knowledge source's localization, and the fingers only when nothing can localize it -- not from
                 # the simulator's grasp assist, which stays diagnostic (scene.check_hands).
-                if self.sim.press_grasp(self.sim.arm, bddl, spare=(self.support_of(bddl),)):
-                    self.note_pressed_grasp(bddl)
+                support = self.support_of(bddl)  # None when it was never perceived: nothing to spare
+                pressed_from = self.sim.n_steps
+                if self.sim.press_grasp(self.sim.arm, bddl, spare=(support,) if support else ()):
+                    self.note_pressed_grasp(bddl, after=pressed_from)
                 if self.holding(bddl):
                     log.info(f"{bddl}: taken by pressing the hand onto it, which is how a flat object is held")
                     self.records.append(
@@ -485,17 +498,22 @@ class Episode:
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
         return False
 
-    def note_pressed_grasp(self, bddl: str) -> bool:
+    def note_pressed_grasp(self, bddl: str, after=None) -> bool:
         """Enter a pressed grasp in the robot's own hand record, by the same rule a planner round uses.
 
         ``note_hands`` (run.py) decides a pick worked from the knowledge source's localization, falling back to
         the fingers when nothing can localize the object. The pressed grasp goes through none of that -- it is not
-        a planner round -- so its success was invisible to ``holding()``.
+        a planner round -- so its success was invisible to ``holding()``. ``after``: the step the grasp started
+        at; a localization older than that is from before the hand moved and does not count.
         """
         from omnigibson.tiptop.run import DROP_STEPS, in_hand_by_localization
 
         try:
-            at_hand = in_hand_by_localization(self.sim, self.knowledge, bddl, self.sim.arm) if self.knowledge else None
+            at_hand = (
+                in_hand_by_localization(self.sim, self.knowledge, bddl, self.sim.arm, after=after)
+                if self.knowledge
+                else None
+            )
             held = self.sim.grasp_sensed(self.sim.arm) if at_hand is None else at_hand
         except Exception as why:  # noqa: BLE001 - never localized: the fingers decide
             log.info(f"{bddl}: could not localize after the pressed grasp ({type(why).__name__}); reading the fingers")
@@ -540,32 +558,57 @@ class Episode:
         self.records.append({"release": True, "step": self.sim.n_steps, "hands": dict(self.sim.hands())})
 
     # ---------------------------------------------------------------- localization (the knowledge source's)
-    def boxes(self, *bddl_names: str) -> dict:
-        """name -> {center, lo, hi} (world frame) from the knowledge source; the floor has no box."""
-        return self.knowledge.localize(*[n for n in bddl_names if not self.is_floor(n)])
+    def boxes(self, *bddl_names: str, after=None) -> dict:
+        """name -> {center, lo, hi} (world frame) for every named object the knowledge source can localize. The
+        floor has no box, and an object the source has never perceived is left out rather than made up: each
+        caller below says what an unknown position means for it. ``after``: only knowledge observed after that
+        env step counts -- a box that carries ``step`` is a remembered look (the onboard source), one that does not
+        is a live reading (the oracle) and always counts."""
+        boxes = self.knowledge.localize(*[n for n in bddl_names if not self.is_floor(n)])
+        if after is not None:
+            boxes = {n: b for n, b in boxes.items() if b.get("step") is None or b["step"] > after}
+        return boxes
+
+    @staticmethod
+    def unknown(boxes: dict, *names: str) -> str:
+        """The names among ``names`` that ``boxes`` does not localize, for a log line."""
+        return ", ".join(n for n in names if n not in boxes)
 
     def position(self, bddl: str) -> np.ndarray:
         return self.boxes(bddl)[bddl]["center"]
 
     def distance(self, a: str, b: str) -> float:
+        """Horizontal distance between two localized objects; KeyError when either has never been perceived
+        (``Runner.gap`` reads that as infinitely far)."""
         boxes = self.boxes(a, b)
         return box_distance(boxes[a], boxes[b])
 
-    def placed(self, item: str, target: str) -> bool:
+    def placed(self, item: str, target: str, after=None) -> bool:
         """Whether the item ended on or in the target, by geometry: its centre inside the target's footprint and
         its bottom anywhere from 2 cm under the target's bottom (inside a container) to 15 cm above its top (on a
-        surface). Onto the floor: the hand let go of it."""
+        surface). Onto the floor: the hand let go of it. Unknown (either never perceived, or not since ``after``)
+        is not placed: nothing says it is."""
         if self.is_floor(target):
             return not self.holding(item)
-        boxes = self.boxes(item, target)
+        boxes = self.boxes(item, target, after=after)
+        if item not in boxes or target not in boxes:
+            log.info(
+                f"cannot judge whether {item} is in {target}: {self.unknown(boxes, item, target)} not localized"
+                + (f" since step {after}" if after is not None else "")
+            )
+            return False
         return placed_over(boxes[item], boxes[target], from_bottom=True)
 
-    def support_of(self, bddl: str) -> str:
+    def support_of(self, bddl: str) -> str | None:
         """The BDDL name of the task object the item stands on (the highest one whose footprint holds it, any
-        category), else the task's floor."""
+        category), else the task's floor; None when the item has never been perceived, since nothing can be said
+        about what an object stands on before it has been seen. Candidates never perceived cannot be the answer."""
         names = [n for n in self.sim.task_scope() if n != bddl and not self.is_floor(n) and bddl_category(n) != "agent"]
         boxes = self.boxes(bddl, *names)
-        return highest_support(boxes[bddl], {n: boxes[n] for n in names}) or self.floor
+        if bddl not in boxes:
+            log.info(f"{bddl} has never been perceived; what it stands on is unknown")
+            return None
+        return highest_support(boxes[bddl], {n: boxes[n] for n in names if n in boxes}) or self.floor
 
     def walk_to_floor(self, name: str) -> bool:
         """Teleport to somewhere on the floor ``name``, so a thing carried there can be set down on it.
@@ -606,15 +649,36 @@ class Episode:
             log.debug(f"cannot judge {predicate}({item}, {container}) yet ({exc}); treating it as still to do")
             return False
 
-    def near_floor(self, name: str) -> bool:
-        """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor."""
-        return True if self.is_floor(name) else on_the_floor(self.boxes(name)[name])
+    def near_floor(self, name: str) -> bool | None:
+        """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor;
+        None when it has never been perceived."""
+        if self.is_floor(name):
+            return True
+        boxes = self.boxes(name)
+        return on_the_floor(boxes[name]) if name in boxes else None
 
-    def edge_gap(self, item: str, support: str) -> float:
-        """How far the item's centre is from the nearest edge of the support's footprint (small: reachable)."""
+    def reaches_floor(self, *names: str) -> bool:
+        """Whether the planner's workspace must reach the floor for a round on these targets: yes when one stands
+        on the floor, and yes when one has never been perceived. Where an unseen object stands is unknown, and
+        the round's capture is the look that finds out -- the detector searches only the workspace's projection,
+        so the tabletop crop would never even show it a can on the floor. The widest look is the only one that
+        finds it wherever it is; once seen, later rounds use its real answer."""
+        verdicts = {name: self.near_floor(name) for name in names}
+        unseen = [name for name, v in verdicts.items() if v is None]
+        if unseen:
+            log.info(f"{', '.join(unseen)} never perceived: the workspace reaches the floor so the look covers it")
+        return any(v is None or v for v in verdicts.values())
+
+    def edge_gap(self, item: str, support: str | None) -> float:
+        """How far the item's centre is from the nearest edge of the support's footprint (small: reachable);
+        infinite when the support is unknown (None) or either has never been perceived."""
+        if support is None:
+            return float("inf")
         if self.is_floor(support):
             return 0.0
         boxes = self.boxes(item, support)
+        if item not in boxes or support not in boxes:
+            return float("inf")
         return box_edge_gap(boxes[item], boxes[support])
 
 

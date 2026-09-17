@@ -5,7 +5,12 @@
 Needs no simulator and no GPU: it reads ``summary.json`` and, when given the log, counts the lines the pipeline
 writes about its own trouble (blocked capture swings, an arm on the head camera's line of sight, a view that was
 all robot, a stance that framed nothing whole) and prints where each object the capture could not see actually
-was. Written on 2026-09-13 so every run is read the same way instead of by grepping afresh."""
+was. Written on 2026-09-13 so every run is read the same way instead of by grepping afresh.
+
+Every round's saved request and response are read too (``<instance>/rNN_*/capture.json`` and
+``server_response.json``): which labels the request asked for and which the planner's perception reported back.
+Under the oracle the two agree by construction; under ``--knowledge onboard`` the difference is the detector's
+recall on the goal objects, which is the number that says whether onboard perception can carry a task at all."""
 
 import json
 import re
@@ -16,6 +21,49 @@ from pathlib import Path
 run = Path(sys.argv[1])
 log = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 BASELINES = Path(__file__).resolve().parent.parent / "baselines.json"
+
+
+def detected(run: Path) -> None:
+    """Per round: the labels the request asked the planner for, the goal's own objects among them, and what the
+    planner's perception reported back (its ``objects``, or the label its detector could not find)."""
+    rows = []
+    for capture in sorted(run.glob("*/r*/capture.json")):
+        meta = json.loads(capture.read_text())
+        asked = list(meta.get("knowledge", {}).get("labels") or [])
+        goal = sorted({a for atom in meta.get("goal_atoms") or [] for a in atom.get("args", [])})
+        goal = [g for g in goal if g in asked]  # the support plane and a button are named, never detected
+        response = capture.with_name("server_response.json")
+        if not response.exists():
+            rows.append((capture.parent.name, asked, goal, None, "no response saved"))
+            continue
+        resp = json.loads(response.read_text())
+        found = sorted((resp.get("objects") or {}).keys())
+        error = resp.get("error") or ""
+        note = ""
+        if "did not find" in error:
+            note = re.search(r"did not find '([^']+)'", error).group(1) + " not found"
+            # what the detector DID find is only in the error text: "(found: ['a', 'b'])"
+            m = re.search(r"\(found: \[([^\]]*)\]\)", error)
+            if m and not found:
+                found = sorted(x.strip().strip("'") for x in m.group(1).split(",") if x.strip())
+        rows.append((capture.parent.name, asked, goal, found, note))
+    if not rows:
+        return
+    print("\n  what the planner's perception reported, per round (asked -> found; goal objects marked *):")
+    hits = misses = 0
+    for name, asked, goal, found, note in rows:
+        if found is None:
+            print(f"    {name:22s} asked {asked}: {note}")
+            continue
+        seen = {f.rsplit("_", 1)[0] if f.rsplit("_", 1)[-1].isdigit() else f for f in found}  # can_2 -> can
+        got = [g for g in goal if g in seen or g in found]
+        lost = [g for g in goal if g not in got]
+        hits += not lost
+        misses += bool(lost)
+        shown = ", ".join(("*" if a in goal else "") + a for a in asked)
+        print(f"    {name:22s} asked [{shown}] -> found {found}" + (f"   MISSING {lost}" if lost else "") + (f"  ({note})" if note else ""))
+    if hits + misses:
+        print(f"    goal objects all found in {hits} of {hits + misses} rounds with a response ({100 * hits / (hits + misses):.0f}%)")
 
 summary = json.loads((run / "summary.json").read_text()) if (run / "summary.json").exists() else None
 if summary:
@@ -41,6 +89,7 @@ if summary:
         print(f"      {p['what_failed']}")
 else:
     print(f"{run}: no summary.json (the run did not finish)")
+detected(run)
 
 if log and log.exists():
     text = log.read_text(encoding="utf-8", errors="replace")
@@ -49,6 +98,10 @@ if log and log.exists():
         "rounds executed": r"round \d+ .*: executed",
         "rounds lost to empty masks": r"\[\w+\]: GoalNotVisible",
         "rounds lost to planning": r"\[\w+\]: TiptopPlanningError",
+        # a goal object the planner's own detector could not find (onboard knowledge sends no masks): the same
+        # loss as empty masks, reported by the other side of the wire. Counted inside "rounds lost to planning"
+        # too, since the client sees it as a planning error
+        "  of which the detector found no goal object": r"\[\w+\]: TiptopPlanningError: .*did not find",
         "segments abandoned (arm not following)": r"so the rest of this segment is abandoned",
         "capture swings blocked": r"capture swing stopped against something",
         "arms blocked against something": r"stopped following the ramp",

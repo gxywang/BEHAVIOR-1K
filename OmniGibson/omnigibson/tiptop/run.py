@@ -565,8 +565,16 @@ def live_round(
     try:
         response = client.plan(request, timeout_s=args.plan_timeout)
     except TiptopPlanningError:
-        if client.last_response and client.last_response.get("objects"):  # what perception made of the frame
-            perception_report(request, extras, client.last_response)
+        # What perception made of the frame is knowledge whether or not a plan followed: a round that found no
+        # plan still reports where it saw the objects, and a round the detector failed says which label it could
+        # not find. Both are learned and saved, so a failed round is as readable as one that ran.
+        seen = client.last_response or {}
+        if seen.get("objects"):
+            perception_report(request, extras, seen)
+            knowledge.learned(seen)
+        if seen:
+            with open(out_dir / "server_response.json", "w") as f:
+                json.dump({k: v for k, v in seen.items() if k != "plan"}, f, indent=2)
         raise
     with open(out_dir / "server_response.json", "w") as f:
         json.dump({k: v for k, v in response.items() if k != "plan"}, f, indent=2)
@@ -639,8 +647,10 @@ def do_execute(
         if block:
             sim.block_grasping(sim.arm)
         try:
+            start_step = sim.n_steps  # knowledge from before this is from before the plan moved anything
             stats = executor.execute(plan)
-            note_hands(sim, atoms, executor, knowledge)
+            stats["start_step"] = start_step
+            note_hands(sim, atoms, executor, knowledge, after=start_step)
         finally:
             if block:
                 sim.unblock_grasping()
@@ -679,30 +689,40 @@ HOLD_RADIUS = 0.15  # m: an object localized within this distance of the hand af
 DROP_STEPS = 45  # env steps the hand is held open after a pick that closed on the wrong thing (Episode.release)
 
 
-def in_hand_by_localization(sim, knowledge, bddl: str, arm: str) -> bool | None:
+def in_hand_by_localization(sim, knowledge, bddl: str, arm: str, after=None) -> bool | None:
     """Whether the object is at the hand of ``arm``, by where the knowledge source localizes it: its box centre
-    within ``HOLD_RADIUS`` of the hand. None when the source cannot localize it (never perceived)."""
+    within ``HOLD_RADIUS`` of the hand. None when the source cannot localize it: never perceived, or -- with
+    ``after``, the env step the hand started moving at -- not seen since. A source that remembers its last look
+    (the onboard source, whose look is the capture the plan was made from) knows where the object WAS, and
+    where it was before the hand closed says nothing about whether the hand has it now: read as live, it would
+    call every real pick a miss and open the hand on it. A live reading (the oracle) carries no step and
+    always counts."""
     try:
-        box = knowledge.localize(bddl)[bddl]
-    except (KeyError, NotImplementedError):
+        box = knowledge.localize(bddl).get(bddl)
+    except NotImplementedError:
+        return None
+    if box is None or (after is not None and box.get("step") is not None and box["step"] <= after):
         return None
     hand = sim.base_to_world(sim.eef_pose_base(arm)[:3, 3])
     return bool(np.linalg.norm(np.asarray(box["center"], dtype=np.float64) - hand) < HOLD_RADIUS)
 
 
-def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
+def note_hands(sim, atoms: list[dict], executor, knowledge, after=None) -> None:
     """Update the robot's own record of what its hands hold after a plan. A plan for ``holding(x)`` that closed
     the hand put x in it when x is now localized at the hand (``in_hand_by_localization``), or, when the source
     cannot localize it, when the fingers stopped on something (``grasp_sensed``; with sticky grasping the fingers
     close through the attached object, so that reading is the fallback, not the rule). A plan that placed x, or
     an object no longer at the hand, leaves the record. The simulator's grasp assist is only compared with the
     record in the log. A newly taken object is reported to the knowledge source (a button on it moves with the
-    gripper from now on)."""
+    gripper from now on). ``after``: the step the plan started executing at; a localization from before it is
+    from before the plan and does not count (see ``in_hand_by_localization``)."""
     before = dict(sim.held_objects)
     for atom in atoms:
         if atom["predicate"] == "holding" and executor.close_eef is not None:
             bddl, label = atom["args"][0], sim.tracked_label(atom["args"][0])
-            at_hand = in_hand_by_localization(sim, knowledge, bddl, sim.arm) if knowledge is not None else None
+            at_hand = (
+                in_hand_by_localization(sim, knowledge, bddl, sim.arm, after=after) if knowledge is not None else None
+            )
             held = sim.grasp_sensed(sim.arm) if at_hand is None else at_hand
             if held:
                 sim.held_objects[label] = sim.arm
@@ -731,7 +751,7 @@ def note_hands(sim, atoms: list[dict], executor, knowledge) -> None:
             sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
     for label, holder in list(sim.held_objects.items()):  # an object that left the hand (fell, was released)
         bddl = sim.bddl_names.get(label, label) if hasattr(sim, "bddl_names") else label
-        at_hand = in_hand_by_localization(sim, knowledge, bddl, holder) if knowledge is not None else None
+        at_hand = in_hand_by_localization(sim, knowledge, bddl, holder, after=after) if knowledge is not None else None
         if at_hand is False or (at_hand is None and holder == sim.arm and not sim.grasp_sensed(sim.arm)):
             log.info(f"{label}: no longer at the {holder} hand")
             sim.held_objects.pop(label)

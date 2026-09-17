@@ -557,6 +557,27 @@ def test_an_unreachable_container_puts_the_item_back_on_its_support():
     assert ep.hand is None
 
 
+def test_an_item_whose_support_is_unknown_is_still_transferred():
+    """Before anything has been perceived, support_of answers None. The runner still picks the item (the pick is
+    the look), never stands for a support it does not have, and puts the item down on the floor when the
+    container is out of reach."""
+    boxes, goal = basket_world()
+    ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set(), unreachable={"basket.n.01_1"})
+    ep.support_of = lambda item: None
+    ep.edge_gap = lambda item, support: float("inf") if support is None else 0.0
+    Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    picks = [c for c in ep.calls if c[0] == "pick"]
+    assert picks, "the pick is how an unseen item gets seen"
+    assert not any(c[0] == "stand_for" and None in c[1] for c in ep.calls), "never stand for an unknown support"
+    assert ("put_down", "candle.n.01_1", ep.floor) in ep.calls, "the basket was out of reach: down on the floor"
+    # a hand still full at the next pick, with the support unknown: the floor, then release, never stand_for(None)
+    ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())
+    ep.hand = "candle.n.01_1"
+    ep.put_down = lambda bddl, support, floor=None: ep.calls.append(("put_down", bddl, support)) or False
+    Runner.free_hand(ep, None)
+    assert not any(c[0] == "stand_for" for c in ep.calls) and ("release",) in ep.calls
+
+
 def test_emptying_a_hand_never_stands_for_the_floor():
     """The floor is not an object to stand at: standing for it crashed an instance (putting_away_toys, whose
     support_of falls back to the task floor for a toy lying on it)."""
@@ -666,6 +687,95 @@ def test_the_episode_judges_rounds_without_the_simulator():
     assert ep.satisfied([atom("inside", "candle.n.01_1", "basket.n.01_1")], record={"round": 4})
 
 
+def test_the_episode_tolerates_an_object_it_has_never_perceived():
+    """The onboard source localizes only what the planner has reported, and before the first round that is
+    nothing. The callers answer "unknown" rather than crash or invent: no support, no floor verdict (so the round
+    looks with the workspace down to the floor), an infinite edge gap, and a placement that cannot be judged is
+    not a placement."""
+    from omnigibson.tiptop.bench import Episode
+
+    class Sim:
+        arm = "left"
+        held_objects = {}
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def tracked_label(self, name):
+            return name.replace(".n.01_", "_")
+
+        def task_scope(self):
+            return {"table.n.02_1": None, "candle.n.01_1": None, "basket.n.01_1": None, "agent.n.01_1": None}
+
+    class Knowledge:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+        def localize(self, *names):
+            return {n: self.boxes[n] for n in names if n in self.boxes}
+
+    ep = Episode.__new__(Episode)
+    ep.sim, ep.floor = Sim(), "floor.n.01_1"
+    ep.knowledge = Knowledge({})  # nothing has been seen yet
+    assert ep.support_of("candle.n.01_1") is None
+    assert ep.near_floor("candle.n.01_1") is None and ep.near_floor("floor.n.01_1") is True
+    assert ep.reaches_floor("candle.n.01_1") is True, "where it stands is unknown: the look must cover the floor"
+    assert ep.edge_gap("candle.n.01_1", None) == float("inf")
+    assert ep.edge_gap("candle.n.01_1", "table.n.02_1") == float("inf")
+    assert ep.placed("candle.n.01_1", "basket.n.01_1") is False
+    assert ep.beside("candle.n.01_1", "basket.n.01_1") is False
+    with pytest.raises(KeyError):  # Runner.gap reads this as infinitely far
+        ep.distance("candle.n.01_1", "basket.n.01_1")
+    # the basket has been seen and stands high: no floor for it, and the candle is still unknown
+    ep.knowledge.boxes["basket.n.01_1"] = box((1.0, 0, 0.7), half=(0.15, 0.15, 0.1))
+    assert ep.near_floor("basket.n.01_1") is False
+    assert ep.reaches_floor("basket.n.01_1") is False
+    assert ep.reaches_floor("basket.n.01_1", "candle.n.01_1") is True
+    # the candle seen on the table, the table never seen: the candle's support is not the table, it is the floor
+    # by default -- a candidate never perceived cannot be the answer
+    ep.knowledge.boxes["candle.n.01_1"] = box((0.1, 0, 0.77))
+    assert ep.support_of("candle.n.01_1") == "floor.n.01_1"
+    ep.knowledge.boxes["table.n.02_1"] = box((0, 0, 0.7), half=(0.6, 0.4, 0.02))
+    assert ep.support_of("candle.n.01_1") == "table.n.02_1"
+
+
+def test_a_placement_is_judged_only_on_knowledge_from_after_the_plan_ran():
+    """A remembered look (a box with a step) from the capture the plan was made from says where the item WAS. The
+    oracle's live boxes carry no step and always count."""
+    from omnigibson.tiptop.bench import Episode
+
+    class Sim:
+        arm = "left"
+        held_objects = {}
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def tracked_label(self, name):
+            return name.replace(".n.01_", "_")
+
+    class Knowledge:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+        def localize(self, *names):
+            return {n: self.boxes[n] for n in names if n in self.boxes}
+
+    ep = Episode.__new__(Episode)
+    ep.sim, ep.floor = Sim(), "floor.n.01_1"
+    inside = dict(box((1.02, 0, 0.05)), step=500)
+    basket = dict(box((1.0, 0, 0.1), half=(0.15, 0.15, 0.1)), step=500)
+    ep.knowledge = Knowledge({"candle.n.01_1": inside, "basket.n.01_1": basket})
+    placement = [atom("inside", "candle.n.01_1", "basket.n.01_1")]
+    assert ep.satisfied(placement, record={"round": 4}), "no execution recorded: the look is as fresh as it gets"
+    assert not ep.satisfied(placement, record={"round": 4, "executed_from": 500}), "the look predates the plan"
+    assert ep.satisfied(placement, record={"round": 4, "executed_from": 499}), "the look came after the plan"
+    ep.knowledge = Knowledge({"candle.n.01_1": box((1.02, 0, 0.05)), "basket.n.01_1": basket})  # a live item box
+    assert not ep.satisfied(placement, record={"round": 4, "executed_from": 500}), "the basket's look is still old"
+    ep.knowledge = Knowledge({"candle.n.01_1": box((1.02, 0, 0.05)), "basket.n.01_1": box((1.0, 0, 0.1), half=(0.15, 0.15, 0.1))})
+    assert ep.satisfied(placement, record={"round": 4, "executed_from": 500}), "live readings always count"
+
+
 # --------------------------------------------------------------- nextto, OmniGibson's own measure
 def test_beside_matches_omnigibsons_nextto_threshold():
     """object_states/next_to.py: the per-axis AABB gap, as a norm, within a sixth of the mean of the extents."""
@@ -675,7 +785,7 @@ def test_beside_matches_omnigibsons_nextto_threshold():
         def __init__(self, boxes):
             self._boxes = boxes
 
-        def boxes(self, *names):
+        def boxes(self, *names, after=None):
             return {n: self._boxes[n] for n in names}
 
     def box(cx, cy, half):
@@ -695,7 +805,7 @@ def test_beside_scales_the_threshold_with_the_objects():
         def __init__(self, boxes):
             self._boxes = boxes
 
-        def boxes(self, *names):
+        def boxes(self, *names, after=None):
             return {n: self._boxes[n] for n in names}
 
     # a 2 m object and a 0.2 m one: mean extent is much larger, so 10 cm of gap is still "beside"

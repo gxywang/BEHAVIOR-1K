@@ -65,6 +65,7 @@ class _Sim:
         self.button_calls = []
         self.furniture = list(furniture)  # what nearby_obstacles offers with --obstacles on
         self.send_obstacles = False
+        self.n_steps = 0  # the env step clock the onboard source stamps its looks with
 
     def tiptop_goal(self, atoms, category_level):
         def name(bddl):
@@ -251,7 +252,7 @@ class _Episode(Episode):
                 self.on_table.discard(a["args"][0])
         return {}
 
-    def placed(self, item, target):
+    def placed(self, item, target, after=None):
         return any((p, item, target) in self.true for p in ("inside", "ontop"))
 
     def near_floor(self, name):
@@ -560,19 +561,27 @@ def test_no_knowledge_source_tells_the_executor_when_a_switch_flips():
 
 
 def test_the_onboard_source_localizes_from_the_planner_reports():
-    """Positions the planner reported (base frame) become world-frame boxes of a nominal extent."""
+    """Positions the planner reported (base frame) become world-frame boxes of a nominal extent, stamped with the
+    step of the look they came from; an object never reported is left out, never made up."""
     from omnigibson.tiptop.knowledge import SEEN_HALF_EXTENT, OnboardKnowledge
 
-    sim = _Sim(_masks(radio_1=20))
+    sim = _Sim(_masks(radio_1=20, candle_1=20))
     sim.base_to_world = lambda p: np.asarray(p, float) + np.array([10.0, 0.0, 0.0])
     sim.tracked_label = lambda name: name.replace(".n.01_", "_")
     source = OnboardKnowledge(sim, [{"predicate": "toggled_on", "args": ["radio.n.01_1"]}])
-    with pytest.raises(KeyError):
-        source.localize("radio.n.01_1")
+    assert source.localize("radio.n.01_1") == {}, "never perceived: nothing to localize it from"
+    sim.n_steps = 120
     source.learned({"objects": {"radio": {"position": [1.0, 2.0, 0.5], "movable": True}}})
-    box = source.localize("radio.n.01_1")["radio.n.01_1"]
+    boxes = source.localize("radio.n.01_1", "candle.n.01_1")
+    assert list(boxes) == ["radio.n.01_1"], "the candle was never reported and is left out"
+    box = boxes["radio.n.01_1"]
     assert np.allclose(box["center"], [11.0, 2.0, 0.5])
     assert np.allclose(box["hi"] - box["lo"], 2 * SEEN_HALF_EXTENT)
+    assert box["step"] == 120, "a remembered look says when it was taken"
+    # a report from a plan that failed is still a report of where things were, and a later look replaces it
+    sim.n_steps = 300
+    source.learned({"success": False, "objects": {"radio": {"position": [1.5, 2.0, 0.5], "movable": True}}})
+    assert source.localize("radio.n.01_1")["radio.n.01_1"]["step"] == 300
 
 
 def test_what_failed_names_the_unsatisfied_atoms_the_unreachable_objects_and_the_failed_rounds():
@@ -744,7 +753,7 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
 
         def localize(self, *names):
             if self.center is None:
-                raise KeyError(names[0])
+                return {}
             c = np.asarray(self.center, float)
             return {n: {"center": c, "lo": c - 0.03, "hi": c + 0.03} for n in names}
 
@@ -784,6 +793,77 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
     know.center = [3.0, 0.0, 0.1]
     note_hands(sim, [], Executor(), know)
     assert sim.hands() == {}
+
+
+def test_a_look_from_before_the_plan_does_not_judge_what_the_plan_did():
+    """The onboard source remembers where the planner saw the object in the capture the plan was made from --
+    on the floor, before the pick. Read as live after the pick, that says "not at the hand" of every real pick,
+    and note_hands would open the hand on the can it just took. A look stamped at or before the step the plan
+    started executing from is no evidence either way: the fingers decide, as when nothing can localize it."""
+    from omnigibson.tiptop.run import HOLD_RADIUS, in_hand_by_localization, note_hands
+
+    class Sim:
+        arm = "left"
+        OPEN = 1.0
+
+        def __init__(self, finger):
+            self.held_objects, self.bddl_names = {}, {"can_1": "can.n.01_1"}
+            self.finger, self.hand, self.opened = finger, np.array([1.0, 0.0, 0.8]), []
+
+        tracked_label = staticmethod(lambda name: name.replace(".n.01_", "_"))
+        base_to_world = staticmethod(lambda p: np.asarray(p, float))
+
+        def eef_pose_base(self, arm):
+            m = np.eye(4)
+            m[:3, 3] = self.hand
+            return m
+
+        def grasp_sensed(self, arm):
+            return self.finger > 0.006
+
+        def finger_width(self, arm):
+            return self.finger
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def check_hands(self):
+            pass
+
+        def hold(self, n_steps, gripper=None):
+            self.opened.append((n_steps, gripper))
+
+    class Remembered:
+        """A source whose knowledge is a look taken at env step ``step``."""
+
+        def __init__(self, center, step):
+            self.center, self.step = center, step
+
+        def localize(self, *names):
+            c = np.asarray(self.center, float)
+            return {n: {"center": c, "lo": c - 0.1, "hi": c + 0.1, "step": self.step} for n in names}
+
+        def picked(self, *a):
+            pass
+
+    class Executor:
+        close_eef = np.eye(4)
+
+    pick = [{"predicate": "holding", "args": ["can.n.01_1"]}]
+    on_the_floor = [1.0 + HOLD_RADIUS + 0.5, 0.0, 0.06]  # where the capture saw it, before the arm moved
+    # the look is from step 400 and the plan ran from step 400: it is from before the plan, so it does not count
+    assert in_hand_by_localization(Sim(0.03), Remembered(on_the_floor, 400), "can.n.01_1", "left", after=400) is None
+    sim = Sim(finger=0.03)
+    note_hands(sim, pick, Executor(), Remembered(on_the_floor, 400), after=400)
+    assert sim.hands() == {"can_1": "left"}, "the fingers stopped on something and nothing fresher says otherwise"
+    assert sim.opened == [], "the hand must not be opened on the can it just took"
+    # a look from after the plan ran is evidence: the can is still on the floor, so the fingers caught something else
+    sim = Sim(finger=0.03)
+    note_hands(sim, pick, Executor(), Remembered(on_the_floor, 401), after=400)
+    assert sim.hands() == {} and sim.opened, "a fresh look that puts it elsewhere means the hand is on something else"
+    # a live reading carries no step and always counts
+    live = {"can.n.01_1": {"center": np.array([1.02, 0.0, 0.78]), "lo": 0, "hi": 0}}
+    assert in_hand_by_localization(Sim(0.03), type("Live", (), {"localize": lambda self, *n: live})(), "can.n.01_1", "left", after=400)
 
 
 def test_the_oracle_sends_nearby_furniture_to_the_planner_and_only_what_a_view_actually_shows():
