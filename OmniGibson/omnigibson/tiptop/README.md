@@ -340,8 +340,25 @@ M2T2's pixi env in a separate clone. Only websocket/HTTP crosses the boundaries.
 to a request (oracle masks, button poses, what the hands hold, the mirror) lives in tiptop behind optional request
 fields, so the real-robot path stays untouched.
 
+### The sim env needs the policy package installed
+
+The modules in this directory are now **re-export shims over `b1k.bridge`**: the policy half of the
+bridge lives in the `b1k-submission` repository, which keeps it free of every simulator import and
+lets it run under the challenge's own evaluator in its own interpreter. So the sim env has to be able
+to import `b1k`, once, per machine:
+
+```bash
+uv pip install -e /path/to/b1k-submission --no-deps --python /path/to/BEHAVIOR-1K/b1k/bin/python
+```
+
+Without it **every** `omnigibson.tiptop` import fails with `ModuleNotFoundError: No module named
+'b1k.bridge'`, which reads like a broken branch and is not. `--no-deps` is load-bearing: this env
+pins Isaac Sim's numpy and torch and must not have the policy's resolution dragged into it. See that
+repo's README for the rest.
+
 | Concern | Repo |
 |---|---|
+| The policy: observation seam, localization, the self-mask, and the simulator-free half of this bridge (`b1k.bridge`) | **b1k-submission** (its own uv env; imports no simulator module, by test) |
 | Planner, perception, embodiments (cuRobo/cuTAMP configs, tool frame, gripper spheres), the wire protocol | **tiptop** (submodule `tiptop/`, private fork; runs in its own pixi env, deployable unchanged) |
 | Scenes, tasks, robot and controller configs, capture, what the planner is told (`knowledge.py`), plan execution, scoring, video, the Rerun mirror's sim side, task strategies and the benchmark | **BEHAVIOR-1K** (this directory; needs Isaac Sim) |
 
