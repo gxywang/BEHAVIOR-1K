@@ -38,23 +38,47 @@ from b1k.bridge.articulation import (
 from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
 from b1k.bridge.geometry import (
     FOOTPRINT_CELL,
-    FOOTPRINT_FACE_CELLS,
-    FRAME_MARGIN_PX,
     HEAD_AIM_LIMIT,
-    REACH_WIDEN,
-    TRAVEL_POSE,
+    HeadCamera,
+    best_base_pose as search_base_poses,
     blocks_ray,
-    box_corners,
     footprint_cells,
-    frame_objects,
     head_aim_yaw,
     polyline_hits_box,
     rect_box_gap,
-    rect_hits_box,
     sample_polyline,
     segment_hits_box,
     travel_fold_targets,
     turned_joints,
+)
+
+# Re-exported and not used here: the stance search took its constants and the rest of its geometry with it,
+# and test_tiptop_kinematics.py, the scripts and the unmerged dev/* branches read them out of this module.
+from b1k.bridge.geometry import (  # noqa: F401
+    AVOID_RADIUS,
+    CLEAR_WEIGHT,
+    FOOTPRINT_FACE_CELLS,
+    FRAMING_PENALTY,
+    FRAMING_PENALTY_PX,
+    FRAME_MARGIN_PX,
+    HIDE_DEPTH,
+    HIDE_MARGIN,
+    MIN_AHEAD,
+    MIN_SIDE,
+    REACH_WIDEN,
+    RING_ANGLE_STEP,
+    RING_START,
+    RING_STEP,
+    SIDE_TARGET,
+    SIDE_WEIGHT,
+    STANCE_CLEARANCE,
+    TARGET_HALF_WIDTH,
+    TRAVEL_POSE,
+    YAW_OFFSETS,
+    YAW_WEIGHT,
+    box_corners,
+    frame_objects,
+    rect_hits_box,
     widen_then_clip,
 )
 from b1k.bridge.protocol import (
@@ -274,24 +298,6 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 # stances for another reason and the tighter margin only costs reach. What actually recovers the round is the
 # retry from a different pose, which finds the battery every time (493 mask pixels at the stance that works).
 
-TARGET_HALF_WIDTH = 0.22  # containers this wide (basket) hide an item behind them from the head camera
-FRAMING_PENALTY = 2.0  # score cost per radian an object's edge falls outside the frame (see best_base_pose)
-# best_base_pose projects the objects themselves into the head camera a candidate stance would have
-# (geometry.frame_objects, whose FRAME_MARGIN_PX takes the image border a little way in). Every pixel an
-# object still falls outside costs FRAMING_PENALTY_PX: 0.006 is FRAMING_PENALTY per radian divided by the
-# head camera's focal length in pixels (308 at 99 deg over 720), so a clipped object keeps about the weight
-# the angle measure gave it.
-FRAMING_PENALTY_PX = 0.006
-# best_base_pose: the candidate grid around the objects' centroid and the score terms (lower is better)
-RING_START, RING_STEP = 0.25, 0.05  # m, rings out to the arm's reach
-RING_ANGLE_STEP = np.pi / 18  # 10 deg around the centroid
-YAW_OFFSETS = np.arange(-np.pi / 3, np.pi / 3 + 1e-6, np.pi / 12)  # facing the centroid +-60 deg, 15 deg steps
-MIN_AHEAD = 0.15  # m every object must be ahead of the base at least
-MIN_SIDE = -0.30  # m to the right at most (the torso can turn a little); further left is preferred
-SIDE_TARGET, SIDE_WEIGHT = 0.15, 0.5  # objects less than SIDE_TARGET m to the left cost SIDE_WEIGHT per m short
-YAW_WEIGHT = 0.1  # per radian of turning away from the centroid
-HIDE_DEPTH, HIDE_MARGIN = 0.05, 0.06  # m: a container nearer by less than HIDE_DEPTH hides an item behind it, as
-# seen from the camera, when their bearings are within its angular half-width plus an item margin of HIDE_MARGIN
 # _footprint_free: what an AABB in the footprint means
 # Furniture sent to the planner as static obstacles (see nearby_obstacles). Close enough to matter, big enough
 # to be a fixture, and capped because every one of them costs a mask in the capture and a hull in perception.
@@ -304,7 +310,6 @@ HOUSE_AABB_AREA = 20.0  # m^2; larger boxes are merged walls, roofs or ceilings 
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
-AVOID_RADIUS = 0.15  # a retried base pose must be at least this far (m) from the ones tried before
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # The robot DOES fold before a teleport: place_robot calls fold_for_travel, and the way back out is
@@ -317,14 +322,6 @@ SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # cost was ramping it at the CAPTURE cap of 0.6 rad/s; folding in over the robot's own base is the opposite
 # motion, runs at travel speed and costs about a quarter as much. See place_robot for the full write-up.
 FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
-# Room the stance search wants between the robot and everything it is not there to touch, and what a metre short
-# of it costs in the score. Without this the score is indifferent between standing 1 mm from a cabinet and 6 cm
-# from it and takes the nearer one, because it is 6 cm closer to the object: the filter decides everything and the
-# objective pushes straight back against it. A clearance term also covers every residual error in the shapes at
-# once -- box against mesh, the arms the footprint does not model, the base settling -- which a bigger footprint
-# does not. At 4.0 per metre a 5 cm shortfall costs 0.20 against the 0.05 of approach it buys.
-STANCE_CLEARANCE = 0.05
-CLEAR_WEIGHT = 4.0
 # Opening a container: how finely the joint's path is followed, and the holds around it. The steps matter more
 # than they look -- the hand is holding the link, so a coarse path drags it through poses its joint does not
 # allow and the grasp is what gives way.
@@ -1808,177 +1805,34 @@ class R1ProSim(TiptopSim):
         ex, ey = float(hi[0] - lo[0]), float(hi[1] - lo[1])
         return 0.5 * math.hypot(ex, ey)
 
-    def best_base_pose(
-        self,
-        points_xy,
-        ignore=(),
-        reach: float = 0.9,
-        aabbs=None,
-        half_widths=None,
-        support_z=None,
-        avoid=(),
-        boxes=None,
-        frame_strict: bool = True,
-        footprint: dict | None = None,
-        reaching=(),
-    ) -> tuple[tuple | None, dict]:
-        """Best base pose with every point (world xy; the last one is the container) ahead and to the left, within
-        the left arm's reach.
+    def best_base_pose(self, points_xy, ignore=(), reach: float = 0.9, aabbs=None, half_widths=None, support_z=None,
+                       avoid=(), boxes=None, frame_strict: bool = True, footprint: dict | None = None, reaching=()):
+        """``geometry.best_base_pose`` on this robot: the search itself is geometry and lives there.
 
-        Candidates on rings (0.25 m to ``reach``) around the points' centroid, facing it; scored by the farthest point's distance and
-        how far left the points are (lower is better), rejected when a point is behind the robot, well to its right,
-        out of reach, outside the head camera's view, hidden behind the container, or the footprint is not free
-        (``ignore``: objects that do not count; ``aabbs``: a scene_aabbs() snapshot to reuse across searches, taken
-        here otherwise).
-
-        ``boxes``: each object's world AABB as (low xyz, high xyz). Given them, whether a candidate frames an object
-        is decided by projecting the object into the head camera that candidate would have (``frame_objects``)
-        rather than by the angle measures below -- the same projection the masks use, so the test is exact. A
-        candidate that cuts an object the frame could hold whole is rejected; when no candidate frames them all,
-        the search runs again with ``frame_strict=False``, where a cut only costs score.
-
-        ``footprint``: a {(x, y, yaw): _footprint_free result} cache to fill and reuse. The fallback pass is given
-        the strict pass's own, so the second search does not repeat the first's mesh work; nothing moves between
-        them, so the answers are the same.
-
-        ``half_widths``, ``support_z``: the angle measures used when no boxes are passed. Each point's xy radius, so
-        the view test can keep the object's *edges* in frame and not just its centre (None reproduces the point
-        test), and the world height each object stands at (one value, or one per point) so the head camera's reach
-        for it can be measured (``camera_floor_distance``; None skips that test). ``avoid``: (x, y) poses already
-        tried; candidates within ``AVOID_RADIUS`` of one are rejected, so a retry gets a different viewpoint.
-        Returns ((score, x, y, yaw, dists, sides, clearance) or None, rejection counts by reason).
+        Four of the five things it used to read off the live scene are one reading each -- the head camera's K,
+        image size and base-frame pose (``head_camera_in_base``), how far ahead of the base the bottom of the
+        frame meets each object's support (``camera_floor_distance``), and the scene's AABBs, which was already
+        an argument. The fifth, ``_footprint_free``, genuinely has to ask the scene for every candidate, so it
+        goes in as a callback with ``ignore``, ``aabbs`` and ``reaching`` bound here.
         """
-        pts = [np.asarray(p, dtype=np.float64)[:2] for p in points_xy]
-        if not pts:
-            raise ValueError("best_base_pose needs at least one point (the last one is the target)")
-        half_widths = [0.0] * len(pts) if half_widths is None else list(half_widths)
-        if support_z is None:
-            min_dists = [0.0] * len(pts)
-        else:
-            heights = [support_z] * len(pts) if np.isscalar(support_z) else list(support_z)
-            min_dists = [self.camera_floor_distance(float(z)) + CAMERA_MIN_MARGIN for z in heights]
-        half_fov = math.atan2(self.robot_cam.image_width / 2, float(_intrinsics(self.robot_cam)[0, 0]))
-        view = None
-        if boxes is not None:
-            k, base_from_cam, base_z = self.head_camera_in_base()
-            view = dict(
-                corners=[box_corners(lo, hi) for lo, hi in boxes],
-                intrinsics=k,
-                base_from_cam=base_from_cam,
-                base_z=base_z,
-                width=int(self.robot_cam.image_width),
-                height=int(self.robot_cam.image_height),
-                strict=frame_strict,
-            )
-        t = len(pts) - 1  # the target (container) is last
-        mid = np.mean(pts, axis=0)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
-        best, rejected = None, {}
-        # (x, y, yaw) -> _footprint_free result. Handed to the fallback pass below so the second search does not
-        # redo the mesh work of the first: nothing moves between them, and the strict pass now fails more often
-        # (a stance that shows nothing of the object is refused), so the fallback is entered more often too.
-        footprint = {} if footprint is None else footprint
-        for radius in np.arange(RING_START, reach + RING_STEP, RING_STEP):  # rings out to the reach itself
-            for angle in np.arange(0.0, 2 * np.pi, RING_ANGLE_STEP):
-                x, y = mid + radius * np.array([np.cos(angle), np.sin(angle)])
-                if any(np.hypot(x - ax, y - ay) < AVOID_RADIUS for ax, ay in avoid):
-                    rejected["tried before"] = rejected.get("tried before", 0) + 1
-                    continue
-                for yaw_offset in YAW_OFFSETS:
-                    yaw = np.arctan2(mid[1] - y, mid[0] - x) + yaw_offset
-                    fwd, left = np.array([np.cos(yaw), np.sin(yaw)]), np.array([-np.sin(yaw), np.cos(yaw)])
-                    rel = [p - np.array([x, y]) for p in pts]
-                    ahead = [float(r @ fwd) for r in rel]
-                    side = [float(r @ left) for r in rel]
-                    dist = [float(np.linalg.norm(r)) for r in rel]
-                    # Reach is to the NEAREST part of the target, not to its centre. A point is an object with a
-                    # width: to put something on a bed the arm has to reach the bed, not the middle of the bed,
-                    # and a bed is 2 m across. Measuring to the centre means the only accepted stances are the
-                    # ones standing ON it, and the footprint test then refuses every one -- 30,718 candidates
-                    # refused for "overlaps bed" while standing FOR that bed, 24,505 for a bookcase, 7,598 for a
-                    # coffee table, across four tasks (2026-09-15). half_widths is each target's xy radius and was
-                    # already computed here; it only fed the framing penalty.
-                    near = [max(0.0, d - hw) for d, hw in zip(dist, half_widths)]
-                    if min(ahead) < MIN_AHEAD or min(side) < MIN_SIDE or max(near) > reach:
-                        rejected["geometry"] = rejected.get("geometry", 0) + 1
-                        continue
-                    # cut by the bottom of the head camera's frame. The measure is how far AHEAD the object is,
-                    # which is what camera_floor_distance returns; the radial distance flattered a stance with the
-                    # object off to one side, and a battery 0.48 m ahead of a base whose camera sits 0.44 m ahead
-                    # of it came out of the capture with an empty mask (2026-09-12, dispose_of_batteries).
-                    if view is None and any(a < m for a, m in zip(ahead, min_dists)):
-                        rejected["too close for the camera"] = rejected.get("too close for the camera", 0) + 1
-                        continue
-                    # a container nearer than an item and in line with it hides the item (empty mask): keep their
-                    # bearings apart by the container's angular half-width plus a margin for the item
-                    bearing = [math.atan2(sd, ah) for ah, sd in zip(ahead, side)]
-                    if any(
-                        dist[t] < dist[i] + HIDE_DEPTH
-                        and abs(bearing[i] - bearing[t])
-                        < math.atan(TARGET_HALF_WIDTH / dist[t]) + math.atan(HIDE_MARGIN / dist[i])
-                        for i in range(t)
-                    ):
-                        rejected["container hides the item"] = rejected.get("container hides the item", 0) + 1
-                        continue
-                    if view is None and max(abs(sd) / max(ah, 1e-6) for ah, sd in zip(ahead, side)) > 1.0:
-                        rejected["outside camera view"] = rejected.get("outside camera view", 0) + 1
-                        continue
-                    if view is not None:
-                        why, off_frame = frame_objects(**view, x=x, y=y, yaw=yaw)
-                        if why:
-                            rejected[why] = rejected.get(why, 0) + 1
-                            continue
-                    # Prefer poses that keep each object's *edges* in frame, not just its centre. A mask cut by the
-                    # image border reconstructs into a hull that runs past the real object, and the planner then
-                    # places into that phantom part: on 2026-09-04 a basket whose centre sat at 43 deg had its edge
-                    # at 61 deg, lost a third of its width off the left of the image, and the cookie was released
-                    # 3 cm outside the rim. This is a penalty rather than a rejection because for some item/container
-                    # pairs no pose frames both -- the item is then simply out of reach of a single base pose (see
-                    # README, "what stands between this and the full task").
-                    clipped = sum(
-                        max(0.0, abs(br) + math.atan2(hw, max(d, 1e-6)) - half_fov)
-                        for br, d, hw in zip(bearing, dist, half_widths)
-                    )
-                    score = (
-                        max(dist)
-                        + SIDE_WEIGHT * max(0.0, SIDE_TARGET - min(side))
-                        + YAW_WEIGHT * abs(yaw_offset)
-                        + (FRAMING_PENALTY_PX * off_frame if view is not None else FRAMING_PENALTY * clipped)
-                    )
-                    if best is None or score < best[0]:
-                        key = (float(x), float(y), round(float(yaw), 3))  # the base's box turns with the yaw
-                        if key not in footprint:
-                            footprint[key] = self._footprint_free(
-                                x, y, ignore, aabbs=aabbs, yaw=float(yaw), reaching=reaching
-                            )
-                        free, why, clearance = footprint[key]
-                        if not free:
-                            rejected[why] = rejected.get(why, 0) + 1
-                        else:
-                            # Standing closer is worth 1 per metre to the score above, so without this the search
-                            # takes every centimetre the filter allows and stops a hair from the furniture.
-                            score += CLEAR_WEIGHT * max(0.0, STANCE_CLEARANCE - clearance)
-                            if best is None or score < best[0]:
-                                best = (score, x, y, yaw, dist, side, clearance)
-        return widen_then_clip(
-            best,
-            rejected,
+        k, base_from_cam, base_z = self.head_camera_in_base()
+        camera = HeadCamera(k, base_from_cam, base_z, int(self.robot_cam.image_width), int(self.robot_cam.image_height))
+        min_dists = None
+        if support_z is not None:
+            heights = [support_z] * len(points_xy) if np.isscalar(support_z) else list(support_z)
+            min_dists = [self.camera_floor_distance(float(z)) + CAMERA_MIN_MARGIN for z in heights]
+        return search_base_poses(
+            points_xy,
+            camera,
+            lambda x, y, yaw: self._footprint_free(x, y, ignore, aabbs=aabbs, yaw=yaw, reaching=reaching),
             reach=reach,
+            half_widths=half_widths,
+            min_dists=min_dists,
+            avoid=avoid,
+            boxes=boxes,
             frame_strict=frame_strict,
-            has_boxes=boxes is not None,
-            search=lambda r, strict: self.best_base_pose(
-                points_xy,
-                ignore=ignore,
-                reach=r,
-                aabbs=aabbs,
-                half_widths=half_widths,
-                support_z=support_z,
-                avoid=avoid,
-                boxes=boxes,
-                frame_strict=strict,
-                footprint=footprint,
-                reaching=reaching,
-            ),
+            footprint=footprint,
         )
 
     def hidden_from_here(self, names, aabbs=None) -> dict:
