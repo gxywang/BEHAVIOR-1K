@@ -11,8 +11,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from omnigibson.tiptop.client import TiptopClient, TiptopPlanningError
-from omnigibson.tiptop.protocol import load_observation_h5, plan_summary, request_from_observation
+from b1k.bridge.client import TiptopClient, TiptopPlanningError
+from b1k.bridge.protocol import load_observation_h5, plan_summary, request_from_observation
 
 log = logging.getLogger("omnigibson.tiptop")
 

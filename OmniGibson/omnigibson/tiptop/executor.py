@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 
-from omnigibson.tiptop.protocol import resample_trajectory
+from b1k.bridge.protocol import resample_trajectory
 
 log = logging.getLogger(__name__)
 

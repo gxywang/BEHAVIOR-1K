@@ -24,8 +24,8 @@ from pathlib import Path
 
 import yaml
 
-from omnigibson.tiptop.articulation import OPEN_FRACTION_REACH, OPEN_FRACTION_SCORED
-from omnigibson.tiptop.protocol import bddl_category
+from b1k.bridge.articulation import OPEN_FRACTION_REACH, OPEN_FRACTION_SCORED
+from b1k.bridge.protocol import bddl_category
 
 log = logging.getLogger(__name__)
 

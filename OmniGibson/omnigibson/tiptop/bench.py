@@ -27,7 +27,7 @@ import numpy as np
 import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
-from omnigibson.tiptop.protocol import bddl_category
+from b1k.bridge.protocol import bddl_category
 from omnigibson.tiptop.strategies import PLACE_PREDICATES, STRATEGIES, Unreachable, atom
 from omnigibson.tiptop.run import (
     add_common,
@@ -155,7 +155,7 @@ class Episode:
         the joint says, and at evaluation that verdict would have to come from the hand's own travel and a fresh
         look at the container.
         """
-        from omnigibson.tiptop.articulation import OPEN_FRACTION_SCORED
+        from b1k.bridge.articulation import OPEN_FRACTION_SCORED
 
         # open_container chooses its own stance, in front of the container's leading face where the whole pull
         # solves (r1pro.stance_for_grasp); stand_for's stance is built for looking at things and stood 0.9 m off
@@ -240,7 +240,8 @@ class Episode:
 
     def is_shut(self, name: str) -> bool:
         """Whether every joint of ``name`` that could open is closed."""
-        from omnigibson.tiptop.articulation import is_open, openable_joints
+        from b1k.bridge.articulation import is_open
+        from omnigibson.tiptop.articulation import openable_joints
 
         try:
             joints = openable_joints(self.sim.scene_object(name))
