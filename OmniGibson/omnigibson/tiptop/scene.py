@@ -362,7 +362,7 @@ class TiptopSim:
     def recording(self, path):
         """Record every env step inside the block to the video at ``path`` (``executor.VideoRecorder``, fed from
         ``step``); the file is closed on the way out, whatever ended the block."""
-        from omnigibson.tiptop.executor import VideoRecorder
+        from b1k.bridge.executor import VideoRecorder
 
         recorder = VideoRecorder(path)
         self.recorders.append(recorder)

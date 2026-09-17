@@ -769,7 +769,7 @@ def main(argv=None) -> None:
     from omnigibson.eval.utils.eval_utils import EVAL_TIMEOUT_MULTIPLIER
     from omnigibson.eval.utils.score_utils import load_human_stats
     from omnigibson.metrics import AgentMetric, TaskMetric
-    from omnigibson.tiptop.executor import VideoRecorder
+    from b1k.bridge.executor import VideoRecorder
     from omnigibson.tiptop.knowledge import make_knowledge
     from omnigibson.tiptop.scene import EpisodeOver
     from b1k.bridge.strategies import strategy_for, task_goal_atoms, task_goal_options
