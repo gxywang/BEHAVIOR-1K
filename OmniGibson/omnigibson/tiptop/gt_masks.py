@@ -1,8 +1,234 @@
-"""Moved to ``b1k.bridge.gt_masks``: the masks are computed from a depth image and trimesh surfaces, with no
-Isaac annotator and no prim, so they live with the policy.
+"""Oracle object masks from rendered depth + object meshes, without Isaac's instance-segmentation annotator.
 
-Kept here as a re-export; new code should import ``b1k.bridge.gt_masks`` directly.
+PRIVILEGED, and that is why this module stays in BEHAVIOR-1K. Its imports are numpy, scipy and trimesh -- it was
+moved to b1k.bridge on the strength of that and moved straight back -- but clean imports are not the test. The
+test is whether a module needs the simulator's ground truth to do its job, and this one cannot answer at all
+without every object's true mesh at its true pose. A policy that could compute these masks would be reading the
+answer, not perceiving it. The onboard policy segments its own images instead (b1k/selfmask.py, the challenge's
+detector); ground-truth masks exist for the deliberately-easier development setting and for grading.
+
+Isaac's ``seg_instance`` annotator segfaults on the first render in large BEHAVIOR house scenes (see README/DEPLOYMENT),
+so task runs render rgb + depth only. Ground-truth masks are then computed geometrically: a pixel belongs to an object
+when its unprojected depth point lies on (within ``tol`` of) that object's surface mesh at its current pose.
+
+No torch / Isaac Sim imports: numpy + scipy (a trimesh dependency) + trimesh, plus ``protocol.depth_to_points``
+(pure numpy), so this is unit-testable.
 """
 
-from b1k.bridge.gt_masks import *  # noqa: F401,F403
-from b1k.bridge.gt_masks import _prepare, _triangle_distances  # noqa: F401
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+from b1k.bridge.protocol import depth_to_points
+
+# Triangles longer than this are subdivided before the proximity test: the candidate-pair search radius grows with the
+# largest triangle, so a few huge faces (a table top) would otherwise pair every point with every triangle.
+MAX_TRIANGLE_EDGE = 0.03
+
+# A view's pose for an object counts as different from the capture's only past these: below them the mask would not
+# move by a pixel, and an object sitting still still jitters by microns between renders.
+MOVED_M = 0.001
+MOVED_RAD = 0.002  # about a tenth of a degree
+
+
+def meshes_at_view_poses(meshes: dict, poses: dict, log=None) -> dict:
+    """The capture's meshes moved to where each object was when one view was rendered.
+
+    A capture builds one mesh per object, at the pose it has when the knowledge source runs -- after every view has
+    been rendered. But a capture turns the torso between head views, and an object in the gripper travels with it,
+    so a view rendered earlier saw that object somewhere else and masking it with the later mesh gives an empty
+    mask. Each object is rigid, so the correction is the rigid motion from the pose the mesh was built at (its
+    ``metadata["world_from_obj"]``) to the pose that view saw (``poses[label]``): ``T_view @ inv(T_built)``.
+
+    Args:
+        meshes: {label: trimesh} as built for the capture, each tagged with ``metadata["world_from_obj"]``.
+        poses: {label: 4x4} world pose of each object at the moment this view rendered.
+        log: optional logger for the objects that actually moved.
+
+    Returns:
+        {label: trimesh}, the same objects. A mesh is returned untouched when it did not move, when this view
+        recorded no pose for it, or when it carries no build pose (an obstacle, or an older capture).
+    """
+    out = {}
+    for label, mesh in meshes.items():
+        built = (mesh.metadata or {}).get("world_from_obj")
+        seen = poses.get(label)
+        if built is None or seen is None:
+            out[label] = mesh
+            continue
+        try:
+            seen, built = np.asarray(seen, dtype=np.float64), np.asarray(built, dtype=np.float64)
+            square = seen.shape == (4, 4) and built.shape == (4, 4)
+        except ValueError:  # a ragged pair: numpy cannot even make an array of it
+            square = False
+        if not square:
+            raise ValueError(
+                f"{label}: poses must be 4x4 matrices (a (pos, quat) pair is a different thing -- the per-view key "
+                f"is object_pose_mats_at_render, not the capture's object_poses_world)"
+            )
+        motion = seen @ np.linalg.inv(built)
+        # A resting object jitters by a few microns between renders, which is not worth copying a mesh over (and
+        # reads as a spurious "it moved" in the log). Only a motion that could actually shift a mask counts.
+        # How far the OBJECT went, not motion[:3, 3]: that is the translation of the motion about the world
+        # origin, so a plain rotation of something standing several metres out reads as several metres.
+        shift = float(np.linalg.norm(seen[:3, 3] - built[:3, 3]))
+        turn = float(np.arccos(np.clip((np.trace(motion[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
+        if shift < MOVED_M and turn < MOVED_RAD:
+            out[label] = mesh
+            continue
+        moved = mesh.copy()
+        moved.apply_transform(motion)
+        moved.metadata = dict(mesh.metadata or {}, world_from_obj=seen)
+        out[label] = moved
+        if log is not None:
+            log.info(
+                f"{label} was {100 * shift:.1f} cm and {np.degrees(turn):.0f} deg from where the capture's mesh "
+                f"puts it when this view rendered; masking it where the view saw it"
+            )
+    return out
+
+
+def masks_from_geometry(depth, intrinsics, world_from_cam, meshes: dict, tol: float = 0.008) -> dict:
+    """Per-object boolean masks (H, W) from a z-depth image and the objects' surface meshes.
+
+    Args:
+        depth: (H, W) float z-depth in metres (distance to the image plane); 0 (or non-finite) = invalid pixel.
+        intrinsics: (3, 3) OpenCV pinhole matrix for the same resolution.
+        world_from_cam: (4, 4) pose of the OpenCV camera frame (+x right, +y down, +z forward) expressed in the frame
+            the meshes are in. Any consistent frame works (world or robot base); mixing frames gives empty masks.
+        meshes: {label: trimesh.Trimesh} surface meshes at their current poses, in the ``world_from_cam`` frame.
+        tol: surface distance (m) within which a depth point counts as lying on the mesh.
+
+    Returns:
+        {label: (H, W) bool} for every requested label, mutually disjoint like instance segmentation; a label whose
+        mesh has no candidate pixels (outside the view, fully occluded, empty mesh) gets an all-False mask. Pixel
+        counts per label are ``mask.sum()``.
+
+    Method: unproject the depth (``protocol.depth_to_points``), keep the finite points inside the mesh AABB expanded by
+    ``tol`` (cheap prefilter), then test the point-to-surface distance (vertex KD-tree first; exact point-triangle
+    distance only for the undecided points and the triangles whose centroid is close enough). A pixel within ``tol``
+    of several labelled surfaces (two objects in contact: the contact band of each lies within ``tol`` of the other)
+    is assigned to the label with the smallest exact surface distance, so masks never overlap; that exact distance is
+    only computed for the contested pixels, so the common case costs nothing extra.
+
+    Caveat (contact halo): depth points of an UNLABELLED support surface that lie within ``tol`` of an object's bottom
+    edge (the table around a mug's foot) are attributed to the object, giving a halo of ``tol`` / (pixel footprint)
+    pixels along the contact line (1-2 px at 720 px / 0.5 m, ~4 px at 1280 px). When the support surface is itself a
+    label the closest-surface rule gives it those pixels instead. Occluders are never attributed: their depth points
+    are far from the occluded surface. Measured on the Panda tabletop demo (1280x720, fx 667, seg_instance as
+    reference): every seg pixel is within 2 mm of the mesh, and tol 2 / 4 / 8 mm gives IoU 0.97 / 0.95 / 0.90 (mug)
+    and 1.00 / 0.99 / 0.96 (bowl), the whole difference being the table halo. The 8 mm default keeps headroom for
+    coarser cameras (the sampling error grows with the pixel footprint).
+    """
+    depth = np.asarray(depth, dtype=np.float64)
+    if depth.ndim != 2:
+        raise ValueError(f"depth must be (H, W), got {depth.shape}")
+    pts = depth_to_points(depth, np.asarray(intrinsics, dtype=np.float64), np.asarray(world_from_cam, dtype=np.float64))
+    flat = pts.reshape(-1, 3)
+    finite = np.isfinite(flat).all(axis=1)
+    labels = list(meshes)
+    hits = []  # per label: flat pixel indices within tol of the surface
+    for label in labels:
+        mesh = meshes[label]
+        idx = np.zeros(0, dtype=np.intp)
+        if mesh is not None and len(mesh.faces) > 0:
+            lo, hi = mesh.bounds[0] - tol, mesh.bounds[1] + tol
+            with np.errstate(invalid="ignore"):  # NaN rows compare False and are excluded by ``finite`` anyway
+                candidates = np.flatnonzero(finite & (flat >= lo).all(axis=1) & (flat <= hi).all(axis=1))
+            if candidates.size:
+                idx = candidates[points_within_tol(mesh, flat[candidates], tol)]
+        hits.append(idx)
+    owner = np.full(depth.size, -1, dtype=np.int64)
+    n_hits = np.zeros(depth.size, dtype=np.int32)
+    for i, idx in enumerate(hits):
+        owner[idx] = i
+        n_hits[idx] += 1
+    contested = np.flatnonzero(n_hits > 1)
+    if contested.size:  # objects in contact: the pixel goes to the closest surface (ties / no finite distance: first)
+        best = np.full(contested.size, np.inf)
+        for i, (label, idx) in enumerate(zip(labels, hits)):
+            sel = np.flatnonzero(np.isin(contested, idx, assume_unique=True))
+            if sel.size == 0:
+                continue
+            dist = surface_distances(meshes[label], flat[contested[sel]], tol)
+            better = dist < best[sel]
+            best[sel[better]] = dist[better]
+            owner[contested[sel[better]]] = i
+    return {label: (owner == i).reshape(depth.shape) for i, label in enumerate(labels)}
+
+
+_PREPARED: dict = {}  # id(mesh) -> (mesh, prepared): see _prepare
+
+
+def _prepare(mesh: trimesh.Trimesh):
+    """Subdivide oversized triangles; return (triangles, referenced vertices, max edge, centroids, centroid radii).
+
+    Cached per mesh object, because the subdivision is the expensive part and the same scene mesh is queried again
+    and again: the stance and look-pose ranking asks about a desk once per candidate pose, and a desk top is two
+    big triangles that subdivide into thousands every time. Uncached, that took a putting-away round from about
+    150 s to 880 s (2026-09-13). The mesh itself is kept in the cache entry so the id cannot be reused by another
+    object after a collection.
+    """
+    hit = _PREPARED.get(id(mesh))
+    if hit is not None and hit[0] is mesh:
+        return hit[1]
+    original = mesh
+    tris = np.asarray(mesh.triangles, dtype=np.float64)
+    edge_max = float(np.linalg.norm(tris - np.roll(tris, 1, axis=1), axis=2).max())
+    if edge_max > MAX_TRIANGLE_EDGE:
+        mesh = mesh.subdivide_to_size(MAX_TRIANGLE_EDGE)
+        tris = np.asarray(mesh.triangles, dtype=np.float64)
+        edge_max = float(np.linalg.norm(tris - np.roll(tris, 1, axis=1), axis=2).max())
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)[np.unique(mesh.faces)]  # referenced vertices only
+    centroids = tris.mean(axis=1)
+    radii = np.linalg.norm(tris - centroids[:, None, :], axis=2).max(axis=1)
+    prepared = (tris, vertices, edge_max, centroids, radii)
+    _PREPARED[id(original)] = (original, prepared)
+    return prepared
+
+
+def _triangle_distances(tris, centroids, radii, points, tol: float) -> np.ndarray:
+    """(N,) exact distance from each point to the nearest triangle when that is <= tol, +inf otherwise.
+
+    Only triangles that can be within tol are tested: |p - centroid| <= tol + (centroid-to-vertex radius).
+    """
+    dist = np.full(len(points), np.inf)
+    pairs = cKDTree(points).sparse_distance_matrix(cKDTree(centroids), tol + float(radii.max()), output_type="ndarray")
+    keep = pairs["v"] <= tol + radii[pairs["j"]]
+    pi, ti = pairs["i"][keep], pairs["j"][keep]
+    if pi.size:
+        closest = trimesh.triangles.closest_point(tris[ti], points[pi])
+        np.minimum.at(dist, pi, np.linalg.norm(closest - points[pi], axis=1))
+        dist[dist > tol] = np.inf
+    return dist
+
+
+def points_within_tol(mesh: trimesh.Trimesh, points, tol: float) -> np.ndarray:
+    """(N,) bool: whether each point lies within ``tol`` of the surface of ``mesh`` (exact point-triangle distance)."""
+    points = np.asarray(points, dtype=np.float64)
+    hit = np.zeros(len(points), dtype=bool)
+    if len(points) == 0 or len(mesh.faces) == 0:
+        return hit
+    tris, vertices, edge_max, centroids, radii = _prepare(mesh)
+    # vertices: within tol of a vertex -> hit; farther than tol + edge_max from every vertex -> miss
+    # (every point of a triangle is within edge_max of one of its vertices); exact distance only for the rest
+    d_vertex, _ = cKDTree(vertices).query(points, distance_upper_bound=tol + edge_max)
+    hit[d_vertex <= tol] = True
+    undecided = np.flatnonzero(~hit & np.isfinite(d_vertex))
+    if undecided.size:
+        hit[undecided] = np.isfinite(_triangle_distances(tris, centroids, radii, points[undecided], tol))
+    return hit
+
+
+def surface_distances(mesh: trimesh.Trimesh, points, tol: float) -> np.ndarray:
+    """(N,) float: exact distance from each point to the surface of ``mesh`` when <= ``tol``, +inf otherwise."""
+    points = np.asarray(points, dtype=np.float64)
+    dist = np.full(len(points), np.inf)
+    if len(points) == 0 or len(mesh.faces) == 0:
+        return dist
+    tris, vertices, edge_max, centroids, radii = _prepare(mesh)
+    d_vertex, _ = cKDTree(vertices).query(points, distance_upper_bound=tol + edge_max)
+    near = np.flatnonzero(np.isfinite(d_vertex))  # the others are farther than tol from every triangle
+    if near.size:
+        dist[near] = _triangle_distances(tris, centroids, radii, points[near], tol)
+    return dist

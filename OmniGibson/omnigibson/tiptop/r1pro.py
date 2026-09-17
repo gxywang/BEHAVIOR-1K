@@ -35,7 +35,6 @@ from b1k.bridge.articulation import (
     opening_travel,
     pose_matrix,
 )
-from b1k.bridge.gt_masks import masks_from_geometry, points_within_tol
 from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
 from b1k.bridge.protocol import (
     add_view,
@@ -53,6 +52,7 @@ from omnigibson.macros import gm
 from omnigibson.objects.usd_object import USDObject
 from omnigibson.tasks.behavior_task import BehaviorTask
 from omnigibson.tiptop.articulation import openable_joints
+from omnigibson.tiptop.gt_masks import masks_from_geometry, points_within_tol
 from omnigibson.tiptop.kinematics import ArmIK
 from omnigibson.tiptop.scene import (
     CAMERA_NAME,

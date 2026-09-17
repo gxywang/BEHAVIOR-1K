@@ -20,7 +20,6 @@ import numpy as np
 import torch as th
 import trimesh
 
-from b1k.bridge.gt_masks import masks_from_geometry, meshes_at_view_poses
 from b1k.bridge.kinematics import look_at_quat_xyzw as _look_at_quat_xyzw
 from b1k.bridge.protocol import (
     DROID_CAMERA_KWARGS,
@@ -37,6 +36,7 @@ from b1k.bridge.protocol import (
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
 from omnigibson.macros import gm
+from omnigibson.tiptop.gt_masks import masks_from_geometry, meshes_at_view_poses
 from omnigibson.utils.usd_utils import mesh_prim_to_trimesh_mesh
 
 log = logging.getLogger(__name__)
