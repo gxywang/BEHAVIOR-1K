@@ -1044,14 +1044,14 @@ def test_touching_a_support_is_served_by_placing_onto_it():
     Resting on a support IS touching it, and the four not-touching atoms come free the moment a shoe leaves the
     floor (2026-09-15).
     """
-    from omnigibson.tiptop.r1pro import R1ProSim
+    from b1k.bridge.protocol import tiptop_goal
     from omnigibson.tiptop.strategies import PLACE_PREDICATES
 
     assert "touching" in PLACE_PREDICATES, "the demand has to see a touching atom to act on it"
 
     import inspect
 
-    src = inspect.getsource(R1ProSim.tiptop_goal)
+    src = inspect.getsource(tiptop_goal)  # the translation moved out of R1ProSim; the mapping is the wire's
     assert '"touching": "on"' in src, "and the wire has to carry it as a placement onto the support"
 
 

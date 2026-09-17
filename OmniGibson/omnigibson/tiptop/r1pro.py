@@ -87,12 +87,14 @@ from b1k.bridge.protocol import (
     add_view,
     bddl_category,
     bddl_label,
+    button_label,
     detector_phrase,
     face_normal_local,
     joint_ramp,
     label_category,
     points_to_pixels,
     reach_candidates,
+    tiptop_goal as translate_goal,
     via_configuration,
 )
 
@@ -716,50 +718,8 @@ class R1ProSim(TiptopSim):
         return dict(self.bddl_names)
 
     def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
-        """Translate BDDL goal atoms (inside/ontop/on/nextto/holding/toggled_on over BDDL names) for TiPToP.
-
-        Returns the labels the request names and the atoms in TiPToP's predicates. Per instance ('candle_1', with
-        oracle masks) or per category ('candle': the detector finds every instance and the goal takes the
-        best-scoring one, since the task does not care which candle goes into which basket). toggled_on(obj)
-        becomes pressed(<label>_button): the button is described by pose (button_hints) or found by the detector.
-        A table or floor named as a support becomes the planner's own support plane, "table" (whatever horizontal
-        plane the objects in view rest on), so an object can be put down where the robot stands.
-        """
-        predicates = {
-            "inside": "on",
-            "ontop": "on",
-            "on": "on",
-            # touching(x, support) is served by putting x ON the support -- resting on a thing is touching it.
-            # putting_shoes_on_rack is 4 touching(shoe, hallstand) plus 4 not-touching(shoe, floor), and with no
-            # action behind either its ceiling was 2/10 = 0.200, which is exactly what it scores. The four
-            # not-touching atoms come free the moment a shoe leaves the floor (2026-09-15).
-            "touching": "on",
-            "nextto": "near",
-            "holding": "holding",
-            "toggled_on": "pressed",
-        }
-        label_of = {bddl: label for label, bddl in self.bddl_names.items()}
-
-        def name(arg):
-            if label_category(arg) in SUPPORT_CATEGORIES:
-                return PLANNER_SUPPORT  # the planner's name for the support plane under the objects it sees
-            if arg not in label_of:
-                raise ValueError(f"goal names {arg!r}, which is not a tracked task object: {sorted(label_of)}")
-            return label_category(arg) if category_level else label_of[arg]
-
-        out = []
-        for atom in atoms:
-            if atom["predicate"] not in predicates:
-                raise ValueError(f"unsupported goal predicate {atom['predicate']!r} ({sorted(predicates)})")
-            args = [name(a) for a in atom["args"]]
-            if atom["predicate"] == "toggled_on":
-                args = [self.button_label(a) for a in args]
-            out.append({"predicate": predicates[atom["predicate"]], "args": args})
-        if category_level:
-            labels = sorted({label_category(b) for b in self.bddl_names.values()})
-        else:
-            labels = sorted(self.bddl_names)
-        return labels, out
+        """``protocol.tiptop_goal`` over the BDDL names this sim tracks; the translation itself is the wire's."""
+        return translate_goal(atoms, self.bddl_names, category_level)
 
     def _goal_values(self) -> list[list[bool]]:
         """Truth of every predicate of every ground goal option, evaluating each grounded predicate once.
@@ -800,10 +760,6 @@ class R1ProSim(TiptopSim):
         no perception of its own yet)."""
         return bool(self.env.task._evaluate_predicate(bddl_predicate_class(predicate), *bddl_names))
 
-    @staticmethod
-    def button_label(label: str) -> str:
-        """Request label of an object's toggle button ('radio_receiver_1' -> 'radio_receiver_1_button')."""
-        return f"{label}_button"
 
     def button_world(self, bddl: str) -> tuple[np.ndarray, np.ndarray, float]:
         """A toggle button as the simulator knows it (privileged): world position, the outward unit normal of the
