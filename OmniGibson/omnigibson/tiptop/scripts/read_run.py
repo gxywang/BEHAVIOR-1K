@@ -103,7 +103,10 @@ if log and log.exists():
         # loss as empty masks, reported by the other side of the wire. Counted inside "rounds lost to planning"
         # too, since the client sees it as a planning error
         "  of which the detector found no goal object": r"\[\w+\]: TiptopPlanningError: .*did not find",
-        "segments abandoned (arm not following)": r"so the rest of this segment is abandoned",
+        # The executor reports contact and runs on (executor.py, "it is pushing against something"); it no longer
+        # abandons a segment, so the old "so the rest of this segment is abandoned" pattern matched nothing and
+        # every lane report read 0. These are planned segments hitting geometry the planner was never given.
+        "planned segments pushing against something": r"it is pushing against something",
         "capture swings blocked": r"capture swing stopped against something",
         "arms blocked against something": r"stopped following the ramp",
         "arm on the camera's line of sight": r"stands between the head camera",

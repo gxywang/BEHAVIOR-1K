@@ -116,3 +116,64 @@ def test_a_crawling_planner_segment_is_played_faster_but_never_slower():
     assert plan_dt({"positions": [[0.0]], "dt": 0.1}, floor=1.0) == 0.1
     assert plan_dt({"positions": [[0.0], [0.1]], "dt": 0.0}, floor=1.0) == 0.0
     assert plan_dt({"positions": [[0.0], [0.0]], "dt": 0.1}, floor=1.0) == 0.1
+
+
+# --------------------------------------------------------------- the leash on bridge ramps
+class StubArm:
+    """One planned joint that stops dead at ``wall`` however hard it is commanded.
+
+    ``ramp_to`` is called unbound against this, so it needs only what the method itself touches.
+    """
+
+    dt = 1 / 30
+    planned_joints = ("j",)
+    joint_index = {"j": 0}
+    n_steps = 0
+
+    def __init__(self, wall: float = 0.2, speed: float = 0.2):
+        import torch as th
+
+        self.q, self.wall, self.speed, self.posture = [0.0], wall, speed, {}
+        self.leads = []  # how far ahead of the arm each command was sent
+        self.robot = type("R", (), {"get_joint_positions": lambda _s: th.tensor(self.q, dtype=th.float32)})()
+
+    def step(self, q_arm, gripper):
+        cmd = float(np.asarray(q_arm).reshape(-1)[0])
+        self.leads.append(cmd - self.q[0])
+        self.q = [min(self.q[0] + float(np.clip(cmd - self.q[0], -self.speed, self.speed)), self.wall)]
+
+    def hold(self, n, gripper, q_arm=None):
+        for _ in range(n):  # the settle steps lean too, so they must be measured, not skipped
+            self.step(self.q if q_arm is None else q_arm, gripper)
+
+
+def _ramp(leashed: bool):
+    from omnigibson.tiptop.r1pro import TRAVEL_MAX_JOINT_VEL, R1ProSim
+
+    sim = StubArm()
+    blocked = R1ProSim.ramp_to(
+        sim, [2.0], {}, 0.0, 12, note="fold for travel", max_vel=TRAVEL_MAX_JOINT_VEL, leashed=leashed
+    )
+    return sim, blocked
+
+
+def test_a_bridge_ramp_into_furniture_is_leashed_like_a_planned_segment():
+    """91% of measured arm-vs-world contact is on these ramps; the leash bounds how hard they lean."""
+    from omnigibson.tiptop.executor import EXEC_LEASH
+
+    sim, blocked = _ramp(leashed=True)
+    assert blocked is not None, "the ramp still notices it is blocked"
+    assert max(sim.leads) <= EXEC_LEASH + 1e-6, f"it leaned {max(sim.leads):.3f} rad past the arm"
+
+
+def test_the_leash_does_not_change_when_a_ramp_calls_itself_blocked():
+    """Detection runs on the path target, not the leashed command, so the block fires at the same step."""
+    assert _ramp(leashed=True)[1] == _ramp(leashed=False)[1]
+
+
+def test_an_unleashed_ramp_still_gets_to_push():
+    """The grasp press and the drawer pull exist to load a joint and opt out."""
+    from omnigibson.tiptop.executor import EXEC_LEASH
+
+    sim, _ = _ramp(leashed=False)
+    assert max(sim.leads) > EXEC_LEASH

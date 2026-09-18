@@ -35,6 +35,7 @@ from b1k.bridge.articulation import (
     opening_travel,
     pose_matrix,
 )
+from b1k.bridge.executor import leash
 from b1k.bridge.kinematics import link_from_camera, link_pose_for_camera, look_pose
 from b1k.bridge.geometry import (
     FOOTPRINT_CELL,
@@ -1241,7 +1242,11 @@ class R1ProSim(TiptopSim):
             for name_j, value in zip(joints_of, solution):
                 if name_j in self.planned_joints:
                     targets[self.planned_joints.index(name_j)] = float(value)
-            self.ramp_to(targets, self.posture, self.CLOSE, OPEN_SETTLE_STEPS, note="press onto the panel")
+            # unleashed: this press exists to make contact -- the grasp assist fires on finger contact, so bounding
+            # how hard it leans would be bounding the thing it is for
+            self.ramp_to(
+                targets, self.posture, self.CLOSE, OPEN_SETTLE_STEPS, note="press onto the panel", leashed=False
+            )
             seed = [float(v) for v in solution]
         return seed, False
 
@@ -1541,9 +1546,11 @@ class R1ProSim(TiptopSim):
         done, why = 0, ""
         pulls = plan["solutions"][2:]
         for i, solution in enumerate(pulls):
+            # unleashed: pulling a drawer IS pushing on a joint, and follow_pull already fails on "the hand moved
+            # but the joint did not", so it does not need the leash to notice it is stuck
             stopped = self.ramp_to(
                 self._targets_from(joints_of, solution), self.posture, self.CLOSE, 0,
-                note=f"pull {obj.name} waypoint {i + 1} of {len(pulls)}", max_vel=OPEN_MAX_JOINT_VEL,
+                note=f"pull {obj.name} waypoint {i + 1} of {len(pulls)}", max_vel=OPEN_MAX_JOINT_VEL, leashed=False,
             )  # fmt: skip
             now = link.get_position_orientation()[0].cpu().numpy().astype(np.float64)
             joint_now = next((k["position"] for k in openable_joints(obj) if k["name"] == j["name"]), joint0)
@@ -2707,7 +2714,14 @@ class R1ProSim(TiptopSim):
         return self.ramp_to(q_arm, posture, gripper, settle_steps, note) is None
 
     def ramp_to(
-        self, q_arm, posture: dict, gripper: float, settle_steps: int, note: str = "", max_vel: float | None = None
+        self,
+        q_arm,
+        posture: dict,
+        gripper: float,
+        settle_steps: int,
+        note: str = "",
+        max_vel: float | None = None,
+        leashed: bool = True,
     ) -> tuple | None:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
         than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
@@ -2721,7 +2735,16 @@ class R1ProSim(TiptopSim):
         A joint that falls more than ``RAMP_BLOCK_TOL`` behind its target is pushing against something, and the ramp
         stops there and holds where the joints actually are rather than leaning on it for the rest of the path
         (a capture swing in a cubicle sweeps what is on the desk onto the floor, 2026-09-12). Returns None when the
-        joints followed, else (joint, step, lag)."""
+        joints followed, else (joint, step, lag).
+
+        The command is leashed to within ``EXEC_LEASH`` of where the joints actually are -- the same bound every
+        planned segment already gets in ``b1k.bridge.executor`` -- so the drive's torque is bounded while the ramp
+        runs on. A travel-speed ramp into furniture used to command 0.47 rad past the arm before the block fired.
+        Detection is unchanged, and the leash is provably inert on a healthy ramp: it can only bite when
+        ``|q - measured| > EXEC_LEASH``, and ``EXEC_LEASH == RAMP_BLOCK_TOL``, so every step it clips is a step that
+        already counts toward ``RAMP_BLOCK_STEPS``. Five in a row and the ramp stops and holds at the measured
+        posture, so it can throttle for at most four steps before the ramp reports the truth. ``leashed=False`` is
+        for the two ramps whose purpose IS to load a joint (the grasp press, the drawer pull)."""
         now = self.robot.get_joint_positions()
         names = list(self.planned_joints) + list(posture)
         start = [float(now[self.joint_index[j]]) for j in names]
@@ -2741,9 +2764,12 @@ class R1ProSim(TiptopSim):
         ramped = moving & np.array(["finger" not in j for j in names])
         last, fastest, culprit, blocked, behind = np.asarray(start), 0.0, "", None, 0
         sagged, sagged_joint = 0.0, ""  # the worst a HELD joint drifted from where it was asked to stay
+        lead = 0.0  # the furthest ahead of the arm this ramp ever commanded: what the leash bounds
         for i, q in enumerate(path):
             self.posture = {j: float(v) for j, v in zip(posture, q[k:])}
-            self.step(q[:k], gripper)
+            cmd = leash(q[:k], last[:k]) if leashed else np.asarray(q[:k], dtype=np.float64)
+            lead = max(lead, float(np.abs(np.asarray(cmd) - last[:k]).max()) if k else 0.0)
+            self.step(cmd, gripper)
             measured = self.robot.get_joint_positions()[idx].cpu().numpy().astype(np.float64)
             rates = np.abs(measured - last) / self.dt
             if rates.max() > fastest:
@@ -2783,7 +2809,8 @@ class R1ProSim(TiptopSim):
             )
         log.info(
             f"joints ramped over {len(path)} steps at up to {speed} rad/s commanded, "
-            f"{fastest:.2f} rad/s measured{culprit}, then {settle_steps} settle steps"
+            f"{fastest:.2f} rad/s measured{culprit}, worst command lead {lead:.3f} rad"
+            f"{'' if leashed else ' (unleashed)'}, then {settle_steps} settle steps"
         )
         return blocked
 
