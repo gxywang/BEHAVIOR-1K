@@ -525,11 +525,17 @@ class TiptopSim:
         return {name: jpeg_bytes(rgb) for name, rgb in self.video_views().items()}
 
     def stream_scene(self) -> dict:
-        """Every mirrored object's mesh in its own frame plus its current base-frame pose (see SimStateStream)."""
+        """Every mirrored object's mesh in its own frame plus its current base-frame pose (see SimStateStream).
+
+        ``obstacle`` is the planner's collision world rather than the viewer's: the furniture standing near this
+        stance (``R1ProSim.nearby_obstacles``), which the server turns into cuRobo statics. Its poses are computed
+        here rather than taken from ``object_poses_base_mats``, which covers only objects and context -- furniture
+        never moves, so there is no reason to pay for it on every mirrored step.
+        """
         t0 = time.time()
         poses = self.object_poses_base_mats()
         scene = {}
-        for kind, group in (("object", self.objects), ("context", self.context)):
+        for kind, group in (("object", self.objects), ("context", self.context), ("obstacle", self.obstacles)):
             for name, obj in group.items():
                 key = rerun_name(name)
                 if key not in self._stream_meshes:
@@ -541,7 +547,11 @@ class TiptopSim:
                 if self._stream_meshes[key] is None:
                     continue
                 vertices, faces = self._stream_meshes[key]
-                scene[key] = {"vertices": vertices, "faces": faces, "pose": poses[key], "kind": kind}
+                pose = poses.get(key)
+                if pose is None:  # an obstacle: not in object_poses_base_mats, so read it here
+                    pos_b, quat_b = self.to_base(*obj.get_position_orientation())
+                    pose = T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float32)
+                scene[key] = {"vertices": vertices, "faces": faces, "pose": pose, "kind": kind}
         log.info(
             f"Rerun mirror: {len(scene)} meshes, {sum(len(m['faces']) for m in scene.values())} triangles "
             f"({time.time() - t0:.1f}s)"

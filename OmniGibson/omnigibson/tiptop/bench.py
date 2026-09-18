@@ -718,6 +718,13 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         "plans around the room instead of through it; costs a mask per obstacle in every capture",
     )
     p.add_argument(
+        "--room",
+        action="store_true",
+        help="send that same furniture to the planner as collision MESHES over the sim_scene channel, which "
+        "bypasses perception entirely (no mask, no depth-point threshold, no workspace crop) -- unlike "
+        "--obstacles, which offers labels and delivered 2 obstacles out of 32 when it was measured",
+    )
+    p.add_argument(
         "--summarize",
         action="store_true",
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",

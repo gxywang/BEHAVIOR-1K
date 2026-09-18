@@ -941,18 +941,67 @@ def test_nearby_obstacles_registers_the_furniture_and_never_offers_an_object_the
         return types.SimpleNamespace(name=name, category=category)
 
     booth, bench, rug, robot = thing("booth_xzrpar_2"), thing("bench_xwphjd_3"), thing("rug_1", "rug"), thing("robot")
-    box = (np.array([0.0, 0.0, 0.0]), np.array([1.0, 1.0, 1.0]))
+    box = (np.array([0.9, 0.9, 0.0]), np.array([1.9, 1.9, 1.0]))  # surface 1.27 m out: clear of the base, in reach
     far = (np.array([9.0, 9.0, 0.0]), np.array([10.0, 10.0, 1.0]))
     sim = types.SimpleNamespace(
         robot=robot,
         objects={"booth_1": booth},  # the task tracks the booth itself, under its tiptop label
         obstacles={"stale_from_the_last_stance": bench},
         base_pose=lambda: (np.array([0.0, 0.0, 0.0]), None),
+        base_box=lambda: np.array([[-0.41, -0.36, 0.0], [0.25, 0.36, 0.37]]),
         scene_aabbs=lambda: [(booth, *box), (bench, *box), (rug, *box), (thing("sideboard_9"), *far)],
     )
     names = R1ProSim.nearby_obstacles(sim, exclude=["booth_1"])
     assert names == ["bench_xwphjd_3"]  # not the booth (already a movable), not the rug, not the far sideboard
     assert sim.obstacles == {"bench_xwphjd_3": bench}  # rebuilt per stance, and resolvable by object_meshes
+
+
+def test_the_room_ships_the_wall_the_arm_can_reach_but_not_what_the_base_or_the_task_stands_on():
+    """Three drops that each cost whole rounds when --room sends the furniture as collision meshes.
+
+    Ranking by distance to an AABB's CENTRE put the wall and the sofa the robot stands against past ``limit``,
+    while their surfaces were 0 m away. A body the base is standing IN must never be shipped: cuRobo's world holds
+    base_link, the wheels, the torso and both arms, so every start state in that round would be refused. And the
+    surface the task's objects stand on is already the planner's fitted slab -- a second copy of it puts every
+    Place particle inside a static.
+    """
+    import types
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+    from omnigibson.tiptop.scene import TiptopSim
+
+    def thing(name, category="furniture"):
+        return types.SimpleNamespace(name=name, category=category)
+
+    wall, sofa, table, mug, robot = (
+        thing("walls_1"), thing("sofa_1"), thing("table_1"), thing("mug_1"), thing("robot")
+    )
+    rows = [
+        (wall, np.array([0.8, -2.0, 0.0]), np.array([1.0, 2.0, 2.0])),  # surface 0.8 m: reachable, kept
+        (sofa, np.array([-0.3, -0.3, 0.0]), np.array([0.6, 0.6, 0.5])),  # the base is inside it: dropped
+        (table, np.array([0.5, -0.5, 0.0]), np.array([1.2, 0.5, 0.7])),  # the mug stands on it: dropped
+        (mug, np.array([0.8, 0.0, 0.70]), np.array([0.9, 0.1, 0.80])),  # tracked, so never an obstacle anyway
+    ]
+    sim = types.SimpleNamespace(
+        robot=robot,
+        objects={"mug_1": mug},
+        obstacles={},
+        base_pose=lambda: (np.array([0.0, 0.0, 0.0]), None),
+        base_box=lambda: np.array([[-0.41, -0.36, 0.0], [0.25, 0.36, 0.37]]),
+        scene_aabbs=lambda: rows,
+    )
+    assert R1ProSim.nearby_obstacles(sim) == ["walls_1"]
+
+    # ... and they reach the wire as kind "obstacle", which is what the server turns into cuRobo statics
+    sim.objects, sim.context, sim._stream_meshes = {}, {}, {}  # only the obstacle group is under test here
+    sim.object_poses_base_mats = lambda: {}
+    sim.mesh_local = lambda obj: (np.zeros((3, 3), np.float32), np.zeros((1, 3), np.int32))
+    import torch as th
+
+    sim.to_base = lambda pos, quat: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0]))  # pose2mat wants tensors
+    wall.get_position_orientation = lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    scene = TiptopSim.stream_scene(sim)
+    assert {k: v["kind"] for k, v in scene.items()} == {"walls_1": "obstacle"}
 
 
 def test_an_object_in_the_robots_own_hand_does_not_need_a_mask():

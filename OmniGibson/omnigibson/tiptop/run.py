@@ -253,6 +253,10 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         look_arm=None if args.no_look else LOOK_ARM,
     )
     sim.send_obstacles = bool(getattr(args, "obstacles", False))
+    sim.send_room = bool(getattr(args, "room", False))
+    # Both rebuild sim.obstacles per stance from nearby_obstacles, by two different routes; running them together
+    # would have the label path and the mesh path fighting over the same dict.
+    assert not (sim.send_obstacles and sim.send_room), "--obstacles and --room cannot be used together"
     if args.activity:
         sim.track_task_objects()
     # furniture the run names is drawn in the Rerun mirror, so the view has a table under the objects

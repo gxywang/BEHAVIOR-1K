@@ -311,6 +311,7 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it anyway
 OBSTACLE_LIMIT = 8
 OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
+STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's underside is that object's support
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
@@ -663,6 +664,7 @@ class R1ProSim(TiptopSim):
         self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
         self._base_cells = {}  # object name -> the floor squares it really occupies at base height
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
+        self.send_room = False  # send that furniture as MESH statics over sim_scene instead (--room)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -2588,8 +2590,14 @@ class R1ProSim(TiptopSim):
         # Sparing by object identity is what the caller meant; ``exclude`` still spares extra scene names.
         spared = set(exclude) | {self.robot.name}
         tracked = set(map(id, self.objects.values()))
+        rows_all = list(self.scene_aabbs())
+        # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
+        # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
+        # inside an obstacle, with no collision message anywhere -- the round just dies with no satisfying particle.
+        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in tracked]
+        base_span = float(np.abs(self.base_box()[:, :2]).max())  # circumscribes the base's own box at any yaw
         rows = []
-        for obj, lo, hi in self.scene_aabbs():
+        for obj, lo, hi in rows_all:
             if obj is self.robot or obj.name in spared or id(obj) in tracked or obj.category in FLOOR_COVERINGS:
                 continue
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
@@ -2599,9 +2607,22 @@ class R1ProSim(TiptopSim):
             extent = np.asarray(hi, dtype=np.float64) - np.asarray(lo, dtype=np.float64)
             if float(np.max(extent)) < OBSTACLE_MIN_SIZE:
                 continue  # small enough to be something to pick up, not a fixture to plan around
-            centre = (np.asarray(lo, dtype=np.float64) + np.asarray(hi, dtype=np.float64))[:2] / 2.0
-            gap = float(np.linalg.norm(centre - here))
-            if gap <= reach:
+            if any(
+                hi[2] <= o_lo[2] + STANDS_ON_TOL
+                and hi[0] > o_lo[0]
+                and lo[0] < o_hi[0]
+                and hi[1] > o_lo[1]
+                and lo[1] < o_hi[1]
+                for o_lo, o_hi in stands_on
+            ):
+                continue  # a tracked object stands on it: perception models this as the support slab
+            # Distance to the BOX, not to its centre. The wall and the sofa the robot is standing against have
+            # their centres metres away: in store_honey the walls and the sofa ranked ninth and tenth by centre
+            # distance, past ``limit``, while their surfaces were 0.00 m from the base. Anything nearer than the
+            # base's own box is something the base is standing IN -- shipping it makes every start state invalid,
+            # because cuRobo's world holds base_link, the wheels, the torso and both arms.
+            gap = float(np.linalg.norm(np.clip(here, lo[:2], hi[:2]) - here))
+            if base_span < gap <= reach:
                 rows.append((gap, obj.name, obj))
         rows.sort(key=lambda row: (row[0], row[1]))
         # Register them so the capture can mask them and ``object_meshes`` can build their geometry: a label the
@@ -3023,10 +3044,17 @@ class R1ProSim(TiptopSim):
                 back = max(abs(float(now[self.joint_index[j]]) - original[j]) for j in self.robot.arm_joint_names[arm])
                 if back > LOOK_TOL:
                     log.warning(f"{arm} arm is {back:.3f} rad from its locked posture after the capture")
+        # The furniture standing by THIS stance, for the planner's collision world. Rebuilt here because the set
+        # depends on where the base is, and sent after clear_start_posture has had its say about what the arm is
+        # already inside -- shipping that would make the start state invalid and cost the whole round.
+        if self.send_room:
+            self.nearby_obstacles()
         # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
         # in collision is refused before the goal is considered (``clear_start_posture``).
         q_ready = self.clear_start_posture(self.arm, q_ready)
         request["q_init"] = np.asarray(q_ready, dtype=np.float32)
+        if self.send_room and self.state_stream is not None:
+            self.state_stream.send_scene()  # these poses are base-frame and the base has moved since the last one
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
@@ -3252,6 +3280,8 @@ class R1ProSim(TiptopSim):
                 f"the {arm} arm starts inside {inside[0]} and no lift up to {max(START_LIFTS):.2f} rad frees it; "
                 "asking for the plan from here, which the planner will probably refuse"
             )
+            # Never ship the planner a body the arm is already in: it would refuse every start state in this round
+            self.obstacles = {n: o for n, o in self.obstacles.items() if n not in inside}
             return q_ready
         q, joints, delta = best
         log.info(
