@@ -303,6 +303,12 @@ class Episode:
         (``EpisodeOver``) propagates."""
         from omnigibson.tiptop.scene import EpisodeOver
 
+        # What this round MOVES, as opposed to what it moves things relative to. The planner owns a movable and
+        # must be able to reach it, so a movable is never geometry to avoid; a fixture is the opposite. Deciding
+        # by goal role rather than by size is the correction that made boxing_books plannable: the books were
+        # being shipped as obstacles, and cuRobo cannot grasp what it must avoid.
+        self.sim.round_movables = tuple(a["args"][0] for a in atoms if a.get("args"))
+        self.sim.round_labels = tuple({arg for a in atoms for arg in a.get("args", ())})
         i = len(self.records)
         # An object no capture can see is not worth another capture. Instance 301 of assembling_gift_baskets spent
         # rounds 7 to 15 -- nine rounds, thirteen minutes, a quarter of its step budget -- on swiss_cheese_2, which
