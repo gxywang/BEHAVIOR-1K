@@ -2884,10 +2884,23 @@ class R1ProSim(TiptopSim):
                 blocked = (names[j], i + 1, float(lag[j]))
                 break  # stop pushing: the rest of the path would only lean harder on whatever is in the way
         if blocked is not None:
+            # WHAT it met, not just which joint lagged. Every block was unattributable until now, so 31 of them in
+            # one episode said nothing about where to look. Probed at the posture the arm actually stopped in.
+            try:
+                probe_arm = self.arm if self.arm in self.robot.arm_names else self.robot.arm_names[0]
+                stopped_at = self.robot.get_joint_positions()
+                struck = self.arm_hits_scene(
+                    probe_arm,
+                    self._stance_ik(probe_arm),
+                    [float(stopped_at[self.joint_index[j]]) for j in self.robot.arm_joint_names[probe_arm]],
+                )
+            except Exception:  # noqa: BLE001 - a diagnostic must never end a ramp
+                struck = []
             log.warning(
                 f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
                 f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
-                f"ramp stopped there [motion: {note or 'unnamed'}, env step {self.n_steps}]"
+                f"ramp stopped there [motion: {note or 'unnamed'}, env step {self.n_steps}, "
+                f"in the way: {struck or 'nothing the box test sees'}]"
             )
             held = self.robot.get_joint_positions()
             self.posture = {j: float(held[self.joint_index[j]]) for j in posture}

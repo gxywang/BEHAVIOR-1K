@@ -119,6 +119,22 @@ if log and log.exists():
     print("\n  from the log:")
     for name, n in counts.items():
         print(f"    {n:4d}  {name}")
+    # Which motion met which body: a blocked ramp used to name only the joint that lagged, which said nothing
+    # about where to look. 91% of measured arm-vs-world contact is on these ramps.
+    blocked = re.findall(r"\[motion: ([^,]+), env step \d+, in the way: ([^\]]*)\]", text)
+    if blocked:
+        by_motion, by_body = Counter(), Counter()
+        for motion, struck in blocked:
+            by_motion[motion] += 1
+            for name in re.findall(r"'([^']+)'", struck):
+                by_body[name] += 1
+        print(f"\n  blocked ramps by motion ({len(blocked)} total):")
+        for motion, n in by_motion.most_common(8):
+            print(f"    {n:4d}  {motion}")
+        print("  ... and what they met:")
+        for body, n in by_body.most_common(8) or [("nothing the box test sees", 0)]:
+            print(f"    {n:4d}  {body}")
+
     capped = re.findall(
         r"held a target for the whole budget \((\d+) steps, ([\d.]+) rad short\); it last got "
         r"closer (\d+) step\(s\) before the end",
