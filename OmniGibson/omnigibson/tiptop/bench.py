@@ -214,10 +214,6 @@ class Episode:
         so such a pose is treated as occupied and the search is asked for another (2026-09-13).
         """
         avoid = self.stood.setdefault(names, [])
-        # What this round is aiming at, for the collision world: the goal pose is computed on these objects'
-        # PERCEIVED hulls, so the ground-truth copies must not become path obstacles. ``sim.look_names`` cannot
-        # serve -- place_robot clears it right after the teleport, before the capture reads it.
-        self.sim.stood_for = tuple(names)
         self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
         try:  # where the robot stood before the search, which it was working from
             was_pos, was_quat = self.sim.robot.get_position_orientation()

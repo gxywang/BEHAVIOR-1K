@@ -662,7 +662,6 @@ class R1ProSim(TiptopSim):
         self.urdf_joints = set(re.findall(r'<joint name="([^"]+)"', Path(self.robot.urdf_path).read_text()))
         self.look_target = None  # base-frame point the wrist cameras look at in a capture (place_robot_for sets it)
         self.look_names = ()  # the objects it was chosen for: one of them in a hand is looked at there instead
-        self.stood_for = ()  # what the round is aiming at; survives the teleport, unlike look_names
         self._base_box = None  # base_link's bounding box in the base frame (constant; measured on first use)
         self._hand_convention = {}  # arm -> how its hand approaches and closes (constant; measured on first use)
         self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
@@ -2707,9 +2706,7 @@ class R1ProSim(TiptopSim):
                 hits.append(obj.name)
         return hits
 
-    def nearby_obstacles(
-        self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT, fixtures: bool = False
-    ) -> list[str]:
+    def nearby_obstacles(self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT) -> list[str]:
         """Tracked names of the furniture standing close enough to get in the way of a plan, nearest first.
 
         The planner's collision world holds the task's own objects and one fitted table plane, and nothing else in
@@ -2755,29 +2752,20 @@ class R1ProSim(TiptopSim):
         # it out of every collision world. Only what the planner can actually pick up is spared here. The goal
         # container stays in: on the --room path these go to MotionGen alone (cutamp/tamp_world.py strips sim_*
         # from the particle world and the IK solver), so a fixture constrains the PATH without refusing the goal.
-        # ... except whatever THIS round is aiming at. The goal pose is computed on that body's PERCEIVED hull, so
-        # shipping the real one as a path obstacle asks the arm to reach a pose inside the thing it must now avoid.
-        # Measured on store_honey 303: with the goal cabinet shipped, an executed place became 4 straight
-        # TiptopPlanningErrors; without it, the same round planned and ran.
-        aiming = {id(self.objects[label]) for label in exclude if label in self.objects}
-        pickable = (
-            aiming
-            | {
-                id(o)
-                for o, lo, hi in rows_all
-                if id(o) in tracked and float(np.max(np.asarray(hi) - np.asarray(lo))) < OBSTACLE_MIN_SIZE
-            }
-            if fixtures
-            else tracked  # the label route must still spare every tracked object: perception would mask it twice
-        )
+        # TRIED AND REVERTED 2026-09-18: shipping big task objects as statics too, so the cabinet the arm
+        # swings into is geometry. It breaks the task both ways and the rule was wrong in kind -- what may be
+        # shipped is decided by whether the PLANNER owns the body as a movable, not by how big it is. Shipping
+        # the goal container turned store_honey's executed place into 4 planning errors; shipping the books of
+        # boxing_books_up_for_storage made every pick "no motion to any satisfying particle", because cuRobo then
+        # has to avoid the very book it is reaching for. Spare everything tracked.
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
         # inside an obstacle, with no collision message anywhere -- the round just dies with no satisfying particle.
-        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in pickable]
+        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in tracked]
         base_span = float(np.abs(self.base_box()[:, :2]).max())  # circumscribes the base's own box at any yaw
         rows = []
         for obj, lo, hi in rows_all:
-            if obj is self.robot or obj.name in spared or id(obj) in pickable or obj.category in FLOOR_COVERINGS:
+            if obj is self.robot or obj.name in spared or id(obj) in tracked or obj.category in FLOOR_COVERINGS:
                 continue
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
                 continue  # merged walls, roofs, ceilings
@@ -3240,8 +3228,7 @@ class R1ProSim(TiptopSim):
         # depends on where the base is, and sent after clear_start_posture has had its say about what the arm is
         # already inside -- shipping that would make the start state invalid and cost the whole round.
         if self.send_room:
-            # look_names is what this stance was chosen for, i.e. what this round is aiming at
-            self.nearby_obstacles(exclude=self.stood_for, limit=ROOM_LIMIT, fixtures=True)
+            self.nearby_obstacles(limit=ROOM_LIMIT)
         # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
         # in collision is refused before the goal is considered (``clear_start_posture``).
         q_ready = self.clear_start_posture(self.arm, q_ready)
