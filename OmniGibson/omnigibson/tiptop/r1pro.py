@@ -312,6 +312,8 @@ OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it any
 OBSTACLE_LIMIT = 8
 ROOM_LIMIT = 24  # --room ships this many; the server clamps to the free mesh slots of COLLISION_CACHE
 OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
+FILLABLE_META_LINKS = ("fillable", "openfillable")  # what OmniGibson's Inside state needs to be satisfiable at all
+INSIDE_MIN_SIDE = 0.02  # m: below 2 * cuTAMP's placement shrink the OBB raises and kills the whole round
 STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's underside is that object's support
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
@@ -667,6 +669,7 @@ class R1ProSim(TiptopSim):
         self._base_cells = {}  # object name -> the floor squares it really occupies at base height
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.send_room = False  # send that furniture as MESH statics over sim_scene instead (--room)
+        self.send_inside = False  # plan inside() onto the compartment floor (--inside-region)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -826,6 +829,109 @@ class R1ProSim(TiptopSim):
     def tracked_label(self, name: str) -> str:
         """The tracked label of an object named in a goal atom: BDDL name -> per-instance label; a label stays."""
         return self.label_of(name) if name in self.bddl_names.values() else name
+
+    def inside_region(self, item: str, container: str) -> dict | None:
+        """The placement surface for inside(item, container): the open compartment's floor, as Cuboid kwargs in the
+        base frame whose TOP face IS that floor. None, with the reason logged, when it cannot be derived, which
+        leaves the round exactly as it is today.
+
+        Privileged, like ``button_hints`` and ``openable_joints``. The geometry source is the predicate's own
+        definition rather than a task guess: OmniGibson's ``Inside`` is unsatisfiable without a fillable meta link.
+        """
+        from omnigibson.tiptop.articulation import openable_joints
+
+        from b1k.bridge.articulation import is_open
+
+        obj = self.scene_object(container)
+        if obj is None:
+            return None
+        fills = [
+            link
+            for link in obj.links.values()
+            if getattr(link, "is_meta_link", False) and getattr(link, "meta_link_type", "") in FILLABLE_META_LINKS
+        ]
+        if not fills:
+            log.info(f"inside({item}, {container}): no fillable meta link, so there is no interior to place on")
+            return None
+        joints = openable_joints(obj)
+        opened = [j for j in joints if is_open(j["lower"], j["upper"], j["position"])]
+        if joints and not opened:
+            log.info(f"inside({item}, {container}): every joint of {container} is shut; no region")
+            return None
+        if opened:  # the compartment belonging to the joint that is furthest open
+            j = max(opened, key=lambda j: abs(float(j["position"])))
+            moving = obj.links[j["link"]]
+            mid = sum(v.cpu().numpy().astype(np.float64) for v in moving.aabb) / 2.0
+            link = min(fills, key=lambda l: float(np.abs(l.visual_aabb_center.cpu().numpy() - mid).sum()))
+        else:  # open-topped: no joint to open, the largest fillable volume is the one
+            j, link = None, max(fills, key=lambda l: float(np.prod(l.visual_aabb_extent.cpu().numpy())))
+        lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.visual_aabb)
+        # Clip to the part that has EMERGED from the carcass. The rest is under solid furniture that is in no
+        # collision world this round (nearby_obstacles spares the body the round aims at), so the optimizer would
+        # happily name a pose beneath the cabinet's top panel and the arm would stop against it.
+        if j is not None and j["kind"] == "prismatic":
+            body = self.container_body(obj, j["link"])
+            k = int(np.argmax(np.abs(np.asarray(j["axis"], dtype=np.float64))))
+            if body is not None and k < 2:
+                blo, bhi = body.bounds
+                if float(j["axis"][k]) * float(j["position"]) < 0:
+                    hi[k] = min(hi[k], float(blo[k]))
+                else:
+                    lo[k] = max(lo[k], float(bhi[k]))
+        item_obj = self.scene_object(item)
+        if item_obj is None:
+            return None
+        ilo, ihi = (v.cpu().numpy().astype(np.float64) for v in item_obj.aabb)
+        # where the SCORER will look for the item's AABB centre once it rests on the floor, clamped into the
+        # volume so a tall object is still aimed at the floor rather than refused back onto the lid
+        z_rest = min(lo[2] + (ihi[2] - ilo[2]) / 2.0, (lo[2] + hi[2]) / 2.0)
+        centre, half = (lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2]) / 2.0
+        for _ in range(8):  # shrink until the fillable volume itself accepts all four corners: the scorer's gate
+            corners = th.tensor(
+                [[centre[0] + sx * half[0], centre[1] + sy * half[1], z_rest] for sx in (-1, 1) for sy in (-1, 1)],
+                dtype=th.float32,
+            )
+            if bool(link.check_points_in_volume(corners).all()):
+                break
+            half = half * 0.85
+        else:
+            log.info(f"inside({item}, {container}): {link.name} accepts no rectangle at z={z_rest:.3f}; no region")
+            return None
+        if 2 * float(half.min()) <= INSIDE_MIN_SIDE:
+            log.info(f"inside({item}, {container}): the emerged interior is {2 * half} m, too small to place on")
+            return None
+        dz = float(hi[2] - lo[2])
+        pos_b, quat_b = self.to_base(
+            th.tensor([centre[0], centre[1], lo[2] - dz / 2.0], dtype=th.float32),  # sunk: its TOP face is the floor
+            th.tensor([0.0, 0.0, 0.0, 1.0]),
+        )
+        pos = pos_b.cpu().numpy().astype(np.float64)
+        quat = quat_b.cpu().numpy().astype(np.float64)
+        log.info(
+            f"inside({item}, {container}): placing on {link.name}, floor z={lo[2]:.3f} world, "
+            f"{2 * half[0]:.2f} x {2 * half[1]:.2f} m; the item should rest at z={z_rest:.3f} under a "
+            f"ceiling of {hi[2]:.3f}"
+        )
+        return {
+            "dims": [2 * float(half[0]), 2 * float(half[1]), dz],
+            "pose": [*(float(v) for v in pos), float(quat[3]), *(float(v) for v in quat[:3])],  # cuRobo wants wxyz
+        }
+
+    def inside_regions(self, atoms: list[dict]) -> dict:
+        """``place_surfaces`` for every inside(a, b) in the goal, keyed by b's request label."""
+        supports = {a["args"][1] for a in atoms if a["predicate"] != "inside" and len(a.get("args", ())) == 2}
+        out = {}
+        for atom in atoms:
+            if atom["predicate"] != "inside" or len(atom.get("args", ())) != 2:
+                continue
+            item, container = atom["args"]
+            if container in supports:  # also an ontop target in this goal: it needs its own hull as the surface
+                log.info(f"inside({item}, {container}): {container} is also a support here; no region")
+                continue
+            region = self.inside_region(item, container)
+            if region is not None:
+                out[self.label_of(container)] = region
+        return out
 
     def label_of(self, bddl: str) -> str:
         """Request label of a tracked task object ('radio_receiver.n.01_1' -> 'radio_receiver_1')."""

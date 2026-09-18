@@ -1067,3 +1067,28 @@ def test_what_the_hand_holds_is_part_of_the_arm_for_the_bridges_own_checks():
     # nothing in hand -> nothing added, so an empty gripper costs the checks nothing
     sim.hands = lambda: {}
     assert R1ProSim.held_points(sim, "left", Ik(), [0.0]) == []
+
+
+def test_an_inside_goal_ships_the_container_interior_only_when_the_flag_is_on():
+    """inside(a, b) reaches the planner as on(a, b) and is answered against b's convex hull -- its LID. The
+    compartment floor rides the request as place_surfaces, and only with --inside-region."""
+    goal = [{"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]}]
+    sim = _Sim(_masks(candle_1=20, wicker_basket_1=30))
+    region = {"dims": [0.3, 0.4, 0.1], "pose": [1.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]}
+    sim.inside_regions = lambda atoms: {"wicker_basket_1": region}
+    source = make_knowledge("oracle", sim, goal)
+
+    req = _request()
+    source.describe(goal, req, {})
+    assert "place_surfaces" not in req, "off by default: the baseline must be untouched"
+
+    sim.send_inside = True
+    req = _request()
+    source.describe(goal, req, {})
+    assert req["place_surfaces"] == {"wicker_basket_1": region}
+
+    # a container whose interior cannot be derived leaves the round exactly as it is today
+    sim.inside_regions = lambda atoms: {}
+    req = _request()
+    source.describe(goal, req, {})
+    assert "place_surfaces" not in req

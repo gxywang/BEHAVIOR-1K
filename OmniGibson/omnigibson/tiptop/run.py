@@ -254,6 +254,7 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
     )
     sim.send_obstacles = bool(getattr(args, "obstacles", False))
     sim.send_room = bool(getattr(args, "room", False))
+    sim.send_inside = bool(getattr(args, "inside_region", False))
     # Both rebuild sim.obstacles per stance from nearby_obstacles, by two different routes; running them together
     # would have the label path and the mesh path fighting over the same dict.
     assert not (sim.send_obstacles and sim.send_room), "--obstacles and --room cannot be used together"

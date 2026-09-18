@@ -722,6 +722,12 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         "plans around the room instead of through it; costs a mask per obstacle in every capture",
     )
     p.add_argument(
+        "--inside-region",
+        action="store_true",
+        help="plan an inside() goal onto the container's own open compartment floor instead of onto its convex "
+        "hull's lid, using the fillable meta link OmniGibson's Inside state is itself defined against",
+    )
+    p.add_argument(
         "--room",
         action="store_true",
         help="send that same furniture to the planner as collision MESHES over the sim_scene channel, which "

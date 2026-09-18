@@ -37,6 +37,13 @@ class OracleKnowledge(KnowledgeSource):
 
     def describe(self, atoms, request, extras, floor=False) -> SceneKnowledge:
         labels, tiptop_atoms = self.translate(atoms)
+        # The interior of a container an inside() goal names, as its placement surface. The planner has no
+        # containment predicate, so inside(a, b) arrives as on(a, b) and is answered against b's own convex hull,
+        # i.e. 2 mm above its LID. Privileged, like the button poses; written on the request as `room` is, since
+        # attach_knowledge only carries the fixed set of keys.
+        regions = self.sim.inside_regions(atoms) if getattr(self.sim, "send_inside", False) else {}
+        if regions:
+            request["place_surfaces"] = regions
         # The furniture standing around the robot, so the planner has a world to plan in. cuTAMP's collision world
         # otherwise holds the task's own objects and one fitted plane, and it plans straight through everything
         # else in the room -- which is what the bridge has been compensating for, in the wrong place. These reach
