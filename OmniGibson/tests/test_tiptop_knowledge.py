@@ -1055,6 +1055,7 @@ def test_what_the_hand_holds_is_part_of_the_arm_for_the_bridges_own_checks():
         ),
         joint_index={"j": 0},
     )
+    sim.held_corners = lambda *a: R1ProSim.held_corners(sim, *a)  # unbound call: bind the one method it reaches
     pts = R1ProSim.held_points(sim, "left", Ik(), [0.0])
     assert len(pts) == 8, "the held object contributes its 8 box corners"
     # anchored at the posture it was read in, the corners give the jar back exactly where it is
