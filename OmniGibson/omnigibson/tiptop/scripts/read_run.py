@@ -119,21 +119,19 @@ if log and log.exists():
     print("\n  from the log:")
     for name, n in counts.items():
         print(f"    {n:4d}  {name}")
-    # Which motion met which body: a blocked ramp used to name only the joint that lagged, which said nothing
-    # about where to look. 91% of measured arm-vs-world contact is on these ramps.
-    blocked = re.findall(r"\[motion: ([^,]+), env step \d+, in the way: ([^\]]*)\]", text)
+    # WHAT a blocked ramp met, which the motion tally below cannot say. A block the box test cannot attribute is
+    # not necessarily contact: a joint that cannot track its commanded speed lags the same way (see r1pro.py on
+    # OPEN_MAX_JOINT_VEL, "the block detector reads that lag as a collision").
+    blocked = re.findall(r"in the way: ([^\]]*)\]", text)
     if blocked:
-        by_motion, by_body = Counter(), Counter()
-        for motion, struck in blocked:
-            by_motion[motion] += 1
-            for name in re.findall(r"'([^']+)'", struck):
-                by_body[name] += 1
-        print(f"\n  blocked ramps by motion ({len(blocked)} total):")
-        for motion, n in by_motion.most_common(8):
-            print(f"    {n:4d}  {motion}")
-        print("  ... and what they met:")
-        for body, n in by_body.most_common(8) or [("nothing the box test sees", 0)]:
+        bodies = Counter(n for struck in blocked for n in re.findall(r"'([^']+)'", struck))
+        unattributed = sum(1 for struck in blocked if not re.findall(r"'([^']+)'", struck))
+        print(f"\n  what the blocked ramps met ({len(blocked)} blocks):")
+        for body, n in bodies.most_common(8):
             print(f"    {n:4d}  {body}")
+        if unattributed:
+            print(f"    {unattributed:4d}  nothing the box test sees (self-collision, the held object, or a joint "
+                  f"that cannot track its speed)")
 
     capped = re.findall(
         r"held a target for the whole budget \((\d+) steps, ([\d.]+) rad short\); it last got "
@@ -153,7 +151,7 @@ if log and log.exists():
         )
 
     motions = re.findall(r"stopped following the ramp .*?\[motion: ([^,\]]+)", text)
-    steps = re.findall(r"stopped following the ramp .*?env step (\d+)\]", text)
+    steps = re.findall(r"stopped following the ramp .*?env step (\d+)[,\]]", text)
     if steps:
         print(
             f"\n  env steps to watch in the video (the arm met something): {', '.join(steps[:20])}"
