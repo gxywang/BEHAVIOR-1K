@@ -419,6 +419,17 @@ class Episode:
         if floor is None:
             floor = self.reaches_floor(*[a["args"][1] for a in atoms if len(a["args"]) == 2])
         for attempt in range(self.rounds):
+            # A container that has shut again has no interior to place into, and it does shut: store_honey's
+            # drawer was pulled to 0.200 of 0.39 and read "every joint is shut" by the placing round, so
+            # inside_region refused and the place went back onto the lid. Reopening needs the hand, so a round
+            # already carrying the item says so rather than dropping it to try.
+            for a in atoms:
+                if a["predicate"] == "inside" and len(a.get("args", ())) == 2 and self.is_shut(a["args"][1]):
+                    if self.holding(a["args"][0]):
+                        log.info(f"{a['args'][1]} is shut and the hand is full; this round cannot reopen it")
+                    else:
+                        log.info(f"{a['args'][1]} is shut again; opening it before this round")
+                        self.open_up(a["args"][1])
             where = self.stance_key()
             record = self.plan_and_execute(atoms, arm=arm, floor=floor)
             # The planner fits its support plane by RANSAC and refuses the whole request when it finds no
