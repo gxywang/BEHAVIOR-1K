@@ -274,6 +274,7 @@ class TiptopSim:
         self.metrics = []  # omnigibson.metrics.MetricBase instances fed from step() (the challenge's own scoring)
         self.n_steps = 0  # env steps taken: holds, captures and plans all count, as they do for the challenge's timeout
         self.max_steps = None  # the episode's step limit when known (shown in the frame caption)
+        self.episode_name = ""  # the bench instance this episode is, for the planner's recording
         self.episode_open = True  # env steps count (n_steps, metrics) until end_episode(); a video tail does not
         self.stop_when_done = False  # raise EpisodeOver when the task reports success or its step limit (benchmark)
         self.video_caption = None  # what the robot is doing now, one line, set by the driver (run.py, bench.py)
@@ -378,9 +379,14 @@ class TiptopSim:
         steps = f"step {self.n_steps}" + (f"/{self.max_steps}" if self.max_steps else "")
         return f"{self.video_caption}\n{steps}" if self.video_caption else steps
 
-    def begin_episode(self, metrics=(), stop_when_done: bool = False, max_steps: int | None = None) -> None:
+    def begin_episode(
+        self, metrics=(), stop_when_done: bool = False, max_steps: int | None = None, name: str = ""
+    ) -> None:
         """Start counting from zero for a scored episode: env steps, the metrics fed from ``step`` (each is reset on
-        the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``)."""
+        the environment first) and whether the task's own done signal ends the episode (``EpisodeOver``).
+
+        ``name`` identifies the instance to the planner, which groups one task's Rerun recording by it."""
+        self.episode_name = name
         self.n_steps = 0
         self.max_steps = max_steps
         self.held_objects, self.teleports, self.blocked_swings = {}, 0, 0
@@ -656,6 +662,8 @@ class TiptopSim:
             view["rgb"], view["depth"], view["intrinsics"], view["world_from_cam"], task, self.q_arm()
         )
         request["view_name"] = self.primary_view
+        if self.episode_name:
+            request["episode"] = self.episode_name  # groups the planner's Rerun recording by task instance
         if view["robot_mask"] is not None:
             request["robot_mask"] = view["robot_mask"]  # the server keeps SAM2 off these pixels (occluding gripper)
         self.last_capture_rgb = view["rgb"]

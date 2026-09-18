@@ -794,7 +794,8 @@ def main(argv=None) -> None:
             sim.reset_embodiment(metadata["embodiment"])
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             metrics = [AgentMetric(human), TaskMetric(human)]
-            sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps)  # from here on every step counts
+            # from here on every step counts
+            sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps, name=name)
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")
             if video is not None:
                 sim.recorders.append(video)
