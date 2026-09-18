@@ -1027,3 +1027,42 @@ def test_an_object_in_the_robots_own_hand_does_not_need_a_mask():
     assert "carried" in gate, "a held object must be exempt from the mask gate"
     before = src[: src.index("exempt = ")]
     assert "self.hands()" in before, "and the exemption has to read what the hands actually hold"
+
+
+def test_what_the_hand_holds_is_part_of_the_arm_for_the_bridges_own_checks():
+    """Every carrying ramp used to sweep an invisible object: the polyline stops at the fingertip link origin,
+    and a jar in the fingers reaches ~10 cm past it. The five sites that drop the held object from the OBSTACLE
+    list are right; putting it back onto the ROBOT was simply never written."""
+    import types
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    jar = types.SimpleNamespace(name="jar_1", aabb=(th.tensor([0.0, 0.0, 0.0]), th.tensor([0.1, 0.1, 0.2])))
+
+    class Ik:
+        def fk(self, q, link):  # a gripper that simply slides along +x with the joint
+            return np.array([0.5 + float(q[0]), 0.0, 1.0]), np.array([0.0, 0.0, 0.0, 1.0])
+
+    sim = types.SimpleNamespace(
+        objects={"jar_1": jar},
+        _held_boxes={},
+        hands=lambda: {"jar_1": "left"},
+        to_base=lambda pos, quat: (th.as_tensor(np.asarray(pos), dtype=th.float32), None),
+        robot=types.SimpleNamespace(
+            get_joint_positions=lambda: th.zeros(11), arm_joint_names={"left": ["j"]}
+        ),
+        joint_index={"j": 0},
+    )
+    pts = R1ProSim.held_points(sim, "left", Ik(), [0.0])
+    assert len(pts) == 8, "the held object contributes its 8 box corners"
+    # anchored at the posture it was read in, the corners give the jar back exactly where it is
+    assert np.allclose(np.mean(pts, axis=0), [0.05, 0.05, 0.1], atol=1e-6)
+    # and the point of the whole thing: they travel with the gripper, so a ramp sweeps them
+    moved = R1ProSim.held_points(sim, "left", Ik(), [0.4])
+    assert np.allclose(np.mean(moved, axis=0), [0.45, 0.05, 0.1], atol=1e-6)
+
+    # nothing in hand -> nothing added, so an empty gripper costs the checks nothing
+    sim.hands = lambda: {}
+    assert R1ProSim.held_points(sim, "left", Ik(), [0.0]) == []

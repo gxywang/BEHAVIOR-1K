@@ -310,6 +310,7 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 # to be a fixture, and capped because every one of them costs a mask in the capture and a hull in perception.
 OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it anyway
 OBSTACLE_LIMIT = 8
+ROOM_LIMIT = 24  # --room ships this many; the server clamps to the free mesh slots of COLLISION_CACHE
 OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
 STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's underside is that object's support
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
@@ -674,6 +675,7 @@ class R1ProSim(TiptopSim):
         self.q_home = None
         self.blocked_swings = 0  # capture swings stopped against something this instance (see capture)
         self._scene_meshes = {}  # object name -> (box stamp, world trimesh) for the arm's collision check
+        self._held_boxes = {}  # (arm, label) -> the held object's corners in the gripper frame
         self._init_state()
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
@@ -2454,7 +2456,52 @@ class R1ProSim(TiptopSim):
         judged by where the arm would END UP before the robot is put there.
         """
         names = list(self.robot.arm_link_names[arm]) + [f"{arm}_{suffix}" for suffix in HAND_LINKS]
-        return R1ProSim._link_points(self, ik, q, names, at)
+        points = R1ProSim._link_points(self, ik, q, names, at)
+        if getattr(self, "send_room", False):  # what the hand holds is part of the arm here too
+            points += [R1ProSim._to_world(self, p, at) for p in R1ProSim.held_points(self, arm, ik, q)]
+        return points
+
+    def held_corners(self, arm: str, label: str, ik: ArmIK) -> np.ndarray:
+        """The 8 corners of what ``arm`` holds, in the gripper's frame. The grasp is rigid, so this is read once."""
+        key = (arm, label)
+        if key not in self._held_boxes:
+            lo, hi = (v.cpu().numpy() for v in self.objects[label].aabb)
+            identity = th.tensor([0.0, 0.0, 0.0, 1.0])
+            corners = np.stack(
+                [
+                    self.to_base(th.tensor([x, y, z], dtype=th.float32), identity)[0].cpu().numpy()
+                    for x in (float(lo[0]), float(hi[0]))
+                    for y in (float(lo[1]), float(hi[1]))
+                    for z in (float(lo[2]), float(hi[2]))
+                ]
+            )
+            now = self.robot.get_joint_positions()
+            q_now = [float(now[self.joint_index[j]]) for j in self.robot.arm_joint_names[arm]]
+            pos, quat = ik.fk(q_now, f"{arm}_gripper_link")
+            rot = T.quat2mat(th.tensor(np.asarray(quat), dtype=th.float32)).cpu().numpy()
+            self._held_boxes[key] = (corners - np.asarray(pos, dtype=np.float64)) @ rot
+        return self._held_boxes[key]
+
+    def held_points(self, arm: str, ik: ArmIK, q) -> list[np.ndarray]:
+        """Where the corners of what ``arm`` holds would be at joints ``q``, in the BASE frame.
+
+        Five places drop the held object from the obstacle list, all correctly -- it is not scene furniture. The
+        other half, putting it back onto the ROBOT, was never written, so every carrying ramp swung an invisible
+        object through the room. Corners are appended to an ordered polyline, and the segments drawn between them
+        lie inside the box's own hull, so the approximation errs towards saying "clear", never the reverse.
+        """
+        points = []
+        for label, hand in self.hands().items():
+            if hand != arm or label not in self.objects:
+                continue
+            try:
+                corners = R1ProSim.held_corners(self, arm, label, ik)
+                pos, quat = ik.fk(q, f"{arm}_gripper_link")
+                rot = T.quat2mat(th.tensor(np.asarray(quat), dtype=th.float32)).cpu().numpy()
+                points.extend(np.asarray(pos, dtype=np.float64) + corners @ rot.T)
+            except Exception:  # noqa: BLE001 - no FK for this frame: fall back to the blind check
+                continue
+        return points
 
     def container_body(self, obj, moving: str):
         """World mesh of ``obj``'s links other than ``moving``: the cabinet around the drawer being opened, the
@@ -2505,14 +2552,17 @@ class R1ProSim(TiptopSim):
                 pos, _ = ik.fk(q, name)
             except Exception:
                 continue  # a link Lula's description does not carry
-            p = np.asarray(pos, dtype=np.float64)
-            if at is None:
-                points.append(np.asarray(self.base_to_world(p), dtype=np.float64))
-            else:
-                x, y, yaw = at
-                c, sn = math.cos(float(yaw)), math.sin(float(yaw))
-                points.append(np.array([x + c * p[0] - sn * p[1], y + sn * p[0] + c * p[1], p[2]], dtype=np.float64))
+            points.append(R1ProSim._to_world(self, pos, at))
         return points
+
+    def _to_world(self, p, at=None) -> np.ndarray:
+        """A base-frame point in the world frame, at the base's current pose or at an (x, y, yaw) stance."""
+        p = np.asarray(p, dtype=np.float64)
+        if at is None:
+            return np.asarray(self.base_to_world(p), dtype=np.float64)
+        x, y, yaw = at
+        c, sn = math.cos(float(yaw)), math.sin(float(yaw))
+        return np.array([x + c * p[0] - sn * p[1], y + sn * p[0] + c * p[1], p[2]], dtype=np.float64)
 
     def arm_hits_scene(
         self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None, mesh: bool = True
@@ -2550,7 +2600,9 @@ class R1ProSim(TiptopSim):
                 hits.append(obj.name)
         return hits
 
-    def nearby_obstacles(self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT) -> list[str]:
+    def nearby_obstacles(
+        self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT, fixtures: bool = False
+    ) -> list[str]:
         """Tracked names of the furniture standing close enough to get in the way of a plan, nearest first.
 
         The planner's collision world holds the task's own objects and one fitted table plane, and nothing else in
@@ -2591,14 +2643,28 @@ class R1ProSim(TiptopSim):
         spared = set(exclude) | {self.robot.name}
         tracked = set(map(id, self.objects.values()))
         rows_all = list(self.scene_aabbs())
+        # A task object big enough to be a fixture -- the cabinet the arm swung into for the whole of store_honey
+        # 303 -- is geometry to plan around as well as a thing the task names, and sparing everything tracked kept
+        # it out of every collision world. Only what the planner can actually pick up is spared here. The goal
+        # container stays in: on the --room path these go to MotionGen alone (cutamp/tamp_world.py strips sim_*
+        # from the particle world and the IK solver), so a fixture constrains the PATH without refusing the goal.
+        pickable = (
+            {
+                id(o)
+                for o, lo, hi in rows_all
+                if id(o) in tracked and float(np.max(np.asarray(hi) - np.asarray(lo))) < OBSTACLE_MIN_SIZE
+            }
+            if fixtures
+            else tracked  # the label route must still spare every tracked object: perception would mask it twice
+        )
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
         # inside an obstacle, with no collision message anywhere -- the round just dies with no satisfying particle.
-        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in tracked]
+        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in pickable]
         base_span = float(np.abs(self.base_box()[:, :2]).max())  # circumscribes the base's own box at any yaw
         rows = []
         for obj, lo, hi in rows_all:
-            if obj is self.robot or obj.name in spared or id(obj) in tracked or obj.category in FLOOR_COVERINGS:
+            if obj is self.robot or obj.name in spared or id(obj) in pickable or obj.category in FLOOR_COVERINGS:
                 continue
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
                 continue  # merged walls, roofs, ceilings
@@ -3048,13 +3114,16 @@ class R1ProSim(TiptopSim):
         # depends on where the base is, and sent after clear_start_posture has had its say about what the arm is
         # already inside -- shipping that would make the start state invalid and cost the whole round.
         if self.send_room:
-            self.nearby_obstacles()
+            self.nearby_obstacles(limit=ROOM_LIMIT, fixtures=True)
         # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
         # in collision is refused before the goal is considered (``clear_start_posture``).
         q_ready = self.clear_start_posture(self.arm, q_ready)
         request["q_init"] = np.asarray(q_ready, dtype=np.float32)
-        if self.send_room and self.state_stream is not None:
-            self.state_stream.send_scene()  # these poses are base-frame and the base has moved since the last one
+        if self.send_room:
+            # On the REQUEST rather than the mirror socket. These poses are base-frame, and the base teleports, so
+            # the only frame they are certainly right in is the one this very request was captured in -- shipping
+            # them here removes the stale-frame window the second socket had, and needs nothing of b1k.
+            request["room"] = {n: m for n, m in self.stream_scene().items() if m["kind"] == "obstacle"}
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
