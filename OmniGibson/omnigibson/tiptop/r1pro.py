@@ -2770,13 +2770,15 @@ class R1ProSim(TiptopSim):
         spared = set(exclude) | {self.robot.name}
         tracked = set(map(id, self.objects.values()))
         rows_all = list(self.scene_aabbs())
-        # Collision role, decided by what the GOAL does with a body rather than by its size. A body the goal
-        # moves is one the planner owns and must reach, so it is never geometry to avoid; every other tracked
-        # body is a fixture to work around, and its ground-truth mesh is hollow where its perceived convex hull
-        # is not (a bookcase hull is 77-83% empty space and encloses the very book being picked). ``fixtures``
-        # off restores the old behaviour of sparing everything tracked, which the --obstacles label route needs.
-        movable_labels = {self.tracked_label(b) for b in getattr(self, "task_movables", ())}
-        movables = {id(o) for label, o in self.objects.items() if label in movable_labels}
+        # Collision role, decided by what the GOAL says about a body rather than by its size. The planner
+        # reasons about every body the goal NAMES -- as something to carry or as the surface to put it on -- so
+        # ground truth must not obstruct any of them: shipping the wicker baskets of assembling_gift_baskets cost
+        # 480 "Failed to plan for approach for Pick", and shipping the books cost every pick. A body the goal
+        # never mentions is pure obstacle, and its real mesh is hollow where its perceived hull is not (a
+        # bookcase hull is 77-83% empty space and encloses the very book being picked). ``fixtures`` off spares
+        # everything tracked, which the --obstacles label route still needs.
+        named_labels = {self.tracked_label(b) for b in getattr(self, "task_labels", ())}
+        movables = {id(o) for label, o in self.objects.items() if label in named_labels}
         # ... and the fixture a movable sits INSIDE: the arm has to reach in there, and with no activation
         # distance that approach grazes the shelf it is reaching into. The container you reach into cannot also
         # be the wall you must not touch -- the same lesson the goal container taught on the place side.
@@ -2785,7 +2787,7 @@ class R1ProSim(TiptopSim):
             if id(obj) in movables or obj is self.robot:
                 continue
             for label, m in self.objects.items():
-                if label not in movable_labels:
+                if label not in named_labels:
                     continue
                 centre = sum(v.cpu().numpy().astype(np.float64) for v in m.aabb) / 2.0
                 if np.all(centre >= np.asarray(lo)) and np.all(centre <= np.asarray(hi)):

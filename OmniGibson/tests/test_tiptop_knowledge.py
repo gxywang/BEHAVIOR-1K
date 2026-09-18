@@ -998,7 +998,7 @@ def test_the_room_ships_the_wall_the_arm_can_reach_but_not_what_the_base_or_the_
         base_pose=lambda: (np.array([0.0, 0.0, 0.0]), None),
         base_box=lambda: np.array([[-0.41, -0.36, 0.0], [0.25, 0.36, 0.37]]),
         scene_aabbs=lambda: rows,
-        task_movables=("mug_1",),  # what the goal moves is never geometry to avoid
+        task_labels=("mug_1", "table_1"),  # everything the goal names is spared, movable or surface
         tracked_label=lambda b: b,  # the fake speaks labels already
     )
     assert R1ProSim.nearby_obstacles(sim, fixtures=True) == ["walls_1"]
