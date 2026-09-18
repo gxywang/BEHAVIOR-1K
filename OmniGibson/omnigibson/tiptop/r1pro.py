@@ -669,8 +669,8 @@ class R1ProSim(TiptopSim):
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.send_room = False  # send that furniture as MESH statics over sim_scene instead (--room)
         self.send_inside = False  # plan inside() onto the compartment floor (--inside-region)
-        self.round_movables = ()  # BDDL names this round moves: never collision geometry
-        self.round_labels = ()  # every BDDL name this round's atoms mention
+        self.task_movables = ()  # BDDL names the GOAL moves: the planner owns these, never collision geometry
+        self.task_labels = ()  # every BDDL name the goal mentions
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -841,7 +841,7 @@ class R1ProSim(TiptopSim):
         """
         if not self.send_room:
             return []
-        named = {self.tracked_label(b) for b in self.round_labels} | set(self.round_labels)
+        named = {self.tracked_label(b) for b in self.task_labels} | set(self.task_labels)
         return sorted(
             label
             for label, obj in self.objects.items()
@@ -2781,9 +2781,7 @@ class R1ProSim(TiptopSim):
         # other tracked body is a fixture the arm has to work around, and its ground-truth mesh is hollow where
         # its perceived convex hull is not (a bookcase hull is 77-83% empty space, and encloses the very book
         # being picked). ``fixtures`` off restores the old behaviour of sparing everything tracked.
-        movables = {
-            id(self.objects[label]) for label in getattr(self, "round_movables", ()) if label in self.objects
-        }
+        movables = {id(o) for o in (self.tracked_object(b) for b in getattr(self, "task_movables", ())) if o}
         spare_ids = movables if fixtures else tracked
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is

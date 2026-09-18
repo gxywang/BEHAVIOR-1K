@@ -307,8 +307,6 @@ class Episode:
         # must be able to reach it, so a movable is never geometry to avoid; a fixture is the opposite. Deciding
         # by goal role rather than by size is the correction that made boxing_books plannable: the books were
         # being shipped as obstacles, and cuRobo cannot grasp what it must avoid.
-        self.sim.round_movables = tuple(a["args"][0] for a in atoms if a.get("args"))
-        self.sim.round_labels = tuple({arg for a in atoms for arg in a.get("args", ())})
         i = len(self.records)
         # An object no capture can see is not worth another capture. Instance 301 of assembling_gift_baskets spent
         # rounds 7 to 15 -- nine rounds, thirteen minutes, a quarter of its step budget -- on swiss_cheese_2, which
@@ -815,6 +813,11 @@ def main(argv=None) -> None:
             load_task_instance(sim.env, sim.robot, instance_id, mode=args.mode)
             sim.env.reset()  # episode_steps = 0, as the evaluator does before a rollout
             sim.reset_embodiment(metadata["embodiment"])
+            # Collision roles, for the whole task rather than one round: what the goal MOVES the planner owns
+            # and must reach, so it is never geometry to avoid. A book this round is not carrying is still a
+            # movable. Everything tracked and in neither role is a fixture the arm works around.
+            sim.task_movables = tuple(a["args"][0] for a in strategy.goal if a.get("args"))
+            sim.task_labels = tuple({arg for a in strategy.goal for arg in a.get("args", ())})
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             metrics = [AgentMetric(human), TaskMetric(human)]
             # from here on every step counts
