@@ -2781,7 +2781,10 @@ class R1ProSim(TiptopSim):
         # other tracked body is a fixture the arm has to work around, and its ground-truth mesh is hollow where
         # its perceived convex hull is not (a bookcase hull is 77-83% empty space, and encloses the very book
         # being picked). ``fixtures`` off restores the old behaviour of sparing everything tracked.
-        movables = {id(o) for o in (self.tracked_object(b) for b in getattr(self, "task_movables", ())) if o}
+        # tracked_object takes a LABEL and falls back to self.obstacles, so a BDDL name resolves erratically --
+        # one book of six stayed unspared and was shipped as an obstacle. Map the name first, then match by label.
+        movable_labels = {self.tracked_label(b) for b in getattr(self, "task_movables", ())}
+        movables = {id(o) for label, o in self.objects.items() if label in movable_labels}
         spare_ids = movables if fixtures else tracked
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
