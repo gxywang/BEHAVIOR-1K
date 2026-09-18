@@ -970,17 +970,26 @@ def test_the_room_ships_the_wall_the_arm_can_reach_but_not_what_the_base_or_the_
     from omnigibson.tiptop.r1pro import R1ProSim
     from omnigibson.tiptop.scene import TiptopSim
 
-    def thing(name, category="furniture"):
-        return types.SimpleNamespace(name=name, category=category)
+    def thing(name, category="furniture", aabb=None):
+        ns = types.SimpleNamespace(name=name, category=category)
+        if aabb is not None:
+            ns.aabb = tuple(th.tensor(v, dtype=th.float32) for v in aabb)
+        return ns
+
+    import torch as th
 
     wall, sofa, table, mug, robot = (
-        thing("walls_1"), thing("sofa_1"), thing("table_1"), thing("mug_1"), thing("robot")
+        thing("walls_1"),
+        thing("sofa_1"),
+        thing("table_1"),
+        thing("mug_1", aabb=([0.50, 0.0, 0.70], [0.60, 0.1, 0.80])),  # on the table, clear of the wall
+        thing("robot"),
     )
     rows = [
         (wall, np.array([0.8, -2.0, 0.0]), np.array([1.0, 2.0, 2.0])),  # surface 0.8 m: reachable, kept
         (sofa, np.array([-0.3, -0.3, 0.0]), np.array([0.6, 0.6, 0.5])),  # the base is inside it: dropped
         (table, np.array([0.5, -0.5, 0.0]), np.array([1.2, 0.5, 0.7])),  # the mug stands on it: dropped
-        (mug, np.array([0.8, 0.0, 0.70]), np.array([0.9, 0.1, 0.80])),  # tracked, so never an obstacle anyway
+        (mug, np.array([0.50, 0.0, 0.70]), np.array([0.60, 0.1, 0.80])),  # tracked: never an obstacle
     ]
     sim = types.SimpleNamespace(
         robot=robot,

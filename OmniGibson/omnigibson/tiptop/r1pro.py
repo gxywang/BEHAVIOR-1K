@@ -2770,21 +2770,28 @@ class R1ProSim(TiptopSim):
         spared = set(exclude) | {self.robot.name}
         tracked = set(map(id, self.objects.values()))
         rows_all = list(self.scene_aabbs())
-        # A task object big enough to be a fixture -- the cabinet the arm swung into for the whole of store_honey
-        # 303 -- is geometry to plan around as well as a thing the task names, and sparing everything tracked kept
-        # it out of every collision world. Only what the planner can actually pick up is spared here. The goal
-        # container stays in: on the --room path these go to MotionGen alone (cutamp/tamp_world.py strips sim_*
-        # from the particle world and the IK solver), so a fixture constrains the PATH without refusing the goal.
-        # What may be shipped is decided by GOAL ROLE, not by size. A body this round MOVES is one the planner
-        # owns and must reach, so it is never geometry to avoid -- shipping the books of boxing_books made every
-        # pick "no motion to any satisfying particle", because cuRobo cannot grasp what it must avoid. Every
-        # other tracked body is a fixture the arm has to work around, and its ground-truth mesh is hollow where
-        # its perceived convex hull is not (a bookcase hull is 77-83% empty space, and encloses the very book
-        # being picked). ``fixtures`` off restores the old behaviour of sparing everything tracked.
-        # tracked_object takes a LABEL and falls back to self.obstacles, so a BDDL name resolves erratically --
-        # one book of six stayed unspared and was shipped as an obstacle. Map the name first, then match by label.
+        # Collision role, decided by what the GOAL does with a body rather than by its size. A body the goal
+        # moves is one the planner owns and must reach, so it is never geometry to avoid; every other tracked
+        # body is a fixture to work around, and its ground-truth mesh is hollow where its perceived convex hull
+        # is not (a bookcase hull is 77-83% empty space and encloses the very book being picked). ``fixtures``
+        # off restores the old behaviour of sparing everything tracked, which the --obstacles label route needs.
         movable_labels = {self.tracked_label(b) for b in getattr(self, "task_movables", ())}
         movables = {id(o) for label, o in self.objects.items() if label in movable_labels}
+        # ... and the fixture a movable sits INSIDE: the arm has to reach in there, and with no activation
+        # distance that approach grazes the shelf it is reaching into. The container you reach into cannot also
+        # be the wall you must not touch -- the same lesson the goal container taught on the place side.
+        holding_a_movable = set()
+        for obj, lo, hi in rows_all:
+            if id(obj) in movables or obj is self.robot:
+                continue
+            for label, m in self.objects.items():
+                if label not in movable_labels:
+                    continue
+                centre = sum(v.cpu().numpy().astype(np.float64) for v in m.aabb) / 2.0
+                if np.all(centre >= np.asarray(lo)) and np.all(centre <= np.asarray(hi)):
+                    holding_a_movable.add(id(obj))
+                    break
+        movables |= holding_a_movable
         spare_ids = movables if fixtures else tracked
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
