@@ -535,7 +535,9 @@ class TiptopSim:
         t0 = time.time()
         poses = self.object_poses_base_mats()
         scene = {}
-        for kind, group in (("object", self.objects), ("context", self.context), ("obstacle", self.obstacles)):
+        # --obstacles fills self.obstacles too, by the label route; only --room means them as collision meshes.
+        room = self.obstacles if getattr(self, "send_room", False) else {}
+        for kind, group in (("object", self.objects), ("context", self.context), ("obstacle", room)):
             for name, obj in group.items():
                 key = rerun_name(name)
                 if key not in self._stream_meshes:

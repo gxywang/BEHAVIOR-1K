@@ -994,6 +994,7 @@ def test_the_room_ships_the_wall_the_arm_can_reach_but_not_what_the_base_or_the_
 
     # ... and they reach the wire as kind "obstacle", which is what the server turns into cuRobo statics
     sim.objects, sim.context, sim._stream_meshes = {}, {}, {}  # only the obstacle group is under test here
+    sim.send_room = True  # --obstacles fills the same dict by the label route; only --room means meshes
     sim.object_poses_base_mats = lambda: {}
     sim.mesh_local = lambda obj: (np.zeros((3, 3), np.float32), np.zeros((1, 3), np.int32))
     import torch as th
@@ -1002,6 +1003,10 @@ def test_the_room_ships_the_wall_the_arm_can_reach_but_not_what_the_base_or_the_
     wall.get_position_orientation = lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0]))
     scene = TiptopSim.stream_scene(sim)
     assert {k: v["kind"] for k, v in scene.items()} == {"walls_1": "obstacle"}
+
+    # ... and with --room off the same populated dict puts nothing on the wire, so --obstacles is unchanged
+    sim.send_room, sim._stream_meshes = False, {}
+    assert TiptopSim.stream_scene(sim) == {}
 
 
 def test_an_object_in_the_robots_own_hand_does_not_need_a_mask():
