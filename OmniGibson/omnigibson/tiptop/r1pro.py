@@ -3229,6 +3229,16 @@ class R1ProSim(TiptopSim):
         q_ready = self.clear_start_posture(self.arm, q_ready)
         request["q_init"] = np.asarray(q_ready, dtype=np.float32)
         if self.send_room:
+            # Never ship a body the robot is ALREADY standing in. cuRobo refuses a start state in collision before
+            # it looks at the goal, and assembling_gift_baskets showed what that costs: 96
+            # INVALID_START_STATE_WORLD_COLLISION against 28 IK_FAIL once the room was real. clear_start_posture
+            # lifts the planned ARM out of trouble and drops what it cannot clear, but cuRobo's world also holds
+            # the base, the wheels, the torso and the other arm, which no lift moves.
+            inside = set(self.arm_hits_scene(self.arm, self._stance_ik(self.arm), q_ready, mesh=False))
+            for name in list(self.obstacles):
+                if name in inside:
+                    log.info(f"not shipping {name}: the arm starts inside it, which refuses every start state")
+                    del self.obstacles[name]
             # On the REQUEST rather than the mirror socket. These poses are base-frame, and the base teleports, so
             # the only frame they are certainly right in is the one this very request was captured in -- shipping
             # them here removes the stale-frame window the second socket had, and needs nothing of b1k.
