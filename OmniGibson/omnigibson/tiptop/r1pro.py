@@ -669,8 +669,6 @@ class R1ProSim(TiptopSim):
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.send_room = False  # send that furniture as MESH statics over sim_scene instead (--room)
         self.send_inside = False  # plan inside() onto the compartment floor (--inside-region)
-        self.task_movables = ()  # BDDL names the GOAL moves: the planner owns these, never collision geometry
-        self.task_labels = ()  # every BDDL name the goal mentions
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -830,25 +828,6 @@ class R1ProSim(TiptopSim):
     def tracked_label(self, name: str) -> str:
         """The tracked label of an object named in a goal atom: BDDL name -> per-instance label; a label stays."""
         return self.label_of(name) if name in self.bddl_names.values() else name
-
-    def droppable_hulls(self) -> list[str]:
-        """Request labels whose perceived convex hull should be dropped, because the room now carries the real
-        thing and the hull is a phantom solid.
-
-        Only a fixture this round's atoms never name: a bookcase qualifies -- the books start in it, the goal
-        never mentions it, and its hull encloses them. A label the goal does name keeps its hull, because
-        dropping it would take it out of ``known_labels`` and the server would refuse the request.
-        """
-        if not self.send_room:
-            return []
-        named = {self.tracked_label(b) for b in self.task_labels} | set(self.task_labels)
-        return sorted(
-            label
-            for label, obj in self.objects.items()
-            # shipped as real geometry this round, and not a name the goal atoms use: dropping one the goal names
-            # would take it out of known_labels and the server would refuse the whole request
-            if label not in named and obj.name in self.obstacles
-        )
 
     def inside_region(self, item: str, container: str) -> dict | None:
         """The placement surface for inside(item, container): the open compartment's floor, as Cuboid kwargs in the
@@ -2727,9 +2706,7 @@ class R1ProSim(TiptopSim):
                 hits.append(obj.name)
         return hits
 
-    def nearby_obstacles(
-        self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT, fixtures: bool = False
-    ) -> list[str]:
+    def nearby_obstacles(self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT) -> list[str]:
         """Tracked names of the furniture standing close enough to get in the way of a plan, nearest first.
 
         The planner's collision world holds the task's own objects and one fitted table plane, and nothing else in
@@ -2770,39 +2747,20 @@ class R1ProSim(TiptopSim):
         spared = set(exclude) | {self.robot.name}
         tracked = set(map(id, self.objects.values()))
         rows_all = list(self.scene_aabbs())
-        # Collision role, decided by what the GOAL says about a body rather than by its size. The planner
-        # reasons about every body the goal NAMES -- as something to carry or as the surface to put it on -- so
-        # ground truth must not obstruct any of them: shipping the wicker baskets of assembling_gift_baskets cost
-        # 480 "Failed to plan for approach for Pick", and shipping the books cost every pick. A body the goal
-        # never mentions is pure obstacle, and its real mesh is hollow where its perceived hull is not (a
-        # bookcase hull is 77-83% empty space and encloses the very book being picked). ``fixtures`` off spares
-        # everything tracked, which the --obstacles label route still needs.
-        named_labels = {self.tracked_label(b) for b in getattr(self, "task_labels", ())}
-        movables = {id(o) for label, o in self.objects.items() if label in named_labels}
-        # ... and the fixture a movable sits INSIDE: the arm has to reach in there, and with no activation
-        # distance that approach grazes the shelf it is reaching into. The container you reach into cannot also
-        # be the wall you must not touch -- the same lesson the goal container taught on the place side.
-        holding_a_movable = set()
-        for obj, lo, hi in rows_all:
-            if id(obj) in movables or obj is self.robot:
-                continue
-            for label, m in self.objects.items():
-                if label not in named_labels:
-                    continue
-                centre = sum(v.cpu().numpy().astype(np.float64) for v in m.aabb) / 2.0
-                if np.all(centre >= np.asarray(lo)) and np.all(centre <= np.asarray(hi)):
-                    holding_a_movable.add(id(obj))
-                    break
-        movables |= holding_a_movable
-        spare_ids = movables if fixtures else tracked
+        # TRIED AND REVERTED 2026-09-18: also shipping the task's own fixtures as ground-truth geometry, on the
+        # theory that a body the goal never MOVES is one to plan around. It cost more than it bought and it never
+        # bought anything: dispose_of_batteries improved with the room on, but everything it shipped (cubicles,
+        # cabinets, chairs, walls) is plain scene furniture that was shipped before the rule existed. What the
+        # rule added was the goal's own containers -- the wicker baskets, the toy box -- and each of those
+        # refused the very approach the round needed. Spare everything tracked; the room is furniture.
         # What the task's objects STAND on is perception's job, not ours: the planner fits it as a slab and samples
         # every placement on that slab's top. Ship the real surface as a static too and every Place particle is
         # inside an obstacle, with no collision message anywhere -- the round just dies with no satisfying particle.
-        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in spare_ids]
+        stands_on = [(lo, hi) for obj, lo, hi in rows_all if id(obj) in tracked]
         base_span = float(np.abs(self.base_box()[:, :2]).max())  # circumscribes the base's own box at any yaw
         rows = []
         for obj, lo, hi in rows_all:
-            if obj is self.robot or obj.name in spared or id(obj) in spare_ids or obj.category in FLOOR_COVERINGS:
+            if obj is self.robot or obj.name in spared or id(obj) in tracked or obj.category in FLOOR_COVERINGS:
                 continue
             if (hi[0] - lo[0]) * (hi[1] - lo[1]) > HOUSE_AABB_AREA:
                 continue  # merged walls, roofs, ceilings
@@ -3265,7 +3223,7 @@ class R1ProSim(TiptopSim):
         # depends on where the base is, and sent after clear_start_posture has had its say about what the arm is
         # already inside -- shipping that would make the start state invalid and cost the whole round.
         if self.send_room:
-            self.nearby_obstacles(limit=ROOM_LIMIT, fixtures=True)
+            self.nearby_obstacles(limit=ROOM_LIMIT)
         # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
         # in collision is refused before the goal is considered (``clear_start_posture``).
         q_ready = self.clear_start_posture(self.arm, q_ready)
@@ -3275,10 +3233,6 @@ class R1ProSim(TiptopSim):
             # the only frame they are certainly right in is the one this very request was captured in -- shipping
             # them here removes the stale-frame window the second socket had, and needs nothing of b1k.
             request["room"] = {n: m for n, m in self.stream_scene().items() if m["kind"] == "obstacle"}
-            # ... and the perceived hulls those bodies duplicate, badly. A convex hull of a bookcase is 77-83%
-            # empty space and ENCLOSES the book being picked, so every grasp is inside an obstacle: 135 IK_FAIL
-            # and not one executed round. The real mesh is now in the room for the path; the phantom solid goes.
-            request["drop_hulls"] = self.droppable_hulls()
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"

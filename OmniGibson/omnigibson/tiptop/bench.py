@@ -813,11 +813,6 @@ def main(argv=None) -> None:
             load_task_instance(sim.env, sim.robot, instance_id, mode=args.mode)
             sim.env.reset()  # episode_steps = 0, as the evaluator does before a rollout
             sim.reset_embodiment(metadata["embodiment"])
-            # Collision roles, for the whole task rather than one round: what the goal MOVES the planner owns
-            # and must reach, so it is never geometry to avoid. A book this round is not carrying is still a
-            # movable. Everything tracked and in neither role is a fixture the arm works around.
-            sim.task_movables = tuple(a["args"][0] for a in strategy.goal if a.get("args"))
-            sim.task_labels = tuple({arg for a in strategy.goal for arg in a.get("args", ())})
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             metrics = [AgentMetric(human), TaskMetric(human)]
             # from here on every step counts
