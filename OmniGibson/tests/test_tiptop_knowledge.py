@@ -1,5 +1,7 @@
 """Pure-python tests for the knowledge sources, the request keys they set, and the task strategies (no Isaac Sim)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -66,6 +68,7 @@ class _Sim:
         self.furniture = list(furniture)  # what nearby_obstacles offers with --obstacles on
         self.send_obstacles = False
         self.n_steps = 0  # the env step clock the onboard source stamps its looks with
+        self.seen = None  # (labels, view names) the oracle fed the point store with (remember_seen)
 
     def tiptop_goal(self, atoms, category_level):
         def name(bddl):
@@ -98,6 +101,9 @@ class _Sim:
         masks = self.views[name] if name in self.views else self.masks
         empty = np.zeros(request["depth"].shape, bool)
         return np.stack([masks.get(label, empty) for label in labels])
+
+    def remember_seen(self, views, labels, masks):
+        self.seen = (list(labels), sorted(masks))
 
     def button_hints(self, atoms, category_level=False):
         self.button_calls.append(list(atoms))
@@ -132,6 +138,7 @@ def test_oracle_knowledge_sends_instance_masks_and_every_button_of_the_task():
     assert source.privileged and source.report() == {"source": "oracle", "privileged": True}
     known = source.describe([goal[0]], _request(), {})
     assert known.labels == ["radio_1"]  # the candle is out of view and dropped
+    assert sim.seen[0] == ["candle_1", "radio_1"] and len(sim.seen[1]) == 1  # the point store saw every view's masks
     assert known.masks.shape == (1, 6, 8) and known.atoms == [{"predicate": "holding", "args": ["radio_1"]}]
     assert "radio_1_button" in known.buttons and sim.button_calls == [goal]  # the whole task's buttons, every round
     assert known.in_hand == [] and known.held_labels == [] and known.workspace == sim.workspace()
@@ -241,6 +248,7 @@ class _Episode(Episode):
 
     def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=(), rounds=2):
         self.rounds = rounds  # no Episode.__init__: there is no simulator behind this one
+        self.sim = SimpleNamespace(jaw_spans=lambda bddl: True)  # ...but every item fits the jaw: rounds run
         self.outcomes = list(outcomes)
         self.arms = set(arms)
         self.unreachable = set(unreachable)
@@ -313,10 +321,10 @@ def _radio(goal):
     return strategy_for("turning_on_radio", goal)
 
 
-def _baskets(goal, attempts):
+def _baskets(goal, attempts, options=None):
     from omnigibson.tiptop.strategies import strategy_for
 
-    return strategy_for("assembling_gift_baskets", goal, attempts=attempts)
+    return strategy_for("assembling_gift_baskets", goal, options=options, attempts=attempts)
 
 
 def test_turn_on_radio_holds_the_radio_while_pressing():
@@ -391,10 +399,18 @@ def test_assemble_gift_baskets_carries_items_and_tries_the_reachable_ones_first(
         "bow.n.01_2": (0.3, 0.0),
     }
     on_table = [n for n in positions if not n.startswith(("table", "wicker"))]
+    # the real goal permutes -- one ground option per pairing, any candle and any bow in either basket -- and the
+    # demand reads which items a basket may take per option, so the single-option goal above would tie each one
+    pairings = (((1, 1), (2, 2)), ((1, 2), (2, 1)))
+    options = [
+        [{"predicate": "inside", "args": [f"{kind}.n.01_{i}", f"wicker_basket.n.01_{b}"]}
+         for kind, pairs in (("candle", candles), ("bow", bows)) for i, b in pairs]
+        for candles in pairings for bows in pairings
+    ]  # fmt: skip
     # basket 2 (closer) first: candle_2 picked and placed; bow_1's pick fails twice, bow_2 works; basket 1: candle_1, bow_1
     outcomes = [{"held"}, {"placed"}, set(), set(), {"held"}, {"placed"}, {"held"}, {"placed"}, {"held"}, {"placed"}]
     ep = _Episode(outcomes, on_table=on_table, positions=positions)
-    _baskets(goal, 2).run(ep)
+    _baskets(goal, 2, options).run(ep)
     rounds = [c for c in ep.calls if c[0] == "round"]
     assert rounds[0][1:3] == ("holding", ("candle.n.01_2",))
     assert rounds[1][1:3] == ("inside", ("candle.n.01_2", "wicker_basket.n.01_2"))
@@ -504,9 +520,7 @@ def test_turn_on_radio_gives_up_when_the_radio_is_unreachable():
     assert [c for c in ep.calls if c[0] == "round"] == []
 
 
-def test_assemble_gift_baskets_stops_holding_an_item_no_plan_can_put_down():
-    from omnigibson.tiptop.strategies import TransferBlocked
-
+def test_assemble_gift_baskets_lets_go_of_an_item_no_plan_can_put_down_and_goes_on():
     goal = [
         {"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]},
         {"predicate": "inside", "args": ["bow.n.01_1", "wicker_basket.n.01_1"]},
@@ -517,24 +531,21 @@ def test_assemble_gift_baskets_stops_holding_an_item_no_plan_can_put_down():
         "candle.n.01_1": (0.1, 0),
         "bow.n.01_1": (0.2, 0),
     }
-    # the candle's place fails (two rounds) and so does the planned floor put-down (two rounds): the task stops
-    # with the candle in the hand -- no open-hand drop, no teleport to the bow's support
+    # the candle's place fails (two rounds) and so does the planned floor put-down (two rounds): the hand is opened
+    # where it is, as the last resort, and the bow's transfer goes ahead instead of the task stopping with the
+    # candle in the hand and every atom still open forfeited
     ep = _Episode(
         [{"held"}, set(), set(), set(), set(), {"held"}, {"placed"}],
         on_table=["candle.n.01_1", "bow.n.01_1"],
         positions=positions,
     )
-    with pytest.raises(TransferBlocked):
-        _baskets(goal, 1).run(ep)
+    _baskets(goal, 1).run(ep)
     rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
     inside, floor = ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")), ("ontop", ("candle.n.01_1", "floor.n.01_1"))
-    assert rounds == [("holding", ("candle.n.01_1",)), inside, inside, floor, floor]
-    assert ("release",) not in ep.calls
-    assert [c for c in ep.calls if c[0] == "stand"] == [
-        ("stand", ("candle.n.01_1",)),
-        ("stand", ("wicker_basket.n.01_1",)),
-    ]
-    assert ep.in_hand == {"candle.n.01_1"}
+    bow = [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
+    assert rounds == [("holding", ("candle.n.01_1",)), inside, inside, floor, floor, *bow]
+    assert ep.calls.index(("release",)) > ep.calls.index(("round", *floor, "left"))
+    assert ep.in_hand == set() and ep.true == {("inside", "bow.n.01_1", "wicker_basket.n.01_1")}
 
 
 def test_verdict_caption_tells_success_from_failure_and_lists_what_is_missing():
@@ -552,8 +563,11 @@ def test_verdict_caption_tells_success_from_failure_and_lists_what_is_missing():
     partial = {"success": False, "q_score": 0.6875, "satisfied": ["x"] * 11, "unsatisfied": missing, "total": 16}
     text = verdict_caption("strategy finished", False, partial)
     first, second = text.split("\n")
-    assert first == "RESULT: FAILED (strategy finished)  q_score 0.688  11/16 satisfied"
+    assert first == "RESULT: FAILED  q_score 0.688  11/16 satisfied (strategy finished)"
     assert second == "unsatisfied: " + ", ".join(missing[:3]) + " +2 more"
+    # the reason comes last: a 147-character "blocked: ..." ran the score off the 1280 px frame (mousetraps 303)
+    long = verdict_caption("blocked: " + "x" * 150, False, partial).split("\n")[0]
+    assert long.startswith("RESULT: FAILED  q_score 0.688  11/16 satisfied (blocked: ")
 
 
 def test_no_knowledge_source_tells_the_executor_when_a_switch_flips():
@@ -1080,9 +1094,12 @@ def test_an_inside_goal_ships_the_container_interior_only_when_the_flag_is_on():
     assert "place_surfaces" not in req, "off by default: the baseline must be untouched"
 
     sim.send_inside = True
+    sim.seen, at_region = None, []
+    sim.inside_regions = lambda atoms: at_region.append(sim.seen) or {"wicker_basket_1": region}
     req = _request()
     source.describe(goal, req, {})
     assert req["place_surfaces"] == {"wicker_basket_1": region}
+    assert at_region[0] is not None  # the region is chosen after this capture's points are recorded (the item's height)
 
     # a container whose interior cannot be derived leaves the round exactly as it is today
     sim.inside_regions = lambda atoms: {}

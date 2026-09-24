@@ -265,7 +265,9 @@ def test_an_object_beside_the_camera_is_refused_however_big_its_projection_is():
     """
     beside = cube([0.34, 0.61, 0.89], half=0.06)
     assert measured_framing([beside])[0] == "out of the head camera's frame altogether"
-    assert measured_framing([beside], strict=False)[1] > 0.0, "the fallback pass still charges for it"
+    # The fallback pass used to charge for it and could still take it: that is where the blind stances came from
+    # (the toy box 0.95 m to the robot's left at pixel -522, taken, GoalNotVisible; 2026-09-23).
+    assert measured_framing([beside], strict=False)[0] == "out of the head camera's frame altogether"
 
 
 def test_the_refusal_does_not_get_weaker_the_further_out_of_frame_the_object_goes():
@@ -868,6 +870,48 @@ def test_standing_inside_a_target_is_still_in_reach_not_negative():
 def test_a_target_further_than_reach_plus_its_radius_is_still_refused():
     """The change must not make everything reachable."""
     assert not _reach_ok(dist=2.5, half_width=1.0), "0.9 m past a bed's edge is still too far"
+
+
+def test_the_rings_reach_past_a_target_wider_than_the_arms_reach():
+    """The reach test measures to the bed's edge, but the candidate rings stopped at the reach itself: with a
+    bed's radius (1.42 m) past the 1.1 m reach every candidate stood ON the bed and the footprint refused them all
+    -- 4229 "overlaps bed", no stance, all three tidying_bedroom episodes (2026-09-23)."""
+    from b1k.bridge.geometry import HeadCamera, best_base_pose, rect_box_gap
+
+    bed = (np.array([-1.085, -0.915, 0.0]), np.array([1.085, 0.915, 0.5]))  # 2.17 x 1.83 m, centred
+    half = 0.5 * float(np.hypot(2.17, 1.83))
+    rect = (np.array([-0.46, -0.41]), np.array([0.30, 0.41]))  # the base with FOLD_OVERHANG
+
+    def free(x, y, yaw):  # a bed is solid at base height: the base may not stand in its box
+        gap = rect_box_gap((x, y), yaw, rect[0], rect[1], bed[0], bed[1])
+        return gap > 0.0, "free" if gap > 0.0 else "overlaps bed", max(gap, 0.0)
+
+    camera = HeadCamera(HEAD_K, head_in_base(), 0.0, 720, 720)
+    best, rejected = best_base_pose([(0.0, 0.0)], camera, free, reach=0.9, half_widths=[half], boxes=[bed])
+    assert best is not None, f"no stance beside the bed: {rejected}"
+    _, x, y, yaw, _, _, _ = best
+    assert np.hypot(x, y) > 0.9, "the stance lies beyond the rings the search used to stop at"
+    to_bed = float(np.linalg.norm(np.clip([x, y], bed[0][:2], bed[1][:2]) - [x, y]))
+    assert free(x, y, yaw)[0] and 0.0 < to_bed <= 0.9, f"off the bed and within reach of its edge, not {to_bed:.2f} m"
+
+
+def test_a_floor_is_stood_on_not_reached_from_beside():
+    """The rings widened for the bed put a floor's stance off the floor: within 0.9 m of the corridor floor's
+    BOX the strict pass takes a stance in the next room, from where it sees the whole floor ahead of the camera
+    (bringing_in_wood, 2026-09-23). Ground is stood on: the stance stays inside the floor's own box."""
+    from b1k.bridge.geometry import HeadCamera, best_base_pose
+
+    floor = (np.array([-1.47, -1.22, -0.3]), np.array([1.12, 7.81, 0.0]))  # corridor_0 of house_double_floor_lower
+    mid = (floor[0][:2] + floor[1][:2]) / 2
+    half = 0.5 * float(np.hypot(*(floor[1][:2] - floor[0][:2])))
+    camera = HeadCamera(HEAD_K, head_in_base(), 0.005, 720, 720)
+    free = lambda x, y, yaw: (True, "free", 1.0)  # the footprint is not what is under test
+    for reach in (0.9, 1.1):
+        best, rejected = best_base_pose([mid], camera, free, reach=reach, half_widths=[half], boxes=[floor])
+        assert best is not None, f"no stance on the floor: {rejected}"
+        _, x, y, _, _, _, _ = best
+        assert np.all(floor[0][:2] <= [x, y]) and np.all([x, y] <= floor[1][:2]), f"({x:.2f}, {y:.2f}) is off the floor"
+        assert np.hypot(*(np.array([x, y]) - mid)) <= reach, "within reach of the floor's centre, not of its edge"
 
 
 def test_the_fold_for_travel_moves_the_arms_and_leaves_the_torso_alone():

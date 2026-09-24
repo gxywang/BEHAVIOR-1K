@@ -725,3 +725,15 @@ def test_resampling_plays_at_planned_speed_and_every_sample_is_on_the_checked_pa
     assert np.allclose(result[0], path[0]) and np.allclose(result[-1], path[-1])
     # time-true: playback lasts as long as the plan, to within the last control tick
     assert (len(result) - 2) * control_dt < (len(path) - 1) * 0.02 <= (len(result) - 1) * control_dt + 1e-8
+
+
+def test_under_is_a_placement_on_the_planners_support_plane():
+    """under(x, f) had no translation (setting_mousetraps: 'no sub-plan for goal atoms ['under']' in 9 episodes).
+    It is a floor placement inside f's footprint: the client sends that floor as the support plane, and the atom
+    names the plane, not the fixture, so the fixture need not be in view and cannot become a surface to place on."""
+    from omnigibson.tiptop.protocol import PLANNER_SUPPORT, tiptop_goal
+
+    names = {"mousetrap_4": "mousetrap.n.01_4", "sink_1": "sink.n.01_1"}
+    goal = [{"predicate": "under", "args": ["mousetrap.n.01_4", "sink.n.01_1"]}]
+    assert tiptop_goal(goal, names, False)[1] == [{"predicate": "on", "args": ["mousetrap_4", PLANNER_SUPPORT]}]
+    assert tiptop_goal(goal, names, True)[1] == [{"predicate": "on", "args": ["mousetrap", PLANNER_SUPPORT]}]

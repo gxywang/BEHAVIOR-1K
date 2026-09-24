@@ -140,6 +140,7 @@ def _path_model():
     model.links = np.array(["torso_link4", "right_realsense_link", "left_gripper_link"])
     model.local_centres = np.array([[0.0, 0.0, 1.0], [0.0, -0.5, 1.0], [0.0, 0.5, 1.0]])
     model.radii = np.array([0.05, 0.02, 0.02])
+    model.self_ignore = set()
     model.buffer, model.self_buffer = 0.0, {}
     model.attachment_ignore = {"left_gripper_link": {"left_gripper_link"}, "right_gripper_link": set()}
     model.bounds = np.array([[1, 0, 0], [1, 1, 0], [1, 0, 1]], dtype=float)
@@ -204,7 +205,7 @@ def test_ramp_preflight_failure_commands_no_motor_step():
     )
     # No step/hold methods: geometric refusal must happen before either can execute.
     result = R1ProSim.ramp_to(sim, [0.5], {}, 1.0, 10)
-    assert result == ("right_realsense_link intersects bookcase", 0, 0.0)
+    assert result == ("right_realsense_link intersects bookcase", 0, 0.0, 4)  # ..., the path sample refused at
 
 
 def test_descendant_prismatic_extension_is_included_in_rotational_sweep_bound(tmp_path):
@@ -277,7 +278,9 @@ def test_planned_polyline_preserves_corner_and_checks_each_edge():
     model.links = np.array(["right_realsense_link"])
     model.local_centres = np.zeros((1, 3))
     model.radii = np.array([0.02])
-    model.bounds = np.ones((1, 2))
+    model.self_ignore = set()
+    model.buffer, model.self_buffer = 0.0, {}
+    model.bounds = np.ones((1,2))
     model.fk = SimpleNamespace(fk=lambda q, link: (np.array([q[0], q[1], 1.0]), np.array([0, 0, 0, 1])))
     path = [[-1, -1], [-1, 1], [1, 1]]
     middle = _box([0.1, 0.1, 0.1], [0, 0, 1])
@@ -295,7 +298,9 @@ def test_gripper_event_checks_the_whole_open_close_sweep_with_no_arm_motion():
     model.links = np.array(["left_gripper_finger_link1"])
     model.local_centres = np.zeros((1, 3))
     model.radii = np.array([0.003])
-    model.bounds = np.ones((1, 1))
+    model.self_ignore = set()
+    model.buffer, model.self_buffer = 0.0, {}
+    model.bounds = np.ones((1,1))
     model.parents = {"left_gripper_finger_link1": ("base_link", "finger_joint", "prismatic", 0.05)}
     model.joint_axes = {"finger_joint": np.array([1, 0, 0])}
     model.fk = SimpleNamespace(fk=lambda q, link: (np.array([q[0], 0, 0]), np.array([0, 0, 0, 1])))
@@ -443,7 +448,7 @@ def test_gripper_only_ramp_is_checked_before_any_motor_command(command):
         ramp_collision=collision,
     )
     assert R1ProSim.ramp_to(sim, [0.0], {}, command, 10) == (
-        "left_gripper_finger_link1 intersects bookcase", 0, 0.0
+        "left_gripper_finger_link1 intersects bookcase", 0, 0.0, 3
     )
     assert checks[0][-1] == command
 
@@ -560,9 +565,10 @@ def _destination_sim(obstacle, held=None):
         base_pose=_pose,
         collision_mesh_world=lambda obj: meshes[obj.name],
         scene_aabbs=lambda: [(obj, *meshes[obj.name].bounds) for obj in bodies],
+        objects={}, seen_boxes={},  # no capture has seen the held object: its mesh box, as before
     )
-    sim._motion_obstacles = MethodType(R1ProSim._motion_obstacles, sim)
-    sim.base_placement_collision = MethodType(R1ProSim.base_placement_collision, sim)
+    for name in ("_motion_obstacles", "base_placement_collision", "own_box", "carried_volume"):
+        setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
     return sim
 
 
@@ -606,7 +612,7 @@ def test_a_blocked_unfold_limits_how_far_the_arm_goes_not_whether_the_stance_is_
 def test_teleport_checks_live_held_volume_and_rejects_unavailable_geometry():
     sim = _destination_sim(_box([0.04, 0.04, 0.04], [4.5, 0.3, 1.0]))
     assert sim.base_placement_collision(5, 0, np.pi / 2) is None
-    held = SimpleNamespace(name="carried_can", category="can", fixed_base=False)
+    held = SimpleNamespace(name="carried_can", category="can", fixed_base=False, get_position_orientation=_pose)
     sim = _destination_sim(_box([0.04, 0.04, 0.04], [4.5, 0.3, 1.0]), held)
     assert sim.base_placement_collision(5, 0, np.pi / 2)[:2] == ("attached_object_left", "trash_can")
     sim.fold_for_travel = lambda: None
@@ -649,13 +655,13 @@ def test_stance_retry_avoids_rejected_landings_without_repeating_motor_attempts(
     searches, placements, endpoint_checks = [], [], []
 
     def best(*args, **kwargs):
-        searches.append(list(kwargs["avoid"]))
+        searches.append((list(kwargs["avoid"]), list(kwargs["refused"])))
         return (0, float(len(searches)), 0.0, 0.0, [0.5], [0.0], 0.1), {}
 
     def place(x, y, yaw, **kwargs):
         placements.append(x)
         if x == 1.0:
-            raise BasePlacementCollision("camera intersects bin after blocked fold")
+            raise BasePlacementCollision("camera intersects bin after blocked fold", obstacle="bin")
         return {"x": x, "y": y, "yaw": yaw}
 
     def check(x, y, yaw):
@@ -668,10 +674,45 @@ def test_stance_retry_avoids_rejected_landings_without_repeating_motor_attempts(
         best_base_pose=best, hands=lambda: {}, xy_radius=lambda name: 0.1, place_robot=place, base_placement_collision=check,
         hidden_from_here=lambda names: {}, to_base=lambda *args: args,
     )
-    result = R1ProSim.place_robot_for(sim, "target")
+    refused = []
+    result = R1ProSim.place_robot_for(sim, "target", refused=refused)
     assert result["x"] == 3.0
     assert placements == [1.0, 3.0] and endpoint_checks == [2.0, 3.0]
-    assert searches == [[], [(1.0, 0.0)], [(1.0, 0.0), (2.0, 0.0)]]
+    # each refusal goes into the next search with its heading and what it met, and out to the caller for a retry;
+    # the accepted-stance avoid list is not where they go (a disc there hid every heading at that spot)
+    assert searches == [([], []), ([], [(1.0, 0.0, 0.0, "bin")]), ([], [(1.0, 0.0, 0.0, "bin"), (2.0, 0.0, 0.0, "bin")])]
+    assert refused == [(1.0, 0.0, 0.0, "bin"), (2.0, 0.0, 0.0, "bin")]
+
+
+def test_the_landing_checks_verdicts_are_fed_back_into_the_next_search(monkeypatch):
+    """68% of the sweep's 2801 landing refusals named an obstacle the same search had already been refused for, and a
+    refusal left only an (x, y) disc behind, which hid every other heading at that spot (2026-09-23)."""
+    import omnigibson.tiptop.r1pro as r1pro
+
+    asked, captured = [], {}
+    sim = SimpleNamespace(
+        scene_aabbs=lambda: [], head_camera_in_base=lambda: (np.eye(3), np.eye(4), 0.0),
+        robot_cam=SimpleNamespace(image_width=720, image_height=720),
+        _footprint_free=lambda x, y, ignore, aabbs=None, yaw=None, reaching=(): (True, "free", 0.5),
+        base_placement_collision=lambda x, y, yaw, only=None: asked.append((x, only))
+        or (("base_link", "kerb", 0) if x < 1.0 else None),
+        scene_object=lambda name: SimpleNamespace(fixed_base=name == "kerb"),  # the hamper is a movable basket
+    )
+    monkeypatch.setattr(r1pro, "search_base_poses", lambda pts, cam, fp, **kw: captured.setdefault("fp", fp) and (None, {}))
+    # a landing refused by the kerb; a short unfold; a landing refused by a movable basket (its mesh is not ours)
+    refused = [(0.0, 0.0, 0.0, "kerb"), (5.0, 5.0, 0.0, None), (7.0, 0.0, 0.0, "hamper_225")]
+    R1ProSim.best_base_pose(sim, [np.zeros(2)], refused=refused)
+    fp = captured["fp"]
+    assert fp(0.1, 0.0, np.radians(15)) == (False, "refused before", 0.0)  # the same spot, nearly the same heading
+    assert fp(5.1, 5.0, np.radians(-15)) == (False, "refused before", 0.0)
+    assert fp(7.1, 0.0, np.radians(-15)) == (False, "refused before", 0.0)  # the basket keeps its avoid disc
+    assert fp(0.1, 0.0, np.radians(45)) == (False, "base_link would intersect kerb", 0.0)  # turned: the kerb is asked
+    assert fp(2.0, 0.0, 0.0) == (True, "free", 0.5)
+    assert fp(7.1, 0.0, np.radians(45)) == (True, "free", 0.5)
+    assert asked == [(0.1, {"kerb"}), (2.0, {"kerb"}), (7.1, {"kerb"})]  # about the kerb only, never the basket
+    captured.clear()
+    R1ProSim.best_base_pose(sim, [np.zeros(2)])
+    assert captured["fp"](0.1, 0.0, 0.0) == (True, "free", 0.5) and len(asked) == 3  # nothing refused: no check
 
 
 def test_base_teleport_cannot_detach_fixed_articulated_furniture_as_a_carried_object():
@@ -689,7 +730,9 @@ def _linear_sphere_model(radius):
     model.links = np.array(["left_arm_link6"])
     model.local_centres = np.zeros((1, 3))
     model.radii = np.array([radius])
-    model.bounds = np.ones((1, 1))
+    model.self_ignore = set()
+    model.buffer, model.self_buffer = 0.0, {}
+    model.bounds = np.ones((1,1))
     model.fk = SimpleNamespace(fk=lambda q, link: (np.array([q[0], 0, 0]), np.array([0, 0, 0, 1])))
     return model
 
@@ -721,3 +764,189 @@ def test_finer_sweep_still_rejects_a_collision_between_two_clear_sample_endpoint
     # This edge gets one interval: both sampled centres are clear, but the unchanged Lipschitz inflation
     # covers their entire intervening motion and therefore still refuses to cross the thin wall.
     assert model.check([0], [MAX_SWEEP_STEP], np.eye(4), [("wall", thin_wall)]) is not None
+
+
+def test_a_contact_the_motion_starts_in_is_excused_while_it_comes_no_closer():
+    """bringing_in_wood 302 (2026-09-23): after a floor pick the finger sat 4.6 mm over the floor, inside the sampling
+    inflation, and every later motion was refused at sample 0 -- the episode froze with the plank in hand."""
+    model = _path_model()
+    model.motion_bounds = lambda links, centres: np.ones((len(links), 3))
+    wall = _box([0.02, 0.2, 0.2], [0.3, 0.5, 1.0])  # its near face at x = 0.29; the gripper sphere (r 0.02) starts 5 mm in
+    start, away, deeper = [0, 0, 0.275], [0, 0, 0.0], [0, 0, 0.285]
+    assert model.check(start, away, np.eye(4), [("wall", wall)]) == ("left_gripper_link", "wall", 0)
+    assert model.check(start, away, np.eye(4), [("wall", wall)], excuse_start=True) is None
+    hit = model.check(start, deeper, np.eye(4), [("wall", wall)], excuse_start=True)
+    assert hit[:2] == ("left_gripper_link", "wall") and hit[2] > 0  # deeper is still a hit
+    # a lone gripper event has no motion to excuse: its finger sweep is the motion, and it may still hit the wall
+    assert model.check_polyline([start], np.eye(4), [("wall", wall)], excuse_start=True) == ("left_gripper_link", "wall", 0)
+    # what the start does NOT touch is judged as before: a clear start that runs into the wall is a hit
+    hit = model.check(away, deeper, np.eye(4), [("wall", wall)], excuse_start=True)
+    assert hit[:2] == ("left_gripper_link", "wall") and hit[2] > 0
+    # the carried volume against the robot's own body: the same rule (laying_tile's tile at the base)
+    carried = ("left_gripper_link", np.array([[0.0, 0.0, 1.0]]), np.array([0.02]))  # 6 cm from the torso sphere at q2 = 0.06
+    assert model.check([0, 0, 0.06], [0, 0, 0.5], np.eye(4), [], attachments=[carried])[:2] == ("attached_object_left", "torso_link4")
+    assert model.check([0, 0, 0.06], [0, 0, 0.5], np.eye(4), [], attachments=[carried], excuse_start=True) is None
+    assert model.check([0, 0, 0.06], [0, 0, 0.02], np.eye(4), [], attachments=[carried], excuse_start=True)[:2] == (
+        "attached_object_left", "torso_link4"
+    )
+    hit = model.check([0, 0, 0.5], [0, 0, 0.02], np.eye(4), [], attachments=[carried], excuse_start=True)
+    assert hit[:2] == ("attached_object_left", "torso_link4") and hit[2] > 0  # from clear into the torso: still a hit
+
+
+def test_the_carried_volume_is_the_objects_own_box_not_its_gripper_frame_aabb():
+    """laying_tile 301 (2026-09-23): a 0.45 x 0.42 m tile at 132 deg to the jaw became a 0.61 x 0.62 m gripper-frame
+    AABB and 'intersected' base_link it cleared by 3 cm. The box is the capture's depth points in the tile's own
+    frame (never its mesh); an object no capture has seen keeps the gripper-frame box of its mesh, as before."""
+    from scipy.spatial.transform import Rotation
+
+    turned = Rotation.from_euler("z", 45, degrees=True)
+    mesh = trimesh.creation.box([0.4, 0.2, 0.02])
+    mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 4, [0, 0, 1]))
+    mesh.apply_translation([1.0, 2.0, 0.5])
+    pose = (th.tensor([1.0, 2.0, 0.5]), th.tensor(turned.as_quat(), dtype=th.float32))
+    tile = SimpleNamespace(name="tile", get_position_orientation=lambda: pose)
+    sim = SimpleNamespace(
+        objects={"tile_1": tile},
+        seen_boxes={"tile_1": (np.array([-0.2, -0.1, -0.01]), np.array([0.2, 0.1, 0.01]))},  # what captures saw, own frame
+        collision_mesh_world=lambda obj: mesh,
+        robot=SimpleNamespace(links={"left_gripper_link": SimpleNamespace(get_position_orientation=lambda: (
+            th.tensor([1.0, 2.0, 0.5]), th.tensor([0.0, 0.0, 0.0, 1.0])))}),
+    )
+    sim.own_box = MethodType(R1ProSim.own_box, sim)
+    link, centres, radii = R1ProSim.carried_volume(sim, tile, "left")
+    assert link == "left_gripper_link" and len(centres) < 11 * 11  # 4 cm cells over 0.4 x 0.2, not over the 0.42 x 0.42 AABB
+    own = turned.inv().apply(centres)  # gripper frame == world frame here; back into the tile's own frame
+    assert np.all(np.abs(own) <= np.array([0.2, 0.1, 0.01]) + 1e-3)  # every sphere centre inside the tile's own box
+    assert np.abs(own[:, 0]).max() > 0.15  # ...and spread along its length, not clustered at the centre
+    sim.seen_boxes = {}
+    _, centres, _ = R1ProSim.carried_volume(sim, tile, "left")
+    assert len(centres) == 11 * 11  # unseen: 4 cm cells over the mesh's 0.42 x 0.42 gripper-frame AABB, as before
+
+
+def test_a_capture_grows_what_it_saw_of_each_object_in_its_own_frame():
+    """What the hands carry is the capture's depth under the object's mask (in the competition an object is its
+    point cloud, not a mesh): each view's points, brought back by the pose that view rendered the object at, as a
+    box in the object's frame that every later capture grows (one capture sees one side: laying_tile 303's wrist
+    view of the tile in the hand covered 0.31 x 0.28 m of 0.47 x 0.44)."""
+    k = np.array([[100.0, 0.0, 32.0], [0.0, 100.0, 32.0], [0.0, 0.0, 1.0]])
+    depth = np.ones((64, 64), dtype=np.float32)  # the floor, 1 m under a camera looking straight down
+    depth[27:37, 22:42] = 0.9  # the top face of a 10 cm box: 20 x 10 pixels = 0.18 x 0.09 m at that range
+    depth[30, 30] = 0.0  # a pixel the robot's self-mask zeroed
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[27:37, 22:42] = True
+    box_1 = np.array([[0.0, -1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.05], [0.0, 0.0, 0.0, 1.0]])
+    view, extras = {"depth": depth, "intrinsics": k}, {
+        "cam_pos_world": [0.0, 0.0, 1.0], "cam_quat_xyzw_world_cv": [1.0, 0.0, 0.0, 0.0],  # OpenCV z down
+        "object_pose_mats_at_render": {"box_1": box_1.tolist()},  # turned 90 deg, its origin 5 cm up
+    }
+    sim = TiptopSim.__new__(TiptopSim)
+    sim.seen_boxes = {}
+    sim.remember_seen([("head", view, extras)], ["box_1", "unseen_1"], {"head": np.stack([mask, np.zeros_like(mask)])})
+    lo, hi = sim.seen_boxes["box_1"]
+    assert "unseen_1" not in sim.seen_boxes
+    assert lo == pytest.approx([-0.036, -0.081, 0.05], abs=1e-6)  # world x became the box's -y; the zeroed pixel dropped
+    assert hi == pytest.approx([0.045, 0.09, 0.05], abs=1e-6)
+    raised = box_1.copy()
+    raised[2, 3] = 0.06  # the same face seen with the box's origin 1 cm higher: the face is 1 cm lower in its frame
+    sim.remember_seen([("head", view, {**extras, "object_pose_mats_at_render": {"box_1": raised.tolist()}})],
+                      ["box_1"], {"head": mask[None]})
+    assert sim.seen_boxes["box_1"][0] == pytest.approx([-0.036, -0.081, 0.04], abs=1e-6)  # the box grew downward
+    assert sim.seen_boxes["box_1"][1] == pytest.approx([0.045, 0.09, 0.05], abs=1e-6)
+    sim.remember_seen([("head", view, extras)], ["box_1"], {"head": np.zeros((1, 64, 64), dtype=bool)})
+    assert sim.seen_boxes["box_1"][0] == pytest.approx([-0.036, -0.081, 0.04], abs=1e-6)  # unseen: nothing changes
+
+
+def test_the_landing_check_excuses_a_hand_already_at_the_floor_here():
+    """bringing_in_wood 302 (2026-09-23): 48 corridor stances refused for a finger 'in' the floor that it was already
+    'in' at the current stance; a teleport of the same posture deepens nothing."""
+    from omnigibson.tiptop.r1pro import GROUND_TOP
+
+    model = _path_model()
+    model.joint_names = ["torso", "right", "left"]
+    model.motion_bounds = lambda links, centres: np.ones((len(links), 3))
+    here = SimpleNamespace(name="floors_here", category="floors", fixed_base=True)
+    there = SimpleNamespace(name="floors_there", category="floors", fixed_base=True)
+    # strips under the gripper sphere (y 0.5) only: 1.5 cm into both, and neither under the torso or the camera
+    meshes = {"floors_here": _box([2, 0.2, 0.1], [0.0, 0.5, 0.945]), "floors_there": _box([2, 0.2, 0.1], [5.0, 0.5, 0.945])}
+    assert meshes["floors_here"].bounds[1][2] > GROUND_TOP  # the test's floor is up at the gripper; ground by category
+    sim = SimpleNamespace(
+        arm="left", robot=SimpleNamespace(get_joint_positions=lambda: th.zeros(3), _ag_obj_in_hand={},
+                                          finger_link_names={"left": ["left_gripper_finger_link1"]}),
+        joint_index={name: i for i, name in enumerate(model.joint_names)}, _motion_collision_model=lambda: model,
+        base_pose=_pose, collision_mesh_world=lambda obj: meshes[obj.name],
+        scene_aabbs=lambda: [(obj, *meshes[obj.name].bounds) for obj in (here, there)],
+    )
+    sim._motion_obstacles = MethodType(R1ProSim._motion_obstacles, sim)
+    assert R1ProSim.base_placement_collision(sim, 5.0, 0.0, 0.0) is None  # in the floor here too: the stance stands
+    meshes["floors_here"].apply_translation([0.0, 0.0, -0.1])  # clear of the floor here: the destination is refused
+    assert R1ProSim.base_placement_collision(sim, 5.0, 0.0, 0.0) == ("left_gripper_link", "floors_there", 0)
+
+
+def test_a_loose_tile_at_the_destination_is_ground_for_the_base_but_not_floor_for_the_hand():
+    """laying_tile_floors (2026-09-23): a tile lying flat is ground by height (top 3 cm) but not the map's, and the
+    hand-at-the-floor excuse let a carried tile be stood into one. Only fixed-base ground is excused; a paver is."""
+    from omnigibson.tiptop.r1pro import GROUND_TOP
+
+    model = _path_model()
+    model.joint_names = ["torso", "right", "left"]
+    model.motion_bounds = lambda links, centres: np.ones((len(links), 3))
+    model.local_centres = np.array([[0.0, 0.0, 1.0], [0.0, -0.5, 1.0], [0.0, 0.5, 0.02]])  # the hand down at the floor
+    floor = SimpleNamespace(name="floors_here", category="floors", fixed_base=True)
+    tile = SimpleNamespace(name="ceramic_tile_186", category="ceramic_tile", fixed_base=False)
+    meshes = {"floors_here": _box([0.3, 0.3, 0.02], [0.0, 0.5, 0.0]),  # top 1 cm: the hand is in it here
+              "ceramic_tile_186": _box([0.45, 0.42, 0.03], [5.0, 0.5, 0.015])}  # top 3 cm, lying at the destination
+    assert meshes["ceramic_tile_186"].bounds[1][2] < GROUND_TOP
+    sim = SimpleNamespace(
+        arm="left", robot=SimpleNamespace(get_joint_positions=lambda: th.zeros(3), _ag_obj_in_hand={},
+                                          finger_link_names={"left": ["left_gripper_finger_link1"]}),
+        joint_index={name: i for i, name in enumerate(model.joint_names)}, _motion_collision_model=lambda: model,
+        base_pose=_pose, collision_mesh_world=lambda obj: meshes[obj.name],
+        scene_aabbs=lambda: [(obj, *meshes[obj.name].bounds) for obj in (floor, tile)],
+    )
+    sim._motion_obstacles = MethodType(R1ProSim._motion_obstacles, sim)
+    assert R1ProSim.base_placement_collision(sim, 5.0, 0.0, 0.0) == ("left_gripper_link", "ceramic_tile_186", 0)
+    tile.fixed_base = True  # a paver: the map's own ground, excused like the floor
+    assert R1ProSim.base_placement_collision(sim, 5.0, 0.0, 0.0) is None
+
+
+def test_a_ramp_that_swings_a_hand_into_the_robots_own_head_is_refused():
+    """bringing_in_wood 301 (2026-09-23): the capture swing rolled left_arm_joint3 through 3.7 rad and the fingers
+    stopped on zed_link, logged 'in the way: nothing the box test sees'; 43 such swings in 30 episodes. The real
+    r1pro spheres and the simulator's own disabled pairs, no scene."""
+    import yaml
+    from pathlib import Path
+
+    from omnigibson.tiptop.collision import JointPathCollision
+
+    r1pro = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro"
+    joints = [f"torso_joint{i}" for i in range(1, 5)] + [f"{s}_arm_joint{i}" for i in range(1, 8) for s in ("left", "right")]
+    joints += [f"{s}_gripper_finger_joint{i}" for s in ("left", "right") for i in (1, 2)]
+    disabled = yaml.safe_load((r1pro / "r1pro.yaml").read_text())["disabled_collision_pairs"]
+    model = JointPathCollision(r1pro / "urdf/r1pro.urdf", r1pro / "curobo/r1pro_description_curobo_arm_no_torso.yaml",
+                               joints, disabled)
+    ready = np.array([1.025, -1.45, -0.47, 0.0] + [0.0] * 14 + [0.05] * 4)
+    left = [model.joint_names.index(f"left_arm_joint{i}") for i in range(1, 8)]
+
+    def with_left(arm):
+        q = ready.copy()
+        q[left] = arm
+        return q
+
+    ready = with_left([-1.6312, 0.2636, -1.812, -1.4576, -0.0508, -0.3727, -1.3193])  # r1pro_left's q_home
+    look = [-3.076, 0.7612, 1.8993, -1.9185, 1.7689, -0.9253, -0.838]  # wood 301's commanded look posture
+
+    def elbow_first(arm):  # ramp_arms' swing: the elbow alone, then the rest (swing_collision checks the same)
+        via = ready.copy()
+        via[left[3]] = arm[3]
+        return [ready, via, with_left(arm)]
+
+    hit = model.check_polyline(elbow_first(look), np.eye(4), [], excuse_start=True)
+    assert hit[:2] == ("left_gripper_finger_link1", "zed_link") and hit[2] > 0
+    # the other shoulder branch of the same look (302) swings out to the side, clear of the head
+    assert model.check_polyline(elbow_first([0.01, 2.36, -1.19, -1.86, 1.69, -0.85, -0.89]), np.eye(4), []) is None
+    # from the stop, the fingers on the head at sample 0, the way back is the robot's own business, not the ramp's
+    stuck = with_left([-2.11, 0.43, -0.76, -1.92, 0.41, -0.57, -1.2])
+    assert model.check(stuck, ready, np.eye(4), []) is None
+    # what the simulator lets pass is not judged: left_arm_link2 sits 8 mm off torso_link4 at ready and closes on it
+    # on most clean swings
+    assert ("left_arm_link2", "torso_link4") in model.self_ignore and ("left_arm_link1", "left_arm_link2") in model.self_ignore

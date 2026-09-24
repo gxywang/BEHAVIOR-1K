@@ -87,6 +87,7 @@ class FakeEpisode:
         return False
 
     put_down_ok = True  # whether a planned put-down finds a plan
+    release_ok = True  # whether opening the hand where it is lets go of the object
 
     def put_down(self, bddl, support, floor=None):
         self.calls.append(("put_down", bddl, support))
@@ -96,7 +97,8 @@ class FakeEpisode:
 
     def release(self):
         self.calls.append(("release",))
-        self.hand = None
+        if self.release_ok:
+            self.hand = None
 
     def holding(self, bddl):
         return self.hand == bddl
@@ -213,7 +215,9 @@ def test_the_demand_is_read_from_every_way_the_goal_can_be_satisfied():
         ("bow", "wicker_basket.n.01_1"): 1,
         ("bow", "wicker_basket.n.01_2"): 1,
     }
-    assert demand.items == {"candle": candles, "bow": bows}
+    for kind, names in (("candle", candles), ("bow", bows)):
+        for c in containers:
+            assert sorted(demand.items[(kind, c)]) == names, "either basket may take either candle and either bow"
     assert demand.containers == containers and demand.total() == 4
 
     # a goal that takes any container (the toys): one option per assignment, so a box may want every toy
@@ -233,6 +237,8 @@ def test_the_demand_is_read_from_every_way_the_goal_can_be_satisfied():
     demand = place_demand([option])
     assert demand.wanted == {("battery", "ashcan.n.01_1"): 3, ("ashcan", "floor.n.01_1"): 1}
     assert demand.predicate[("ashcan", "floor.n.01_1")] == "ontop"
+    assert demand.items[("battery", "ashcan.n.01_1")] == [f"battery.n.02_{i}" for i in (1, 2, 3)]
+    assert demand.items[("ashcan", "floor.n.01_1")] == ["ashcan.n.01_1"], "a fixed atom names its one instance"
 
 
 # ---------------------------------------------------------------- transfers
@@ -243,7 +249,13 @@ def test_transfers_go_container_by_container_nearest_first_and_items_nearest_the
         pick_ok={"candle.n.01_1", "candle.n.01_2", "cookie.n.01_1"},
         place_ok={"candle.n.01_1", "candle.n.01_2", "cookie.n.01_1"},
     )
-    strategy_for("assembling_gift_baskets", goal).run(ep)
+    # the task pairs the candles off with the baskets, so either candle may go in either basket
+    swapped = [
+        atom("inside", "candle.n.01_2", "basket.n.01_1"),
+        atom("inside", "cookie.n.01_1", "basket.n.01_1"),
+        atom("inside", "candle.n.01_1", "basket.n.01_2"),
+    ]
+    strategy_for("assembling_gift_baskets", goal, options=[goal, swapped]).run(ep)
     picks = [c[1] for c in ep.calls if c[0] == "pick"]
     # basket_2 (nearer the table) first; it wants a candle: candle_1 is nearest the table edge so it goes first
     assert picks[0] == "candle.n.01_1"
@@ -414,11 +426,10 @@ def test_a_floor_that_cannot_be_located_retains_the_object():
     goal = [atom("ontop", "plywood.n.01_1", "floor.n.01_2")]
     ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
     ep.unreachable_floors = {"floor.n.01_2"}
-    ep.put_down_ok = False
+    ep.put_down_ok = ep.release_ok = False
     with pytest.raises(TransferBlocked, match="floor.n.01_2"):
         strategy_for("bringing_in_wood", goal).run(ep)
     assert ep.hand == "plywood.n.01_1"
-    assert not any(c[0] == "release" for c in ep.calls)
     assert {c[2] for c in ep.calls if c[0] == "put_down"} == {"floor.n.01_1"}
 
 
@@ -557,19 +568,21 @@ def test_items_on_a_second_support_are_transferred_too():
     ]
 
 
-def test_an_unreachable_container_retains_the_item():
+def test_an_unreachable_container_puts_the_item_back_and_opens_the_hand_only_as_the_last_resort():
     boxes, goal = basket_world()
+    options = [goal, [atom("inside", "candle.n.01_2", "basket.n.01_1"), goal[1], atom("inside", "candle.n.01_1", "basket.n.01_2")]]
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, unreachable={"basket.n.01_2"})
-    ep.put_down_ok = False
+    ep.put_down_ok = ep.release_ok = False
     with pytest.raises(TransferBlocked, match="object retained"):
-        Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
-    assert not any(c[0] == "release" for c in ep.calls)
+        Runner(STRATEGIES["assembling_gift_baskets"], goal, options=options, attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert kinds.index("release") > kinds.index("put_down"), "opened only after every planned put-down failed"
     assert ep.hand == "candle.n.01_1"
     # the item goes back on its own support where the robot stands, else onto the floor, with a plan
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, unreachable={"basket.n.01_2"})
-    Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    Runner(STRATEGIES["assembling_gift_baskets"], goal, options=options, attempts=1).run(ep)
     assert ("put_down", "candle.n.01_1", ep.support_of("candle.n.01_1")) in ep.calls
-    assert not any(c[0] == "release" for c in ep.calls)
+    assert not any(c[0] == "release" for c in ep.calls), "a put-down that plans leaves nothing to let go of"
 
 
 def test_an_item_whose_support_is_unknown_can_be_picked_but_is_not_abandoned():
@@ -577,37 +590,51 @@ def test_an_item_whose_support_is_unknown_can_be_picked_but_is_not_abandoned():
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set(), unreachable={"basket.n.01_1"})
     ep.support_of = lambda item: None
     ep.edge_gap = lambda item, support: float("inf") if support is None else 0.0
-    ep.put_down_ok = False
+    ep.put_down_ok = ep.release_ok = False
     with pytest.raises(TransferBlocked):
         Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
     assert any(c[0] == "pick" for c in ep.calls)
     assert not any(c[0] == "stand_for" and None in c[1] for c in ep.calls)
-    assert not any(c[0] == "release" for c in ep.calls)
     assert {c[2] for c in ep.calls if c[0] == "put_down"} == {ep.floor}  # an unknown support: the floor
     assert ep.hand == "candle.n.01_1"
 
 
-def test_a_full_hand_is_only_emptied_by_a_planned_floor_put_down():
+def test_a_full_hand_is_emptied_by_a_planned_floor_put_down_and_opened_only_when_none_plans():
     ep = FakeEpisode({})
-    ep.hand, ep.put_down_ok = "toy.n.01_1", False
+    ep.hand, ep.put_down_ok, ep.release_ok = "toy.n.01_1", False, False
     assert Runner.free_hand(ep) is False
-    # from where it stands, then again from a stance chosen for the floor; never a release
-    assert ep.calls == [("put_down", "toy.n.01_1", ep.floor), ("walk_to_floor", ep.floor), ("put_down", "toy.n.01_1", ep.floor)]
+    # from where it stands, then again from a stance chosen for the floor, and only then the hand opened where it
+    # is -- the alternative is TransferBlocked, which ends the instance with the object in the hand
+    assert ep.calls == [
+        ("put_down", "toy.n.01_1", ep.floor),
+        ("walk_to_floor", ep.floor),
+        ("put_down", "toy.n.01_1", ep.floor),
+        ("release",),
+    ]
     assert ep.hand == "toy.n.01_1"
-    ep.put_down_ok = True
+    ep.release_ok = True
     assert Runner.free_hand(ep) is True and ep.hand is None
+    ep.hand, ep.put_down_ok, ep.calls = "toy.n.01_1", True, []
+    assert Runner.free_hand(ep) is True and ep.hand is None
+    assert ep.calls == [("put_down", "toy.n.01_1", ep.floor)], "a put-down that plans is the whole recovery"
 
 
 def test_a_full_hand_blocks_the_next_pick():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set())
-    ep.hand, ep.put_down_ok = "cookie.n.01_1", False
+    ep.hand, ep.put_down_ok, ep.release_ok = "cookie.n.01_1", False, False
     with pytest.raises(TransferBlocked, match="cannot start pickup"):
         Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
-    # the only recovery is a planned put-down on the floor where the robot stands
-    assert not any(c[0] in ("pick", "stand_for", "release") for c in ep.calls)
+    # the recovery is a planned put-down on the floor where the robot stands, and failing that an open hand
+    assert not any(c[0] in ("pick", "stand_for") for c in ep.calls)
     assert all(c[2] == ep.floor for c in ep.calls if c[0] == "put_down")
     assert ep.hand == "cookie.n.01_1"
+    # once the hand is empty the picks go ahead rather than the instance ending
+    ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set())
+    ep.hand, ep.put_down_ok = "cookie.n.01_1", False
+    Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert "release" in kinds and "pick" in kinds and kinds.index("release") < kinds.index("pick")
 
 
 # ---------------------------------------------------------------- presses
@@ -663,6 +690,11 @@ def test_the_episode_judges_rounds_without_the_simulator():
         def task_scope(self):
             return {"table.n.02_1": None, "candle.n.01_1": None, "basket.n.01_1": None, "agent.n.01_1": None}
 
+        truth = True  # what the task's own evaluator says of the pair (Episode.goal_already_holds)
+
+        def holds(self, predicate, *names):
+            return self.truth
+
     class Knowledge:
         def __init__(self, boxes):
             self.boxes = boxes
@@ -691,6 +723,9 @@ def test_the_episode_judges_rounds_without_the_simulator():
     assert not ep.satisfied([atom("toggled_on", "radio.n.01_1")], record={"error": "no plan"})
     assert ep.satisfied([atom("toggled_on", "radio.n.01_1")], record={"round": 3})
     assert ep.satisfied([atom("inside", "candle.n.01_1", "basket.n.01_1")], record={"round": 4})
+    # on the lid is not inside: the boxes take an item up to 15 cm over the target's top, the evaluator does not
+    ep.sim.truth = False
+    assert not ep.satisfied([atom("inside", "candle.n.01_1", "basket.n.01_1")], record={"round": 4})
 
 
 def test_the_episode_tolerates_an_object_it_has_never_perceived():
@@ -759,6 +794,9 @@ def test_a_placement_is_judged_only_on_knowledge_from_after_the_plan_ran():
 
         def tracked_label(self, name):
             return name.replace(".n.01_", "_")
+
+        def holds(self, predicate, *names):
+            return True  # the evaluator agrees; the freshness of the look is what this tests
 
     class Knowledge:
         def __init__(self, boxes):
@@ -1183,6 +1221,22 @@ def test_a_touching_goal_lifts_the_item_onto_its_support():
     assert "pick" in kinds, "a touching goal must actually lift the shoe"
 
 
+def test_an_under_goal_is_a_placement_the_runner_schedules():
+    """sorting_household_items asks for two bottles under the sink; "under" was not in PLACE_PREDICATES, so the
+    demand never saw them and the runner warned "no sub-plan for goal atoms ['under']" (2026-09-23). The wire
+    carries it as a placement on the planner's support (test_tiptop_protocol), which the bridge sets to the floor
+    inside the sink's footprint, and the episode judges it by the evaluator alone."""
+    from omnigibson.tiptop.strategies import PLACE_PREDICATES
+
+    assert "under" in PLACE_PREDICATES
+    boxes = {"bottle.n.01_1": box((0.0, 0.0, 0.05)), "sink.n.01_1": box((1.0, 0.0, 0.6), half=(0.3, 0.3, 0.2))}
+    ep = FakeEpisode(boxes, pick_ok={"bottle.n.01_1"}, place_ok={("bottle.n.01_1", "sink.n.01_1")})
+    goal = [atom("under", "bottle.n.01_1", "sink.n.01_1")]
+    Runner(STRATEGIES["sorting_household_items"], goal, attempts=1).run(ep)
+    assert ("pick", "bottle.n.01_1") in ep.calls
+    assert ("achieve", ("under",), ("bottle.n.01_1", "sink.n.01_1"), "left") in ep.calls
+
+
 def test_a_switch_the_goal_wants_OFF_still_gets_its_button_described():
     """A goal asking for a switch to be off arrives as not(toggled_on, x) -- bddl compiles the negation into the
     ground atom. press_targets has read both forms since it was written; button_hints read only the positive one.
@@ -1258,3 +1312,188 @@ def test_a_fallen_base_is_righted_at_the_last_level_pose_before_searching_again(
     ep = Episode(sim, SimpleNamespace(rounds=2, settle_steps=1), {}, None, None)
     assert ep.stand_for("book.n.02_6") == {"x": 1.5, "y": 2.0, "yaw": 0.0}
     assert righted == [(1.0, 2.0, 0.0)]  # the pose the scene started it at, the last one known level
+
+
+# --------------------------------------------------------------- the goal model, from the 2026-09-23 sweep's recordings
+def bedroom_options():
+    """tidying_bedroom's two ground options as bddl grounds them: two fixed nextto atoms and an exists over the
+    two nightstands for the book."""
+    fixed = [atom("nextto", "sandal.n.01_1", "bed.n.01_1"), atom("nextto", "sandal.n.01_2", "sandal.n.01_1")]
+    return [fixed + [atom("ontop", "book.n.02_1", table)] for table in ("table.n.02_1", "table.n.02_2")]
+
+
+def bedroom_world(book_on="bed.n.01_1"):
+    """The shipped bedroom: the bed 1.8 x 2.1 m, the two nightstands flanking its head, the sandals lying near
+    each other on the floor about 2 m from the bed, and the book on the bed or already on a nightstand."""
+    boxes = {
+        "bed.n.01_1": box((23.84, 23.96, 0.4), half=(0.9, 1.07, 0.4)),
+        "table.n.02_1": box((24.65, 22.5, 0.17), half=(0.24, 0.39, 0.17)),
+        "table.n.02_2": box((24.66, 25.41, 0.17), half=(0.24, 0.39, 0.17)),
+        "sandal.n.01_1": box((21.78, 24.67, 0.017), half=(0.12, 0.045, 0.017)),
+        "sandal.n.01_2": box((21.5, 24.9, 0.017), half=(0.12, 0.045, 0.017)),
+    }
+    top = boxes[book_on]["hi"][2]
+    boxes["book.n.02_1"] = box((boxes[book_on]["center"][0], boxes[book_on]["center"][1], top + 0.01), half=(0.1, 0.07, 0.01))
+    return boxes
+
+
+class Bedroom(FakeEpisode):
+    """A FakeEpisode that can judge nextto: the pairs in ``beside`` hold, and an executed nextto placement joins them."""
+
+    def __init__(self, boxes, **kw):
+        super().__init__(boxes, pick_ok=set(boxes), place_ok=set(boxes), **kw)
+        self.beside = set()
+
+    def goal_already_holds(self, predicate, item, container):
+        if predicate == "nextto":
+            return frozenset((item, container)) in self.beside
+        return super().goal_already_holds(predicate, item, container)
+
+    def achieve(self, atoms, arm="left", floor=None):
+        ok = super().achieve(atoms, arm=arm, floor=floor)
+        if ok and atoms[0]["predicate"] == "nextto":
+            self.beside.add(frozenset(atoms[0]["args"]))
+        return ok
+
+
+def test_a_book_already_on_one_nightstand_is_not_carried_to_the_other():
+    """tidying_bedroom 301: at round 4 the book went onto table_1, which satisfies the exists over the two
+    nightstands. The demand, read across both options, still asked for "book x1 -> table_2"; sweep 2 took the
+    book off table_1, failed four rounds at table_2 and left it on the floor: 0.0 for a 0.33 (2026-09-23)."""
+    options = bedroom_options()
+    ep = Bedroom(bedroom_world(book_on="table.n.02_1"), unreachable={"bed.n.01_1"})
+    ep.sim = _Budget(max_steps=100000, n_steps=0)  # room for the extra sweeps, which is where it happened
+    Runner(STRATEGIES["tidying_bedroom"], options[0], options=options).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert "book.n.02_1" not in picks, f"the book is where one option wants it; got picks {picks}"
+    assert not any(c[0] == "stand_for" and "table.n.02_2" in c[1] for c in ep.calls)
+
+
+def test_the_bed_slot_takes_only_the_sandal_the_goal_names():
+    """tidying_bedroom 303: sandal_2 was carried for the bed slot, put back when no stance reached the bed, and
+    happened to land beside it. Sweep 2 then read "already there: sandal_2" and closed the slot, although the
+    goal names sandal_1 for nextto(sandal_1, bed_1), which stayed false. Two of 301's four bed carries took
+    sandal_2 as well, which no atom asks for (2026-09-23)."""
+    options = bedroom_options()
+    ep = Bedroom(bedroom_world())
+    ep.beside.add(frozenset(("sandal.n.01_2", "bed.n.01_1")))
+    Runner(STRATEGIES["tidying_bedroom"], options[0], options=options).run(ep)
+    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
+    assert ("sandal.n.01_1", "bed.n.01_1") in achieved, f"the named sandal still has to go: {achieved}"
+    assert ("sandal.n.01_2", "bed.n.01_1") not in achieved
+
+
+def test_a_partner_is_placed_before_anything_is_put_beside_it():
+    """nextto(sandal_2, sandal_1) names sandal_1 as the target, and sandal_1 itself is wanted beside the bed.
+    Containers went nearest first, so sandal_2 was set beside sandal_1 where it lay (the two sandals lie closer
+    to each other than to the bed in 88 of the 300 shipped states) and stopped being beside it the moment
+    sandal_1 was carried off."""
+    options = bedroom_options()
+    ep = Bedroom(bedroom_world())
+    Runner(STRATEGIES["tidying_bedroom"], options[0], options=options).run(ep)
+    stands = [c[1] for c in ep.calls if c[0] == "stand_for"]
+    assert stands.index(("bed.n.01_1",)) < stands.index(("sandal.n.01_1",)), stands
+
+
+def test_an_item_is_not_carried_again_to_a_container_no_stance_reached():
+    """picking_up_toys 301: toy_box_1 sits in the back corner of an L-shaped desk and no stance reached it while
+    carrying. Every sweep picked each toy again, ran the same search with the same rejections and put it back:
+    14 fallback put-downs against 4 goal places over the task's three instances, and sweep-wide 83 of 167
+    put-backs repeated a container that had already raised Unreachable (2026-09-23)."""
+    toys = [f"board_game.n.01_{i}" for i in (1, 2, 3)] + [f"jigsaw_puzzle.n.01_{i}" for i in (1, 2)] + ["tennis_ball.n.01_1"]
+    boxes = {"toy_box.n.01_1": box((20.57, 18.63, 0.9), half=(0.3, 0.3, 0.2))}
+    for i, toy in enumerate(toys):
+        boxes[toy] = box((19.0 + 0.3 * i, 20.0, 0.03))
+    goal = [atom("inside", toy, "toy_box.n.01_1") for toy in toys]
+    ep = FakeEpisode(boxes, pick_ok=set(toys), unreachable={"toy_box.n.01_1"})
+    ep.sim = _Budget(max_steps=100000, n_steps=0)
+    strategy_for("picking_up_toys", goal).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert len(picks) == len(set(picks)), f"a toy put back for a box no stance reaches is not carried there again: {picks}"
+
+
+def test_an_item_already_placed_is_only_moved_for_an_atom_it_can_add():
+    """setup_a_bar 302: can_1 stood on the countertop, satisfying ontop(can_1, countertop). The runner took it
+    down for nextto(can_1, can_2) with can_2 still on the floor, that placement failed, and the can ended on the
+    floor: one atom undone. sorting_bottles 303 did the same with a bottle out of one bucket for another. With
+    can_2 on the countertop the same move keeps the ontop atom, and stays allowed (2026-09-23)."""
+    cans = ["can__of__soda.n.01_1", "can__of__soda.n.01_2"]
+    goal = [atom("ontop", cans[0], "countertop.n.01_1"), atom("ontop", cans[1], "countertop.n.01_1"), atom("nextto", cans[0], cans[1])]
+    boxes = {"countertop.n.01_1": box((0, 2, 0.9), half=(0.8, 0.3, 0.02)), cans[0]: box((0, 2, 0.97)), cans[1]: box((1.0, 0, 0.05))}
+    ep = FakeEpisode(boxes, pick_ok=set(cans), place_ok=set())  # can_2's own placement fails, so it stays on the floor
+    Runner(STRATEGIES["setup_a_bar_for_a_cocktail_party"], goal, attempts=1).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks == [cans[1]], f"can_1 is where the goal wants it and beside a can on the floor it would not be: {picks}"
+
+    boxes[cans[1]] = box((0.3, 2, 0.97))  # can_2 on the countertop too
+    ep = FakeEpisode(boxes, pick_ok=set(cans), place_ok=set(cans))
+    Runner(STRATEGIES["setup_a_bar_for_a_cocktail_party"], goal, attempts=1).run(ep)
+    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
+    assert (cans[0], cans[1]) in achieved, f"beside a can on the countertop it keeps ontop and gains nextto: {achieved}"
+
+
+def test_tiles_lying_beside_each_other_are_still_carried_to_the_other_floor():
+    """laying_tile_floors 301: tile_1 and tile_4 lie beside each other on the corridor floor, one nextto atom each.
+    Protecting those atoms asked whether the bathroom floor is beside the partner tile, which it never is, so
+    neither tile was picked for floor_2 on any sweep and at most 2 of the 4 ontop atoms could be won. The partner
+    is itself wanted on that floor, and the pair can be re-formed there (2026-09-23)."""
+    tiles = [f"tile.n.01_{i}" for i in range(1, 5)]
+    options = [  # the 256 ground options: every tile ontop floor_2, and each tile beside one of the four
+        [atom("ontop", t, "floor.n.01_2") for t in tiles] + [atom("nextto", t, f"tile.n.01_{j}") for t, j in zip(tiles, js)]
+        for js in itertools.product(range(1, 5), repeat=4)
+    ]
+    boxes = {t: box((10.0 + 0.3 * i, 5.0, 0.005), half=(0.09, 0.09, 0.005)) for i, t in enumerate(tiles)}
+    ep = Bedroom(boxes)
+    ep.beside.add(frozenset((tiles[0], tiles[3])))
+    Runner(STRATEGIES["laying_tile_floors"], options[0], options=options).run(ep)
+    laid = {c[1] for c in ep.calls if c[0] == "put_down" and c[2] == "floor.n.01_2"}
+    assert laid == set(tiles), f"tile_1 and tile_4 lie beside each other and both still belong on floor_2: {sorted(laid)}"
+
+
+def test_an_item_in_a_basket_the_goal_accepts_stays_when_the_options_read_lack_the_pairing_that_keeps_it():
+    """assembling_gift_baskets grounds into 331,776 pairings and the runner reads a sample of 20,000. Once most
+    items are in baskets the sample usually has no pairing that agrees with all of them, and the demand read from
+    the best of it named other baskets for correctly placed items: replayed, a second pass took an item out of a
+    correct basket in about half the instances (2026-09-23). Two of the 24 candle pairings are read here, and
+    candle_3's basket is kept only by the lower-scoring one."""
+    candles = [f"candle.n.01_{i}" for i in range(1, 5)]
+    baskets = [f"wicker_basket.n.01_{i}" for i in range(1, 5)]
+
+    def pairing(*to):
+        return [atom("inside", c, baskets[j - 1]) for c, j in zip(candles, to)]
+
+    boxes = {b: box((1.0 * i, 0, 0.1), half=(0.15, 0.15, 0.1)) for i, b in enumerate(baskets)}
+    for c, b in zip(candles, baskets):  # candle_1..3 in basket_1..3, candle_4 still on the table
+        boxes[c] = box(boxes[b]["center"])
+    boxes["table.n.02_1"] = box((0, 3, 0.7), half=(0.6, 0.4, 0.02))
+    boxes[candles[3]] = box((0, 3, 0.77))
+    ep = FakeEpisode(boxes, pick_ok=set(candles), place_ok=set(candles))
+    options = [pairing(1, 2, 4, 3), pairing(2, 1, 3, 4)]
+    Runner(STRATEGIES["assembling_gift_baskets"], options[0], options=options).run(ep)
+    picks = [c[1] for c in ep.calls if c[0] == "pick"]
+    assert picks == [candles[3]], f"three candles are in baskets and stay; the fourth goes to the basket left: {picks}"
+    assert (candles[3], baskets[3]) in [c[2] for c in ep.calls if c[0] == "achieve"]
+
+
+def test_the_capped_read_samples_the_options_rather_than_taking_the_first():
+    """bddl lists the ground options as a product in a regular order, so the first 20,000 of the gift baskets'
+    331,776 all put candle_1 in basket_1; read per (kind, container), that would tie every candle to one basket."""
+    from types import SimpleNamespace
+
+    from bddl.condition_evaluation import HEAD
+
+    from omnigibson.tiptop.strategies import task_goal_options
+
+    def head(*terms):
+        h = HEAD.__new__(HEAD)
+        h.terms = list(terms)
+        return h
+
+    candles = [f"candle.n.01_{i}" for i in range(1, 6)]
+    baskets = [f"basket.n.01_{i}" for i in range(1, 6)]
+    options = [[head("inside", c, b) for c, b in zip(perm, baskets)] for perm in itertools.permutations(candles)]
+    sim = SimpleNamespace(env=SimpleNamespace(task=SimpleNamespace(ground_goal_state_options=options)))
+    read = task_goal_options(sim, limit=40)
+    assert len(read) == 40
+    first_basket = {a["args"][0] for o in read for a in o if a["args"][1] == baskets[0]}
+    assert first_basket == set(candles), f"the first 40 permutations give basket_1 only two candles: {first_basket}"

@@ -225,6 +225,9 @@ class Episode:
         so such a pose is treated as occupied and the search is asked for another (2026-09-13).
         """
         avoid = self.stood.setdefault(names, [])
+        # What the landing check refuses is judged at THIS search's posture and load, so it lives for this search
+        # only -- the widened retry and another attempt after an off-level settle, not the next round's search.
+        refused = []
         self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
         try:  # where the robot stood before the search, which it was working from
             was_pos, was_quat = self.sim.robot.get_position_orientation()
@@ -247,11 +250,11 @@ class Episode:
         fell = False
         for attempt in range(STANCE_ATTEMPTS):
             try:
-                pose = self.sim.place_robot_for(*names, avoid=avoid)
+                pose = self.sim.place_robot_for(*names, avoid=avoid, refused=refused)
             except RuntimeError as e:
                 log.info(f"{e}; widening the search to {REACH_FAR} m")
                 try:
-                    pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid)
+                    pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid, refused=refused)
                 except RuntimeError as far:
                     self.records.append({"stand_for": list(names), "error": str(far), "step": self.sim.n_steps})
                     raise Unreachable(str(far)) from far
@@ -417,7 +420,12 @@ class Episode:
             elif predicate == "nextto" and len(args) == 2:
                 ok = self.beside(args[0], args[1], after=after)
             elif predicate in PLACE_PREDICATES and len(args) == 2:
-                ok = self.placed(args[0], args[1], after=after)
+                # and the task's own evaluator: the geometry takes an item up to 15 cm over the target's top as
+                # in it, and 16 of 18 executed inside(x, bookcase) rounds ended on the top board (2026-09-23).
+                # under(x, f) has no box geometry (the item is below f's bottom): the evaluator alone
+                ok = self.goal_already_holds(predicate, *args) and (
+                    predicate == "under" or self.placed(args[0], args[1], after=after)
+                )
             elif predicate == "open" and args:
                 ok = not self.is_shut(args[0])
             elif predicate == "not" and len(args) >= 2 and args[0] == "open":
@@ -444,8 +452,10 @@ class Episode:
         ``done()`` (default: ``satisfied``); the retry every goal of every task gets, and the only one. ``floor``
         (the planner's workspace reaches the floor) is read off the target when not given: a container or support
         that stands on the floor."""
-        if floor is None:
-            floor = self.reaches_floor(*[a["args"][1] for a in atoms if len(a["args"]) == 2])
+        if floor is None:  # under(x, f) is a floor placement inside f's footprint, wherever f's bottom is
+            floor = any(a["predicate"] == "under" for a in atoms) or self.reaches_floor(
+                *[a["args"][1] for a in atoms if len(a["args"]) == 2]
+            )
         for attempt in range(self.rounds):
             # A container that has shut again has no interior to place into, and it does shut: store_honey's
             # drawer was pulled to 0.200 of 0.39 and read "every joint is shut" by the placing round, so
@@ -505,9 +515,12 @@ class Episode:
                 log.warning(f"{bddl}: {e}")
                 return False
             # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
-            self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
-            if self.holding(bddl):
-                return True
+            if self.sim.jaw_spans(bddl):
+                self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
+                if self.holding(bddl):
+                    return True
+            else:  # wider than the open jaw every way round: no planned grasp exists, the press is all there is
+                log.info(f"{bddl} is wider than the planner's open jaw every way round; no planner round, pressing")
             # M2T2 proposes grasps from the point cloud and a flat object -- a book lying down, a board game --
             # gives it no side a parallel jaw can get under. The sticky fallback reaches a clear standoff,
             # closes, then seeks gentle finger contact with a physical surface. It stops advancing at contact
@@ -545,6 +558,12 @@ class Episode:
                             "pressed_grasp": True,
                         }
                     )
+                    # A planned pick ends where GoToInitial leaves it, the ready posture; this one ended crouched
+                    # over the object with the head camera at 0.75-1.04 m, and the destination stance was searched
+                    # from there: sticky carries lost 70% of those searches against 13% from ready, and were put
+                    # back 52% of the time against 8% (2026-09-23). Same posture for both, carrying.
+                    self.sim.return_to_ready(note=f"ready posture with {bddl} in hand",
+                                             allowed_contacts=self.sim.retreat_contacts(bddl))
                     return True
                 # Sticky attachment can succeed on the wrong object, or disagree with localization. Let go of it
                 # where it is (it was never lifted) before another approach; only a hand that will not let go
@@ -636,8 +655,8 @@ class Episode:
     def release(self, steps: int = 45) -> None:
         """Explicitly open the planned hand and wait ``steps`` for release.
 
-        The task runner does not use this as recovery for a failed placement. Such a failure retains its object
-        and destination; opening at an arbitrary pose is not a validated put-down.
+        Not a validated put-down: the runner uses it only as the last resort (``Runner.free_hand``) after both
+        planned floor put-downs fail, since an object left in the hand scores nothing and blocks every pick after it.
         """
         self.sim.video_caption = f"release [{self.sim.arm} arm]"
         self.sim.hold(steps, self.sim.OPEN)

@@ -1,4 +1,5 @@
-"""A failed placement retries its own destination, then only a planned floor put-down; never a drop."""
+"""A failed placement retries its own destination, then a planned floor put-down; the hand is opened where it is
+only when no put-down plans, as the last resort before the instance ends with the object in it."""
 
 from types import SimpleNamespace
 
@@ -80,7 +81,7 @@ class TransferEpisode:
         return self.achieve([atom("ontop", item, support)])
 
     def release(self):
-        pytest.fail("a failed placement must never trigger an unplanned drop")
+        self.calls.append(("release",))  # the last resort, and here nothing comes free: the hand keeps the item
 
     def open_up(self, target, **kwargs):
         pytest.fail("a retained grasp must not be repurposed to open its destination")
@@ -116,6 +117,7 @@ def test_exhausted_placement_tries_a_planned_floor_put_down_then_stops():
         ("walk_to_floor", ep.floor),
         ("put_down", ITEM, ep.floor),
         ("achieve", "ontop", ITEM, ep.floor),
+        ("release",),
     ]
 
 
@@ -150,14 +152,14 @@ def test_other_held_object_prevents_unrelated_transfer_without_any_action():
     with pytest.raises(TransferBlocked, match="cannot start pickup"):
         runner().transfer(ep, "inside", ITEM, TARGET, SOURCE)
     assert ep.hand == OTHER
-    assert ep.calls == [("put_down", OTHER, ep.floor), ("achieve", "ontop", OTHER, ep.floor), ("walk_to_floor", ep.floor), ("put_down", OTHER, ep.floor), ("achieve", "ontop", OTHER, ep.floor)]
+    assert ep.calls == [("put_down", OTHER, ep.floor), ("achieve", "ontop", OTHER, ep.floor), ("walk_to_floor", ep.floor), ("put_down", OTHER, ep.floor), ("achieve", "ontop", OTHER, ep.floor), ("release",)]
 
 
 def test_free_hand_does_not_use_the_next_items_support():
     ep = TransferEpisode(held=ITEM)
     assert Runner.free_hand(ep) is False
     assert ep.hand == ITEM
-    assert ep.calls == [("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("walk_to_floor", ep.floor), ("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor)]
+    assert ep.calls == [("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("walk_to_floor", ep.floor), ("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("release",)]
 
 
 def test_unreachable_named_floor_never_falls_back_to_the_current_floor():
@@ -176,17 +178,18 @@ def test_unreachable_named_floor_never_falls_back_to_the_current_floor():
         ("walk_to_floor", ep.floor),
         ("put_down", ITEM, ep.floor),
         ("achieve", "ontop", ITEM, ep.floor),
+        ("release",),
     ]
     assert ("ontop", ITEM, target_floor) not in ep.completed
 
 
-def test_a_container_that_closed_while_carrying_does_not_trigger_open_or_drop():
+def test_a_container_that_closed_while_carrying_does_not_trigger_open():
     ep = TransferEpisode(held=ITEM)
     ep.shut = True
     with pytest.raises(TransferBlocked):
         runner().run(ep)
     assert ep.hand == ITEM
-    assert ep.calls == [("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("walk_to_floor", ep.floor), ("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor)]
+    assert ep.calls == [("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("walk_to_floor", ep.floor), ("put_down", ITEM, ep.floor), ("achieve", "ontop", ITEM, ep.floor), ("release",)]
 
 
 @pytest.mark.parametrize("still_held,at_destination", [(True, True), (False, False)])

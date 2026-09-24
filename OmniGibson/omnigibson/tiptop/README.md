@@ -11,6 +11,7 @@ installing the planner and grasp server on a new machine and the problems you wi
 
 The [2026-09-22 collision audit](COLLISION_AUDIT.md) describes the physical room map, planner and execution fixes,
 reproducible commands, and measured task-23 contacts. It supersedes the historical collision workarounds below.
+[Fix4 changes](FIX4_CHANGES.md): six fixes from the sweep3 video review (2026-09-23), tested offline, not yet scored.
 
 > **Read this before quoting any number from here.** Every score in this file was produced with the simulator
 > telling the policy where every object is, at every moment. Object boxes decide whether a pick worked (is the

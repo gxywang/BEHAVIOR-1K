@@ -268,6 +268,7 @@ class TiptopSim:
         self._link_meshes = {}  # (link prim path, max faces) -> its mesh in the link frame (link_trimesh_world)
         self.arm = self.robot.default_arm  # the arm the plans move (R1ProSim: the planner embodiment's arm)
         self.held_objects = {}  # tracked label -> arm, for objects a plan picked up (they move with that gripper)
+        self.seen_boxes = {}  # tracked label -> (lo, hi) of every depth point seen of it, OBJECT frame (remember_seen)
         self.teleports = 0  # base teleports so far (the navigation stand-in; the benchmark reports the count)
         self._in_hand_object = None  # the robot's own grasp search while block_grasping() has it wrapped
         self.recorders = []  # executor.VideoRecorder instances, fed from step(); frame_caption() is stamped on each
@@ -834,6 +835,28 @@ class TiptopSim:
         cam_quat_cv = th.tensor(view_extras["cam_quat_xyzw_world_cv"], dtype=th.float32)
         meshes = self.posed_for_view(self.object_meshes(labels) if meshes is None else meshes, view_extras)
         return self.geometry_masks(view["depth"], view["intrinsics"], cam_pos, cam_quat_cv, labels, meshes=meshes)
+
+    def remember_seen(self, views, labels: list[str], masks: dict) -> None:
+        """Grow each tracked object's box in ITS OWN frame (``seen_boxes``) by what a capture saw of it: every view's
+        depth unprojected under the object's mask, brought back by the pose that view rendered it at. The union over
+        captures, since one capture sees one side: with the tile in the hand the wrist camera saw 0.31 x 0.28 m of
+        0.47 x 0.44 (laying_tile 303, 2026-09-23). This is the shape of what the hands carry (``R1ProSim.own_box``):
+        in the competition an object's geometry is its point cloud, not the simulator's mesh."""
+        for name, view, view_extras in views:
+            cam = (th.tensor(view_extras["cam_pos_world"]), th.tensor(view_extras["cam_quat_xyzw_world_cv"]))
+            points = depth_to_points(view["depth"], view["intrinsics"], T.pose2mat(cam).cpu().numpy())
+            poses = view_extras.get("object_pose_mats_at_render") or {}
+            for label, mask in zip(labels, masks[name]):
+                if label not in poses or not mask.any():
+                    continue
+                world_from_obj = np.asarray(poses[label], dtype=np.float64)
+                local = (points[mask] - world_from_obj[:3, 3]) @ world_from_obj[:3, :3]
+                local = local[np.isfinite(local).all(axis=1)]
+                if len(local):
+                    lo, hi = self.seen_boxes.get(label, (local[0], local[0]))
+                    self.seen_boxes[label] = (np.minimum(lo, local.min(axis=0)), np.maximum(hi, local.max(axis=0)))
+        # ponytail: bounds, not points, and only of the faces a camera saw (a tile seen from above alone is a
+        # sheet); keep the points if a hull is ever wanted
 
     def tiptop_goal(self, atoms: list[dict], category_level: bool) -> tuple[list[str], list[dict]]:
         """The request labels and TiPToP atoms for goal atoms over tracked object names (spawned presets: the

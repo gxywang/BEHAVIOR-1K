@@ -37,13 +37,6 @@ class OracleKnowledge(KnowledgeSource):
 
     def describe(self, atoms, request, extras, floor=False) -> SceneKnowledge:
         labels, tiptop_atoms = self.translate(atoms)
-        # The interior of a container an inside() goal names, as its placement surface. The planner has no
-        # containment predicate, so inside(a, b) arrives as on(a, b) and is answered against b's own convex hull,
-        # i.e. 2 mm above its LID. Privileged, like the button poses; written on the request as `room` is, since
-        # attach_knowledge only carries the fixed set of keys.
-        regions = self.sim.inside_regions(atoms) if getattr(self.sim, "send_inside", False) else {}
-        if regions:
-            request["place_surfaces"] = regions
         # The furniture standing around the robot, so the planner has a world to plan in. cuTAMP's collision world
         # otherwise holds the task's own objects and one fitted plane, and it plans straight through everything
         # else in the room -- which is what the bridge has been compensating for, in the wrong place. These reach
@@ -60,6 +53,16 @@ class OracleKnowledge(KnowledgeSource):
         masks = {
             name: self.sim.oracle_masks(view, view_extras, labels, meshes=meshes) for name, view, view_extras in views
         }
+        self.sim.remember_seen(views, labels, masks)  # the objects' shapes, as the depth under these masks sees them
+        # The interior of a container an inside() goal names, as its placement surface. The planner has no
+        # containment predicate, so inside(a, b) arrives as on(a, b) and is answered against b's own convex hull,
+        # i.e. 2 mm above its LID. The same channel carries a fixture's board for touching(a, b), a named table's
+        # top and the floor under a fixture for under(a, b) (r1pro.inside_regions). Privileged, like the button
+        # poses; written on the request as `room` is, since attach_knowledge only carries the fixed set of keys.
+        # After remember_seen: the board is chosen by the item's height as this capture's points see it too.
+        regions = self.sim.inside_regions(atoms) if getattr(self.sim, "send_inside", False) else {}
+        if regions:
+            request["place_surfaces"] = regions
         counts = {
             name: {label: int(m.sum()) for label, m in zip(labels, view_masks)} for name, view_masks in masks.items()
         }
