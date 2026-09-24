@@ -27,7 +27,7 @@ import numpy as np
 import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
-from b1k.bridge.protocol import bddl_category
+from b1k.bridge.protocol import FLOOR_CATEGORIES, bddl_category
 from b1k.bridge.judgement import (  # FLOOR_LEVEL and UNSATISFIED_SHOWN moved with the geometry and the
     FLOOR_LEVEL,  # verdict they parameterize; both are re-exported here, where callers still read them
     UNSATISFIED_SHOWN,  # noqa: F401
@@ -172,7 +172,7 @@ class Episode:
         of furniture to stand at; bringing_in_wood targets the same floor and scored 0.000 with no rounds run
         (2026-09-15). A floor is a floor by category, not by being listed first.
         """
-        return bool(name) and bddl_category(name) == "floor"
+        return bool(name) and bddl_category(name) in FLOOR_CATEGORIES
 
     def switched_on(self, name: str) -> bool | None:
         """Whether ``name``'s switch is on right now; None when it has no such state.
@@ -515,12 +515,13 @@ class Episode:
                 log.warning(f"{bddl}: {e}")
                 return False
             # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
-            if self.sim.jaw_spans(bddl):
-                self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
-                if self.holding(bddl):
-                    return True
-            else:  # wider than the open jaw every way round: no planned grasp exists, the press is all there is
-                log.info(f"{bddl} is wider than the planner's open jaw every way round; no planner round, pressing")
+            self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
+            if self.holding(bddl):
+                return True
+            if self.args.grasping_mode != "sticky":
+                # the press closes the hand before it touches (press_grasp), so the assisted weld's finger-to-finger
+                # ray has nothing to hit (robot.py ~3150): only the planned grasp can take it
+                continue
             # M2T2 proposes grasps from the point cloud and a flat object -- a book lying down, a board game --
             # gives it no side a parallel jaw can get under. The sticky fallback reaches a clear standoff,
             # closes, then seeks gentle finger contact with a physical surface. It stops advancing at contact
@@ -790,7 +791,7 @@ class Episode:
         return box_edge_gap(boxes[item], boxes[support])
 
 
-def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common(p)
     add_planner_args(p)
@@ -831,11 +832,6 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",
     )
     args = p.parse_args(argv)
-    # A task description is what the RUNNER needs to sequence a task; a tool that only loads the scene (the
-    # drawer rig, a probe) needs none, and refusing to parse its arguments kept those tools to the eight tasks
-    # that happen to have been written up (2026-09-13).
-    if require_strategy and args.task_name not in STRATEGIES:
-        p.error(f"no task description for {args.task_name!r}; known: {sorted(STRATEGIES)}")
     # what run.py's helpers read: the challenge robot, the activity to load, the instruction the planner is given
     args.embodiment = "r1pro"
     args.activity = args.task_name

@@ -338,6 +338,22 @@ def test_face_normal_local_picks_the_nearest_face():
     assert face_normal_local(box, [0.0, -0.159, 0.0]).tolist() == [0.0, -1.0, 0.0]
 
 
+def test_face_normal_local_prefers_the_braced_face_among_those_within_the_markers_radius():
+    from omnigibson.tiptop.protocol import face_normal_local
+
+    lighter = np.array([[-0.03, -0.035, -0.009], [0.03, 0.035, 0.009]])
+    button = [0.018, 0.0266, 0.0]  # 8.4 mm from the +y end, 9 mm from the top and the bottom
+    assert face_normal_local(lighter, button).tolist() == [0.0, 1.0, 0.0]  # the nearest, as before
+    up = [0.0, 0.0, 1.0]
+    assert face_normal_local(lighter, button, within=0.0209, up=up).tolist() == [0.0, 0.0, 1.0]
+    assert face_normal_local(lighter, button, within=0.0209, up=[0.0, 1.0, 0.0]).tolist() == [0.0, 1.0, 0.0]  # on end
+    assert face_normal_local(lighter, button, within=0.005, up=up).tolist() == [0.0, 1.0, 0.0]  # none within
+    switch = np.array([[-0.01, -0.04, -0.06], [0.01, 0.04, 0.06]])
+    up = [1e-9, 0.0, 1.0]  # a hair of rotation noise must not hand the wall side to the nearer of two level faces
+    assert face_normal_local(switch, [0.0098, 0.0, -0.008], within=0.046, up=up).tolist() == [1.0, 0.0, 0.0]
+    assert face_normal_local(switch, [-0.0098, 0.0, -0.008], within=0.046, up=up).tolist() == [-1.0, 0.0, 0.0]
+
+
 def test_match_objects_per_object_tolerance():
     from omnigibson.tiptop.protocol import match_objects
 

@@ -313,9 +313,10 @@ def test_gripper_event_checks_the_whole_open_close_sweep_with_no_arm_motion():
 
 def test_planned_validation_uses_live_grasp_state_measured_opposite_arm_and_narrow_contacts():
     held = SimpleNamespace(name="held_book", category="book")
-    target = SimpleNamespace(name="pick_book", category="book")
+    target = SimpleNamespace(name="pick_book", category="book", aabb=(th.tensor([-1.0, -1, -1]), th.tensor([1.0, 1, 1])))
     support = SimpleNamespace(name="bookcase", category="bookcase")
     floor = SimpleNamespace(name="floor", category="floors")
+    lamp = SimpleNamespace(name="lamp", category="lamp")  # in reach, but 20 cm clear of the book's box
     calls = []
     names = ["torso", "left_arm", "right_arm", "left_finger", "right_finger"]
     model = SimpleNamespace(joint_names=names, buffer=0.002, check_polyline=lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -335,28 +336,33 @@ def test_planned_validation_uses_live_grasp_state_measured_opposite_arm_and_narr
         arm="left", other_arm="right", other_gripper=1.0,
         objects={"book_1": target, "carried_1": held},
         base_pose=_pose,
-        scene_aabbs=lambda: [(obj, np.array([-1, -1, -1]), np.array([1, 1, 1])) for obj in (held, target, support, floor)],
+        scene_aabbs=lambda: [(obj, np.array([-1, -1, -1]), np.array([1, 1, 1])) for obj in (held, target, support, floor)]
+        + [(lamp, np.array([1.2, 1.2, 0]), np.array([1.4, 1.4, 0.5]))],
         collision_mesh_world=lambda obj: _box([0.1, 0.1, 0.1], [0, 0, 1]),
     )
     sim._motion_obstacles = MethodType(R1ProSim._motion_obstacles, sim)
     sim._motion_finger_ranges = MethodType(R1ProSim._motion_finger_ranges, sim)
+    sim.rests_against = MethodType(R1ProSim.rests_against, sim)
     assert R1ProSim.validate_motion(sim, [[0.1, 0.2], [0.4, 0.5]], -1.0, "Pick(book_1, grasp0)") is None
     (positions, _, obstacles), options = calls[-1]
     assert np.allclose(positions[:, 2], [0.3, 0.3])  # actual opposite arm, never nominal zero
     assert np.allclose(positions[:, :2], [[0.1, 0.2], [0.4, 0.5]])
-    assert {name for name, _ in obstacles} == {"pick_book", "bookcase", "floor"}
+    assert {name for name, _ in obstacles} == {"pick_book", "bookcase", "floor", "lamp"}
     assert options["joint_ranges"]["left_finger"] == pytest.approx((0.04, 0.0))
-    assert options["allowed_contacts"]["pick_book"] == set(robot.finger_link_names["left"])
+    fingers = set(robot.finger_link_names["left"])
+    assert options["allowed_contacts"]["pick_book"] == fingers
+    # at the grasp the fingertips may meet what the book rests against (the planner lets them, cutamp-19), no more
+    assert options["allowed_contacts"]["bookcase"] == fingers
     assert options["allowed_contacts"]["floor"] == {
-        "base_link", "wheel_motor_link1", "wheel_motor_link2", "wheel_motor_link3"
+        "base_link", "wheel_motor_link1", "wheel_motor_link2", "wheel_motor_link3", *fingers
     }
-    assert "bookcase" not in options["allowed_contacts"]
+    assert "lamp" not in options["allowed_contacts"]
     assert "attachments" not in options  # planner owns its attachment collision model
     assert options["clearance"] == -model.buffer  # the planner already applied the sphere buffer
     robot._ag_obj_in_hand["left"] = None
     R1ProSim.validate_motion(sim, [[0.1, 0.2]], 1.0, "GoToInitial(q0)")
     assert "held_book" in {name for name, _ in calls[-1][0][2]}  # released object is physical world again
-    assert "pick_book" not in calls[-1][1]["allowed_contacts"]
+    assert not {"pick_book", "bookcase"} & set(calls[-1][1]["allowed_contacts"])
 
 
 def test_planned_motion_validation_unavailability_is_an_error_without_steps():

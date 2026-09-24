@@ -348,7 +348,7 @@ def test_an_unfold_the_straight_line_cannot_make_is_tried_elbow_first():
     assert len(checked) == 2  # straight, then elbow first; the torso-first/arm-first copies are not re-checked
 
 
-def _pick_ep(attached_first, target, releases=True):
+def _pick_ep(attached_first, target, releases=True, grasping_mode="sticky"):
     from omnigibson.tiptop.bench import Episode
 
     calls = []
@@ -360,13 +360,14 @@ def _pick_ep(attached_first, target, releases=True):
 
     sim = SimpleNamespace(
         arm="left", n_steps=0, OPEN=1.0, held_objects={},
-        robot=SimpleNamespace(_ag_obj_in_hand={"left": attached_first}), jaw_spans=lambda bddl: True,
+        robot=SimpleNamespace(_ag_obj_in_hand={"left": attached_first}),
         press_grasp=lambda arm, bddl, spare=(): False, scene_object=lambda name: target, hold=hold,
         return_to_ready=lambda note, allowed_contacts=None: calls.append(("ready", note, allowed_contacts)) or True,
         retreat_contacts=lambda bddl=None: {"floors_1": {"left_gripper_link"}, "target": {"left_gripper_link"}},
     )
     ep = SimpleNamespace(
         sim=sim, rounds=1, records=[], planners={"left": ("planner", {})},
+        args=SimpleNamespace(grasping_mode=grasping_mode),
         stand_for=lambda bddl: None, plan_and_execute=lambda atoms, floor=False: None, reaches_floor=lambda b: False,
         support_of=lambda b: None, holding=lambda b: b in sim.held_objects,
         note_pressed_grasp=lambda b, after=None: calls.append(("note", b)) or sim.held_objects.update({b: "left"}),
@@ -503,36 +504,20 @@ def test_a_sticky_pick_ends_at_the_ready_posture_carrying():
     assert calls[-1][2] == {"floors_1": {"left_gripper_link"}, "target": {"left_gripper_link"}}  # it may leave them
 
 
-def test_an_object_wider_than_the_jaw_every_way_round_skips_the_planner_round():
-    """assembling_gift_baskets 2026-09-23: every 10 cm pillar candle cost a full planner holding() round (0 of 9
-    could succeed, 673 s over 3 episodes) before the press took it."""
+def test_under_assisted_grasping_every_pick_is_a_planner_round_and_the_press_never_runs():
+    """The evaluator welds only a grasp whose finger-to-finger ray hits the object; the sticky press closes the hand
+    before it touches, so under assisted it can take nothing. The jaw gate that skipped the planner round for a
+    10 cm candle is gone with it: the planner's part grasps are what a bulky object gets (A-assist, 2026-09-24)."""
     candle = SimpleNamespace(name="pillar_candle_88")
-    planned = []
-    for spans in (False, True):
-        ep, calls = _pick_ep(attached_first=None, target=candle)
-        ep.sim.press_grasp = lambda arm, bddl, spare=(): True
-        ep.sim.jaw_spans = lambda bddl: spans
+    for mode, pressed, rounds in (("assisted", [], 2), ("sticky", ["candle.n.01_1"], 1)):
+        planned, presses = [], []
+        ep, calls = _pick_ep(attached_first=None, target=candle, grasping_mode=mode)
+        ep.rounds = 2
+        ep.sim.press_grasp = lambda arm, bddl, spare=(): presses.append(bddl) or True
         ep.plan_and_execute = lambda atoms, floor=False: planned.append(atoms)
-        assert ep.pick("candle.n.01_1") is True
-        assert planned == ([] if not spans else [[{"predicate": "holding", "args": ["candle.n.01_1"]}]])
-
-
-def test_the_jaw_test_reads_the_objects_own_level_axes():
-    from omnigibson.tiptop.r1pro import JAW_GAP
-
-    def sim_with(lo, hi):
-        return SimpleNamespace(
-            scene_object=lambda name: name,
-            own_box=lambda obj: (np.zeros(3), np.eye(3), np.array(lo), np.array(hi)),
-        )
-
-    assert not R1ProSim.jaw_spans(sim_with([-0.05, -0.05, 0.0], [0.05, 0.05, 0.11]), "candle")  # 10 cm every way round
-    assert R1ProSim.jaw_spans(sim_with([-0.14, -0.045, 0.0], [0.14, 0.045, 0.12]), "shoe")  # 9 cm across, 12 cm tall
-    assert R1ProSim.jaw_spans(sim_with([-0.225, -0.21, -0.015], [0.225, 0.21, 0.015]), "tile")  # thin: a side grasp spans it
-    # a plate lying flat, 17 x 18 cm and 2.6 cm thick: the planner held it by the rim (putting_dirty_dishes, sweep3)
-    assert R1ProSim.jaw_spans(sim_with([-0.085, -0.09, 0.0], [0.085, 0.09, 0.026]), "plate")
-    assert R1ProSim.jaw_spans(SimpleNamespace(scene_object=lambda n: n, own_box=lambda obj: None), "unseen")
-    assert JAW_GAP < 0.1
+        assert ep.pick("candle.n.01_1") is (mode == "sticky")
+        assert planned == [[{"predicate": "holding", "args": ["candle.n.01_1"]}]] * rounds
+        assert presses == pressed  # the fallback still runs after a failed round under sticky
 
 
 def test_a_lift_refused_by_the_robots_own_body_lets_go_where_the_object_rests():
@@ -545,7 +530,7 @@ def test_a_lift_refused_by_the_robots_own_body_lets_go_where_the_object_rests():
         tile = SimpleNamespace(name="ceramic_tile_186", aabb=(th.zeros(3), th.ones(3)))
         sim = SimpleNamespace(
             robot=SimpleNamespace(get_joint_positions=lambda: th.zeros(1)), joint_index={"j": 0},
-            scene_aabbs=lambda: [], retreat_contacts=lambda: {}, objects={"tile_1": tile}, held_objects={},
+            rests_against=lambda obj: set(), retreat_contacts=lambda: {}, objects={"tile_1": tile}, held_objects={},
             _targets_from=lambda names, q: q, posture={}, CLOSE=-1.0, OPEN=1.0,
             _motion_collision_model=lambda: SimpleNamespace(links=np.array(["base_link", "torso_link4"])),
             ramp_to=lambda *a, **k: stopped, hold=lambda n, gripper: holds.append((n, gripper)),
@@ -724,7 +709,20 @@ def test_a_case_of_shelves_offers_one_reachable_compartment_not_its_bottom_board
     assert sim.shelf_of(None, 0.31, fillable)[0] == pytest.approx(0.73)  # the only compartment 0.34 m clear
     assert sim.shelf_of(None, 0.5, fillable) is None  # nothing has room for it
     assert sim.shelf_of(None, 0.04, (fillable[0], np.array([1.1, 0.4, 0.6])))[0] == pytest.approx(0.44)
-    assert _region_sim(case, base=(-1.5, 0.0)).shelf_of(None, 0.04, fillable) is None  # 2.2 m from the near edge
+    # 2.2 m from the near edge nothing is in reach: still the best board, the stance search moves the robot to it
+    assert _region_sim(case, base=(-1.5, 0.0)).shelf_of(None, 0.04, fillable)[0] == pytest.approx(0.73)
+
+
+def test_a_board_above_the_arms_reach_is_never_chosen_even_when_it_is_the_only_one_in_reach():
+    """putting_shoes_on_rack i0 2026-09-24: standing 1.06 m from the hallstand's bench (0.55 m), the only board within
+    BOARD_REACH was its 2.37 m top, and 6 rounds IK-failed on it. The bench is sent from there too."""
+    bench = trimesh.creation.box([0.55, 1.5, 0.02])
+    bench.apply_translation([1.335, 0.0, 0.54])  # its near edge 1.06 m ahead
+    top = trimesh.creation.box([0.58, 1.7, 0.02])
+    top.apply_translation([0.99, 0.0, 2.36])  # 0.7 m ahead, in reach
+    sim = _region_sim(trimesh.util.concatenate([bench, top]))
+    assert sim.shelf_of(None, 0.12)[0] == pytest.approx(0.55)
+    assert _region_sim(top).shelf_of(None, 0.12) is None  # the top alone offers nothing
 
 
 def test_a_touching_goal_gets_a_reachable_board_of_the_fixture_not_its_hull_top():
@@ -771,7 +769,8 @@ def test_a_named_table_and_a_fixtures_footprint_become_the_planners_support_plan
     assert sim.floor_surface()["pose"][2] == pytest.approx(-0.01)  # the plain slab is unchanged
     # the dispatch: which surface rides under the planner's support label, and a fixture's board under its own
     sim = SimpleNamespace(
-        floor_surface=lambda within=None: {"floor": within}, footprint_region=lambda table: {"top": table},
+        floor_surface=lambda within=None: {"floor": within},
+        footprint_region=lambda table: None if table == "table.n.02_4" else {"top": table},  # _4: never seen
         rest_region=lambda item, fixture: {"board": fixture}, inside_region=lambda item, container: None,
         label_of=lambda bddl: bddl.split(".")[0] + "_1", region_refused=set(),
         scene_object=lambda name: SimpleNamespace(fixed_base=name != "table.n.02_3"),  # _3 is a movable table
@@ -780,9 +779,77 @@ def test_a_named_table_and_a_fixtures_footprint_become_the_planners_support_plan
     assert regions(("under", "mousetrap.n.01_4", "sink.n.01_1")) == {"table": {"floor": "sink.n.01_1"}}
     assert regions(("ontop", "book.n.02_1", "table.n.02_1")) == {"table": {"top": "table.n.02_1"}}
     assert regions(("ontop", "book.n.02_1", "table.n.02_1"), ("ontop", "book.n.02_2", "table.n.02_2")) == {}
-    assert regions(("ontop", "book.n.02_1", "table.n.02_3")) == {}  # a movable table's box is not the map's to read
+    assert regions(("ontop", "book.n.02_1", "table.n.02_3")) == {"table": {"top": "table.n.02_3"}}  # from its own box
+    assert regions(("ontop", "book.n.02_1", "table.n.02_4")) == {}
     assert regions(("ontop", "x.n.01_1", "floor.n.01_1"), ("under", "y.n.01_1", "sink.n.01_1")) == {"table": {"floor": None}}
+    assert regions(("ontop", "easter_egg.n.01_1", "lawn.n.01_1")) == {"table": {"floor": None}}  # a lawn is ground
     assert regions(("touching", "gym_shoe.n.01_2", "hallstand.n.01_1")) == {"hallstand_1": {"board": "hallstand.n.01_1"}}
+
+
+def test_a_lawn_is_the_floor_under_the_robot():
+    """hiding_Easter_eggs wants the eggs ontop lawn.n.01_1 and has no floor at all: the lawn's top is the slab."""
+    from omnigibson.tiptop.bench import Episode
+
+    sim = _region_sim(None, base=(3.0, 4.0))
+    lawn = SimpleNamespace(category="lawn")
+    sim.scene_aabbs = lambda: [(lawn, np.array([-9.0, -9.0, -0.1]), np.array([9.0, 9.0, 0.05]))]
+    assert sim.floor_surface()["pose"][2] + 0.01 == pytest.approx(0.05)
+    assert Episode.is_floor(None, "lawn.n.01_1") and Episode.is_floor(None, "floor.n.01_2")
+    assert not Episode.is_floor(None, "table.n.02_1")
+
+
+def test_a_movable_tables_slab_is_the_world_box_of_the_points_that_saw_it():
+    """putting_up_Christmas_decorations_inside names a table that is not fixed: its AABB is not the map's to read,
+    so its top is the world box of its own seen box; nothing until a capture has seen it."""
+    yaw90 = th.tensor([0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)])
+    table = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: (th.tensor([2.0, 1.0, 0.0]), yaw90))
+    sim = _region_sim(None, objects={"table.n.02_3": table})
+    assert sim.footprint_region("table.n.02_3") is None
+    sim.objects = {"table_3": table}
+    sim.seen_boxes = {"table_3": (np.array([-0.4, -0.25, 0.0]), np.array([0.4, 0.25, 0.75]))}
+    slab = sim.footprint_region("table.n.02_3")
+    assert slab["pose"][:3] == pytest.approx([2.0, 1.0, 0.74], abs=1e-6)
+    assert slab["dims"] == pytest.approx([0.5, 0.8, 0.02])
+
+
+def _button_world(mesh, marker, extent, pos=(0.0, 0.0, 0.0), quat=(0.0, 0.0, 0.0, 1.0)):
+    """button_world over a fake toggle object: ``mesh`` and ``marker`` in the object's frame, posed at (pos, quat)."""
+    from omnigibson.object_states import ToggledOn
+    import omnigibson.utils.transform_utils as T
+
+    pos, quat = th.tensor(pos), th.tensor(quat)
+    rot = T.quat2mat(quat).numpy().astype(np.float64)
+    world = mesh.copy()
+    world.apply_transform(T.pose2mat((pos, quat)).numpy())
+    marker_w = th.tensor(pos.numpy() + rot @ np.asarray(marker, dtype=np.float64), dtype=th.float32)
+    identity = th.tensor([0.0, 0.0, 0.0, 1.0])
+    link = SimpleNamespace(get_position_orientation=lambda: (marker_w, identity), scale=th.ones(3))
+    state = SimpleNamespace(link=link, visual_marker=SimpleNamespace(extent=th.full((3,), extent)), scale=th.ones(3))
+    obj = SimpleNamespace(states={ToggledOn: state}, get_position_orientation=lambda: (pos, quat))
+    sim = SimpleNamespace(scene_object=lambda bddl: obj, collision_mesh_world=lambda o: world)
+    return R1ProSim.button_world(sim, "x.n.01_1")
+
+
+def test_a_button_sits_on_the_body_face_the_press_is_braced_on_and_its_position_is_on_that_surface():
+    """The visual mesh carries the toggle marker: a 46 mm sphere at the switch's face pulled the box face to the
+    wall side of every wall switch and the lighter's button to its underside (marker_in_box.out). Off the
+    physical mesh, the switch's face is +x; the lighter's button is 8.4 mm from its end and 8.9 mm from its top,
+    and of the faces within the marker's radius the top is the one a press is braced on. The washer's marker
+    centre floats 11.2 mm proud of the body (washer_gap.out): the position is projected onto the face."""
+    switch = trimesh.creation.box([0.02, 0.08, 0.12])
+    pos, normal, radius = _button_world(switch, [0.0098, 0.0, -0.008], 0.046, pos=(2.0, 3.0, 1.2),
+                                        quat=(0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)))  # on a wall, facing +y
+    assert normal == pytest.approx([0.0, 1.0, 0.0], abs=1e-6) and radius == pytest.approx(0.046)
+    assert pos == pytest.approx([2.0, 3.01, 1.192], abs=1e-6)  # projected onto the face, 0.2 mm out
+    lighter = trimesh.creation.box([0.06, 0.07, 0.018])
+    pos, normal, _ = _button_world(lighter, [0.018, 0.0266, 0.0], 0.0209)  # lying flat: the top face
+    assert normal == pytest.approx([0.0, 0.0, 1.0], abs=1e-6) and pos == pytest.approx([0.018, 0.0266, 0.009], abs=1e-6)
+    stood = (np.sin(np.pi / 4), 0.0, 0.0, np.cos(np.pi / 4))  # stood on its end: its +y face is now up
+    pos, normal, _ = _button_world(lighter, [0.018, 0.0266, 0.0], 0.0209, quat=stood)
+    assert normal == pytest.approx([0.0, 0.0, 1.0], abs=1e-6) and pos == pytest.approx([0.018, 0.0, 0.035], abs=1e-6)
+    washer = trimesh.creation.box([0.6, 0.6, 0.85])
+    pos, normal, _ = _button_world(washer, [0.3112, 0.0, 0.33], 0.046)
+    assert normal == pytest.approx([1.0, 0.0, 0.0], abs=1e-6) and pos == pytest.approx([0.3, 0.0, 0.33], abs=1e-6)
 
 
 def test_the_widened_retry_is_told_what_the_first_search_refused():

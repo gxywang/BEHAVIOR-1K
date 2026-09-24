@@ -248,7 +248,8 @@ class _Episode(Episode):
 
     def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=(), rounds=2):
         self.rounds = rounds  # no Episode.__init__: there is no simulator behind this one
-        self.sim = SimpleNamespace(jaw_spans=lambda bddl: True)  # ...but every item fits the jaw: rounds run
+        self.sim = SimpleNamespace()
+        self.args = SimpleNamespace(grasping_mode="sticky")  # the press fallback is tried (and fails: no sim behind it)
         self.outcomes = list(outcomes)
         self.arms = set(arms)
         self.unreachable = set(unreachable)

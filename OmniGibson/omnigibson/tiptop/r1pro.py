@@ -15,6 +15,7 @@ simulator knows and the robot could not (object poses, button poses, masks, a sw
 ``knowledge.py``'s oracle source and by the base-pose search; both are privileged and say so.
 """
 
+import itertools
 import logging
 import math
 import re
@@ -90,6 +91,7 @@ from b1k.bridge.geometry import (  # noqa: F401
     widen_then_clip,
 )
 from b1k.bridge.protocol import (
+    FLOOR_CATEGORIES,
     PLANNER_SUPPORT,
     SUPPORT_CATEGORIES,
     add_view,
@@ -317,6 +319,7 @@ SHELF_CASE_HEIGHT = 0.4  # m: a joint-less fillable volume taller than this is a
 BOARD_MIN_AREA = 0.02  # m2 of level faces at one height that make a board something can rest on
 BOARD_GAP = 0.025  # m between face heights that separates two boards (a convex piece's top is not quite flat)
 PLACE_HEIGHT = 0.9  # m: the board nearest this is the one a standing robot places on comfortably (0.7-1.1)
+PLACE_HEIGHT_MAX = 1.5  # m: a board above this is out of the arm's reach from any stance (a hallstand's 2.37 m top)
 HEADROOM = 0.03  # m the item needs under the next board
 BOARD_REACH = 1.0  # m from the base to the nearest point of a board for it to be placed on from here
 STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's underside is that object's support
@@ -398,11 +401,6 @@ STICKY_LIFT = 0.05  # m a sticky-taken object is lifted back out along its appro
 STICKY_LIFT_FRONT = 0.10  # ... and pulled back out of a shelf
 STICKY_LIFT_VEL = 0.5  # rad/s: slow, with an object in the hand
 STICKY_STANDOFF = 0.02  # m of free space in front of the physical contact surface
-# The planner holds the fingers open at 0.05 (r1pro_left.yml) and its innermost finger sphere sits 4.85 cm from the
-# gripper centre: nothing wider than this every way round has a parallel-jaw grasp, and the holding round that
-# tries costs its whole budget first (a 10 cm pillar candle: 9 rounds, 673 s, over 3 episodes, 2026-09-23).
-# ponytail: r1pro's number; read it from the embodiment's sphere yml if another gripper ever arrives
-JAW_GAP = 0.097
 STICKY_CONTACT_STEP = 0.002  # m between Cartesian contact-seeking waypoints
 STICKY_CONTACT_SPEED = 0.01  # m/s requested Cartesian advance, also capped at 0.1 rad/s per joint
 # Places to try taking hold of one panel, spread up its face. A fridge door is 2 m tall and only a band of it
@@ -767,19 +765,20 @@ class R1ProSim(TiptopSim):
 
     # ---------------------------------------------------------------- challenge task
     def task_scope(self) -> dict:
-        """BDDL instance name -> simulated object for the loaded BehaviorTask (no agent, no floors, no systems)."""
+        """BDDL instance name -> simulated object for the loaded BehaviorTask (no agent, no floors or lawns, no
+        systems)."""
         task = self.env.task
         scope = task.object_scope if isinstance(task, BehaviorTask) else {}  # a DummyTask has no scope
         return {
             k: v
             for k, v in scope.items()
-            if isinstance(v, USDObject) and not k.startswith(("agent.", "floor."))  # systems have no pose
+            if isinstance(v, USDObject) and bddl_category(k) not in ("agent", *FLOOR_CATEGORIES)  # systems have no pose
         }
 
     def floor_name(self) -> str:
-        """The BDDL name of the loaded task's floor (``task_scope`` leaves floors out; a strategy puts things down
-        on it when nothing else will do)."""
-        names = [name for name in self.env.task.object_scope if name.startswith("floor.")]
+        """The BDDL name of the loaded task's floor, or its lawn (``task_scope`` leaves both out; a strategy puts
+        things down on it when nothing else will do)."""
+        names = [name for name in self.env.task.object_scope if bddl_category(name) in FLOOR_CATEGORIES]
         if not names:
             raise KeyError(f"the task {self.config['task'].get('activity_name')!r} has no floor in its scope")
         return names[0]
@@ -841,21 +840,41 @@ class R1ProSim(TiptopSim):
 
 
     def button_world(self, bddl: str) -> tuple[np.ndarray, np.ndarray, float]:
-        """A toggle button as the simulator knows it (privileged): world position, the outward unit normal of the
-        object face it sits on (from the object's own mesh), and the radius within which ToggledOn counts a finger."""
+        """A toggle button as the simulator knows it (privileged; reached only through OracleKnowledge's
+        button_hints): world position ON the body's surface, the outward unit normal of the body face it sits on,
+        and the radius within which ToggledOn counts a finger.
+
+        The face is read off the physical mesh: the visual one carries the toggle marker itself, a sphere up to
+        46 mm wide that pulled the box face to the wrong side of every wall switch and put the lighter's button on
+        its underside (verify_press/marker_in_box.out, 2026-09-24). Of the faces the marker's sphere reaches (half
+        the width ToggledOn's overlap sphere is given) the most upward wins, since a press down on it is braced
+        by the support; else the nearest. The position is where a ray along the normal meets the physical
+        surface, so the stroke's push_depth counts from the surface: the washer's centre floats 11.2 mm proud of
+        it and the 5 mm stroke stopped 6.2 mm short (press_verify/washer_gap.out); the box face is no substitute,
+        a lamp's or a microwave's stands 2-21 cm in front of the button (manip_atoms/T1-bridge/button_faces.out)."""
         from omnigibson.object_states import ToggledOn
 
         obj = self.scene_object(bddl)
         if ToggledOn not in obj.states:
             raise ValueError(f"{bddl} has no toggle button (no ToggledOn state)")
+        mesh = self.collision_mesh_world(obj)
+        if mesh is None:
+            raise ValueError(f"{bddl} has no physical mesh to find its button's face on")
         state = obj.states[ToggledOn]
         pos_w = state.link.get_position_orientation()[0].cpu().numpy().astype(np.float64)
         obj_pos, obj_quat = obj.get_position_orientation()
+        obj_pos = obj_pos.cpu().numpy().astype(np.float64)
         rot = T.quat2mat(obj_quat).cpu().numpy().astype(np.float64)
-        vertices, _ = self.mesh_local(obj)  # the object's own frame
-        p_local = rot.T @ (pos_w - obj_pos.cpu().numpy().astype(np.float64))
-        n_world = rot @ face_normal_local(vertices, p_local)
+        vertices = (np.asarray(mesh.vertices, dtype=np.float64) - obj_pos) @ rot  # the object's own frame
         radius = float(th.min(state.visual_marker.extent * state.scale * state.link.scale))
+        up = rot.T @ np.array([0.0, 0.0, 1.0])  # world up in the object's frame
+        n_local = face_normal_local(vertices, rot.T @ (pos_w - obj_pos), within=radius / 2, up=up)
+        n_world = rot @ n_local
+        hits, _, _ = mesh.ray.intersects_location([pos_w + 0.05 * n_world], [-n_world], multiple_hits=True)
+        if len(hits):
+            pos_w = hits[np.argmin(np.linalg.norm(hits - (pos_w + 0.05 * n_world), axis=1))]
+        else:
+            log.warning(f"{bddl}: no physical surface under its button along {np.round(n_world, 2).tolist()}")
         return pos_w, n_world, radius
 
     def button_hints(self, atoms: list[dict], category_level: bool = False) -> dict:
@@ -997,23 +1016,26 @@ class R1ProSim(TiptopSim):
 
     def shelf_of(self, obj, item_height: float, within=None) -> tuple | None:
         """The board of a piece of furniture an item should rest on: (top z, xy lo, xy hi, ceiling z), world
-        frame. Of the boards of its physical mesh (``boards``), those inside ``within`` (a world AABB) with
-        headroom for the item under the next board and a point within BOARD_REACH of the base; the one nearest
-        PLACE_HEIGHT. None when there is no such board."""
+        frame. Of the boards of its physical mesh (``boards``), those inside ``within`` (a world AABB), under
+        PLACE_HEIGHT_MAX, with headroom for the item under the next board; the one nearest PLACE_HEIGHT among those
+        with a point within BOARD_REACH of the base, else among the rest (the stance search moves the robot to it:
+        from 1 m off the bench, a hallstand's 2.37 m top was the only board "in reach" and 6 rounds IK-failed on it,
+        putting_shoes_on_rack 2026-09-24). None when no board has room."""
         mesh = self.collision_mesh_world(obj)
         if mesh is None:
             return None
         base = self.base_pose()[0][:2].cpu().numpy().astype(np.float64)
-        found = []
+        near, far = [], []
         for z, lo, hi, ceiling in boards(mesh.vertices, mesh.faces):
             if within is not None:
                 lo, hi = np.maximum(lo, within[0][:2]), np.minimum(hi, within[1][:2])
                 ceiling = min(ceiling, float(within[1][2]))
                 if not within[0][2] - 0.02 <= z < within[1][2] or (hi <= lo).any():
                     continue
-            if ceiling - z >= item_height + HEADROOM and np.linalg.norm(np.clip(base, lo, hi) - base) <= BOARD_REACH:
-                found.append((z, lo, hi, ceiling))
-        return min(found, key=lambda b: abs(b[0] - PLACE_HEIGHT), default=None)
+            if z > PLACE_HEIGHT_MAX or ceiling - z < item_height + HEADROOM:
+                continue
+            (near if np.linalg.norm(np.clip(base, lo, hi) - base) <= BOARD_REACH else far).append((z, lo, hi, ceiling))
+        return min(near or far, key=lambda b: abs(b[0] - PLACE_HEIGHT), default=None)
 
     def rest_region(self, item: str, fixture: str) -> dict | None:
         """The placement surface for touching(item, fixture): the fixture's board nearest PLACE_HEIGHT with
@@ -1034,12 +1056,22 @@ class R1ProSim(TiptopSim):
         )
         return self.region_box((lo + hi) / 2.0, (hi - lo) / 2.0, z, 0.02)
 
-    def footprint_region(self, name: str, z: float | None = None) -> dict:
-        """A placement slab over the named fixture's footprint (its box: fixed furniture only, the scanned map's) at
-        world ``z``, its own top by default. A table's top as the planner's support plane instead of the plane
+    def footprint_region(self, name: str, z: float | None = None) -> dict | None:
+        """A placement slab over the named fixture's footprint at world ``z``, its own top by default: the box of
+        fixed furniture is the scanned map's; a movable table's is the world box of the points the captures saw
+        it by (``own_box``), None until one has. A table's top as the planner's support plane instead of the plane
         RANSAC fits: with the item in hand nothing rests on the table, and 4 of 5 executed ontop(x, table) rounds
         were planned onto the floor (2026-09-23); the floor inside a fixture's footprint for under(x, it)."""
-        lo, hi = (v.cpu().numpy().astype(np.float64) for v in self.scene_object(name).aabb)
+        obj = self.scene_object(name)
+        if obj.fixed_base:
+            lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
+        elif (box := self.own_box(obj)) is not None:
+            pos, rot, blo, bhi = box
+            corners = pos + np.array(list(itertools.product(*zip(blo, bhi)))) @ rot.T
+            lo, hi = corners.min(axis=0), corners.max(axis=0)
+        else:
+            log.info(f"{name} is movable and no capture has seen it: its top is not the map's to read; no region")
+            return None
         return self.region_box((lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2]) / 2.0, float(hi[2]) if z is None else z, 0.02)
 
     def inside_regions(self, atoms: list[dict]) -> dict:
@@ -1050,14 +1082,14 @@ class R1ProSim(TiptopSim):
         pairs = [(a["predicate"], *a["args"]) for a in atoms if len(a.get("args", ())) == 2]
         supports = {c for p, _, c in pairs if p != "inside"}
         out = {}
-        # a fixture's footprint or top is read off its box only when it is part of the scanned map (fixed base)
-        tables = {s for s in supports if bddl_category(s) == "table" and self.scene_object(s).fixed_base}
-        if any(bddl_category(support) == "floor" for support in supports):
+        # a fixture's footprint is read off its box only when it is part of the scanned map (fixed base)
+        tables = {s for s in supports if bddl_category(s) == "table"}
+        if any(bddl_category(support) in FLOOR_CATEGORIES for support in supports):
             out[PLANNER_SUPPORT] = self.floor_surface()
         elif under := [c for p, _, c in pairs if p == "under" and self.scene_object(c).fixed_base]:
             out[PLANNER_SUPPORT] = self.floor_surface(within=under[0])
-        elif len(tables) == 1:
-            out[PLANNER_SUPPORT] = self.footprint_region(tables.pop())
+        elif len(tables) == 1 and (top := self.footprint_region(tables.pop())) is not None:
+            out[PLANNER_SUPPORT] = top
         refused = getattr(self, "region_refused", set())
         self.region_sent = set()  # the pairs this request carries a region for (bench refuses only those)
         for predicate, item, container in pairs:
@@ -1085,7 +1117,7 @@ class R1ProSim(TiptopSim):
         as it keeps the plane it replaces."""
         bx, by, bz = (float(v) for v in self.base_pose()[0])
         tops = [float(hi[2]) for o, lo, hi in self.scene_aabbs()
-                if o.category == "floors" and lo[0] <= bx <= hi[0] and lo[1] <= by <= hi[1]]
+                if o.category in ("floors", "lawn") and lo[0] <= bx <= hi[0] and lo[1] <= by <= hi[1]]
         top = min(tops, key=lambda t: abs(t - bz)) if tops else bz
         if within is None:
             return {"dims": [0.6, 0.8, 0.02], "pose": [0.6, 0.15, top - bz - 0.01, 1.0, 0.0, 0.0, 0.0]}
@@ -1143,14 +1175,14 @@ class R1ProSim(TiptopSim):
 
     # ---------------------------------------------------------------- scene setup
     def scope_floor(self, name: str):
-        """The simulated object a BDDL floor name stands for, or None.
+        """The simulated object a BDDL floor (or lawn) name stands for, or None.
 
         ``task_scope`` leaves floors out on purpose -- they are not things the episode poses or frames -- but a
         goal may still name one as the place an item has to end up, and then the runner needs to know where it
         is. bringing_in_wood asks for three sheets of plywood ontop floor.n.01_2 while they start on
         floor.n.01_1, so "the floor" is not one place.
         """
-        if not name.startswith("floor."):
+        if bddl_category(name) not in FLOOR_CATEGORIES:
             return None
         obj = getattr(self.env.task, "object_scope", {}).get(name)
         return obj if isinstance(obj, USDObject) else None
@@ -3350,17 +3382,6 @@ class R1ProSim(TiptopSim):
         centres, radii = box_spheres(np.stack([lo, hi]))
         return link, (centres @ rot.T + pos - gpos) @ grip, radii
 
-    def jaw_spans(self, name: str) -> bool:
-        """Whether the planner's open jaw can get round the object some way (its own box's smallest extent under
-        JAW_GAP: a plate lying flat is 2.6 cm thick, and a side grasp closing on its rim spans that); True when no
-        capture has seen it yet (the planner round tells). Judged on the level axes alone, plates, bowls, books and
-        toys the planner had been holding were pressed instead (sweep3, 2026-09-23)."""
-        box = self.own_box(self.scene_object(name))
-        if box is None:
-            return True
-        _, _, lo, hi = box
-        return float(np.min(hi - lo)) < JAW_GAP
-
     def base_placement_collision(self, x, y, yaw, then=None, only=None):
         """Check the measured landing posture and live carried volume before any base teleport, and with ``then``
         (planned-joint targets) the straight unfold from it to them as well; ``only`` restricts the room to the
@@ -3454,7 +3475,14 @@ class R1ProSim(TiptopSim):
                 if obj is None and action[1] == "Push":
                     obj = self.objects.get(name.removesuffix("_button"))
                 if obj is not None:
-                    allowed_contacts[obj.name] = set(self.robot.finger_link_names[self.arm])
+                    fingers = set(self.robot.finger_link_names[self.arm])
+                    allowed_contacts[obj.name] = fingers
+                    if action[1] == "Pick":
+                        # the planner lets the fingers meet what the object rests on at the grasp (cutamp-19: a thin
+                        # eraser's desk), where the sphere model has them a few mm in; a finger at the tote refused
+                        # Pick(paintbrush_1) at execution (organizing_art_supplies, sweep4 2026-09-24)
+                        for name in self.rests_against(obj):
+                            allowed_contacts.setdefault(name, set()).update(fingers)
             obstacles = self._motion_obstacles(held_ids, allowed_contacts)
             # The planner already inflated these same spheres by the model's buffer; counting it again here refused
             # a Place whose forearm sphere was 0.4 mm clear of a trash can (1.6 mm "inside" once re-buffered,
@@ -4127,12 +4155,7 @@ class R1ProSim(TiptopSim):
         if solution is None:
             log.info(f"{obj.name}: no local IK to lift it {distance:.2f} m back the way the hand came in")
             return False
-        lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
-        resting = {
-            other.name: {CARRIED}
-            for other, olo, ohi in self.scene_aabbs()
-            if other is not obj and other is not self.robot and np.all(olo <= hi + 0.01) and np.all(lo - 0.01 <= ohi)
-        }
+        resting = {name: {CARRIED} for name in self.rests_against(obj)}
         for name, links in self.retreat_contacts().items():  # a hand that closed on something lying on the floor
             resting.setdefault(name, set()).update(links)
         # The hand record is written only after press_grasp returns (bench.note_pressed_grasp), and ramp_collision
@@ -4169,6 +4192,16 @@ class R1ProSim(TiptopSim):
                 log.info(f"{obj.name}: letting go where it rests rather than holding what nothing can carry")
                 self.hold(DROP_STEPS, self.OPEN)
         return stopped is None
+
+    def rests_against(self, obj) -> set[str]:
+        """The scene bodies whose boxes meet ``obj``'s (within 1 cm): what it stands on, and the container and
+        neighbours packed round it."""
+        lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
+        return {
+            other.name
+            for other, olo, ohi in self.scene_aabbs()
+            if other is not obj and other is not self.robot and np.all(olo <= hi + 0.01) and np.all(lo - 0.01 <= ohi)
+        }
 
     def retreat_contacts(self, bddl: str | None = None) -> dict:
         """What a hand backing out of a grasp may still be touching as it leaves: the target and the floor, for the

@@ -1497,3 +1497,75 @@ def test_the_capped_read_samples_the_options_rather_than_taking_the_first():
     assert len(read) == 40
     first_basket = {a["args"][0] for o in read for a in o if a["args"][1] == baskets[0]}
     assert first_basket == set(candles), f"the first 40 permutations give basket_1 only two candles: {first_basket}"
+
+
+def _cup_world(cup_at=(2.0, 0, 0.05)):
+    """A cup on the floor, a plate on a solid table: the goal wants the cup on the table and beside the plate."""
+    boxes = {
+        "table.n.02_1": box((0, 0, 0.35), half=(0.6, 0.4, 0.35)),
+        "plate.n.04_1": box((-0.4, 0, 0.75)),
+        "cup.n.01_1": box(cup_at),
+    }
+    goal = [atom("ontop", "cup.n.01_1", "table.n.02_1"), atom("nextto", "cup.n.01_1", "plate.n.04_1")]
+    return boxes, goal
+
+
+def test_a_placement_asks_for_every_atom_of_the_item_it_decides():
+    """sorting_household_items 301 (sweep4): nextto(bottle_1, bottle_2) held at the start and the under(bottle_1,
+    sink) round lost it, because a round asked for one atom. The simulator reads OnTop, NextTo, Under and Touching
+    each at the end of one placement, so the round asks for the item's atoms together: one achieve, both atoms,
+    whichever of them the demand serves first."""
+    boxes, goal = _cup_world()
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_household_items", goal).run(ep)
+    achieved = [c[1:3] for c in ep.calls if c[0] == "achieve"]
+    assert achieved == [(("ontop", "nextto"), ("cup.n.01_1", "table.n.02_1"))], achieved
+
+    boxes, goal = _cup_world(cup_at=(-2.0, 0, 0.05))  # the plate is now the nearer target: nextto leads
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_household_items", goal).run(ep)
+    achieved = [c[1:3] for c in ep.calls if c[0] == "achieve"]
+    assert achieved == [(("nextto", "ontop"), ("cup.n.01_1", "plate.n.04_1"))], achieved
+
+
+def test_a_partner_still_to_move_is_not_asked_for_beside_the_item():
+    """A nextto partner this pass will carry off is left out: a placement beside where it lies now is undone the
+    moment it moves, and the pair is re-formed once both are where the goal wants them."""
+    boxes, goal = _cup_world()
+    boxes["plate.n.04_1"] = box((3.0, 0, 0.05))  # the plate is on the floor and wanted on the table too
+    goal.append(atom("ontop", "plate.n.04_1", "table.n.02_1"))
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_household_items", goal).run(ep)
+    achieved = [c[1] for c in ep.calls if c[0] == "achieve"]
+    assert achieved == [("ontop",), ("ontop",)], achieved
+
+
+def test_a_stacking_round_does_not_also_ask_for_the_bookcase():
+    """sorting_books_on_shelf: every book is wanted inside the bookcase AND ontop of another. Two on-type atoms
+    cannot hold from one placement (the book it stacks on is not there yet), so the ontop round carries no inside
+    atom; a nextto primary takes at most one on-type atom, an on-type primary none."""
+    boxes = {
+        "bookcase.n.01_1": box((2.0, 0, 0.8), half=(0.4, 0.2, 0.8)),
+        "comic_book.n.01_1": box((2.0, 0, 0.9), half=(0.08, 0.05, 0.01)),
+        "comic_book.n.01_2": box((2.0, 0.1, 0.9), half=(0.08, 0.05, 0.01)),
+    }
+    goal = [
+        atom("inside", "comic_book.n.01_1", "bookcase.n.01_1"),
+        atom("inside", "comic_book.n.01_2", "bookcase.n.01_1"),
+        atom("ontop", "comic_book.n.01_2", "comic_book.n.01_1"),
+    ]
+    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
+    strategy_for("sorting_books_on_shelf", goal).run(ep)
+    achieved = [c[1:3] for c in ep.calls if c[0] == "achieve"]
+    assert achieved == [(("ontop",), ("comic_book.n.01_2", "comic_book.n.01_1"))], achieved
+
+
+def test_a_task_without_a_description_runs_on_its_name():
+    """hiding_Easter_eggs and three other tier-1 tasks have no yaml; the runner used to refuse them. The name is
+    the instruction, and a press stays one-handed because "hold" needs the right-arm planner."""
+    runner = strategy_for("hiding_Easter_eggs", [atom("ontop", "egg.n.02_1", "lawn.n.01_1")])
+    assert (runner.spec.task, runner.spec.instruction, runner.spec.press) == (
+        "hiding_Easter_eggs",
+        "hiding Easter eggs",
+        "in_place",
+    )
