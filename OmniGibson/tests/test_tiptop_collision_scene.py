@@ -686,33 +686,41 @@ def test_stance_retry_avoids_rejected_landings_without_repeating_motor_attempts(
 
 def test_the_landing_checks_verdicts_are_fed_back_into_the_next_search(monkeypatch):
     """68% of the sweep's 2801 landing refusals named an obstacle the same search had already been refused for, and a
-    refusal left only an (x, y) disc behind, which hid every other heading at that spot (2026-09-23)."""
+    refusal left only an (x, y) disc behind, which hid every other heading at that spot (2026-09-23). A refusal may
+    also name a ROBOT link -- "base_link" when a carried tile's volume met the base -- which is no scene object: the
+    search crashed looking it up (laying_tile_floors, 2026-09-24); it keeps its disc and blocks nothing else."""
     import omnigibson.tiptop.r1pro as r1pro
 
     asked, captured = [], {}
+    scene = {"kerb": SimpleNamespace(fixed_base=True), "hamper_225": SimpleNamespace(fixed_base=False)}  # a basket
     sim = SimpleNamespace(
         scene_aabbs=lambda: [], head_camera_in_base=lambda: (np.eye(3), np.eye(4), 0.0),
         robot_cam=SimpleNamespace(image_width=720, image_height=720),
         _footprint_free=lambda x, y, ignore, aabbs=None, yaw=None, reaching=(): (True, "free", 0.5),
         base_placement_collision=lambda x, y, yaw, only=None: asked.append((x, only))
         or (("base_link", "kerb", 0) if x < 1.0 else None),
-        scene_object=lambda name: SimpleNamespace(fixed_base=name == "kerb"),  # the hamper is a movable basket
+        env=SimpleNamespace(scene=SimpleNamespace(object_registry=lambda _key, name: scene.get(name))),
     )
     monkeypatch.setattr(r1pro, "search_base_poses", lambda pts, cam, fp, **kw: captured.setdefault("fp", fp) and (None, {}))
-    # a landing refused by the kerb; a short unfold; a landing refused by a movable basket (its mesh is not ours)
-    refused = [(0.0, 0.0, 0.0, "kerb"), (5.0, 5.0, 0.0, None), (7.0, 0.0, 0.0, "hamper_225")]
-    R1ProSim.best_base_pose(sim, [np.zeros(2)], refused=refused)
+    # a landing refused by the kerb; a short unfold; a landing refused by a movable basket (its mesh is not ours);
+    # a landing refused by the robot's own base link (not in the scene at all)
+    refused = [(0.0, 0.0, 0.0, "kerb"), (5.0, 5.0, 0.0, None), (7.0, 0.0, 0.0, "hamper_225"),
+               (9.0, 0.0, 0.0, "base_link")]
+    R1ProSim.best_base_pose(sim, [np.zeros(2)], refused=refused)  # must not raise on "base_link"
     fp = captured["fp"]
     assert fp(0.1, 0.0, np.radians(15)) == (False, "refused before", 0.0)  # the same spot, nearly the same heading
     assert fp(5.1, 5.0, np.radians(-15)) == (False, "refused before", 0.0)
     assert fp(7.1, 0.0, np.radians(-15)) == (False, "refused before", 0.0)  # the basket keeps its avoid disc
+    assert fp(9.1, 0.0, np.radians(-15)) == (False, "refused before", 0.0)  # so does the robot's own link
     assert fp(0.1, 0.0, np.radians(45)) == (False, "base_link would intersect kerb", 0.0)  # turned: the kerb is asked
     assert fp(2.0, 0.0, 0.0) == (True, "free", 0.5)
     assert fp(7.1, 0.0, np.radians(45)) == (True, "free", 0.5)
-    assert asked == [(0.1, {"kerb"}), (2.0, {"kerb"}), (7.1, {"kerb"})]  # about the kerb only, never the basket
+    assert fp(9.1, 0.0, np.radians(45)) == (True, "free", 0.5)  # a robot link is nobody's hard blocker
+    # about the kerb only: never the basket, never the robot's link
+    assert asked == [(0.1, {"kerb"}), (2.0, {"kerb"}), (7.1, {"kerb"}), (9.1, {"kerb"})]
     captured.clear()
     R1ProSim.best_base_pose(sim, [np.zeros(2)])
-    assert captured["fp"](0.1, 0.0, 0.0) == (True, "free", 0.5) and len(asked) == 3  # nothing refused: no check
+    assert captured["fp"](0.1, 0.0, 0.0) == (True, "free", 0.5) and len(asked) == 4  # nothing refused: no check
 
 
 def test_base_teleport_cannot_detach_fixed_articulated_furniture_as_a_carried_object():

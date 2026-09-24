@@ -2076,8 +2076,11 @@ class R1ProSim(TiptopSim):
         if support_z is not None:
             heights = [support_z] * len(points_xy) if np.isscalar(support_z) else list(support_z)
             min_dists = [self.camera_floor_distance(float(z)) + CAMERA_MIN_MARGIN for z in heights]
-        # by its mesh only when it is the map's (fixed base); a movable basket leaves its avoid disc and nothing else
-        hard = {o for *_, o in refused if o and getattr(self.scene_object(o), "fixed_base", False)}
+        # by its mesh only when it is the map's (fixed base); a movable basket leaves its avoid disc and nothing else.
+        # The name can be a robot link ("base_link" when a carried tile's volume met the base, laying_tile_floors
+        # 2026-09-24): no scene object, never a blocker -- the registry answers None where scene_object raises
+        hard = {o for *_, o in refused
+                if o and getattr(self.env.scene.object_registry("name", o), "fixed_base", False)}
 
         def footprint_free(x, y, yaw):
             if any(
