@@ -436,25 +436,6 @@ def test_a_pressed_grasp_that_worked_is_entered_in_the_hand_record():
     assert ep.note_pressed_grasp("book.n.01_1") is False
 
 
-def test_the_way_down_to_a_flat_object_may_pass_through_what_it_rests_on():
-    """A bookcase's bounding box covers every shelf in it, so reaching onto a book standing in one swept the
-    bookcase and the pressed grasp refused its own approach every time."""
-    import inspect
-
-    from omnigibson.tiptop.r1pro import R1ProSim
-
-    src = inspect.getsource(R1ProSim.press_grasp)
-    assert "spare" in src.split("\n")[0], "the caller has to be able to name what the object is standing on"
-    body = src.split('"""')[-1]
-    assert "ignore" in body and "spare" in body, "and the sweep check has to honour it"
-    assert "if n != obj.name]" not in body, "the old check spared only the object itself"
-    # the CALL, not the prose -- the comment above it explains what mesh=False used to do
-    call = [ln for ln in body.split("\n") if "path_hits_scene(" in ln]
-    assert call and not any("mesh=False" in ln for ln in call), (
-        "mesh=False returns box-level hits and returns early, before the filter that drops floors and ceilings: "
-        "48 refusals blamed a ceiling for blocking a downward reach"
-    )
-
 
 def test_the_pressed_grasp_no_longer_refuses_a_thick_object_out_of_hand():
     """It used to return without moving for anything thicker than FLAT_THICKNESS, 366 times across the corpus --
@@ -496,17 +477,6 @@ def test_the_pressed_grasp_tries_the_front_when_above_is_a_shelf():
     )
 
 
-def test_the_front_approach_aims_at_the_near_face_not_the_middle():
-    """The fingertips stop at the surface; aiming at the centre would drive them half the object deep."""
-    import inspect
-
-    from omnigibson.tiptop.r1pro import R1ProSim
-
-    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
-    assert "middle_base - into * depth" in body, "back off half the object's depth along the approach"
-    assert "_press_solution" in body, "the IK-with-two-tolerances is shared between the two ways in"
-
-
 def test_the_press_chooses_its_way_in_the_way_the_drawer_pull_does():
     """A pose being reachable is not the same as the arm being able to get to it.
 
@@ -527,24 +497,57 @@ def test_the_press_chooses_its_way_in_the_way_the_drawer_pull_does():
     assert "reach_plan(" in body, "five ways in, not one straight line"
     after = body[body.index("reach_plan(") :]
     assert "path_hits_scene" in after, "and the chosen plan is still checked"
-    assert "continue" in after[: after.index("pressing the hand onto")], "a dirty plan is still refused"
+    assert "continue" in after[: after.index("approaching the sticky precontact")], "a dirty plan is still refused"
     assert "_targets_from" in after, "every leg of the chosen plan is ramped, not just the last"
 
 
-def test_the_thing_a_book_sits_inside_is_not_an_obstacle_on_the_way_to_it():
-    """press_grasp takes a ``spare`` from the caller, but Episode.support_of only searches TASK objects and a
-    bookcase is not one -- so for a book on a shelf it returns the floor and the bookcase went on being counted.
+def test_pressed_grasp_keeps_supports_and_stops_after_a_rejected_approach():
+    from types import SimpleNamespace
 
-    sorting_books_on_shelf named bookcase_otwukr_3, the bookcase the books are in and must stay in, in 10 of its
-    15 refusals. A book inside a bookcase is inside its bounding box by construction, so containment is the test
-    that catches it without the caller having to know (2026-09-15).
-    """
-    import inspect
+    import torch as th
+    import trimesh
 
     from omnigibson.tiptop.r1pro import R1ProSim
 
-    body = inspect.getsource(R1ProSim.press_grasp).split('"""')[-1]
-    assert "around" in body and "centre" in body, "what the object sits inside has to be worked out here"
-    assert "HOUSE_AABB_AREA" in body, "and merged walls and roofs excluded by area, as every other scene test does"
-    ignore_line = [ln for ln in body.split("\n") if ln.strip().startswith("ignore =")]
-    assert ignore_line and "around" in ignore_line[0], "and it has to reach the set the sweep test consults"
+    book = SimpleNamespace(name="book", aabb=(th.tensor([0.5, 0.0, 0.7]), th.tensor([0.65, 0.1, 0.72])))
+    calls = []
+
+    def reach(*args, **kwargs):
+        calls.append(("reach", kwargs))
+        return [[0.2]]
+
+    def ramp(*args, **kwargs):
+        calls.append(("ramp", kwargs, args))
+        if len(calls) == 1:  # closing the hand where it is, before the approach
+            return None
+        return ("right_realsense_link intersects bookcase", 0, 0.0)
+
+    sim = SimpleNamespace(
+        scene_object=lambda name: book,
+        to_base=lambda pos, quat: (pos, quat),
+        base_pose=lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0])),
+        collision_mesh_world=lambda obj: trimesh.creation.box([0.15, 0.1, 0.02], transform=np.array(
+            [[1, 0, 0, 0.575], [0, 1, 0, 0.05], [0, 0, 1, 0.71], [0, 0, 0, 1]])),
+        arm_ik=lambda *args, **kwargs: object(),
+        ik_joint_names=lambda *args, **kwargs: ["left_arm_joint1"],
+        robot=SimpleNamespace(get_joint_positions=lambda: th.zeros(1)),
+        joint_index={"left_arm_joint1": 0},
+        scene_aabbs=lambda: [],
+        _press_solution=lambda *args, **kwargs: [0.2],
+        grasp_target=lambda *args, **kwargs: (np.zeros(3), np.eye(3)),
+        reach_plan=reach,
+        path_hits_scene=lambda *args, **kwargs: [],
+        _targets_from=lambda joints, target: target,
+        ramp_to=ramp,
+        grasp_contacts=R1ProSim.grasp_contacts,
+        posture={},
+        OPEN=1.0,
+        CLOSE=-1.0,
+        q_arm=lambda: np.zeros(1),
+    )
+    # No close_on method: a failed approach must return without pressing deeper.
+    assert R1ProSim.press_grasp(sim, "left", "book", spare=("bookcase",)) is False
+    assert calls[0][0] == "ramp" and calls[0][2][2] == sim.CLOSE  # closed first, in free space
+    assert calls[1][1]["exclude"] == {"book"}
+    assert calls[2][2][2] == sim.CLOSE  # the transit travels closed
+    assert not calls[2][1].get("allowed_contacts")  # and keeps the target collidable

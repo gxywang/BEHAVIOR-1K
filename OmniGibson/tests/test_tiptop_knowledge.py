@@ -278,6 +278,9 @@ class _Episode(Episode):
     def placed(self, item, target, after=None):
         return any((p, item, target) in self.true for p in ("inside", "ontop"))
 
+    def goal_already_holds(self, predicate, item, target):
+        return (predicate, item, target) in self.true
+
     def near_floor(self, name):
         return name == self.floor
 
@@ -364,7 +367,7 @@ def test_episode_rounds_are_the_one_retry_policy():
     ep = _Episode([set(), {"held"}, set()], arms=("left", "right"), rounds=1)  # one pose, then no press
     _radio(goal).run(ep)
     assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding"]
-    # a put-down is done when the hand is empty, wherever the object landed; a press with no plan twice is False
+    # a put-down requires the requested support and an empty hand; a press with no plan twice is False
     ep = _Episode([{"held"}, {"placed"}, {"failed"}, {"failed"}])
     assert ep.pick("candle.n.01_1") and ep.put_down("candle.n.01_1", "table.n.02_1")
     assert [c[1] for c in ep.calls if c[0] == "round"] == ["holding", "ontop"]
@@ -501,7 +504,9 @@ def test_turn_on_radio_gives_up_when_the_radio_is_unreachable():
     assert [c for c in ep.calls if c[0] == "round"] == []
 
 
-def test_assemble_gift_baskets_frees_a_full_hand_before_the_next_pick():
+def test_assemble_gift_baskets_stops_holding_an_item_no_plan_can_put_down():
+    from omnigibson.tiptop.strategies import TransferBlocked
+
     goal = [
         {"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]},
         {"predicate": "inside", "args": ["bow.n.01_1", "wicker_basket.n.01_1"]},
@@ -512,46 +517,24 @@ def test_assemble_gift_baskets_frees_a_full_hand_before_the_next_pick():
         "candle.n.01_1": (0.1, 0),
         "bow.n.01_1": (0.2, 0),
     }
-    # the candle's place fails (two rounds) and so does the put-down (two rounds): the next transfer starts by
-    # putting it down
+    # the candle's place fails (two rounds) and so does the planned floor put-down (two rounds): the task stops
+    # with the candle in the hand -- no open-hand drop, no teleport to the bow's support
     ep = _Episode(
-        [{"held"}, set(), set(), set(), set(), {"placed"}, {"held"}, {"placed"}],
+        [{"held"}, set(), set(), set(), set(), {"held"}, {"placed"}],
         on_table=["candle.n.01_1", "bow.n.01_1"],
         positions=positions,
     )
-    _baskets(goal, 1).run(ep)
+    with pytest.raises(TransferBlocked):
+        _baskets(goal, 1).run(ep)
     rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
     inside, floor = ("inside", ("candle.n.01_1", "wicker_basket.n.01_1")), ("ontop", ("candle.n.01_1", "floor.n.01_1"))
-    assert rounds[:5] == [("holding", ("candle.n.01_1",)), inside, inside, floor, floor]
-    assert rounds[5] == floor  # freed at the start of the bow's transfer
-    assert rounds[6:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
-    assert not ep.in_hand
-
-
-def test_assemble_gift_baskets_releases_an_item_no_plan_can_put_down():
-    goal = [
-        {"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]},
-        {"predicate": "inside", "args": ["bow.n.01_1", "wicker_basket.n.01_1"]},
+    assert rounds == [("holding", ("candle.n.01_1",)), inside, inside, floor, floor]
+    assert ("release",) not in ep.calls
+    assert [c for c in ep.calls if c[0] == "stand"] == [
+        ("stand", ("candle.n.01_1",)),
+        ("stand", ("wicker_basket.n.01_1",)),
     ]
-    positions = {
-        "table.n.02_1": (0, 0),
-        "wicker_basket.n.01_1": (2, 0),
-        "candle.n.01_1": (0.1, 0),
-        "bow.n.01_1": (0.2, 0),
-    }
-    # the candle's place fails, the put-down fails, and at the bow's transfer both put-downs fail too (two rounds
-    # each): release
-    ep = _Episode(
-        [{"held"}] + [set()] * 8 + [{"held"}, {"placed"}],
-        on_table=["candle.n.01_1", "bow.n.01_1"],
-        positions=positions,
-    )
-    _baskets(goal, 1).run(ep)
-    kinds = [c[0] if c[0] != "round" else c[1] for c in ep.calls]
-    assert "release" in kinds
-    rounds = [c[1:3] for c in ep.calls if c[0] == "round"]
-    assert rounds[-2:] == [("holding", ("bow.n.01_1",)), ("inside", ("bow.n.01_1", "wicker_basket.n.01_1"))]
-    assert not ep.in_hand
+    assert ep.in_hand == {"candle.n.01_1"}
 
 
 def test_verdict_caption_tells_success_from_failure_and_lists_what_is_missing():
@@ -785,6 +768,7 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
 
     class Executor:
         close_eef = np.eye(4)
+        gripper = -1.0
 
     pick = [{"predicate": "holding", "args": ["candle.n.01_1"]}]
     place = [{"predicate": "inside", "args": ["candle.n.01_1", "basket.n.01_1"]}]
@@ -792,8 +776,12 @@ def test_the_hand_record_comes_from_localization_at_the_hand_with_the_fingers_as
     sim, know = Sim(), Knowledge([1.02, 0.0, 0.78])
     note_hands(sim, pick, Executor(), know)
     assert sim.hands() == {"candle_1": "left"} and know.picked_calls == ["candle_1"]
-    # a placement clears it
+    # An interrupted place that never released the object must keep its attachment.
     note_hands(sim, place, Executor(), know)
+    assert sim.hands() == {"candle_1": "left"}
+    released = Executor()
+    released.gripper = sim.OPEN
+    note_hands(sim, place, released, know)
     assert sim.hands() == {}
     # localized far from the hand: not held, even with the fingers on something -- and because the fingers ARE
     # on something, the hand is opened rather than left shut on whatever else it caught (see below)

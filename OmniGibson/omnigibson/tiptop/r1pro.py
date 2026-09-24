@@ -310,7 +310,6 @@ CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object
 # to be a fixture, and capped because every one of them costs a mask in the capture and a hull in perception.
 OBSTACLE_REACH = 2.5  # m from the base; beyond this the arm cannot reach it anyway
 OBSTACLE_LIMIT = 8
-ROOM_LIMIT = 24  # --room ships this many; the server clamps to the free mesh slots of COLLISION_CACHE
 OBSTACLE_MIN_SIZE = 0.30  # m on its longest axis
 FILLABLE_META_LINKS = ("fillable", "openfillable")  # what OmniGibson's Inside state needs to be satisfiable at all
 INSIDE_MIN_SIDE = 0.02  # m: below 2 * cuTAMP's placement shrink the OBB raises and kills the whole round
@@ -320,6 +319,8 @@ STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's un
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
+LOCKED_DRIFT = 0.015  # rad a locked joint may sit off the planner's model before it is driven back
+FALL_DROP = 0.05  # m below the teleport height: the base is falling, not settling
 TILT_LIMIT_DEG = 1.0  # a base that settles further off level than this is fighting something it was put in
 SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # The robot DOES fold before a teleport: place_robot calls fold_for_travel, and the way back out is
@@ -378,6 +379,20 @@ OPEN_GRASP_TOLERANCE = 0.004
 # as soon as the fingers report contact. The cap keeps it inside a drawer front's thickness (15.5 mm here).
 GRASP_NUDGE = 0.008  # m deeper per attempt
 GRASP_NUDGES = 3  # attempts after the first, so at most 24 mm past where the fingertips were first sent
+# Free-object sticky grasps close BEFORE contact; only the final slow approach may touch the target.
+# A teleport materialises the robot: nothing backs it off an obstacle it lands a few millimetres inside, and its
+# physics colliders are not its collision spheres. book_6's stance left 5 cm to a wall, passed the zero-margin
+# check, and PhysX flipped the robot onto its back (base 179 deg off level, boxing_books 2026-09-22).
+TELEPORT_CLEARANCE = 0.03
+UNFOLD_FRACTIONS = (1.0, 0.75, 0.5, 0.25)  # of the straight unfold after a teleport: the first that stays clear
+UNFOLD_MIN = 0.5  # a stance is taken at once if the arm unfolds at least this far there (place_robot_for)
+GROUND_TOP = 0.05  # m: an object whose top is below this is ground (floor, paver, lawn, rug), no TELEPORT_CLEARANCE
+STICKY_LIFT = 0.05  # m a sticky-taken object is lifted back out along its approach (off a table)
+STICKY_LIFT_FRONT = 0.10  # ... and pulled back out of a shelf
+STICKY_LIFT_VEL = 0.5  # rad/s: slow, with an object in the hand
+STICKY_STANDOFF = 0.02  # m of free space in front of the physical contact surface
+STICKY_CONTACT_STEP = 0.002  # m between Cartesian contact-seeking waypoints
+STICKY_CONTACT_SPEED = 0.01  # m/s requested Cartesian advance, also capped at 0.1 rad/s per joint
 # Places to try taking hold of one panel, spread up its face. A fridge door is 2 m tall and only a band of it
 # is in the arm's reach, so one point per joint is one guess; these are offered nearest the hand's own height
 # first, which is both the likeliest to solve and the least the arm has to travel.
@@ -597,6 +612,15 @@ def _intrinsics(sensor, tries: int = 10) -> np.ndarray:
     return sensor.intrinsic_matrix.cpu().numpy()
 
 
+class BasePlacementCollision(RuntimeError):
+    """The measured robot or carried volume occupies physical geometry at a requested base destination, or (with
+    ``unfold`` set) the landing is clear but the arm unfolds only that fraction of the way there."""
+
+    def __init__(self, message: str, unfold: float | None = None):
+        super().__init__(message)
+        self.unfold = unfold
+
+
 class R1ProSim(TiptopSim):
     """R1Pro in a BEHAVIOR scene; the TiptopSim interface (capture / step / q_arm / objects) for the left arm."""
 
@@ -667,7 +691,7 @@ class R1ProSim(TiptopSim):
         self._stance_iks = {}  # arm -> the IK the stance search reuses (built once, not per candidate)
         self._base_cells = {}  # object name -> the floor squares it really occupies at base height
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
-        self.send_room = False  # send that furniture as MESH statics over sim_scene instead (--room)
+        self.send_room = False  # privileged physical collision map, independent of masks and viewer (--room)
         self.send_inside = False  # plan inside() onto the compartment floor (--inside-region)
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
@@ -676,6 +700,7 @@ class R1ProSim(TiptopSim):
         self.bddl_names = {}  # tiptop label -> BDDL instance name for tracked task objects
         self.posture = {}
         self.q_home = None
+        self.stance_ready = None  # the posture a partway unfold left the arm in at this stance; captures return to it
         self.blocked_swings = 0  # capture swings stopped against something this instance (see capture)
         self._scene_meshes = {}  # object name -> (box stamp, world trimesh) for the arm's collision check
         self._held_boxes = {}  # (arm, label) -> the held object's corners in the gripper frame
@@ -813,15 +838,15 @@ class R1ProSim(TiptopSim):
             pos_b, _ = self.to_base(th.tensor(pos_w, dtype=th.float32), identity)
             tip_b, _ = self.to_base(th.tensor(pos_w + n_world, dtype=th.float32), identity)
             label = label_category(bddl) if category_level else self.label_of(bddl)
-            out[self.button_label(label)] = {
+            out[button_label(label)] = {
                 "position": [float(v) for v in pos_b],
                 "normal": [float(v) for v in (tip_b - pos_b)],
                 "radius": radius,
             }
             log.info(
-                f"button of {bddl}: {self.button_label(label)} at {np.round(out[self.button_label(label)]['position'], 3).tolist()} "
-                f"(base), normal {np.round(out[self.button_label(label)]['normal'], 2).tolist()}, "
-                f"radius {out[self.button_label(label)]['radius']:.3f} m"
+                f"button of {bddl}: {button_label(label)} at {np.round(out[button_label(label)]['position'], 3).tolist()} "
+                f"(base), normal {np.round(out[button_label(label)]['normal'], 2).tolist()}, "
+                f"radius {out[button_label(label)]['radius']:.3f} m"
             )
         return out
 
@@ -865,9 +890,8 @@ class R1ProSim(TiptopSim):
         else:  # open-topped: no joint to open, the largest fillable volume is the one
             j, link = None, max(fills, key=lambda l: float(np.prod(l.visual_aabb_extent.cpu().numpy())))
         lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.visual_aabb)
-        # Clip to the part that has EMERGED from the carcass. The rest is under solid furniture that is in no
-        # collision world this round (nearby_obstacles spares the body the round aims at), so the optimizer would
-        # happily name a pose beneath the cabinet's top panel and the arm would stop against it.
+        # Restrict placement sampling to the exposed part of an open drawer. The complete collision map still
+        # contains the cabinet above the hidden part; this region describes placement semantics, not free space.
         if j is not None and j["kind"] == "prismatic":
             body = self.container_body(obj, j["link"])
             k = int(np.argmax(np.abs(np.asarray(j["axis"], dtype=np.float64))))
@@ -920,17 +944,36 @@ class R1ProSim(TiptopSim):
         """``place_surfaces`` for every inside(a, b) in the goal, keyed by b's request label."""
         supports = {a["args"][1] for a in atoms if a["predicate"] != "inside" and len(a.get("args", ())) == 2}
         out = {}
+        if any(bddl_category(support) == "floor" for support in supports):
+            out[PLANNER_SUPPORT] = self.floor_surface()
+        refused = getattr(self, "region_refused", set())
+        self.region_sent = set()  # the pairs this request carries a region for (bench refuses only those)
         for atom in atoms:
             if atom["predicate"] != "inside" or len(atom.get("args", ())) != 2:
                 continue
             item, container = atom["args"]
+            if (item, container) in refused:  # the region already failed to plan for it: the hull's top, as before
+                log.info(f"inside({item}, {container}): its compartment floor found no placement before; no region")
+                continue
             if container in supports:  # also an ontop target in this goal: it needs its own hull as the surface
                 log.info(f"inside({item}, {container}): {container} is also a support here; no region")
                 continue
             region = self.inside_region(item, container)
             if region is not None:
                 out[self.label_of(container)] = region
+                self.region_sent.add((item, container))
         return out
+
+    def floor_surface(self) -> dict:
+        """A placement slab on the floor in front of the robot (base frame, top face at the floor under the base),
+        for goals that put something on the floor. The planner otherwise places onto whatever plane its RANSAC fit
+        picked: at the sink that was a shelf inside the sink stand, and every put-down failed (dishes 2026-09-22).
+        The planner keeps it as a collider, as it keeps the plane it replaces."""
+        bx, by, bz = (float(v) for v in self.base_pose()[0])
+        tops = [float(hi[2]) for o, lo, hi in self.scene_aabbs()
+                if o.category == "floors" and lo[0] <= bx <= hi[0] and lo[1] <= by <= hi[1]]
+        top = (min(tops, key=lambda t: abs(t - bz)) if tops else bz) - bz
+        return {"dims": [0.6, 0.8, 0.02], "pose": [0.6, 0.15, top - 0.01, 1.0, 0.0, 0.0, 0.0]}
 
     def label_of(self, bddl: str) -> str:
         """Request label of a tracked task object ('radio_receiver.n.01_1' -> 'radio_receiver_1')."""
@@ -1137,6 +1180,13 @@ class R1ProSim(TiptopSim):
             room = "unknown"
         if room is None:
             return False, "outside every room", 0.0
+        # A partial-rooms scene loads the walls of every room but only the floors of the rooms it loads, so the
+        # stance search could put the robot in a room with no floor and it fell out of the world: boxing_books
+        # (bedroom_0) twice on 2026-09-22, and 117 of last week's 189 topples of 45 deg or more. The floor test
+        # above uses the floor objects' boxes, and an L-shaped living-room floor's box covers the missing room.
+        loaded = getattr(self.env.scene, "load_room_instances", None)
+        if loaded is not None and room not in (None, "unknown") and room not in loaded:
+            return False, f"in {room}, which this scene did not load (no floor there)", 0.0
         near = [
             (obj, lo, hi)
             for obj, lo, hi in aabbs
@@ -1193,6 +1243,10 @@ class R1ProSim(TiptopSim):
         roll, pitch, _ = T.quat2euler(quat)
         tilt = math.degrees(max(abs(float(roll)), abs(float(pitch))))
         moved = float(np.hypot(float(pos[0]) - x, float(pos[1]) - y))
+        drop = -float(pos[2])  # move_base puts the base at z 0; a fall through a missing floor stays level at first
+        self.last_settle = {"tilt_deg": tilt, "drop_m": drop, "moved_m": moved}
+        if drop > FALL_DROP:
+            return False, f"the base dropped {drop:.2f} m below where it was put (no floor under it)"
         if tilt > tilt_deg:
             return False, f"the base settled {tilt:.1f} deg off level"
         if moved > shift:
@@ -1315,6 +1369,14 @@ class R1ProSim(TiptopSim):
         """
         panel = self.link_trimesh_world(obj.links[link_name])
         for attempt in range(nudges + 1):
+            try:
+                collision = self.ramp_collision([], [], [], self.grasp_contacts(arm, obj), self.CLOSE)
+            except Exception as exc:
+                log.warning("refusing unvalidated grasp closure on %s: %s", obj.name, exc)
+                return seed, False
+            if collision is not None:
+                log.warning("refusing grasp closure on %s: %s", obj.name, collision)
+                return seed, False
             self.hold(OPEN_GRASP_STEPS, self.CLOSE)
             held = self.robot._ag_obj_in_hand.get(arm)
             if held is not None and held.name == obj.name:
@@ -1354,9 +1416,13 @@ class R1ProSim(TiptopSim):
                     targets[self.planned_joints.index(name_j)] = float(value)
             # unleashed: this press exists to make contact -- the grasp assist fires on finger contact, so bounding
             # how hard it leans would be bounding the thing it is for
-            self.ramp_to(
-                targets, self.posture, self.CLOSE, OPEN_SETTLE_STEPS, note="press onto the panel", leashed=False
+            stopped = self.ramp_to(
+                targets, self.posture, self.CLOSE, OPEN_SETTLE_STEPS, note="press onto the panel", leashed=False,
+                allowed_contacts=self.grasp_contacts(arm, obj),
             )
+            if stopped is not None:
+                log.warning("stopping the grasp press after rejected motion: %s", stopped[0])
+                return seed, False
             seed = [float(v) for v in solution]
         return seed, False
 
@@ -1609,8 +1675,7 @@ class R1ProSim(TiptopSim):
         sweeping through the scene, chosen among: straight; via the ready posture; torso first then the arm; the
         arm first then the torso; elbow first. Each leg is a straight ramp in joint space, which is what
         ``ramp_to`` executes, so ``path_hits_scene`` judges the motion the arm will really make. The first clean
-        plan wins; when none is clean the plan with the fewest objects swept is taken and logged, because
-        refusing to move at all was measured to be worse than moving through a box (2026-09-14).
+        plan wins; an empty list means every candidate intersects geometry and no motion is authorized.
         """
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         clear = [row for row in aabbs if row[0].name not in exclude]
@@ -1638,8 +1703,8 @@ class R1ProSim(TiptopSim):
                 return legs
             if best is None or len(swept) < len(best[2]):
                 best = (name, legs, swept)
-        log.info(f"reach: no plan is clear; {best[0]} sweeps the least ({best[2]})")
-        return best[1]
+        log.warning("reach: no candidate clears the scene; closest candidate intersects %s", best[2] if best else [])
+        return []
 
     def follow_pull(self, arm: str, joints_of, plan: dict, obj, grasp: dict) -> tuple[int, str]:
         """Stream the pre-solved pull waypoints as one continuous motion at ``OPEN_MAX_JOINT_VEL`` with the gripper
@@ -1661,6 +1726,7 @@ class R1ProSim(TiptopSim):
             stopped = self.ramp_to(
                 self._targets_from(joints_of, solution), self.posture, self.CLOSE, 0,
                 note=f"pull {obj.name} waypoint {i + 1} of {len(pulls)}", max_vel=OPEN_MAX_JOINT_VEL, leashed=False,
+                allowed_contacts=self.grasp_contacts(arm, obj),
             )  # fmt: skip
             now = link.get_position_orientation()[0].cpu().numpy().astype(np.float64)
             joint_now = next((k["position"] for k in openable_joints(obj) if k["name"] == j["name"]), joint0)
@@ -1736,7 +1802,10 @@ class R1ProSim(TiptopSim):
             pose, chosen, jaw_world = self.stance_for_grasp(obj, grasps, arm=arm)
             if pose is None:
                 return {"opened": False, "why": f"no stance in front of {name} lets the arm reach its handle and pull"}
-            self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
+            try:
+                self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
+            except RuntimeError as exc:  # BasePlacementCollision or an unvalidated destination
+                return {"opened": False, "why": f"opening stance rejected ({exc})"}
             self.hold(OPEN_SETTLE_STEPS, self.OPEN)
         # solve from where the robot actually stands (a teleport settles a little off the pose asked for), seeded
         # from the ready posture as the stance search was, not from the travel fold the arms are in now
@@ -1767,9 +1836,15 @@ class R1ProSim(TiptopSim):
         legs = self.reach_plan(
             arm, ik, joints_of, plan["solutions"][0], exclude=(obj.name,), aabbs=aabbs, body=self.container_body(obj, j["link"])
         )
+        if not legs and not self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name):
+            return {"opened": False, "why": f"no collision-free approach to {name}"}
         for k, leg in enumerate(legs):
             stopped = self.ramp_to(self._targets_from(joints_of, leg), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
                                    note=f"reach the standoff of {name} (leg {k + 1} of {len(legs)})", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
+            if stopped is not None and " intersects " in stopped[0]:
+                # refused before it moved: the straight leg sweeps the cabinet (store_honey, 2026-09-22)
+                if self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name):
+                    break
             if stopped is not None:
                 q_now = self.robot.get_joint_positions()
                 measured = [float(q_now[self.joint_index[jn]]) for jn in joints_of]
@@ -1781,9 +1856,10 @@ class R1ProSim(TiptopSim):
                                    f"hand {off * 100:.1f} cm short)"}  # fmt: skip
                 log.info(f"{stopped[0]} settled {stopped[2]:.2f} rad short at the end of the reach; the hand is {off * 100:.1f} cm off the standoff, going on")
         stopped = self.ramp_to(self._targets_from(joints_of, plan["solutions"][1]), self.posture, self.OPEN,
-                               OPEN_SETTLE_STEPS, note=f"approach the handle of {name}", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
+                               OPEN_SETTLE_STEPS, note=f"approach the handle of {name}", max_vel=OPEN_MAX_JOINT_VEL,
+                               allowed_contacts=self.grasp_contacts(arm, obj))  # fmt: skip
         if stopped is not None:
-            log.info(f"{stopped[0]} stopped {stopped[2]:.2f} rad short on the approach; closing where the hand is")
+            return {"opened": False, "why": f"handle approach rejected: {stopped[0]}"}
         seed, grabbed = self.close_on(arm, ik, obj, j["link"], plan["grasp_pose"], -plan["lead"], plan["solutions"][1],
                                       joints_of, nudges=chosen["nudges"])  # fmt: skip
         if not grabbed:
@@ -1930,29 +2006,69 @@ class R1ProSim(TiptopSim):
             f"head camera at z {float(self.robot_cam.get_position_orientation()[0][2]):.2f} m sees a surface at "
             f"z {min(support_z):.2f} from {self.camera_floor_distance(min(support_z)):.2f} m ahead"
         )
-        best, rejected = self.best_base_pose(
-            points,
-            ignore=ignore,
-            reaching=objects,  # the arm may rest inside what it is reaching for; the base still may not
-            reach=reach,
-            half_widths=[self.xy_radius(n) for n in names],
-            support_z=support_z,
-            avoid=avoid,
-            boxes=[(o.aabb[0].cpu().numpy(), o.aabb[1].cpu().numpy()) for o in objects],
-        )
-        if best is None:
-            raise RuntimeError(
-                f"no base pose reaches {list(names)} within {reach} m (objects "
-                f"{[np.round(p, 2).tolist() for p in points]}; rejections "
-                f"{dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
+        avoided = list(avoid)
+        short = []  # (unfold fraction, -attempt, x, y, yaw): landing clear, the arm unfolds less than UNFOLD_MIN
+        placed = False
+        # Carrying, the arm is wherever the grasp left it (a fold with something in the hand is usually blocked), and
+        # "how far does it unfold from here" says nothing about the stance: every stance at the toy box was refused
+        # at 0% while the toy was in the hand, each toy went back on the floor, putting_away_toys 0.75 -> 0.0
+        # (2026-09-23). The landing check already covers the arm and what it carries where they are.
+        need = 0.0 if self.hands() else UNFOLD_MIN
+        for attempt in range(8):
+            best, rejected = self.best_base_pose(
+                points,
+                ignore=ignore,
+                reaching=objects,  # the arm may rest inside what it is reaching for; the base still may not
+                reach=reach,
+                half_widths=[self.xy_radius(n) for n in names],
+                support_z=support_z,
+                avoid=avoided,
+                boxes=[(o.aabb[0].cpu().numpy(), o.aabb[1].cpu().numpy()) for o in objects],
             )
-        score, x, y, yaw, dist, side, clearance = best
-        log.info(
-            f"standing for {' + '.join(names)}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
-            f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m, "
-            f"{clearance:.2f} m of room to the nearest obstacle"
-        )
-        pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}")
+            if best is None:
+                if short:  # the search ran dry, but some stances let the arm part of the way out
+                    break
+                raise RuntimeError(
+                    f"no base pose reaches {list(names)} within {reach} m (objects "
+                    f"{[np.round(p, 2).tolist() for p in points]}; rejections "
+                    f"{dict(sorted(rejected.items(), key=lambda kv: -kv[1])[:6])})"
+                )
+            score, x, y, yaw, dist, side, clearance = best
+            log.info(
+                f"standing for {' + '.join(names)}: ({x:.2f}, {y:.2f}) yaw {np.degrees(yaw):.0f} deg, "
+                f"distances {np.round(dist, 2).tolist()} m, left offsets {np.round(side, 2).tolist()} m, "
+                f"{clearance:.2f} m of room to the nearest obstacle"
+            )
+            if attempt:
+                try:
+                    collision = self.base_placement_collision(float(x), float(y), float(yaw))
+                except Exception as exc:
+                    raise RuntimeError(f"cannot validate base destination: {exc}") from exc
+                if collision is not None:
+                    avoided.append((float(x), float(y)))
+                    log.warning("rejecting destination before another fold: %s intersects %s", *collision[:2])
+                    continue
+            try:
+                pose = self.place_robot(float(x), float(y), float(yaw), note=f"stand for {' + '.join(names)}",
+                                        min_unfold=need)  # fmt: skip
+            except BasePlacementCollision as exc:
+                log.warning("%s; trying another stance", exc)
+                avoided.append((float(x), float(y)))
+                if exc.unfold:  # landing clear, the arm gets part of the way out
+                    short.append((exc.unfold, -attempt, float(x), float(y), float(yaw)))
+                continue
+            placed = True
+            break
+        if not placed:
+            if not short:
+                raise RuntimeError(f"no collision-free base destination for {list(names)} after 8 candidates")
+            fraction, _, x, y, yaw = max(short)  # the furthest unfold, the better-scored stance on a tie
+            log.info(f"no stance for {list(names)} lets the arm unfold {UNFOLD_MIN:.0%} of the way; standing at "
+                     f"({x:.2f}, {y:.2f}), where it unfolds {fraction:.0%}")  # fmt: skip
+            try:
+                pose = self.place_robot(x, y, yaw, note=f"stand for {' + '.join(names)}", min_unfold=fraction)
+            except BasePlacementCollision as exc:
+                raise RuntimeError(f"no collision-free base destination for {list(names)}: {exc}") from exc
         # Only a log line comes of this, so nothing it does is worth ending an episode for. It reads the mesh of
         # every object whose box the sight line crosses, and preparing a mesh can fail on geometry trimesh will
         # not subdivide: on 2026-09-15 a picking_up_toys episode died here with "max_iter exceeded!" at round 4,
@@ -1993,6 +2109,13 @@ class R1ProSim(TiptopSim):
         folded = travel_fold_targets(here, self.planned_joints)
         if folded is None:
             return None
+        # The torso comes home too, and the arm unfolds to the READY posture at the new stance, not back to wherever
+        # it was: after a place on a high shelf the torso stood raised (head camera 1.53 m), the unfold from there
+        # swept the wrist camera through the desk at every stance, and re_shelving_library_books spent 44 minutes
+        # refusing 175 stances without attempting another book (2026-09-23). The capture drives to ready anyway.
+        for i, joint in enumerate(self.planned_joints):
+            if joint.startswith("torso"):
+                folded[i] = float(self.q_home[i])
         blocked = self.ramp_to(
             folded,
             self.posture,
@@ -2003,43 +2126,13 @@ class R1ProSim(TiptopSim):
         )
         self._fold_blocked = blocked is not None
         if blocked is not None:
-            log.warning(f"the fold before the teleport was stopped by {blocked[0]}; travelling as the robot stands")
-        return here
+            log.warning(f"the fold before the teleport was stopped by {blocked[0]}; the measured landing posture must pass validation")
+        return [float(v) for v in self.q_home]
 
     def unfold_after_travel(self, targets) -> None:
-        """Come back out of the travel fold at the new stance, checking the way out before taking it.
-
-        Folding in is safe because it moves over the robot's own base. Coming out is the opposite -- the arms go
-        into a room the robot has only just arrived in -- so the path is tested first with ``path_hits_scene`` and
-        a warning says what is in the way. It unfolds regardless: the ramp stops the moment a joint falls behind
-        its target, which is the collision-awareness that matters, and refusing to unfold was measured to be worse
-        than unfolding carefully (see below).
-        """
+        """Unfold through ramp_to's complete, measured whole-robot collision preflight."""
         if targets is None:
             return
-        arm = self.arm if self.arm in self.robot.arm_names else self.robot.arm_names[0]
-        try:
-            ik = self._stance_ik(arm)
-            names = self.robot.arm_joint_names[arm]
-            now = dict(zip(self.planned_joints, [float(v) for v in self.q_arm()]))
-            want = dict(zip(self.planned_joints, [float(v) for v in targets]))
-            swept = self.path_hits_scene(
-                arm, ik, [now.get(j, 0.0) for j in names], [want.get(j, 0.0) for j in names], mesh=False
-            )
-        except Exception:  # noqa: BLE001 - no description for this arm: unfold as before rather than stay folded
-            swept = []
-        if swept:
-            # Say so, but still go. Refusing to unfold was measured to be worse than unfolding carefully: in
-            # putting_away_toys the arms stayed folded over the base, which is INSIDE the toy box the robot had
-            # come to work at, so the start-state lift then fired three times trying to get them out and every
-            # plan was refused anyway -- 0.000 against a 0.75 baseline (2026-09-14). The ramp is already
-            # collision-aware in the way that matters: it stops the moment a joint falls behind its target
-            # instead of leaning on the obstacle. What this check is worth is the warning, and one day a choice
-            # between paths; it is not worth staying folded for.
-            log.warning(
-                f"the way back to the working posture passes through {swept[0]}; unfolding anyway, and the ramp "
-                "will stop if a joint meets it"
-            )
         blocked = self.ramp_to(
             targets,
             self.posture,
@@ -2054,12 +2147,46 @@ class R1ProSim(TiptopSim):
                 "not the one it asked for, and something is in the way of it here"
             )
 
-    def place_robot(self, x: float, y: float, yaw: float, note: str = "", unfold: bool = True) -> dict:
+    def unfold_reach(self, targets, x: float, y: float, yaw: float) -> tuple[float, list | None, str]:
+        """How far toward ``targets`` the arm can unfold from its posture now at a base pose, checked before going
+        there: (fraction of UNFOLD_FRACTIONS, the legs to ramp through in turn or None, what stops it further).
+
+        Each fraction is tried straight and then elbow first (the hand rises before it travels): from the travel
+        fold the hand hangs low beside the base, and the straight line out sweeps it forward at coffee-table height
+        -- turning_on_radio's 0.65 m stance could not unfold even 25% straight (2026-09-22).
+
+        A stance is not refused because the FULL unfold hits something: that refused exactly the stances the robot
+        wanted, where the ready hand lands on the table the object stands on or in the object itself --
+        turning_on_radio's 0.65 m stance for "left_gripper_finger_link1 intersects coffee_table", the next for
+        "... intersects radio_89", and the 0.75 m one it took reached none of the grasps (2026-09-22). Nor is a
+        stance taken where the arm cannot come out at all: with the arm left in the travel fold the capture's
+        return-to-ready ramps are refused, two refusals switch the wrist looks off for the instance, the folded
+        wrist cameras see nothing, and the planner plans from the fold (setup_a_bar, the same day)."""
+        if targets is None:
+            return 1.0, None, ""
+        here = [float(v) for v in self.q_arm()]
+        why = "nothing checked"
+        for fraction in UNFOLD_FRACTIONS:
+            partway = [a + fraction * (b - a) for a, b in zip(here, targets)]
+            tried = []
+            for name, legs in reach_candidates(self.planned_joints, here, partway, None, elbow=ELBOW):
+                legs = [leg for leg in legs if np.max(np.abs(np.subtract(leg, here)), initial=0.0) > 1e-6]
+                if name not in ("straight", "elbow first") or legs in tried:  # the torso does not move in an unfold
+                    continue
+                tried.append(legs)
+                collision = self.base_placement_collision(x, y, yaw, then=legs)
+                if collision is None:
+                    return fraction, legs, why
+                why = f"{collision[0]} intersects {collision[1]}"
+        return 0.0, None, why
+
+    def place_robot(self, x: float, y: float, yaw: float, note: str = "", unfold: bool = True,
+                    min_unfold: float = 0.0) -> dict:
         """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
         grasp assist along with the robot, so a carried object stays in the gripper.
 
-        The arms come in over the base for the teleport (``fold_for_travel``) and go back out only if the way back
-        is clear (``unfold_after_travel``). A teleport does not sweep -- it materialises the robot wherever it
+        The arms come in over the base for the teleport (``fold_for_travel``) and go back out as far as the way
+        back is clear (``unfold_reach``); ``min_unfold`` refuses a pose where that is less than the fraction. A teleport does not sweep -- it materialises the robot wherever it
         lands -- so the landing posture is the whole of the question: with the working posture the arms sit 0.41 m
         past the base's own rectangle and 0.095 m folded.
 
@@ -2070,6 +2197,19 @@ class R1ProSim(TiptopSim):
         quarter as much. Coming back out IS a motion into the room, so it is collision-checked first (2026-09-14).
         """
         unfold_to = self.fold_for_travel()
+        try:
+            collision = self.base_placement_collision(x, y, yaw)  # the landing posture
+            fraction, partway, why = (self.unfold_reach(unfold_to, x, y, yaw) if unfold and collision is None
+                                      else (1.0, None, ""))  # fmt: skip
+        except Exception as exc:
+            raise RuntimeError(f"cannot validate base destination: {exc}") from exc
+        if collision is not None:
+            raise BasePlacementCollision(f"base destination rejected: {collision[0]} intersects {collision[1]}")
+        if fraction < min_unfold:
+            raise BasePlacementCollision(
+                f"base destination rejected: the arm unfolds only {fraction:.0%} of the way there ({why} further out)",
+                unfold=fraction,
+            )
         self.move_base(x, y, yaw)
         self.look_target, self.look_names = None, ()  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
@@ -2107,11 +2247,42 @@ class R1ProSim(TiptopSim):
                 + (f"it is blocked here too ({again[0]})" if again is not None else "it folded here")
             )
             self._fold_blocked = False
-        if unfold:  # an opening stance keeps the arms folded: reach_plan chooses the way out to the handle
-            self.unfold_after_travel(unfold_to)
+        self.stance_ready = None
+        if unfold and partway is None and unfold_to is not None:
+            self.stance_ready = [float(v) for v in self.q_arm()]  # no clear unfold: captures leave the arm be
+        if unfold and partway is not None:  # an opening stance stays folded: reach_plan chooses the way out
+            if fraction < 1.0:
+                log.info(f"unfolding {fraction:.0%} of the way to the ready posture ({why} further out)")
+                self.stance_ready = list(partway[-1])
+            for leg in partway:  # the legs unfold_reach found clear, straight or elbow first
+                self.unfold_after_travel(leg)
         log.info(f"robot placed at ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg {note}")
         self.log_teleport_contacts()
         return {"x": float(x), "y": float(y), "yaw": float(yaw)}
+
+    def right_robot(self, x: float, y: float, yaw: float) -> bool:
+        """Stand a fallen or toppled robot back up at a known-good pose; whether it then settled level.
+
+        The joints are SET (arms at the travel fold, locked joints at their posture, zero velocity), never ramped:
+        after a fall the old re-stand went through fold_for_travel's collision-checked ramps on a tumbling
+        articulation, and the next stance search then ran from a base frame on its back (2026-09-22)."""
+        q = self.robot.get_joint_positions().clone()
+        folded = travel_fold_targets([float(v) for v in self.q_arm()], self.planned_joints) or list(self.q_arm())
+        if any(obj is not None for obj in self.robot._ag_obj_in_hand.values()):
+            # SETting the joints leaves a grasp-assisted object where it was, and move_base then carries it at that
+            # offset into the folded hand, over the base; with something held the arm stays as it is
+            folded = list(self.q_arm())
+        for joint, value in zip(self.planned_joints, folded):
+            q[self.joint_index[joint]] = float(value)
+        for joint, value in self.posture.items():
+            q[self.joint_index[joint]] = float(value)
+        self.robot.set_joint_positions(q, drive=False)
+        self.robot.set_joint_velocities(th.zeros_like(q))
+        self.move_base(x, y, yaw)
+        self.hold(3, self.last_gripper)
+        level, why = self.settled_level(x, y, tilt_deg=5.0, shift=0.1)
+        log.warning(f"righted the robot at ({x:.2f}, {y:.2f}): " + ("level again" if level else why))
+        return level
 
     def move_base(self, x: float, y: float, yaw: float) -> None:
         """Put the base at a floor pose. THE ONLY PLACE IN THE BRIDGE THAT MOVES THE BASE.
@@ -2130,7 +2301,8 @@ class R1ProSim(TiptopSim):
             ``last_level`` all read it as where the robot is. A drive arrives near, not at; those four readers
             want the measured pose (``base_pose``) once that is true.
           * it is INSTANT -- no steps pass, so nothing in the scene moves while the robot travels.
-          * it ALWAYS ARRIVES -- there is no "could not get there", so no caller handles one.
+          * place_robot validates the destination before calling this primitive, not a navigable route.
+            Occupied endpoints raise BasePlacementCollision.
         """
         quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
         self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
@@ -2189,6 +2361,7 @@ class R1ProSim(TiptopSim):
             self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
         assert len(q_home) == len(self.planned_joints), (len(q_home), self.planned_joints)
         self.posture = {j: float(v) for j, v in locked.items()}
+        self.locked_nominal = {j: float(v) for j, v in locked.items() if "finger" not in j}
         self.q_home = [float(v) for v in q_home]
         q = self.robot.get_joint_positions().clone()
         for j, v in self.posture.items():
@@ -2224,6 +2397,7 @@ class R1ProSim(TiptopSim):
         self.gripper_idx = self.robot.gripper_control_idx[self.arm]
         self.look_arm = LOOK_ARM
         self.mirror_arm_idx = self.mirror_gripper_idx = None
+        self.stance_ready = None
 
     def adopt_embodiment(self, embodiment: dict, tol: float = 0.05) -> None:
         """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
@@ -2259,7 +2433,9 @@ class R1ProSim(TiptopSim):
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
         self.gripper_idx = self.robot.gripper_control_idx[arm]
         self.posture = {j: float(q[self.joint_index[j]]) for j in locked if "finger" not in j}  # hold, do not move
+        self.locked_nominal = {j: v for j, v in locked.items() if "finger" not in j}
         self.q_home = [float(v) for v in embodiment["q_home"]]
+        self.stance_ready = None  # the other arm's joints: this stance's partway posture no longer applies
         log.info(
             f"planning the {arm} arm from here on ({embodiment['robot_type']}: {len(self.planned_joints)} joints); "
             f"the {self.other_arm} arm holds its posture with gripper command {self.other_gripper:+.0f}; "
@@ -2698,43 +2874,44 @@ class R1ProSim(TiptopSim):
         hits = []
         for obj, _, _ in near:  # the box only says "look closer"; the object's own surface decides
             try:
-                mesh = self.scene_mesh(obj)
+                physical = self.collision_mesh_world(obj)
+                if physical is None:  # visual-only geometry has no physical surface
+                    continue
+                # Exact cached triangle BVH queries handle long floor/wall triangles without subdivision.
+                if bool((trimesh.proximity.closest_point(physical, samples)[1] <= clearance).any()):
+                    hits.append(obj.name)
             except Exception:
-                hits.append(obj.name)  # no mesh to check against: keep the box's word
-                continue
-            if bool(points_within_tol(mesh, samples, clearance).any()):
-                hits.append(obj.name)
+                hits.append(obj.name)  # extraction/query failure: conservatively keep the box's word
         return hits
 
-    def nearby_obstacles(self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT) -> list[str]:
-        """Tracked names of the furniture standing close enough to get in the way of a plan, nearest first.
+    def nearby_obstacles(
+        self, exclude=(), reach: float = OBSTACLE_REACH, limit: int = OBSTACLE_LIMIT, *, collision_map: bool = False
+    ) -> list[str]:
+        """Register nearby scene bodies, using a complete physical map for ``--room``.
 
-        The planner's collision world holds the task's own objects and one fitted table plane, and nothing else in
-        the room -- so cuTAMP plans straight through the furniture it was never told about, and the bridge has
-        been second-guessing it afterwards. These labels go out in ``held_labels``, which cuTAMP takes as statics:
-        obstacles it plans around and cannot pick up. That is a change to WHAT THE PLANNER IS TOLD rather than to
-        how the bridge moves, which is the right place for it; the bridge has no business re-deciding a motion the
-        planner already planned.
-
-        Floors, ceilings and rugs are left out (they are stood on, not avoided), as are merged walls and roofs
-        (``HOUSE_AABB_AREA``), anything wholly above the robot, and anything small enough to be a task object
-        rather than a fixture. A hull is only built for a label the capture also masks, so the caller must add
-        these to the labels it segments.
-
-        WHAT THIS ACTUALLY DELIVERS, measured 2026-09-15 on putting_dirty_dishes_in_sink (instance 301, oracle,
-        head/head_up/head_down, the 4 rounds that reached the planner): of 32 labels offered here, 17 carried
-        pixels and were sent, 15 of those were dropped by the planner as "no hull in this frame", and TWO became
-        obstacles in cuTAMP's world -- the same bench both times ("In the other hand (obstacles):
-        ['bench_xwphjd_3']", 157813 and 284216 points). The drops happen in the planner's own reconstruction, for
-        two reasons that have nothing to do with which labels this picks: hulls_from_points drops every label with
-        no points above the fitted table top (z = 0.742 here), which is every bench, chair and seat in a diner
-        below the table; and the perception crop (``workspace``, [[0.35, -0.8, 0.25], [1.3, 0.8, 1.6]] in the base
-        frame) throws away the points of anything not directly in front of the robot, which is how walls and window
-        blinds arrive with "only 0 valid depth points". So this channel can only ever hand over furniture that
-        stands above the work surface inside the workspace box. Giving the planner the geometry the bridge already
-        has needs a channel that is not perception -- a request key cuTAMP turns into statics directly -- and that
-        is a change on the planner's side of the wire.
+        The legacy ``--obstacles`` route reconstructs a small furniture set from masks; it is not a collision
+        map. The physical map includes target containers, supports, small objects, merged walls and objects
+        whose AABB encloses the robot. An AABB is only a broad-phase filter: being inside it does not justify
+        erasing its mesh. Floors are excluded because wheel contact is expected; raised mats and rugs remain.
         """
+        if collision_map:
+            base = self.base_pose()[0]
+            base = base.cpu().numpy() if hasattr(base, "cpu") else np.asarray(base, dtype=np.float64)
+            excluded = set(exclude) | {self.robot.name}
+            rows = []
+            for obj, lo, hi in self.scene_aabbs():
+                if obj is self.robot or obj.name in excluded or obj.category == "floors":
+                    continue
+                if lo[2] > base[2] + reach or hi[2] < base[2] - 0.1:
+                    continue
+                gap = float(np.linalg.norm(np.clip(base[:2], lo[:2], hi[:2]) - base[:2]))
+                if gap <= reach:
+                    rows.append((gap, obj.name, obj))
+            rows.sort(key=lambda row: (row[0], row[1]))
+            # No count cap: omitted obstacles would silently make an otherwise valid plan unsafe. The planner
+            # must size its collision cache for this map or explicitly refuse the request.
+            self.obstacles = {name: obj for _, name, obj in rows}
+            return list(self.obstacles)
         here = (
             self.base_pose()[0][:2].cpu().numpy()
             if hasattr(self.base_pose()[0], "cpu")
@@ -2892,9 +3069,196 @@ class R1ProSim(TiptopSim):
         via = via_configuration(names, now, goal, {a: self.robot.arm_joint_names[a] for a in arms}, ELBOW, elbow_first)
         if any(abs(via[j] - now[j]) > 1e-3 for j in names):
             if self.ramp_to([via[j] for j in self.planned_joints], {j: via[j] for j in posture}, gripper, 0, note):
-                self.hold(settle_steps, gripper)  # blocked on the first leg; do not drive the second into it
-                return False
+                return False  # a settling hold would repeat the gripper command the preflight may have rejected
         return self.ramp_to(q_arm, posture, gripper, settle_steps, note) is None
+
+    def _motion_collision_model(self):
+        from omnigibson.tiptop.collision import JointPathCollision
+
+        if not hasattr(self, "_ramp_collision_model"):
+            urdf = Path(self.robot.urdf_path)
+            config = urdf.parent.parent / "curobo" / "r1pro_description_curobo_arm_no_torso.yaml"
+            joints = [name for name in self.joint_index if name in self.urdf_joints]
+            self._ramp_collision_model = JointPathCollision(urdf, config, joints)
+        return self._ramp_collision_model
+
+    def _motion_finger_ranges(self, measured, gripper):
+        """Actual-to-commanded finger travel, independent of arm interpolation timing."""
+        ranges = {}
+        for arm, command in ((self.arm, gripper), (self.other_arm, self.other_gripper)):
+            for name in self.robot.finger_joint_names[arm]:
+                joint = self.robot.joints[name]
+                fraction = float(np.clip((command + 1.0) / 2.0, 0.0, 1.0))
+                goal = float(joint.lower_limit) + fraction * float(joint.upper_limit - joint.lower_limit)
+                start = float(measured[self.joint_index[name]])
+                if abs(start - goal) > 1e-6:
+                    ranges[name] = (start, goal)
+        return ranges
+
+    def _motion_obstacles(self, held_ids, allowed_contacts, base=None):
+        """Physical world near the current or requested base, with floor contact only for chassis and wheels."""
+        obstacles = []
+        base = self.base_pose()[0].cpu().numpy() if base is None else np.asarray(base)
+        for obj, lo, hi in self.scene_aabbs():
+            if obj is self.robot or id(obj) in held_ids:
+                continue
+            if np.linalg.norm(np.clip(base, lo, hi) - base) > OBSTACLE_REACH:
+                continue
+            mesh = self.collision_mesh_world(obj)
+            if mesh is not None:
+                obstacles.append((obj.name, mesh))
+                if obj.category == "floors":
+                    allowed_contacts.setdefault(obj.name, set()).update(
+                        {"base_link", "wheel_motor_link1", "wheel_motor_link2", "wheel_motor_link3"}
+                    )
+        return obstacles
+
+    def base_placement_collision(self, x, y, yaw, then=None):
+        """Check the measured landing posture and live carried volume before any base teleport, and with ``then``
+        (planned-joint targets) the straight unfold from it to them as well.
+
+        ``then`` is how unfold_reach finds how far the arm may unfold at a stance:
+        dispose_of_batteries landed 0.14 m from a desk, the unfold was refused (left_arm_link6 through the desk),
+        and every round then planned from a folded arm jammed against it (2026-09-22) -- the landing check with
+        TELEPORT_CLEARANCE is what keeps a folded arm off the furniture."""
+        from omnigibson.tiptop.collision import box_spheres
+
+        model = self._motion_collision_model()
+        measured = self.robot.get_joint_positions()
+        full = [float(measured[self.joint_index[name]]) for name in model.joint_names]
+        destination = np.array([x, y, 0.0], dtype=np.float64)
+        if not np.isfinite(destination).all() or not np.isfinite(yaw):
+            raise ValueError("base destination must be finite")
+        c, s = math.cos(yaw), math.sin(yaw)
+        transform = np.array([[c, -s, 0, x], [s, c, 0, y], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+        held_ids, attachments = set(), []
+        for arm, obj in self.robot._ag_obj_in_hand.items():
+            if obj is None:
+                continue
+            if obj.fixed_base:
+                raise ValueError(f"cannot teleport while grasping fixed object {obj.name}")
+            mesh = self.collision_mesh_world(obj)
+            if mesh is None:
+                raise ValueError(f"held object {obj.name!r} has no physical mesh")
+            link = f"{arm}_gripper_link"
+            pos, quat = self.robot.links[link].get_position_orientation()
+            local = (np.asarray(mesh.vertices) - pos.cpu().numpy()) @ T.quat2mat(quat).cpu().numpy()
+            centres, radii = box_spheres(np.stack([local.min(axis=0), local.max(axis=0)]))
+            attachments.append((link, centres, radii))
+            held_ids.add(id(obj))
+        path = [full]
+        waypoints = [] if then is None else (list(then) if np.ndim(then) == 2 else [then])  # one target or legs
+        for waypoint in waypoints:
+            unfolded = list(path[-1])
+            for name, value in zip(self.planned_joints, waypoint):
+                unfolded[model.joint_names.index(name)] = float(value)
+            path.append(unfolded)
+        allowed_contacts = {}
+        obstacles = self._motion_obstacles(held_ids, allowed_contacts, base=destination)
+        # TELEPORT_CLEARANCE is room from walls and furniture; the floor under the robot gets none extra: a hand
+        # low after a floor pick was 2 cm from the floor at every destination, and every stance was refused
+        # (laying_tile_floors, 2026-09-22)
+        # ground by geometry, not by name: pavers and lawns are ground too, and a base 3 cm "into" the paver refused
+        # every outdoor stance (bringing_in_wood 1.0 -> 0.33, 2026-09-23)
+        floors = {obj.name for obj, lo, hi in self.scene_aabbs()
+                  if getattr(obj, "category", None) == "floors" or float(hi[2]) < GROUND_TOP}  # fmt: skip
+        hit = model.check_polyline(
+            path, transform, [o for o in obstacles if o[0] not in floors], allowed_contacts, attachments=attachments,
+            clearance=TELEPORT_CLEARANCE,
+        )
+        if hit is None and any(o[0] in floors for o in obstacles):
+            hit = model.check_polyline(path, transform, [o for o in obstacles if o[0] in floors], allowed_contacts,
+                                       attachments=attachments)  # fmt: skip
+        return hit
+
+    def validate_motion(self, positions, gripper, label):
+        """Robot-only preflight for planned polylines and gripper events; never steps the simulator.
+
+        TiPToP checks its carried-object model; this redundant check uses measured fingers and the complete
+        current robot state. Live grasp-assist state, rather than the episode's delayed hand ledger, determines
+        which physical bodies travel with the robot. Only active fingers may contact an explicit action target.
+        """
+        try:
+            model = self._motion_collision_model()
+            measured = self.robot.get_joint_positions()
+            positions = np.asarray(positions, dtype=np.float64)
+            if positions.ndim == 1:
+                positions = positions[None, :]
+            if positions.ndim != 2 or positions.shape[1] != len(self.planned_joints) or len(positions) == 0:
+                raise ValueError("motion joint shape does not match the robot embodiment")
+            full = np.tile([float(measured[self.joint_index[name]]) for name in model.joint_names], (len(positions), 1))
+            columns = [model.joint_names.index(name) for name in self.planned_joints]
+            full[:, columns] = positions
+            held_ids = {id(obj) for obj in self.robot._ag_obj_in_hand.values() if obj is not None}
+            allowed_contacts = {}
+            action = re.match(r"^(Pick|Place|PlaceNear|Push)\(\s*([^,)]+)", label or "")  # PlaceNear: inside rounds
+            if action:
+                name = action[2].strip()
+                obj = self.objects.get(name)
+                if obj is None and action[1] == "Push":
+                    obj = self.objects.get(name.removesuffix("_button"))
+                if obj is not None:
+                    allowed_contacts[obj.name] = set(self.robot.finger_link_names[self.arm])
+            obstacles = self._motion_obstacles(held_ids, allowed_contacts)
+            # The planner already inflated these same spheres by the model's buffer; counting it again here refused
+            # a Place whose forearm sphere was 0.4 mm clear of a trash can (1.6 mm "inside" once re-buffered,
+            # dispose_of_batteries 2026-09-22). Audit planned motion against the raw spheres, keeping the sampling
+            # inflation; bridge-owned ramps, which nothing planned, keep the buffer.
+            return model.check_polyline(
+                full,
+                T.pose2mat(self.base_pose()).cpu().numpy(),
+                obstacles,
+                allowed_contacts=allowed_contacts,
+                joint_ranges=self._motion_finger_ranges(measured, gripper),
+                clearance=-model.buffer,
+            )
+        except Exception as exc:
+            log.warning("cannot validate planned motion %s: %s", label, exc)
+            return f"motion validation unavailable: {type(exc).__name__}: {exc}"
+
+    def ramp_collision(self, names, start, goal, allowed_contacts=None, gripper=None):
+        """Preflight the actual whole-robot path, including the torso, opposite arm, cameras and held objects."""
+        from omnigibson.tiptop.collision import box_spheres
+
+        model = self._motion_collision_model()
+        measured = self.robot.get_joint_positions()
+        here = {name: float(measured[self.joint_index[name]]) for name in model.joint_names}
+        initial, target = dict(here), dict(here)
+        initial.update(zip(names, start))
+        target.update(zip(names, goal))
+        finger_ranges = self._motion_finger_ranges(measured, gripper) if gripper is not None else {}
+        held = self.hands()
+        held_ids = {id(self.objects[label]) for label in held if label in self.objects}
+        allowed_contacts = {name: set(links) for name, links in (allowed_contacts or {}).items()}
+        obstacles = self._motion_obstacles(held_ids, allowed_contacts)
+        attachments = []
+        for label, arm in held.items():
+            if label not in self.objects:
+                raise ValueError(f"no collision geometry for held object {label!r}")
+            mesh = self.collision_mesh_world(self.objects[label])
+            if mesh is None:
+                raise ValueError(f"held object {label!r} has no physical mesh")
+            link_name = f"{arm}_gripper_link"
+            pos, quat = self.robot.links[link_name].get_position_orientation()
+            rot = T.quat2mat(quat).cpu().numpy().astype(np.float64)
+            local = (np.asarray(mesh.vertices) - pos.cpu().numpy()) @ rot
+            centres, radii = box_spheres(np.stack([local.min(axis=0), local.max(axis=0)]))
+            attachments.append((link_name, centres, radii))
+        world_from_base = T.pose2mat(self.base_pose()).cpu().numpy()
+        return model.check(
+            [initial[name] for name in model.joint_names],
+            [target[name] for name in model.joint_names],
+            world_from_base,
+            obstacles,
+            allowed_contacts=allowed_contacts,
+            attachments=attachments,
+            joint_ranges=finger_ranges,
+        )
+
+    @staticmethod
+    def grasp_contacts(arm, obj):
+        """Only the grasping gripper/fingers may touch the named manipulation target."""
+        return {obj.name: {f"{arm}_gripper_link", f"{arm}_gripper_finger_link1", f"{arm}_gripper_finger_link2"}}
 
     def ramp_to(
         self,
@@ -2905,6 +3269,8 @@ class R1ProSim(TiptopSim):
         note: str = "",
         max_vel: float | None = None,
         leashed: bool = True,
+        allowed_contacts: dict | None = None,
+        stop_on_contact: str | None = None,
     ) -> tuple | None:
         """Move the planned joints to ``q_arm`` and the locked joints to ``posture`` together, every joint at no more
         than ``CAPTURE_MAX_JOINT_VEL``: one interpolated target per control step from where the joints are now, then
@@ -2928,10 +3294,33 @@ class R1ProSim(TiptopSim):
         already counts toward ``RAMP_BLOCK_STEPS``. Five in a row and the ramp stops and holds at the measured
         posture, so it can throttle for at most four steps before the ramp reports the truth. ``leashed=False`` is
         for the two ramps whose purpose IS to load a joint (the grasp press, the drawer pull)."""
+        # Stop at first contact, before the simulator's 0.3 s sticky-grasp window completes. This option is
+        # confined to the short, closed-hand terminal approach; free-space transit has no target exemption.
+        if stop_on_contact is not None:
+            try:
+                touching, _ = self.robot._find_gripper_contacts(arm=stop_on_contact)
+                if touching or self.robot._ag_obj_in_hand.get(stop_on_contact) is not None:
+                    return ("finger contact", 0, 0.0)
+            except Exception as exc:
+                log.warning("refusing contact-seeking ramp without contact observations: %s", exc)
+                return ("contact observation unavailable", 0, 0.0)
         now = self.robot.get_joint_positions()
         names = list(self.planned_joints) + list(posture)
         start = [float(now[self.joint_index[j]]) for j in names]
         goal = [float(v) for v in q_arm] + [float(posture[j]) for j in posture]
+        # This runs before the first control step. Lag remains an execution monitor, not collision planning.
+        try:
+            moving = np.max(np.abs(np.asarray(goal) - np.asarray(start)), initial=0.0) > 1e-4
+            collision = None
+            if moving or self._motion_finger_ranges(now, gripper):
+                collision = self.ramp_collision(names, start, goal, allowed_contacts, gripper)
+        except Exception as exc:
+            log.warning("refusing unvalidated ramp %s: %s", note, exc)
+            return (f"collision validation unavailable: {type(exc).__name__}", 0, 0.0)
+        if collision is not None:
+            link, obstacle, sample = collision
+            log.warning("refusing ramp %s: %s intersects %s at path sample %d", note, link, obstacle, sample)
+            return (f"{link} intersects {obstacle}", 0, 0.0)
         speed = CAPTURE_MAX_JOINT_VEL if max_vel is None else float(max_vel)
         path = joint_ramp(start, goal, speed * self.dt)
         k = len(self.planned_joints)
@@ -2961,6 +3350,16 @@ class R1ProSim(TiptopSim):
                 culprit = f" ({names[j]} at step {i + 1}: {last[j]:+.3f} -> {measured[j]:+.3f} rad, target {q[j]:+.3f})"
             lag = np.where(ramped, np.abs(measured - q), 0.0)
             last = measured
+            if stop_on_contact is not None:
+                try:
+                    touching, _ = self.robot._find_gripper_contacts(arm=stop_on_contact)
+                    if touching or self.robot._ag_obj_in_hand.get(stop_on_contact) is not None:
+                        blocked = ("finger contact", i + 1, 0.0)
+                        break
+                except Exception as exc:
+                    log.warning("stopping contact-seeking ramp without contact observations: %s", exc)
+                    blocked = ("contact observation unavailable", i + 1, 0.0)
+                    break
             # One step behind is a graze the arm slips past (the right arm over the base does it on most basket
             # captures); RAMP_BLOCK_STEPS in a row is something the arm is not going to get past.
             drift = np.where(~moving & np.array(["finger" not in j for j in names]), np.abs(measured - q), 0.0)
@@ -2973,27 +3372,33 @@ class R1ProSim(TiptopSim):
                 blocked = (names[j], i + 1, float(lag[j]))
                 break  # stop pushing: the rest of the path would only lean harder on whatever is in the way
         if blocked is not None:
-            # WHAT it met, not just which joint lagged. Every block was unattributable until now, so 31 of them in
-            # one episode said nothing about where to look. Probed at the posture the arm actually stopped in.
-            try:
-                probe_arm = self.arm if self.arm in self.robot.arm_names else self.robot.arm_names[0]
-                stopped_at = self.robot.get_joint_positions()
-                struck = self.arm_hits_scene(
-                    probe_arm,
-                    self._stance_ik(probe_arm),
-                    [float(stopped_at[self.joint_index[j]]) for j in self.robot.arm_joint_names[probe_arm]],
+            if blocked[0] == "finger contact":
+                log.info("stopping %s at first finger contact (step %d)", note, blocked[1])
+            else:
+                # WHAT it met, not just which joint lagged. Every block was unattributable until now, so 31 of them in
+                # one episode said nothing about where to look. Probed at the posture the arm actually stopped in.
+                try:
+                    probe_arm = self.arm if self.arm in self.robot.arm_names else self.robot.arm_names[0]
+                    stopped_at = self.robot.get_joint_positions()
+                    struck = self.arm_hits_scene(
+                        probe_arm,
+                        self._stance_ik(probe_arm),
+                        [float(stopped_at[self.joint_index[j]]) for j in self.robot.arm_joint_names[probe_arm]],
+                    )
+                except Exception:  # noqa: BLE001 - a diagnostic must never end a ramp
+                    struck = []
+                log.warning(
+                    f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
+                    f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
+                    f"ramp stopped there [motion: {note or 'unnamed'}, env step {self.n_steps}, "
+                    f"in the way: {struck or 'nothing the box test sees'}]"
                 )
-            except Exception:  # noqa: BLE001 - a diagnostic must never end a ramp
-                struck = []
-            log.warning(
-                f"{blocked[0]} stopped following the ramp at step {blocked[1]} of {len(path)} ({blocked[2]:.2f} rad "
-                f"behind its target for {RAMP_BLOCK_STEPS} steps): the arm is pushing against something, so the "
-                f"ramp stopped there [motion: {note or 'unnamed'}, env step {self.n_steps}, "
-                f"in the way: {struck or 'nothing the box test sees'}]"
-            )
             held = self.robot.get_joint_positions()
             self.posture = {j: float(held[self.joint_index[j]]) for j in posture}
             q_hold = [float(held[self.joint_index[j]]) for j in self.planned_joints]
+            # Even a zero-settle waypoint must replace the last drive target after a tracking abort. Keep the
+            # gripper command already sent during this ramp; preflight refusals return before any motor call.
+            settle_steps = max(1, settle_steps)
         else:
             self.posture = {j: float(v) for j, v in posture.items()}
             q_hold = [float(v) for v in q_arm]
@@ -3051,7 +3456,45 @@ class R1ProSim(TiptopSim):
         )
         return HEAD_YAW_JOINT, delta
 
+    def restore_locked_arm(self) -> None:
+        """Drive an empty locked arm back to the posture the planner models it at.
+
+        A blocked ramp keeps whatever the arm was pushed to (that is what stops it pressing into furniture), and
+        nothing ever brought it back: the planner refuses a request whose locked joints differ from its model, so
+        one bump failed every later round of the episode. A holding arm, and the torso, stay where they are."""
+        nominal = getattr(self, "locked_nominal", None) or {}
+        if not nominal:
+            return
+        holding = set(self.hands().values())
+        joints = {j: v for j, v in nominal.items()
+                  if not j.startswith("torso") and not any(j.startswith(f"{arm}_") for arm in holding)}
+        measured = self.robot.get_joint_positions()
+        drift = {j: abs(float(measured[self.joint_index[j]]) - v) for j, v in joints.items() if j in self.joint_index}
+        if not drift or max(drift.values()) < LOCKED_DRIFT:
+            return
+        worst = max(drift, key=drift.get)
+        stopped = self.ramp_to(self.q_arm(), {**self.posture, **joints}, self.last_gripper, TRAVEL_SETTLE_STEPS,
+                               note="locked arm back to its modelled posture", max_vel=TRAVEL_MAX_JOINT_VEL)
+        log.info(f"{worst} was {drift[worst]:.3f} rad off the planner's model; "
+                 + ("returned it" if stopped is None else f"could not return it ({stopped[0]})"))
+
     def capture(self, task: str) -> tuple[dict, dict]:
+        """Capture task perception, then attach the measured start and complete collision map on every exit."""
+        self.restore_locked_arm()
+        request, extras = self._capture_with_motion(task)
+        request["q_init"] = np.asarray(self.q_arm(), dtype=np.float32)
+        measured = self.robot.get_joint_positions()
+        request["locked_joints"] = {
+            name: float(measured[self.joint_index[name]])
+            for name in self.posture
+            if name not in self.planned_joints
+        }
+        if self.send_room:
+            self.nearby_obstacles(collision_map=True)
+            request["room"] = self.room_collision_scene()
+        return request, extras
+
+    def _capture_with_motion(self, task: str) -> tuple[dict, dict]:
         """Every view in one posture: each free arm whose wrist camera is a view points it at the look target
         (``wrist_look``: what the base pose was chosen for, at the hand that holds it once it has been picked up;
         a held object otherwise, when nothing was stood for), which also takes the arm out of the head camera's
@@ -3060,7 +3503,13 @@ class R1ProSim(TiptopSim):
         planned arm swings out of view (``look_arm``) when no look configuration exists; with ``look_arm`` None
         nothing moves. The head views come last, the torso turned to their yaw with the arms as they are
         (``_capture_views``). The plan starts from the ready posture the arms return to."""
-        ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
+        # at a stance where the arm unfolded only partway, q_home is exactly what it could not reach: returning to
+        # it after the looks was refused every capture, and two refusals switched the wrist looks off for the rest
+        # of the instance (setup_a_bar, 2026-09-22)
+        if self.stance_ready is not None:
+            ready = list(self.stance_ready)
+        else:
+            ready = list(self.q_home) if self.q_home is not None else [float(v) for v in self.q_arm()]
         if self.look_arm is None:
             return self._capture_views(task, ready)
         # This room stops the arms: stop trying and stop nudging things over. Not while a hand holds something,
@@ -3181,7 +3630,7 @@ class R1ProSim(TiptopSim):
         else:  # it met something on the way out: go back first, then capture from where the arms rest
             struck = True  # this capture has already spent its strike; being stuck afterwards is the same event
             self.blocked_swings += 1
-            log.warning("the capture swing stopped against something; capturing from the ready posture instead")
+            log.warning("capture motion was refused or interrupted; capturing from the measured posture")
             self.ramp_arms(
                 ready,
                 original,
@@ -3219,30 +3668,6 @@ class R1ProSim(TiptopSim):
                 back = max(abs(float(now[self.joint_index[j]]) - original[j]) for j in self.robot.arm_joint_names[arm])
                 if back > LOOK_TOL:
                     log.warning(f"{arm} arm is {back:.3f} rad from its locked posture after the capture")
-        # The furniture standing by THIS stance, for the planner's collision world. Rebuilt here because the set
-        # depends on where the base is, and sent after clear_start_posture has had its say about what the arm is
-        # already inside -- shipping that would make the start state invalid and cost the whole round.
-        if self.send_room:
-            self.nearby_obstacles(limit=ROOM_LIMIT)
-        # The plan starts here, not at the look posture -- and not inside the furniture either: a start state
-        # in collision is refused before the goal is considered (``clear_start_posture``).
-        q_ready = self.clear_start_posture(self.arm, q_ready)
-        request["q_init"] = np.asarray(q_ready, dtype=np.float32)
-        if self.send_room:
-            # Never ship a body the robot is ALREADY standing in. cuRobo refuses a start state in collision before
-            # it looks at the goal, and assembling_gift_baskets showed what that costs: 96
-            # INVALID_START_STATE_WORLD_COLLISION against 28 IK_FAIL once the room was real. clear_start_posture
-            # lifts the planned ARM out of trouble and drops what it cannot clear, but cuRobo's world also holds
-            # the base, the wheels, the torso and the other arm, which no lift moves.
-            inside = set(self.arm_hits_scene(self.arm, self._stance_ik(self.arm), q_ready, mesh=False))
-            for name in list(self.obstacles):
-                if name in inside:
-                    log.info(f"not shipping {name}: the arm starts inside it, which refuses every start state")
-                    del self.obstacles[name]
-            # On the REQUEST rather than the mirror socket. These poses are base-frame, and the base teleports, so
-            # the only frame they are certainly right in is the one this very request was captured in -- shipping
-            # them here removes the stale-frame window the second socket had, and needs nothing of b1k.
-            request["room"] = {n: m for n, m in self.stream_scene().items() if m["kind"] == "obstacle"}
         extras["q_look"] = moved
         log.info(
             f"captured with {sorted(moved)} arm(s) posed; plan starts from the ready posture (max error {lag:.4f} rad)"
@@ -3250,20 +3675,17 @@ class R1ProSim(TiptopSim):
         return request, extras
 
     def press_grasp(self, arm: str, name: str, spare=()) -> bool:
-        """Take hold of a flat object by pressing the open hand onto it and closing; whether the assist holds it.
+        """Reach a collision-free standoff, close, then make slow finger contact for a sticky grasp.
 
         M2T2 proposes grasps from the point cloud, and a book lying flat on a table gives it nothing usable --
         there is no side a parallel jaw can get under. The round then fails before the arm moves, which reads as a
         planning failure rather than as "this cannot be grasped that way". The user's instruction (2026-09-14):
         close the gripper on the book and let the assisted grasp take it.
 
-        This is the drawer panel's grasp turned upwards: come straight down, put the fingertips on the top face,
-        and press in a step at a time until the assist reports it holds (``close_on``). It solves with the torso,
-        since a book on a low shelf is outside a fixed-torso workspace, and it refuses a path that sweeps the
-        furniture rather than discovering it by collision.
-
-        Returns False without moving when the object is not flat -- this is a fallback for the shape M2T2 cannot
-        serve, not a replacement for it.
+        The hand closes first, in free space, and the closed-hand transit permits no target contact. Only the
+        short terminal approach permits the active fingers to touch the named target; its arm advance stops at
+        first contact while the assist establishes the hold. Physical supports, the palm, cameras and both arms
+        remain collision checked throughout.
         """
         obj = self.scene_object(name)
         lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
@@ -3281,16 +3703,37 @@ class R1ProSim(TiptopSim):
                      f"pressing anyway because the planner has already failed on it")  # fmt: skip
         top = np.array([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, float(hi[2])], dtype=np.float64)
         unit = th.tensor([0.0, 0.0, 0.0, 1.0])
-        top_base = self.to_base(th.tensor(top, dtype=th.float32), unit)[0].cpu().numpy()
+        try:
+            mesh = self.collision_mesh_world(obj)
+            if mesh is None:
+                return False
+        except Exception as exc:
+            log.warning("cannot read sticky contact geometry for %s: %s", name, exc)
+            return False
+
+        def surface(origin, direction):
+            hits = mesh.ray.intersects_location([origin], [direction])[0]
+            distances = (hits - origin) @ direction
+            hits, distances = hits[distances > 0], distances[distances > 0]
+            return hits[int(np.argmin(distances))] if len(hits) else None
+
+        # A hollow bowl's AABB top is empty. Seek a real surface, not an invented lid above its cavity.
+        try:
+            top_hit = surface(top + [0.0, 0.0, STICKY_STANDOFF], np.array([0.0, 0.0, -1.0]))
+        except Exception as exc:
+            log.warning("cannot find a physical top contact for %s: %s", name, exc)
+            return False
         ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
         joints_of = self.ik_joint_names(arm, with_torso=True)
         q = self.robot.get_joint_positions()
         seed = [float(q[self.joint_index[j]]) for j in joints_of]
         aabbs = self.scene_aabbs()
-        down = np.array([0.0, 0.0, -1.0])
-        # The jaw closes across the object's narrower horizontal axis, so the fingers meet over it rather than
-        # along it; a book is gripped across its width, not its length.
-        across = np.array([1.0, 0.0, 0.0]) if extent[0] <= extent[1] else np.array([0.0, 1.0, 0.0])
+        base_pos, base_quat = self.base_pose()
+        world_to_base = T.quat2mat(base_quat).cpu().numpy().astype(np.float64).T
+        down = world_to_base @ np.array([0.0, 0.0, -1.0])
+        # The AABB axes are world-frame directions; rotate both jaw options into the IK's base frame.
+        across_world = np.array([1.0, 0.0, 0.0]) if extent[0] <= extent[1] else np.array([0.0, 1.0, 0.0])
+        jaws_above = (world_to_base @ across_world, world_to_base @ np.array([across_world[1], across_world[0], 0.0]))
 
         # Two ways in, tried in order. FROM ABOVE is the original, and the right one for anything lying on a
         # surface. FROM THE FRONT is for a book standing in a shelf, where above is exactly where the next shelf
@@ -3300,86 +3743,316 @@ class R1ProSim(TiptopSim):
         # which is how a person takes a book off a shelf. Sticky grasping needs one finger in contact, not a jaw
         # around the whole width (2026-09-15).
         middle = np.array([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0], dtype=np.float64)
-        middle_base = self.to_base(th.tensor(middle, dtype=th.float32), unit)[0].cpu().numpy()
-        ways = [("from above", top_base, down, (across, np.array([across[1], across[0], 0.0])))]
-        flat = np.array([middle_base[0], middle_base[1], 0.0], dtype=np.float64)
-        span = float(np.linalg.norm(flat))
+        ways = []
+        if top_hit is not None:
+            top_base = self.to_base(th.tensor(top_hit, dtype=th.float32), unit)[0].cpu().numpy()
+            ways.append(("from above", top_base, down, jaws_above))
+        origin = base_pos.cpu().numpy().astype(np.float64).copy()
+        origin[2] = middle[2]
+        toward = middle - origin
+        span = float(np.linalg.norm(toward))
         if span > 1e-6:
-            into = flat / span
-            depth = (abs(float(into[0])) * float(extent[0]) + abs(float(into[1])) * float(extent[1])) / 2.0
-            ways.append(
-                (
-                    "from the front",
-                    middle_base - into * depth,  # the near face, not the middle: the fingertips stop there
-                    into,
-                    (np.array([0.0, 0.0, 1.0]), np.array([-into[1], into[0], 0.0])),
+            into_world = toward / span
+            # A projected AABB radius is not the ray's near surface, and cannot be combined with a base-frame
+            # direction. Intersect the actual physical mesh in world coordinates before transforming the hit.
+            try:
+                contact = surface(origin, into_world)
+            except Exception as exc:
+                log.warning("cannot find a physical front contact for %s: %s", name, exc)
+                contact = None
+            if contact is not None:
+                point_base = self.to_base(th.tensor(contact, dtype=th.float32), unit)[0].cpu().numpy()
+                ways.append(
+                    (
+                        "from the front",
+                        point_base,
+                        world_to_base @ into_world,
+                        (world_to_base @ np.array([0.0, 0.0, 1.0]),
+                         world_to_base @ np.array([-into_world[1], into_world[0], 0.0])),
+                    )
                 )
-            )
 
-        # Anything the object is INSIDE is not an obstacle on the way to it. ``spare`` carries what the caller
-        # knows it stands on, but Episode.support_of only searches TASK objects, and a bookcase is not one -- so
-        # for a book on a shelf it returns the floor and the bookcase went on being counted. sorting_books_on_shelf
-        # named bookcase_otwukr_3, the bookcase the books are in and must stay in, in 10 of its 15 refusals.
-        # A book inside a bookcase is inside its box by construction, so containment is the test. Merged walls and
-        # roofs are excluded by area, the way every other scene test here excludes them (2026-09-15).
-        centre = (lo + hi) / 2.0
-        around = {
-            row[0].name
-            for row in aabbs
-            if all(row[1][k] <= centre[k] <= row[2][k] for k in range(3))
-            and (row[2][0] - row[1][0]) * (row[2][1] - row[1][1]) <= HOUSE_AABB_AREA
-        }
-        if around - {obj.name}:
-            log.info(f"{name} sits inside {sorted(around - {obj.name})}; not counting them on the way to it")
-        ignore = {obj.name} | {n for n in spare if n} | around
+        # The coarse line model omits only the target; the authoritative full-sphere transit check retains it
+        # with NO contact exception. A terminal contact exception starts only once the hand is at the standoff.
+        ignore = {obj.name}
+        # Close FIRST, here in free space, then travel closed (the user's instruction for sticky grasps: close the
+        # gripper, then touch the object). A closed hand is half the width of an open one: it fits between the
+        # shelf boards around a book and past the neighbours of a battery that the open fingers brushed.
+        if ways and self.ramp_to(
+            self.q_arm(), self.posture, self.CLOSE, OPEN_GRASP_STEPS, note=f"sticky close before approaching {name}"
+        ) is not None:
+            return False
         for how, point_base, into_dir, jaws in ways:
             for jaw in jaws:
-                solution = self._press_solution(arm, ik, seed, point_base, into_dir, jaw)
+                solution = self._press_solution(arm, ik, seed, point_base, into_dir, jaw, press=-STICKY_STANDOFF)
                 if solution is None:
                     continue
-                where, rot = self.grasp_target(arm, point_base, into_dir, jaw)
+                where, rot = self.grasp_target(arm, point_base, into_dir, jaw, press=-STICKY_STANDOFF)
                 quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
-                # The object's own SUPPORT is not an obstacle on the way to it: reaching onto a plate lying on a
-                # cabinet sweeps the box of the thing it rests on every time (``spare``, Episode.support_of).
-                # mesh=True is what every other caller uses; with mesh=False arm_hits_scene returns BOX-level
-                # hits and returns early, before the filter that drops floors, ceilings and rugs -- which is why
-                # 48 refusals once blamed a ceiling for blocking a downward reach.
-                # Not a single straight line from wherever the arm happens to be. reach_plan offers five ways --
-                # straight, via the ready posture, torso first, arm first, elbow first -- and the drawer pull has
-                # used it since 2026-09-14. sorting_books_on_shelf is why it is needed here: the front approach
-                # solved, and the straight path to it swept bookcase_otwukr_1, a DIFFERENT bookcase from the one
-                # holding the book. The pose was reachable; the way the arm took to it was not.
+                # Candidate selection is only a coarse prefilter. ramp_to verifies the complete robot,
+                # including the opposite arm and the torso, against the complete physical map before moving.
                 legs = self.reach_plan(arm, ik, joints_of, solution, exclude=ignore, aabbs=aabbs)
                 swept, start = [], seed
-                for leg in legs:
+                for leg in legs or []:
                     swept += [n for n in self.path_hits_scene(arm, ik, start, leg, aabbs=aabbs) if n not in ignore]
                     start = leg
-                if swept:
-                    # reach_plan returns its least-sweeping plan rather than refusing, which is right for a drawer
-                    # -- "refusing to move at all was measured to be worse than moving through a box". It is NOT
-                    # right here: sorting_books_on_shelf is a stacking-ORDER task and an arm swung through a
-                    # bookcase knocks the order about. So five ways are tried and a dirty one is still refused.
-                    log.info(f"{name}: every way in {how} sweeps through {swept[0]}; trying another way")
+                if not legs or swept:
+                    # No straight way in (a book between a bookcase's boards): let the planner find one.
+                    log.info(f"{name}: no straight way in {how} ({swept[0] if swept else 'no clear candidate'})")
+                    if self.planned_approach(where, quat, note=f"sticky precontact {name} {how}"):
+                        measured = self.robot.get_joint_positions()
+                        held = self._sticky_close_on(
+                            arm, ik, obj, pose_matrix(where, quat), into_dir,
+                            [float(measured[self.joint_index[j]]) for j in joints_of], joints_of,
+                        )
+                        if held:
+                            self.lift_held(ik, obj, into_dir, joints_of, how)
+                        return held
                     continue
-                log.info(f"pressing the hand onto {name} {how} to take hold of it")
+                log.info(f"approaching the sticky precontact pose for {name} {how}")
+                executed = False
                 for leg in legs:
-                    self.ramp_to(self._targets_from(joints_of, leg), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
-                                 note=f"in {how} onto {name}")  # fmt: skip
-                _, held = self.close_on(
-                    arm, ik, obj, obj.root_link_name, pose_matrix(where, quat), into_dir,
-                    [float(v) for v in solution], joints_of,
-                )  # fmt: skip
+                    stopped = self.ramp_to(
+                        self._targets_from(joints_of, leg), self.posture, self.CLOSE, OPEN_SETTLE_STEPS,
+                        note=f"sticky precontact {name} {how}",
+                    )
+                    if stopped is not None:
+                        log.warning("grasp approach rejected before closing: %s", stopped[0])
+                        if executed or stopped[1] != 0:
+                            return False
+                        break  # preflight refused without movement: another jaw/approach may be clear
+                    executed = True
+                if stopped is not None:
+                    continue
+                held = self._sticky_close_on(
+                    arm, ik, obj, pose_matrix(where, quat), into_dir, [float(v) for v in solution], joints_of,
+                )
                 if held:
-                    return True
+                    self.lift_held(ik, obj, into_dir, joints_of, how)
+                return held
         log.info(f"{name}: the pressed grasp found no way onto it")
         return False
 
-    def _press_solution(self, arm: str, ik, seed, point_base, into_dir, jaw):
+    def lift_held(self, ik, obj, into, joints_of, how: str) -> bool:
+        """Back a just-taken object straight out the way the hand came in: up off a table, out of a shelf.
+
+        A sticky grasp leaves the object resting where it was, so the fold for travel was refused (the carried
+        object intersects its support at sample 0) and the robot teleported with the hand down at table height.
+        Only the carried object may touch what it was resting on during this motion; the robot's own links stay
+        checked against everything. Best effort: False leaves the hand where it is."""
+        from omnigibson.tiptop.collision import CARRIED
+
+        measured = self.robot.get_joint_positions()
+        seed = [float(measured[self.joint_index[j]]) for j in joints_of]
+        position, quat = ik.fk(seed)
+        distance = STICKY_LIFT_FRONT if how == "from the front" else STICKY_LIFT
+        goal = np.asarray(position, dtype=np.float64) - np.asarray(into, dtype=np.float64) * distance
+        solution = ik.solve(goal, quat, seed=seed, tolerance_pos=0.005, tolerance_rad=0.05)
+        if solution is None:
+            log.info(f"{obj.name}: no local IK to lift it {distance:.2f} m back the way the hand came in")
+            return False
+        lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
+        resting = {
+            other.name: {CARRIED}
+            for other, olo, ohi in self.scene_aabbs()
+            if other is not obj and other is not self.robot and np.all(olo <= hi + 0.01) and np.all(lo - 0.01 <= ohi)
+        }
+        for name, links in self.retreat_contacts().items():  # a hand that closed on something lying on the floor
+            resting.setdefault(name, set()).update(links)
+        # The hand record is written only after press_grasp returns (bench.note_pressed_grasp), and ramp_collision
+        # reads what is carried from it: without this the object was an obstacle the closed fingers touch, with no
+        # carried spheres for CARRIED to exempt, and every lift was refused at sample 0 (clean_up_your_desk,
+        # 2026-09-22). Counted as held for this one motion only.
+        label = next((name for name, o in self.objects.items() if o is obj), None)
+        arm = "right" if any(j.startswith("right_arm") for j in joints_of) else "left"
+        carrying = label is not None and label not in self.held_objects
+        if carrying:
+            self.held_objects[label] = arm
+        try:
+            stopped = self.ramp_to(
+                self._targets_from(joints_of, solution), self.posture, self.CLOSE, OPEN_SETTLE_STEPS,
+                note=f"lift {obj.name} off what it rested on", max_vel=STICKY_LIFT_VEL, allowed_contacts=resting,
+            )
+        finally:
+            if carrying:
+                self.held_objects.pop(label, None)
+        if stopped is not None:
+            log.info(f"{obj.name}: the lift after the sticky grasp was stopped ({stopped[0]})")
+        return stopped is None
+
+    def retreat_contacts(self, bddl: str | None = None) -> dict:
+        """What a hand backing out of a grasp may still be touching as it leaves: the target and the floor, for the
+        gripper and finger links only (the rest of the robot stays checked). Without it the way back was refused
+        at sample 0 by the very contact it leaves -- a finger in a detergent bottle, the gripper at the floor --
+        and the arm stayed down for the rest of the episode (sorting_household_items, 2026-09-22)."""
+        from omnigibson.tiptop.collision import CARRIED
+
+        links = {f"{self.arm}_gripper_link", *self.robot.finger_link_names[self.arm]}
+        # CARRIED too: what the hand lifts off the floor starts on it (a knocked-over bottle), and its box can sit a
+        # little clear of the floor's so the resting test in lift_held missed it (sorting_household_items, 2026-09-22)
+        allowed = {obj.name: {*links, CARRIED} for obj, _, _ in self.scene_aabbs()
+                   if getattr(obj, "category", None) == "floors"}  # fmt: skip
+        if bddl is not None:
+            allowed.setdefault(self.scene_object(bddl).name, set()).update(links)
+        return allowed
+
+    def return_to_ready(self, note: str = "back to the ready posture", allowed_contacts=None) -> bool:
+        """The planned arm back at its ready posture, where a planned Pick's GoToInitial leaves it and where the
+        other arm's planner locks it (adopt_embodiment); False when neither a checked straight ramp nor the
+        planner's path gets it there. After a sticky grasp the arm is wherever the grasp ended, and the right-arm
+        press was refused with "r1pro_right locks left_arm_joint5 at -0.051 rad but the simulator has it at
+        -0.510" (turning_on_radio, 2026-09-22)."""
+        if self.q_home is None:
+            return False
+        if np.max(np.abs(np.subtract(self.q_arm(), self.q_home)), initial=0.0) < 0.02:
+            return True
+        stopped = self.ramp_to(list(self.q_home), self.posture, self.last_gripper, OPEN_SETTLE_STEPS, note=note,
+                               max_vel=STICKY_LIFT_VEL, allowed_contacts=allowed_contacts)  # fmt: skip
+        if stopped is None:
+            return True
+        if self.robot._ag_obj_in_hand.get(self.arm) is not None:
+            # a move request carries no attachment: the held object would be a room static the fingers start in
+            log.info(f"{note}: the straight ramp was stopped ({stopped[0]}) and the hand holds something the "
+                     "planner's move request cannot carry; staying here")
+            return False
+        log.info(f"{note}: the straight ramp was stopped ({stopped[0]}); asking the planner")
+        return self.planned_approach(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), note=note, goal_q=list(self.q_home))
+
+    def planned_standoff(self, arm: str, ik, joints_of, q_standoff, name: str) -> bool:
+        """The planner's path to a handle's pre-solved standoff where no straight reach is clear; False without one.
+
+        The goal is the standoff CONFIGURATION, not its pose: the approach and the pull were solved from it, and
+        another IK branch at the same pose would swing the arm on the straight approach that follows."""
+        if arm != self.arm or any(j not in joints_of for j in self.planned_joints):
+            return False
+        self.hold(OPEN_SETTLE_STEPS, self.OPEN)  # the planner plans with the fingers as they are
+        where, quat = ik.fk(q_standoff, f"{arm}_gripper_link")
+        goal_q = [float(q_standoff[joints_of.index(j)]) for j in self.planned_joints]
+        if self.planned_approach(where, quat, note=f"reach the standoff of {name}", goal_q=goal_q):
+            return True
+        # cuRobo found the pre-solved configuration itself in collision (store_honey: "Start or End state in
+        # collision" with a valid start; Lula's IK never checks self-collision). Let its own IK pick a branch at
+        # the same pose: the straight approach from there is still preflighted, so a swinging branch is refused.
+        return self.planned_approach(where, quat, note=f"reach the standoff of {name} (any configuration)")
+
+    def planned_approach(self, where, quat, note: str, goal_q=None) -> bool:
+        """Put the planned hand's gripper link at ``where``/``quat`` (base frame) along a path the planner checked
+        through the room, with the fingers as they are now; False when there is no planner, no path, or the path
+        did not complete. Executed like any plan, so the bridge audits it against the measured robot first.
+        ``goal_q`` (planned joints) asks for that exact configuration instead of any one reaching the pose."""
+        from b1k.bridge.client import move
+        from b1k.bridge.executor import PlanExecutor
+        from b1k.bridge.protocol import parse_plan
+
+        client = getattr(self, "move_planner", None)
+        if client is None or not self.send_room:
+            return False
+        measured = self.robot.get_joint_positions()
+        self.nearby_obstacles(collision_map=True)
+        request = {
+            "type": "move",
+            "q_init": np.asarray(self.q_arm(), dtype=np.float32),
+            "locked_joints": {j: float(measured[self.joint_index[j]]) for j in self.posture if j not in self.planned_joints},
+            "room": self.room_collision_scene(),
+            "goal_link": f"{self.arm}_gripper_link",
+            "goal_pose": np.asarray(pose_matrix(where, quat), dtype=np.float64),
+        }
+        if goal_q is not None:
+            request["goal_q"] = np.asarray(goal_q, dtype=np.float32)
+        try:
+            response = move(client, request)
+        except Exception as exc:  # noqa: BLE001 - a planner that cannot answer leaves the old refusal standing
+            log.warning(f"{note}: the planner could not be asked for a path ({type(exc).__name__}: {exc})")
+            return False
+        if not response.get("success"):
+            log.info(f"{note}: the planner has no path either ({response.get('error')})")
+            return False
+        if list(response["joint_names"]) != list(self.planned_joints):
+            log.warning(f"{note}: the planner's joints {response['joint_names']} are not {self.planned_joints}")
+            return False
+        plan = parse_plan({"steps": [{"type": "trajectory", "positions": response["positions"], "dt": response["dt"],
+                                      "label": note}], "q_init": request["q_init"]})
+        stats = PlanExecutor(self).execute(plan)
+        log.info(f"{note}: planned path {'completed' if stats.get('completed') else 'stopped: ' + str(stats.get('error'))}")
+        return bool(stats.get("completed")) and not stats.get("error")
+
+    def _sticky_close_on(self, arm, ik, obj, pose, into, seed, joints_of) -> bool:
+        """Close in free space, then seek first finger contact slowly and wait without advancing the arm.
+
+        Sticky grasping needs 0.3 s of continuous contact while CLOSE is commanded. The terminal search is
+        bounded to the physical surface plus GRASP_PRESS; it never retries deeper after touching an object.
+        """
+        try:
+            self.robot._find_gripper_contacts(arm=arm)
+        except Exception as exc:
+            log.warning("refusing sticky grasp without contact observations: %s", exc)
+            return False
+        stopped = self.ramp_to(
+            self.q_arm(), self.posture, self.CLOSE, OPEN_GRASP_STEPS,
+            note=f"sticky close before contact {obj.name}",
+        )
+        if stopped is not None:
+            return False
+        allowed = {obj.name: set(self.robot.finger_link_names[arm])}
+        direction = np.asarray(into, dtype=np.float64)
+        quat = T.mat2quat(th.tensor(pose[:3, :3], dtype=th.float32)).cpu().numpy()
+        distance = STICKY_STANDOFF + GRASP_PRESS
+        intervals = int(np.ceil(distance / STICKY_CONTACT_STEP))
+        for advance in np.linspace(0.0, distance, intervals + 1):
+            held = self.robot._ag_obj_in_hand.get(arm)
+            touching, _ = self.robot._find_gripper_contacts(arm=arm)
+            if held is not None or touching:
+                break
+            if advance == 0:
+                continue
+            measured = self.robot.get_joint_positions()
+            seed = [float(measured[self.joint_index[j]]) for j in joints_of]
+            goal = np.asarray(pose[:3, 3]) + direction * advance
+            solution = ik.solve(goal, quat, seed=seed, tolerance_pos=0.0005, tolerance_rad=0.05)
+            if solution is None:
+                log.info("sticky contact seek for %s has no local IK", obj.name)
+                return False
+            delta = float(np.max(np.abs(np.asarray(solution) - seed), initial=0.0))
+            # Include the measured IK residual: a loose precontact solution must not turn the first tiny
+            # waypoint into a fast correction. Every waypoint gets at least its requested Cartesian time.
+            travel = max(float(np.linalg.norm(goal - ik.fk(seed)[0])), distance / intervals)
+            speed = min(0.1, max(delta, 1e-6) * STICKY_CONTACT_SPEED / travel)
+            stopped = self.ramp_to(
+                self._targets_from(joints_of, solution), self.posture, self.CLOSE, 0,
+                note=f"sticky contact seek {obj.name}", max_vel=speed,
+                allowed_contacts=allowed, stop_on_contact=arm,
+            )
+            if stopped is not None:
+                if stopped[0] == "finger contact":
+                    break
+                return False
+        # Cancel the advance target and preserve the measured full posture throughout the grasp window.
+        # A failed window ends this attempt; moving farther would push an unattached object.
+        measured = self.robot.get_joint_positions()
+        self.posture = {j: float(measured[self.joint_index[j]]) for j in self.posture}
+        q_hold = self.q_arm().copy()
+        self.step(q_hold, self.CLOSE)
+        for _ in range(OPEN_GRASP_STEPS + 1):
+            held = self.robot._ag_obj_in_hand.get(arm)
+            if held is not None:
+                if held is not obj:
+                    log.warning("sticky grasp expected %s but assist holds %s; stopping", obj.name, held.name)
+                return held is obj
+            touching, _ = self.robot._find_gripper_contacts(arm=arm)
+            target = {link.prim_path for link in obj.links.values()}
+            if not touching or not set(touching).issubset(target):
+                log.info("sticky contact seek for %s ended without exclusive target contact", obj.name)
+                return False
+            self.step(q_hold, self.CLOSE)
+        log.info("sticky contact with %s did not establish a hold; not pressing deeper", obj.name)
+        return False
+
+    def _press_solution(self, arm: str, ik, seed, point_base, into_dir, jaw, press=GRASP_PRESS):
         """Arm joints that put the open hand on ``point_base`` coming in along ``into_dir``, or None.
 
         The two tolerances are the pattern the drawer pull uses: ask for the tight one, settle for 2 cm.
         """
-        where, rot = self.grasp_target(arm, point_base, into_dir, jaw)
+        where, rot = self.grasp_target(arm, point_base, into_dir, jaw, press=press)
         quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
         for tolerance in (OPEN_GRASP_TOLERANCE, 0.02):
             solution = ik.solve(where, quat, seed=seed, tolerance_pos=tolerance, tolerance_rad=0.5)
@@ -3388,96 +4061,30 @@ class R1ProSim(TiptopSim):
         return None
 
     def clear_start_posture(self, arm: str, q_ready):
-        """Lift ``arm`` out of whatever it is resting in before a plan is asked for from there; the posture to send.
+        """Report a potentially obstructed start without moving the arm or hiding its obstacle.
 
-        The plan starts at ``q_init``, and cuRobo refuses a start state that is in collision -- without ever
-        looking at the goal. Each one costs the whole round, and the message repeats once per refinement attempt,
-        because the verdict does not depend on which grasp particle is being tried.
-
-        CORRECTION (2026-09-15). This docstring used to read "6657 times against 1355 IK_FAIL: start states in
-        collision outnumber unreachable goals five to one", and that five-to-one was an artefact of counting raw
-        log lines -- a single refused round writes the message 32 or 96 times, once per attempt. Counted per
-        PLANNER CALL over the 4,974 saved, the order reverses:
-
-            13%  a call with an IK failure
-             8%  a call with a start state in world collision
-             5%  a call with a trajopt timeout (Status: None)
-
-        So this guard is worth having and is not the largest planner loss. Keep the ratio in mind before spending
-        on it again.
-
-        The cause is a height coincidence rather than a broken perception. With the challenge torso posture the
-        elbow and forearm sit at roughly counter height, and the planner's support is a thin slab whose top is
-        sunk 2 cm under the surface it detected, with no activation distance -- so at a counter or a cabinet the
-        margin between "fine" and "the whole plan is refused" is millimetres, while at a floor or a low table it
-        is tens of centimetres. This is the same failure the workspace crop already guards for the BASE
-        (``WORKSPACE_NEAR``, "a support cuboid reaching there puts the robot's start posture in collision"); the
-        reasoning was never extended to the arm.
-
-        Lifting is the right direction: it moves away from the surface, so it is the motion least likely to be
-        blocked in turn. A posture that is already clear is returned untouched, which is every floor and low-table
-        task, so this costs nothing where nothing is wrong.
+        A joint-space lift selected solely for a clear endpoint is not collision-free recovery. Send the measured
+        configuration and complete geometry so the planner can reject an invalid start instead of planning in
+        an artificially emptied world. The bridge mesh check is diagnostic; cuRobo checks the robot's spheres.
         """
         if arm not in self.robot.arm_names:
             return q_ready
         try:
             ik = self._stance_ik(arm)
-        except Exception:  # noqa: BLE001 - no description for this arm: send the posture as it is
+            by_name = dict(zip(self.planned_joints, [float(v) for v in q_ready]))
+            q = [by_name.get(j, 0.0) for j in self.robot.arm_joint_names[arm]]
+            inside = self.arm_hits_scene(arm, ik, q)
+        except Exception as exc:  # diagnostic failure must not erase geometry or change the measured posture
+            log.warning("could not check the planning start against scene meshes: %s", exc)
             return q_ready
-        aabbs = self.scene_aabbs()
-        held = {self.objects[label] for label in self.hands() if label in self.objects}
-        names = [n for n in self.planned_joints if n.startswith(f"{arm}_arm_joint")]
-        if not names:
-            return q_ready
-
-        def arm_q(q):
-            by_name = dict(zip(self.planned_joints, [float(v) for v in q]))
-            return [by_name.get(j, 0.0) for j in self.robot.arm_joint_names[arm]]
-
-        def hits(q):
-            return [
-                n
-                for n in self.arm_hits_scene(arm, ik, arm_q(q), aabbs=aabbs, mesh=False)
-                if n not in {o.name for o in held}
-            ]
-
-        inside = hits(q_ready)
-        if not inside:
-            return q_ready
-        index = {n: self.planned_joints.index(n) for n in names}
-        shoulder, elbow = f"{arm}_arm_joint2", f"{arm}_arm_joint4"
-        best = None
-        for lift in START_LIFTS:
-            for joints in ((shoulder,), (elbow,), (shoulder, elbow)):
-                if any(j not in index for j in joints):
-                    continue
-                for sign in (-1.0, 1.0):
-                    q = [float(v) for v in q_ready]
-                    for j in joints:
-                        q[index[j]] = float(q[index[j]]) + sign * lift
-                    if hits(q):
-                        continue
-                    best = (q, joints, sign * lift)
-                    break
-                if best:
-                    break
-            if best:
-                break
-        if best is None:
+        if inside:
             log.warning(
-                f"the {arm} arm starts inside {inside[0]} and no lift up to {max(START_LIFTS):.2f} rad frees it; "
-                "asking for the plan from here, which the planner will probably refuse"
+                "the %s arm starts near collision geometry %s; retaining all obstacles and asking the planner "
+                "to validate the measured start state",
+                arm,
+                inside,
             )
-            # Never ship the planner a body the arm is already in: it would refuse every start state in this round
-            self.obstacles = {n: o for n, o in self.obstacles.items() if n not in inside}
-            return q_ready
-        q, joints, delta = best
-        log.info(
-            f"the {arm} arm starts inside {inside[0]}, which the planner refuses before it looks at the goal; "
-            f"lifting {'+'.join(joints)} by {delta:+.2f} rad to start clear"
-        )
-        self.ramp_to(q, self.posture, self.last_gripper, LOOK_SETTLE_STEPS, note="lift clear before planning")
-        return self.q_arm()
+        return q_ready
 
     def log_blocked_sight(self) -> list[str]:
         """Say which of the robot's own arm links stand between the head camera and what this capture is about.

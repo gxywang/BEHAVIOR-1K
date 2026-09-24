@@ -13,6 +13,7 @@ from omnigibson.tiptop.strategies import (
     TASKS_DIR,
     Runner,
     TaskSpec,
+    TransferBlocked,
     Unreachable,
     atom,
     commit_to_container,
@@ -79,16 +80,19 @@ class FakeEpisode:
         if a["predicate"] == "toggled_on":
             return True
         item, target = a["args"]
-        if item in self.place_ok:
+        if item in self.place_ok or (item, target) in self.place_ok:
             self.hand = None
             self.boxes[item] = box(self.boxes[target]["center"])  # it is where it was put
             return True
         return False
 
+    put_down_ok = True  # whether a planned put-down finds a plan
+
     def put_down(self, bddl, support, floor=None):
         self.calls.append(("put_down", bddl, support))
-        self.hand = None
-        return True
+        if self.put_down_ok:
+            self.hand = None
+        return self.put_down_ok
 
     def release(self):
         self.calls.append(("release",))
@@ -314,17 +318,17 @@ def test_the_budget_left_over_is_spent_on_the_atoms_still_open():
     step budget unused. A second pass re-chooses the stance, so an item that could not be reached from the first
     one gets another go."""
     boxes, goal = _two_items()
-    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok={"ashcan.n.01_1", "battery.n.02_1"})
+    ep = FakeEpisode(boxes, pick_ok={"battery.n.02_1"}, place_ok={"ashcan.n.01_1", "battery.n.02_1"})
     ep.sim = _Budget(max_steps=1000, n_steps=10)
     strategy_for("dispose_of_batteries", goal).run(ep)
     picks = [c[1] for c in ep.calls if c[0] == "pick"]
-    assert picks.count("battery.n.02_2") > 1, "the item that did not land should be tried again on a later sweep"
+    assert picks.count("battery.n.02_2") > 1, "the item that could not be picked should be tried again on a later sweep"
 
 
 def test_a_sweep_that_wins_nothing_ends_the_sweeping():
     """An atom that cannot be done costs one extra pass, not the whole budget."""
     boxes, goal = _two_items()
-    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set())  # nothing can be placed at all
+    ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())  # nothing can be picked up
     ep.sim = _Budget(max_steps=100000, n_steps=0)
     strategy_for("dispose_of_batteries", goal).run(ep)
     first = [c[1] for c in ep.calls if c[0] == "pick"]
@@ -333,7 +337,7 @@ def test_a_sweep_that_wins_nothing_ends_the_sweeping():
 
 def _picks_of_one_run(budget=None):
     boxes, goal = _two_items()
-    ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok={"ashcan.n.01_1", "battery.n.02_1"})
+    ep = FakeEpisode(boxes, pick_ok={"battery.n.02_1"}, place_ok={"ashcan.n.01_1", "battery.n.02_1"})
     if budget is not None:
         ep.sim = budget
     strategy_for("dispose_of_batteries", goal).run(ep)
@@ -403,15 +407,19 @@ def test_wood_is_carried_to_the_floor_the_goal_names():
     assert ("walk_to_floor", "floor.n.01_2") in ep.calls, "it must travel to the floor the goal names"
 
 
-def test_a_floor_that_cannot_be_located_falls_back_to_putting_it_down_here():
-    """No regression for the ordinary case where the scope cannot resolve the floor at all."""
+def test_a_floor_that_cannot_be_located_retains_the_object():
+    """An unknown destination is never counted as the current room's floor; setting the object down there is only
+    the planned recovery, and without a plan for it the object stays in the hand."""
     boxes = {"plywood.n.01_1": box((1.0, 0, 0.05))}
     goal = [atom("ontop", "plywood.n.01_1", "floor.n.01_2")]
     ep = FakeEpisode(boxes, pick_ok=set(boxes), place_ok=set(boxes))
     ep.unreachable_floors = {"floor.n.01_2"}
-    strategy_for("bringing_in_wood", goal).run(ep)
-    assert not any(c[0] == "walk_to_floor" for c in ep.calls)
-    assert any(c[0] == "pick" for c in ep.calls), "it still tries, it just puts the sheet down where it is"
+    ep.put_down_ok = False
+    with pytest.raises(TransferBlocked, match="floor.n.01_2"):
+        strategy_for("bringing_in_wood", goal).run(ep)
+    assert ep.hand == "plywood.n.01_1"
+    assert not any(c[0] == "release" for c in ep.calls)
+    assert {c[2] for c in ep.calls if c[0] == "put_down"} == {"floor.n.01_1"}
 
 
 def test_wood_that_must_go_to_another_room_is_not_already_delivered():
@@ -549,59 +557,57 @@ def test_items_on_a_second_support_are_transferred_too():
     ]
 
 
-def test_an_unreachable_container_puts_the_item_back_on_its_support():
+def test_an_unreachable_container_retains_the_item():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, unreachable={"basket.n.01_2"})
+    ep.put_down_ok = False
+    with pytest.raises(TransferBlocked, match="object retained"):
+        Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    assert not any(c[0] == "release" for c in ep.calls)
+    assert ep.hand == "candle.n.01_1"
+    # the item goes back on its own support where the robot stands, else onto the floor, with a plan
+    ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, unreachable={"basket.n.01_2"})
     Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
-    assert ("put_down", "candle.n.01_1", "table.n.02_1") in ep.calls
-    assert ep.hand is None
+    assert ("put_down", "candle.n.01_1", ep.support_of("candle.n.01_1")) in ep.calls
+    assert not any(c[0] == "release" for c in ep.calls)
 
 
-def test_an_item_whose_support_is_unknown_is_still_transferred():
-    """Before anything has been perceived, support_of answers None. The runner still picks the item (the pick is
-    the look), never stands for a support it does not have, and puts the item down on the floor when the
-    container is out of reach."""
+def test_an_item_whose_support_is_unknown_can_be_picked_but_is_not_abandoned():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set(), unreachable={"basket.n.01_1"})
     ep.support_of = lambda item: None
     ep.edge_gap = lambda item, support: float("inf") if support is None else 0.0
-    Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
-    picks = [c for c in ep.calls if c[0] == "pick"]
-    assert picks, "the pick is how an unseen item gets seen"
-    assert not any(c[0] == "stand_for" and None in c[1] for c in ep.calls), "never stand for an unknown support"
-    assert ("put_down", "candle.n.01_1", ep.floor) in ep.calls, "the basket was out of reach: down on the floor"
-    # a hand still full at the next pick, with the support unknown: the floor, then release, never stand_for(None)
-    ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())
-    ep.hand = "candle.n.01_1"
-    ep.put_down = lambda bddl, support, floor=None: ep.calls.append(("put_down", bddl, support)) or False
-    Runner.free_hand(ep, None)
-    assert not any(c[0] == "stand_for" for c in ep.calls) and ("release",) in ep.calls
+    ep.put_down_ok = False
+    with pytest.raises(TransferBlocked):
+        Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    assert any(c[0] == "pick" for c in ep.calls)
+    assert not any(c[0] == "stand_for" and None in c[1] for c in ep.calls)
+    assert not any(c[0] == "release" for c in ep.calls)
+    assert {c[2] for c in ep.calls if c[0] == "put_down"} == {ep.floor}  # an unknown support: the floor
+    assert ep.hand == "candle.n.01_1"
 
 
-def test_emptying_a_hand_never_stands_for_the_floor():
-    """The floor is not an object to stand at: standing for it crashed an instance (putting_away_toys, whose
-    support_of falls back to the task floor for a toy lying on it)."""
-    boxes = {"toy_box.n.01_1": box((1.0, 0, 0.2), half=(0.3, 0.3, 0.2)), "toy.n.01_1": box((0.2, 0.5, 0.05))}
-    ep = FakeEpisode(boxes, pick_ok=set(), place_ok=set())
-    ep.hand = "toy.n.01_1"  # held, and its support is the floor
-
-    def refuse(bddl, support, floor=None):
-        ep.calls.append(("put_down", bddl, support))
-        return False  # no put-down plans, so the ladder runs to the end
-
-    ep.put_down = refuse
-    assert Runner.free_hand(ep, ep.floor) is False or True  # the point is the calls it made
-    assert ("stand_for", (ep.floor,)) not in ep.calls
-    assert ("release",) in ep.calls
+def test_a_full_hand_is_only_emptied_by_a_planned_floor_put_down():
+    ep = FakeEpisode({})
+    ep.hand, ep.put_down_ok = "toy.n.01_1", False
+    assert Runner.free_hand(ep) is False
+    # from where it stands, then again from a stance chosen for the floor; never a release
+    assert ep.calls == [("put_down", "toy.n.01_1", ep.floor), ("walk_to_floor", ep.floor), ("put_down", "toy.n.01_1", ep.floor)]
+    assert ep.hand == "toy.n.01_1"
+    ep.put_down_ok = True
+    assert Runner.free_hand(ep) is True and ep.hand is None
 
 
-def test_a_full_hand_is_emptied_before_the_next_pick():
+def test_a_full_hand_blocks_the_next_pick():
     boxes, goal = basket_world()
     ep = FakeEpisode(boxes, pick_ok={"candle.n.01_1"}, place_ok=set())
-    ep.hand = "cookie.n.01_1"  # left over from an earlier failed place
-    Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
-    first = [c for c in ep.calls if c[0] in ("put_down", "pick")][0]
-    assert first == ("put_down", "cookie.n.01_1", "floor.n.01_1")
+    ep.hand, ep.put_down_ok = "cookie.n.01_1", False
+    with pytest.raises(TransferBlocked, match="cannot start pickup"):
+        Runner(STRATEGIES["assembling_gift_baskets"], goal, attempts=1).run(ep)
+    # the only recovery is a planned put-down on the floor where the robot stands
+    assert not any(c[0] in ("pick", "stand_for", "release") for c in ep.calls)
+    assert all(c[2] == ep.floor for c in ep.calls if c[0] == "put_down")
+    assert ep.hand == "cookie.n.01_1"
 
 
 # ---------------------------------------------------------------- presses
@@ -1224,30 +1230,31 @@ def test_a_round_that_finds_nothing_horizontal_asks_again_with_the_floor_in_view
     assert body.index("plan_and_execute") < body.index(guard[0].strip()), "the retry follows a round"
 
 
-def test_a_toppled_base_is_stood_back_up_rather_than_worked_from():
-    """A pose that intersects furniture is resolved by the physics lifting and rolling the whole robot. A small
-    tilt is workable and the runner has always carried on from one -- 66 of 151 settles across every run are
-    under 5 deg off level, and 43 more under 15. But 23 are 45 deg or worse and 12 of those are 120+, which is
-    the robot on its back.
+def test_a_fallen_base_is_righted_at_the_last_level_pose_before_searching_again():
+    """A stance in a room the scene never loaded has no floor: the robot falls out of the world (boxing_books
+    2026-09-22; 117 of last week's 189 topples). Searching again from a fallen base rejects every candidate, since
+    every footprint test reads the live base frame, so the robot is righted first, at the last pose known level."""
+    from types import SimpleNamespace
 
-    clean_up_your_desk settles at 178.6 deg and then runs ZERO rounds, in every run it has ever had, because
-    every field of a request is expressed in a base frame that is upside down (2026-09-15).
-    """
-    import inspect
+    import torch as th
 
-    from omnigibson.tiptop.bench import TOPPLED_DEG, Episode
+    from omnigibson.tiptop.bench import Episode
 
-    assert 15 < TOPPLED_DEG < 90, f"the threshold has to separate a workable tilt from a topple, got {TOPPLED_DEG}"
+    righted, poses = [], iter([{"x": 5.0, "y": 0.0, "yaw": 0.0}, {"x": 1.5, "y": 2.0, "yaw": 0.0}])
+    readings = iter([{"tilt_deg": 0.0, "drop_m": 0.0}, {"tilt_deg": 2.0, "drop_m": 0.38}, {"tilt_deg": 0.0, "drop_m": 0.0}])
+    sim = SimpleNamespace(
+        video_caption="", n_steps=0, last_gripper=1.0, floor_name=lambda: "floor.n.01_1",
+        robot=SimpleNamespace(get_position_orientation=lambda: (th.tensor([1.0, 2.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0]))),
+        place_robot_for=lambda *names, **kwargs: next(poses), hold=lambda *args: None,
+        right_robot=lambda x, y, yaw: righted.append((x, y, yaw)) or True,
+    )
 
-    body = inspect.getsource(Episode.stand_for).split('"""')[-1]
-    assert "TOPPLED_DEG" in body, "the topple case has to be distinguished from a workable tilt"
-    assert "Unreachable" in body[body.index("TOPPLED_DEG"):], "and reported as unreachable, not worked from"
-    assert "place_robot" in body[body.index("TOPPLED_DEG"):], "and the robot stood back where it came from"
-    assert "going on from here" in body, "a workable tilt still carries on, as it always has"
+    def settled_level(x, y):
+        sim.last_settle = next(readings)
+        fell = sim.last_settle["drop_m"] > 0.05
+        return (not fell, "the base dropped 0.38 m below where it was put" if fell else "")
 
-    # ...and the check has to happen on the way IN as well. clean_up_your_desk topples on its FIRST teleport and
-    # the next search raises Unreachable before the attempt loop is exhausted, so the exit path never runs and the
-    # robot stays on its back for the rest of the episode -- 24 failed stance searches, zero rounds.
-    entry = body[: body.index("for attempt in range")]
-    assert "TOPPLED_DEG" in entry, "a robot already toppled cannot search: stand it up before trying"
-    assert "last_level" in body, "and the pose to return to is the last one that settled level"
+    sim.settled_level = settled_level
+    ep = Episode(sim, SimpleNamespace(rounds=2, settle_steps=1), {}, None, None)
+    assert ep.stand_for("book.n.02_6") == {"x": 1.5, "y": 2.0, "yaw": 0.0}
+    assert righted == [(1.0, 2.0, 0.0)]  # the pose the scene started it at, the last one known level

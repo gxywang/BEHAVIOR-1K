@@ -95,17 +95,17 @@ curl -s localhost:8123/health; curl -s localhost:8765/health   # planner answers
    and loads both at start-up, before `/health` answers, whether or not requests then carry ground-truth masks.
    `GOOGLE_API_KEY` is only needed with `perception.detector: gemini`.
 7. **cuTAMP patches.** `tiptop/install/install-cutamp.sh` applies `tiptop/install/patches/cutamp-*.patch` in name
-   order on top of the pinned cuTAMP release: `01-world-cfg-alias` (a `get_world_cfg` list-aliasing fix that
-   otherwise crashes every plan skeleton tried after the first motion-planning attempt with `KeyError: 'table'`),
-   `02-press-button` (the `Push` operator: hover, press, back off along a button's normal), `03-initial-holding`
-   (a plan may start with an object in the gripper: `in_hand` requests), `04-held-object-collisions` (the object in
-   the gripper is not collision-checked against the robot holding it; every retract ignores the object a place just
-   released around the fingers and, when its start state is in collision because the attached object touches what
-   it lay against, is planned again with the object's spheres detached, as cuTAMP's place branch already did;
-   needed once the wrist cameras complete the hulls). A cuTAMP checkout made without the script
-   needs `git apply` of the same patches in that order; the clone on shenlong-gpu-01 carries 01 and 02 as local
-   commits and 03 as its working tree, so `git diff` there regenerates 03. Upstreaming them to tiptop-robot/cuTAMP
-   is the real fix.
+   order on top of pinned cuTAMP v0.0.6. Apply the complete series: later patches correct earlier behavior.
+   On 2026-09-22, duplicate hunks in patches 08/09 were fixed and all 14 patches were verified to reproduce
+   the installed cuTAMP Python source from the pristine release. Patch 12 preserves concave room meshes,
+   covers held-object volume, removes detached-object retries and partial success returns, and restricts
+   contact exceptions. Patch 13 preserves a per-skeleton refinement time budget. Individual motion queries
+   have a 2-second budget with earlier graph fallback; this is not a strict total request deadline.
+   Patch 14 records bounded failure diagnostics with exact attempted pose queries and IK sampling state.
+   The separate `curobo-01` patch restores collision-check flags after failed start validation; the cuRobo
+   installer applies it idempotently. Its Python-only fix needs no CUDA rebuild.
+   See [the collision audit](COLLISION_AUDIT.md) for verification and remaining limits. The existing host
+   environment already contains these changes; do not rebuild it to run the benchmark.
 8. **The first request is slow.** warp JIT-compiles the cuRobo/cuTAMP kernels per GPU into `~/.cache/warp` on the
    first plan; at server start cuRobo warms up MotionGen, the detector and SAM2 load and the Rerun viewer starts
    (`/health` is 200 only afterwards, ~40 s on the server).

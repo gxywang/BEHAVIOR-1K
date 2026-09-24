@@ -87,7 +87,7 @@ def test_parse_plan_and_resample():
     assert parsed["steps"][0]["positions"].shape == (11, 7) and parsed["steps"][1]["action"] == "close"
     traj = resample_trajectory(parsed["steps"][0]["positions"], 0.02, 1 / 30)
     assert traj.shape[1] == 7 and np.allclose(traj[-1], 1.0) and np.allclose(traj[0], 0.0)
-    assert len(traj) == 7  # 0.2 s at 30 Hz -> 6 samples + end point
+    assert len(traj) == 7  # time-true: 0.2 s at 30 Hz -> 6 samples + end point
     with pytest.raises(ValueError):
         parse_plan(dict(plan, version="2.0.0"))
     with pytest.raises(ValueError):
@@ -488,12 +488,12 @@ def test_executor_keeps_a_closed_gripper_at_the_start_of_a_plan():
     sim.last_gripper = sim.CLOSE  # an object is in the hand from an earlier plan
     executor = PlanExecutor(sim, gripper_hold_steps=1)
     plan = {
-        "q_init": np.zeros(1, dtype=np.float32),
+        "q_init": np.zeros(2, dtype=np.float32),
         "steps": [
             {
                 "type": "trajectory",
                 "label": "Place(a, grasp0, p1, table, q1)",
-                "positions": np.zeros((3, 1), np.float32),
+                "positions": np.zeros((3, 2), np.float32),
                 "velocities": None,
                 "dt": sim.dt,
             },
@@ -680,3 +680,48 @@ def test_reach_candidates_offer_the_torso_and_the_arm_separately_and_the_ready_p
     # no elbow index into a short arm, no ready posture when there is none
     short = dict(reach_candidates(["torso_joint1", "left_arm_joint1"], [0.0, 0.0], [1.0, 1.0], None, elbow=3))
     assert list(short) == ["straight", "torso first", "arm first"]
+
+
+@pytest.mark.parametrize("with_geometry", [False, True])
+def test_collision_world_survives_recording_and_replay(tmp_path, with_geometry):
+    from omnigibson.tiptop.protocol import request_from_observation
+
+    req = _request()
+    # An empty room is explicit too: it must not become an absent/stale world on replay.
+    req["room"] = {}
+    if with_geometry:
+        req["room"]["box/physical"] = {
+            "vertices": np.array([[0, 0, 0], [0, 1, 0], [1, 0, 0]], dtype=np.float32),
+            "faces": np.array([[0, 1, 2]], dtype=np.int32),
+            "pose": np.eye(4, dtype=np.float32),
+            "task_label": "box_1",
+            "kind": "obstacle",
+        }
+        # More than ten entries exposes lexicographic HDF5 group iteration (0, 1, 10, 2, ...).
+        req["room"].update({f"shelf/{i}": req["room"]["box/physical"].copy() for i in range(12)})
+    req["place_surfaces"] = {"box_1": {"dims": [0.4, 0.4, 0.01], "pose": [0, 0, 0, 1, 0, 0, 0]}}
+    req["episode"] = "boxing_books_301"
+    req["locked_joints"] = {"right_arm_joint1": 0.1}
+    req["robot_mask"] = np.zeros(req["depth"].shape, dtype=bool)
+    save_observation_h5(tmp_path / "scene.h5", req, [0, 0, 0], [1, 0, 0, 0])
+    again = request_from_observation(load_observation_h5(tmp_path / "scene.h5"))
+    assert set(again) == set(req)
+    assert again["place_surfaces"] == req["place_surfaces"]
+    assert again["locked_joints"] == req["locked_joints"]
+    assert again["episode"] == req["episode"]
+    assert list(again["room"]) == list(req["room"])
+    for name, mesh in req["room"].items():
+        for key in ("vertices", "faces", "pose"):
+            assert np.array_equal(again["room"][name][key], mesh[key])
+        assert again["room"][name]["task_label"] == mesh["task_label"]
+
+
+@pytest.mark.parametrize("control_dt", [0.01, 1 / 30, 0.1])
+def test_resampling_plays_at_planned_speed_and_every_sample_is_on_the_checked_path(control_dt):
+    path = np.array([[0.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
+    result = resample_trajectory(path, 0.02, control_dt)
+    # every commanded sample lies on the checked polyline (none in the open lower-right region off it)
+    assert all(q[0] <= 1e-6 or abs(q[1] - 1.0) <= 1e-6 for q in result)
+    assert np.allclose(result[0], path[0]) and np.allclose(result[-1], path[-1])
+    # time-true: playback lasts as long as the plan, to within the last control tick
+    assert (len(result) - 2) * control_dt < (len(path) - 1) * 0.02 <= (len(result) - 1) * control_dt + 1e-8

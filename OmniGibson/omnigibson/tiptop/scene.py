@@ -577,6 +577,61 @@ class TiptopSim:
             vertices, faces = decimated(vertices, faces, STREAM_MAX_FACES)
         return vertices.astype(np.float32), faces.astype(np.int32)
 
+    def collision_mesh_world(self, obj) -> trimesh.Trimesh | None:
+        """Physical mesh cached by every rigid link's pose, so opening a door cannot leave stale geometry."""
+        if not hasattr(self, "_collision_world_meshes"):
+            self._collision_world_meshes = {}
+        stamp = tuple(
+            tuple(np.round(th.cat(link.get_position_orientation()).cpu().numpy(), 6))
+            for link in obj.links.values()
+        )
+        key = id(obj)
+        cached = self._collision_world_meshes.get(key)
+        if cached is None or cached[0] != stamp:
+            parts = [
+                mesh
+                for link in obj.links.values()
+                if (mesh := self.link_trimesh_world(link, collision_only=True)) is not None
+            ]
+            cached = (stamp, trimesh.util.concatenate(parts) if parts else None)
+            self._collision_world_meshes[key] = cached
+        return cached[1]
+
+    def room_collision_scene(self) -> dict:
+        """Physical scene meshes at this request's measured poses, in the planner's base frame.
+
+        This is a privileged collision map, independent of image masks and the decimated Rerun mirror. Preserve
+        separate mesh components and concavities (especially container openings); cache only rigid link geometry,
+        never an articulated object's assembled mesh. ``task_label`` lets the planner identify a movable/held
+        object without deleting the same object's geometry when it is a placement target.
+        """
+        labels = {id(obj): label for label, obj in self.objects.items()}
+        scene = {}
+        for name, obj in self.obstacles.items():
+            world = self.collision_mesh_world(obj)
+            if world is None:
+                continue  # visual-only objects and semantic meta-links do not collide in the simulator
+            pos, quat = obj.get_position_orientation()
+            rot = T.quat2mat(quat).cpu().numpy().astype(np.float64)
+            vertices = (np.asarray(world.vertices, dtype=np.float64) - pos.cpu().numpy()) @ rot
+            pos_b, quat_b = self.to_base(pos, quat)
+            entry = {
+                "vertices": vertices.astype(np.float32),
+                "faces": np.asarray(world.faces, dtype=np.int32),
+                "pose": T.pose2mat((pos_b, quat_b)).cpu().numpy().astype(np.float32),
+                "kind": "obstacle",
+                "fixed_base": bool(getattr(obj, "fixed_base", False)),
+            }
+            if id(obj) in labels:
+                entry["task_label"] = labels[id(obj)]
+            scene[name] = entry
+        log.info(
+            "collision map: %d objects, %d triangles (physical meshes, current link poses)",
+            len(scene),
+            sum(len(mesh["faces"]) for mesh in scene.values()),
+        )
+        return scene
+
     # ---------------------------------------------------------------- observation
     primary_view = "cam"  # the capture camera's view name (R1ProSim: the --camera choice)
     extra_views = ()  # further views captured with it and fused by the planner (R1ProSim: the wrist cameras)
@@ -794,18 +849,26 @@ class TiptopSim:
         """The tracked label of an object named in a goal atom (the name itself for spawned presets)."""
         return name
 
-    def link_trimesh_world(self, link, max_faces: int | None = None) -> trimesh.Trimesh | None:
+    def link_trimesh_world(
+        self, link, max_faces: int | None = None, *, collision_only: bool = False
+    ) -> trimesh.Trimesh | None:
         """Every visual mesh of one link as one trimesh in the WORLD frame (current pose); None for a link without
         meshes. Links without visual meshes contribute their collision meshes. A link is rigid, so its mesh is read
         from USD once, kept in the link's own frame (decimated to ``max_faces`` when asked: the robot's links are
         only a self-mask), and placed by the link's current pose; poses come from the Fabric hierarchy, so the
         result is current after teleports / set_position_orientation without a physics step."""
-        key = (link.prim_path, max_faces)
+        if collision_only and getattr(link, "visual_only", False):
+            return None
+        key = (link.prim_path, max_faces, collision_only)
         if key not in self._link_meshes:
             # meta-link volumes (particleapplier, slicer, fluidsource, ...) sit in visual_meshes with purpose
             # "guide": never rendered, so they must not claim depth pixels; collision meshes are all "guide" and
             # stay unfiltered
-            geoms = {k: g for k, g in link.visual_meshes.items() if g.purpose != "guide"} or link.collision_meshes
+            geoms = (
+                link.collision_meshes
+                if collision_only
+                else {k: g for k, g in link.visual_meshes.items() if g.purpose != "guide"} or link.collision_meshes
+            )
             parts = [
                 mesh_prim_to_trimesh_mesh(geom.prim, include_normals=False, include_texcoord=False, world_frame=True)
                 for geom in geoms.values()

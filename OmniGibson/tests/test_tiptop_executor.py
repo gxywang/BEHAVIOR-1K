@@ -40,14 +40,14 @@ def executor(sim):
     return PlanExecutor(sim)
 
 
-def test_converge_records_that_it_spent_the_whole_budget_on_a_jam():
+def test_converge_stops_loading_a_stationary_jam():
     sim = StubSim(wall=0.2)  # the joint jams at 0.2; the target is 1.0
     ex = executor(sim)
     err = ex.converge(np.array([1.0], dtype=np.float32), tol=0.01, max_steps=40)
     assert err == pytest.approx(0.8, abs=0.02), "it reports the error it was stuck at"
     trace = ex.last_converge
-    assert trace["capped"] is True and trace["steps"] == 40
-    # it stopped getting closer early and then pushed for the rest: that gap is what a later exit rule needs
+    assert trace["stalled"] is True and trace["steps"] < 40
+    assert trace["capped"] is False
     assert trace["last_improving_step"] < 10
 
 
@@ -104,9 +104,11 @@ def test_a_crawling_planner_segment_is_played_faster_but_never_slower():
 
     # a crawl: one joint moving 0.01 rad per 0.1 s step = 0.1 rad/s
     crawl = {"positions": [[0.0], [0.01], [0.02]], "dt": 0.1}
-    faster = plan_dt(crawl, floor=TRAJECTORY_MIN_SPEED)
+    assert TRAJECTORY_MIN_SPEED == 0.0
+    assert plan_dt(crawl) == crawl["dt"], "execution preserves the planner's timing"
+    faster = plan_dt(crawl, floor=1.0)
     assert faster < crawl["dt"], "a crawl is played faster"
-    assert np.isclose(faster, 0.1 * (0.1 / TRAJECTORY_MIN_SPEED)), "scaled exactly to the floor speed"
+    assert np.isclose(faster, 0.01), "explicit speed-floor opt-in still works"
 
     # already at or above the floor: untouched, so the executor never outruns the planner's own pace
     brisk = {"positions": [[0.0], [0.2], [0.4]], "dt": 0.1}  # 2 rad/s
@@ -141,6 +143,9 @@ class StubArm:
         cmd = float(np.asarray(q_arm).reshape(-1)[0])
         self.leads.append(cmd - self.q[0])
         self.q = [min(self.q[0] + float(np.clip(cmd - self.q[0], -self.speed, self.speed)), self.wall)]
+
+    def ramp_collision(self, names, start, goal, allowed_contacts=None, gripper=None):
+        return None  # these tests isolate tracking/leashing; scene preflight has geometry tests
 
     def hold(self, n, gripper, q_arm=None):
         for _ in range(n):  # the settle steps lean too, so they must be measured, not skipped
@@ -177,3 +182,189 @@ def test_an_unleashed_ramp_still_gets_to_push():
 
     sim, _ = _ramp(leashed=False)
     assert max(sim.leads) > EXEC_LEASH
+
+
+class ExecutionSim(StubSim):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.finger_commands = []
+        self.arm_commands = []
+        self.robot = type("Robot", (), {"is_grasping": lambda self: False})()
+
+    def step(self, q_arm, gripper):
+        self.finger_commands.append(gripper)
+        self.arm_commands.append(np.asarray(q_arm).copy())
+        super().step(q_arm, gripper)
+
+    def q_fingers(self):
+        return np.array([self.finger_commands[-1] if self.finger_commands else self.last_gripper])
+
+    def eef_pose_base(self, arm):
+        return np.eye(4)
+
+
+def motion(positions):
+    return {"type": "trajectory", "label": "Place(book, box)", "positions": positions, "dt": 0.1}
+
+
+def test_plan_start_mismatch_does_not_home_or_release():
+    sim = ExecutionSim(start=0.4)
+    sim.last_gripper = sim.CLOSE
+    result = PlanExecutor(sim).execute({"q_init": [0.0], "gripper_init": "open", "steps": []})
+    assert result["completed"] is False
+    assert "start" in result["error"]
+    assert sim.steps == 0
+    assert not sim.finger_commands
+
+
+def test_blocked_place_stops_before_release_or_later_segments():
+    sim = ExecutionSim(wall=0.2)
+    sim.last_gripper = sim.CLOSE
+    plan = {
+        "q_init": [0.0],
+        "steps": [
+            motion(np.linspace(0, 1.0, 30)[:, None]),
+            {"type": "gripper", "label": "Place(book, box)", "action": "open"},
+            motion([[1.0], [0.0]]),
+        ],
+    }
+    result = PlanExecutor(sim).execute(plan)
+    assert result["completed"] is False
+    assert result["trajectories"][0]["fell_behind"]
+    assert result["gripper_events"] == []
+    assert set(sim.finger_commands) == {sim.CLOSE}
+    assert sim.steps < 40
+    assert np.array_equal(sim.arm_commands[-1], sim.q_arm()), "abort must cancel the residual push command"
+    assert result["env_steps"] == sim.steps
+
+
+def test_discontinuous_plan_is_not_bridged_with_an_unchecked_move():
+    sim = ExecutionSim()
+    result = PlanExecutor(sim).execute({"q_init": [0.0], "steps": [motion([[0.4], [0.5]])]})
+    assert result["completed"] is False
+    assert sim.steps == 0
+
+
+def test_successful_place_follows_motion_then_releases():
+    sim = ExecutionSim()
+    sim.last_gripper = sim.CLOSE
+    result = PlanExecutor(sim, gripper_hold_steps=2).execute(
+        {
+            "q_init": [0.0],
+            "steps": [
+                motion(np.linspace(0, 0.4, 20)[:, None]),
+                {"type": "gripper", "label": "Place(book, box)", "action": "open"},
+            ],
+        }
+    )
+    assert result["completed"] is True
+    assert len(result["gripper_events"]) == 1
+    assert sim.q[0] == pytest.approx(0.4, abs=0.01)
+    assert result["env_steps"] == sim.steps
+
+
+@pytest.mark.parametrize("failure", ["collision", "unavailable"])
+def test_full_body_validation_refuses_a_planned_trajectory_before_motor_commands(failure):
+    sim = ExecutionSim()
+
+    def validate(positions, gripper, label):
+        assert positions[-1][0] == pytest.approx(0.2)
+        if failure == "unavailable":
+            raise ValueError("no physical collision geometry")
+        return ("left_gripper_finger_link1", "box", 4)
+
+    sim.validate_motion = validate
+    result = PlanExecutor(sim).execute({"q_init": [0.0], "steps": [motion([[0.0], [0.2]])]})
+    assert result["completed"] is False
+    assert "validation" in result["error"]
+    assert sim.steps == 0
+
+
+def test_legs_after_a_planned_grasp_or_release_keep_that_objects_finger_allowance():
+    sim = ExecutionSim()
+    labels = []
+    sim.validate_motion = lambda positions, gripper, label: labels.append(label)
+    pick = "Pick(plate_1, grasp1, q1)"
+    result = PlanExecutor(sim).execute({"q_init": [0.0], "steps": [
+        {**motion([[0.0], [0.2]]), "label": pick},
+        {"type": "gripper", "label": pick, "action": "close"},
+        {**motion([[0.2], [0.3]]), "label": "GoToInitial(q0)"},
+        {"type": "gripper", "label": "Place(plate_1, sink)", "action": "open"},
+        {**motion([[0.3], [0.1]]), "label": "GoToInitial(q0)"},
+    ]})
+    assert result["completed"] is True
+    trajectory_labels = [label for label in labels if "GoToInitial" in label]
+    # the picked object keeps its finger allowance until the Place opens; the retreat after it keeps the Place's
+    assert trajectory_labels == [f"{pick} then GoToInitial(q0)", "Place(plate_1, sink) then GoToInitial(q0)"]
+
+
+@pytest.mark.parametrize("initial", [True, False])
+def test_gripper_opening_is_validated_before_release(initial):
+    sim = ExecutionSim()
+    sim.last_gripper = sim.CLOSE
+    checked = []
+
+    def validate(positions, gripper, label):
+        checked.append((np.asarray(positions), gripper, label))
+        return ("left_gripper_finger_link1", "container_wall", 1)
+
+    sim.validate_motion = validate
+    plan = {"q_init": [0.0], "steps": []}
+    if initial:
+        plan["gripper_init"] = "open"
+    else:
+        plan["steps"] = [{"type": "gripper", "label": "Place(book, box)", "action": "open"}]
+    result = PlanExecutor(sim).execute(plan)
+    assert result["completed"] is False
+    assert checked[0][1] == sim.OPEN
+    assert result["gripper_events"] == []
+    assert sim.steps == 0
+
+
+
+@pytest.mark.parametrize("leashed", [True, False])
+def test_zero_settle_bridge_tracking_abort_cancels_residual_target_without_changing_gripper(leashed):
+    from omnigibson.tiptop.r1pro import R1ProSim, TRAVEL_MAX_JOINT_VEL
+
+    class RecordingArm(StubArm):
+        def __init__(self):
+            super().__init__()
+            self.commands = []
+
+        def step(self, q_arm, gripper):
+            self.commands.append((np.asarray(q_arm).copy(), gripper))
+            super().step(q_arm, gripper)
+
+    sim = RecordingArm()
+    blocked = R1ProSim.ramp_to(
+        sim, [2.0], {}, -1.0, 0, note="zero-settle waypoint", max_vel=TRAVEL_MAX_JOINT_VEL, leashed=leashed
+    )
+    assert blocked is not None
+    assert len(sim.commands) == blocked[1] + 1  # exactly one cancellation after the last path command
+    assert sim.commands[-2][0][0] > sim.q[0]
+    assert sim.commands[-1][0] == pytest.approx(sim.q)
+    assert {gripper for _, gripper in sim.commands} == {-1.0}
+
+
+def test_a_placenear_release_keeps_the_released_objects_finger_allowance():
+    """cuTAMP labels inside-round releases PlaceNear(...); "Place(" does not prefix-match it."""
+    sim = ExecutionSim()
+    labels = []
+    sim.validate_motion = lambda positions, gripper, label: labels.append(label)
+    release = "PlaceNear(bowl_1, grasp0, pose2, sink_1, bowl_1, q1)"
+    result = PlanExecutor(sim).execute({"q_init": [0.0], "steps": [
+        {**motion([[0.0], [0.2]]), "label": release},
+        {"type": "gripper", "label": release, "action": "open"},
+        {**motion([[0.2], [0.1]]), "label": "GoToInitial(q0)"},
+    ]})
+    assert result["completed"] is True
+    assert labels[-1] == f"{release} then GoToInitial(q0)"
+    assert release in labels  # its own leg is not relabelled
+
+
+def test_the_motion_audit_gives_a_placenear_target_finger_allowance():
+    import re
+
+    source = open(__import__("omnigibson.tiptop.r1pro", fromlist=["x"]).__file__).read()
+    pattern = re.search(r're\.match\(r"(\^\(Pick[^"]+)"', source)[1]
+    assert re.match(pattern, "PlaceNear(bowl_1, grasp0, pose2, sink_1, bowl_1, q1)")[2].strip() == "bowl_1"

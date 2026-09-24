@@ -137,6 +137,15 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "the objects' geometry); the annotator segfaults in large BEHAVIOR scenes",
     )
     r1.add_argument(
+        "--room", action=argparse.BooleanOptionalAction, default=True,
+        help="send nearby physical collision meshes, including supports and container walls (privileged); "
+        "--no-room is an explicit collision-map ablation",
+    )
+    r1.add_argument(
+        "--inside-region", action=argparse.BooleanOptionalAction, default=True,
+        help="sample inside placements on the container compartment floor (privileged), retaining its walls",
+    )
+    r1.add_argument(
         "--no-look", action="store_true", help="capture in the ready posture instead of swinging the arm out of view"
     )
     r1.add_argument(
@@ -254,6 +263,8 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
     )
     sim.send_obstacles = bool(getattr(args, "obstacles", False))
     sim.send_room = bool(getattr(args, "room", False))
+    if sim.send_room:
+        log.warning("PRIVILEGED collision map: current simulator physical meshes are sent to the planner")
     sim.send_inside = bool(getattr(args, "inside_region", False))
     # Both rebuild sim.obstacles per stance from nearby_obstacles, by two different routes; running them together
     # would have the label path and the mesh path fighting over the same dict.
@@ -467,6 +478,9 @@ def setup_logging() -> None:
         logger.setLevel(logging.INFO)
         logger.propagate = False
         logger.addHandler(handler)
+    import b1k.bridge.executor as bridge_executor
+
+    log.info("bridge executor loaded from %s", bridge_executor.__file__)
 
 
 def open_state_stream(hostport: str | None, sim):
@@ -752,7 +766,12 @@ def note_hands(sim, atoms: list[dict], executor, knowledge, after=None) -> None:
                         f"the {sim.arm} hand is shut on something that is not {label}; opening it before going on"
                     )
                     sim.hold(DROP_STEPS, sim.OPEN)
-        elif atom["predicate"] in ("on", "inside", "ontop", "nextto") and len(atom["args"]) == 2:
+        elif (
+            atom["predicate"] in ("on", "inside", "ontop", "nextto")
+            and len(atom["args"]) == 2
+            and executor.gripper == sim.OPEN
+        ):
+            # A failed trajectory may stop before release; keep the held-object record then.
             sim.held_objects.pop(sim.tracked_label(atom["args"][0]), None)
     for label, holder in list(sim.held_objects.items()):  # an object that left the hand (fell, was released)
         bddl = sim.bddl_names.get(label, label) if hasattr(sim, "bddl_names") else label

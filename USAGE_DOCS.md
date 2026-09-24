@@ -67,7 +67,7 @@ curl -s localhost:8123/health; curl -s localhost:8765/health    # {"status":"hea
 `OmniGibson/omnigibson/tiptop/README.md` "What Rerun shows" for what each entity is). On the laptop:
 
 ```bash
-ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01
+ssh -N -L 9090:127.0.0.1:9090 -L 9876:127.0.0.1:9876 shenlong-gpu-01.cs.illinois.edu
 # then open http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy  and keep the time panel on Following
 ```
 

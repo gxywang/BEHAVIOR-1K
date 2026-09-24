@@ -9,6 +9,9 @@ processes in separate Python environments and talk over a websocket.
 The runbook for the lab server (GPU pinning, tunnels, the exact shell lines) is [USAGE_DOCS.md](../../../USAGE_DOCS.md);
 installing the planner and grasp server on a new machine and the problems you will meet is [DEPLOYMENT.md](DEPLOYMENT.md).
 
+The [2026-09-22 collision audit](COLLISION_AUDIT.md) describes the physical room map, planner and execution fixes,
+reproducible commands, and measured task-23 contacts. It supersedes the historical collision workarounds below.
+
 > **Read this before quoting any number from here.** Every score in this file was produced with the simulator
 > telling the policy where every object is, at every moment. Object boxes decide whether a pick worked (is the
 > object at the hand?), whether a place worked (is its box over the container's?), which item to go for next,
@@ -473,6 +476,8 @@ Why it is set up this way (all measured in the scene):
   reaches ~0.9 m. So the candle, cookie and bow are teleported next to the basket at the table's +x edge, where
   the cheese already is (`--place OBJ:SUPPORT:DX,DY`, offsets from the support's centre). Teleporting is test
   scaffolding: the rules forbid it during evaluation, and the base does not move under its own controller yet.
+- Benchmark runs no longer pass `--torso` (2026-09-22): the crouch parks the ready hand at desk height (fingers at
+  0.71-0.77 m), inside any desk the robot stands at, and the planner refuses that start. The demo keeps it.
 - `--torso 1.2 -1.7 -0.9 0` starts the torso a little lower than the challenge posture (head camera at 1.25 m
   instead of 1.40) and pitched forward. The pitch is what lets the robot stand close: for the posture
   `apply_posture` established, the base-pose search measures where the camera's bottom image edge meets each
@@ -716,8 +721,11 @@ round without the simulator (does a planner failure reproduce?):
 ```
 
 The task strategies (`strategies.py`) order the rounds; the retry is the episode's and the same for every task
-(`--rounds`, default 2: a goal gets two planning rounds, a pick two base poses at least 15 cm apart, a put-down is
-done when the hand is empty; nothing else recovers, see "Kept out of the pipeline"). `turning_on_radio` picks the
+(`--rounds`, default 2: a goal gets two planning rounds, a pick two base poses at least 15 cm apart). A failed
+placement retains the grasp and retries the same destination within `--attempts-per-item`. If those attempts
+expire while holding the item, the benchmark records a blocked transfer and stops. It never frees the hand by
+moving to the next item's support or dropping the object. Placements require release and the requested goal
+predicate, using the benchmark's existing privileged state evaluator. `turning_on_radio` picks the
 radio up with the left hand and presses the switch with the right (the second planner on `--press-port` is
 required: a held radio cannot slide away under the press, a free-standing one did, 20 cm across the glass table,
 without toggling); `assembling_gift_baskets` does 16 transfers, each a pick at the table, a teleport to the basket with
@@ -1121,9 +1129,9 @@ margin, which is zero and cannot be set from the bridge at all: it needs one num
   with the attached object touching its neighbours. All of it passed only while hulls were the head camera's
   partial views; with the wrist cameras completing them every carry failed (`robot_to_movables 0/256`,
   `INVALID_START_STATE_WORLD_COLLISION`) and so did picks of bows lying against each other. The held object is now
-  exempt up to its placement, and every retract ignores the object just released and retries with the attached
-  object's spheres detached when its start state is in collision
-  (`tiptop/install/patches/cutamp-04-held-object-collisions.patch`).
+  exempt up to its placement. The historical patch-04 retry detached carried-object spheres on failure; the
+  [2026-09-22 correction](COLLISION_AUDIT.md) removes that unsafe retry, retains the carried volume, and checks
+  non-finger geometry against a released object during retreat.
 - Placement goes onto the top face of the container's convex hull with a 1 cm surface shrink, which is less than a
   wicker rim: an item can be set down on the rim (2026-09-05, from a stretched 0.8 m reach) and topple the basket.
 - Flat objects (cheese slabs, bows) get few M2T2 grasps; the planner succeeds on them from close, orthogonal

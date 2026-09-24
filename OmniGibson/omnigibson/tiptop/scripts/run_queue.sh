@@ -66,8 +66,10 @@ while read -r task instances; do
   # as a crash on 2026-09-14. Pass PRESS_PORT=<port of an r1pro_right server> for those tasks.
   press_args=""
   [ -n "${PRESS_PORT:-}" ] && press_args="--press-port ${PRESS_PORT}"
+  # No --torso: the planner's home torso. The old crouch (1.2 -1.7 -0.9 0) parked the ready hand at desk height,
+  # inside any desk the robot stood at (dispose_of_batteries, 2026-09-22).
   ./b1k/bin/python -m omnigibson.tiptop.bench --task-name "$task" --instances $instances \
-    --knowledge "$KNOWLEDGE" --grasping-mode sticky --torso 1.2 -1.7 -0.9 0.0 \
+    --knowledge "$KNOWLEDGE" --grasping-mode sticky \
     --views $VIEWS --host localhost --port "$PORT" $press_args --out-dir "$dir" > "$log" 2>&1
   code=$?
   python3 OmniGibson/omnigibson/tiptop/scripts/read_run.py "$dir" "$log" >> "$OUT" 2>&1 \

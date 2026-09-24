@@ -604,32 +604,11 @@ def test_grasp_target_jaw_is_square_to_the_approach():
         assert abs(float(jaw_world @ approach)) < 1e-9
 
 
-def test_the_travel_fold_moves_at_its_own_speed_and_the_unfold_is_checked():
-    """Folding in over the base is cheap; coming back out into the room is the part that needs checking.
-
-    The fold cuts the arms' overhang past the base rectangle from 0.41 m to 0.095 m, and it was the only candidate
-    that both helped and arrived. It was removed for a day because it cost 7967 of an episode's 16946 steps -- but
-    that cost came from ramping it at CAPTURE_MAX_JOINT_VEL, the cap that exists because observation swings out
-    through an unplanned scene were knocking objects about. Bringing the arms in over the robot's own base is the
-    opposite motion and runs at TRAVEL_MAX_JOINT_VEL instead, about a quarter of the steps. Coming back out IS a
-    motion into the room, so path_hits_scene checks it first (2026-09-14).
-    """
+def test_the_travel_fold_moves_at_its_own_speed():
     import omnigibson.tiptop.r1pro as r1pro
 
-    assert r1pro.TRAVEL_MAX_JOINT_VEL > r1pro.CAPTURE_MAX_JOINT_VEL, "a fold over the base is not a capture swing"
+    assert r1pro.TRAVEL_MAX_JOINT_VEL > r1pro.CAPTURE_MAX_JOINT_VEL
     assert r1pro.TRAVEL_POSE == 0.0
-    assert hasattr(r1pro.R1ProSim, "fold_for_travel") and hasattr(r1pro.R1ProSim, "unfold_after_travel")
-    fold = r1pro.R1ProSim.fold_for_travel.__doc__ or ""
-    unfold = r1pro.R1ProSim.unfold_after_travel.__doc__ or ""
-    assert "TRAVEL_MAX_JOINT_VEL" in fold, "the fold must say why it does not pay the capture cap"
-    assert "path_hits_scene" in unfold, "the unfold must say it checks the way back"
-    # It unfolds even when the path looks blocked. Refusing was measured worse: the arms stayed folded over the
-    # base, which was inside the toy box the robot had come to work at, the start-state lift then fired three
-    # times, and every plan was refused anyway -- 0.000 against a 0.75 baseline (2026-09-14). The ramp stopping
-    # when a joint falls behind its target is the collision-awareness that matters.
-    src = (pathlib.Path(r1pro.__file__).read_text().split("def unfold_after_travel")[1]).split("\n    def ")[0]
-    assert "unfolding anyway" in src, "the warning must not become a refusal"
-    assert "not unfolding here" not in src
 
 
 def test_arm_points_can_be_evaluated_at_a_stance_the_robot_is_not_standing_in():
@@ -918,12 +897,12 @@ def test_a_fold_stopped_by_furniture_is_tried_again_at_the_new_stance():
     fold = inspect.getsource(R1ProSim.fold_for_travel)
     assert "_fold_blocked" in fold, "the fold has to record that it was stopped"
 
-    # the body only: place_robot's docstring names unfold_after_travel, and an index into the whole source
+    # the body only: place_robot's docstring names the unfold, and an index into the whole source
     # would match the prose rather than the call
     stand = inspect.getsource(R1ProSim.place_robot).split('"""')[-1]
     assert "_fold_blocked" in stand, "and place_robot has to act on it"
     retry = stand.index("_fold_blocked")
-    unfold = stand.index("unfold_after_travel")
+    unfold = stand.index("self.unfold_after_travel(")
     assert retry < unfold, "fold again BEFORE unfolding, or the unfold starts from the jammed posture"
     teleport = stand.index("set_position_orientation")
     assert teleport < retry, "and only AFTER the teleport, since the obstacle is at the old stance"

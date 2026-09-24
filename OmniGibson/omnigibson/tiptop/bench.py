@@ -44,6 +44,7 @@ from b1k.bridge.judgement import (  # FLOOR_LEVEL and UNSATISFIED_SHOWN moved wi
 from b1k.bridge.strategies import (
     PLACE_PREDICATES,
     STRATEGIES,
+    TransferBlocked,
     Unreachable,
     atom,
     atom_objects,
@@ -64,6 +65,7 @@ from omnigibson.tiptop.run import (
 log = logging.getLogger("omnigibson.tiptop")
 
 REACH_FAR = 1.1  # base-pose search radius (m) when nothing within the usual 0.9 m works: the torso leans that far
+FALL_DROP = 0.05  # m below the teleport height (r1pro.FALL_DROP): falling through a floor that is not there
 TOPPLED_DEG = 45.0  # at or past this the base is not tilted, it is toppled: 23 of 151 settles, 12 of them 120+
 STANCE_ATTEMPTS = 3  # stances tried before a round works from one that did not settle level
 BLIND_LIMIT = 3  # DISTINCT stances a goal object must be invisible from before the runner stops trying for it
@@ -84,11 +86,19 @@ class Episode:
     def __init__(self, sim, args, planners: dict, knowledge, out_dir: Path, spec=None):
         self.sim, self.args, self.planners, self.knowledge, self.out_dir = sim, args, planners, knowledge, out_dir
         self.spec = spec  # the task description, for the values a task names for itself (TaskSpec.opens)
+        sim.region_refused = set()  # inside-regions that failed to plan, this episode only
+        if getattr(sim, "arm", None) in planners:  # a reach no straight ramp can make (a handle, a shelved book)
+            sim.move_planner = planners[sim.arm][0]
         self.rounds = args.rounds
         self.records = []  # one per round, in order
         self.blind = {}  # goal object -> the distinct stances it could not be seen from (BLIND_LIMIT gives up)
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
         self.floor = sim.floor_name()
+        try:  # the pose the scene started the robot at: level by construction, the first place to right it at
+            pos, quat = sim.robot.get_position_orientation()
+            self.last_level = (float(pos[0]), float(pos[1]), float(T.quat2euler(quat)[2]))
+        except Exception:  # noqa: BLE001 - no simulator behind this episode (the strategy tests)
+            self.last_level = None
 
     # ---------------------------------------------------------------- moving
     def open_up(self, name: str, fraction: float | None = None) -> bool:
@@ -121,7 +131,8 @@ class Episode:
         # opened the same drawer 3 times out of 3 (13.0, 12.9 and 30.1 cm of travel, 2026-09-13/14). So when the
         # approach is what failed, stand the old way and pull again from there. A fallback, not a replacement:
         # the pull-solving stance is still tried first and still wins wherever it works.
-        if not result.get("opened") and "on the way to the standoff" in str(result.get("why") or ""):
+        why_not = str(result.get("why") or "")
+        if not result.get("opened") and ("on the way to the standoff" in why_not or "stance rejected" in why_not):
             self.records.append({"open": name, **result, "step": self.sim.n_steps})  # the first attempt's verdict
             log.info(
                 f"{name}: the opening stance solves the pull but the arm cannot reach its start "
@@ -227,18 +238,13 @@ class Episode:
         # this task never gets that far -- the next search raises Unreachable first. So check on the way IN too,
         # and put it back at the last pose that was known level (2026-09-15).
         upright = self.last_level if getattr(self, "last_level", None) else was
-        if upright is not None:
-            level_now, why_now = self.sim.settled_level(float(was[0]), float(was[1])) if was else (True, "")
-            tilt_now = float(re.search(r"([\d.]+) deg off level", why_now).group(1)) if why_now and "deg off level" in why_now else 0.0
-            if not level_now and tilt_now >= TOPPLED_DEG:
-                log.warning(
-                    f"the base is {tilt_now:.0f} deg off level before the search even starts; standing it back at "
-                    f"({upright[0]:.2f}, {upright[1]:.2f}) -- every footprint test is computed in the base frame"
-                )
-                try:
-                    self.sim.place_robot(upright[0], upright[1], upright[2], note="upright again before searching")
-                except Exception as why_up:  # noqa: BLE001 - best effort; the search still runs
-                    log.info(f"could not stand it back up ({type(why_up).__name__}: {why_up})")
+        if upright is not None and was is not None:
+            level_now, why_now = self.sim.settled_level(float(was[0]), float(was[1]))
+            if not level_now and self.fallen():
+                log.warning(f"{why_now} before the search even starts; righting it at ({upright[0]:.2f}, "
+                            f"{upright[1]:.2f}) -- every footprint test is computed in the base frame")
+                self.right(upright)
+        fell = False
         for attempt in range(STANCE_ATTEMPTS):
             try:
                 pose = self.sim.place_robot_for(*names, avoid=avoid)
@@ -258,6 +264,10 @@ class Episode:
             if level:
                 self.last_level = (float(pose["x"]), float(pose["y"]), float(pose["yaw"]))
                 return pose
+            fell = self.fallen()  # read before right(), whose own settle check replaces last_settle
+            if fell and upright is not None:
+                # Searching again from a fallen base rejects every candidate (the tests read the live base frame)
+                self.right(upright)
             log.warning(
                 f"{why} at ({pose['x']:.2f}, {pose['y']:.2f}): the pose is occupied by something the footprint "
                 f"test missed"
@@ -273,28 +283,36 @@ class Episode:
         # then runs ZERO rounds, in every run it has ever had, because every field of a request is expressed in a
         # base frame that is upside down. Standing the robot back where it came from and reporting the objects
         # unreachable is the honest outcome; working from a toppled base is not (2026-09-15).
-        tilt = float(re.search(r"([\d.]+) deg off level", why).group(1)) if why and "deg off level" in why else 0.0
-        if tilt >= TOPPLED_DEG:
-            log.warning(
-                f"the base is {tilt:.0f} deg off level after {STANCE_ATTEMPTS} attempts; "
-                + (f"standing it back at ({was[0]:.2f}, {was[1]:.2f})" if was else "no earlier pose to return to")
-                + " rather than working from a toppled base"
-            )
-            if was is not None:
-                try:
-                    self.sim.place_robot(was[0], was[1], was[2], note="upright again after a toppled stance")
-                except Exception as why_up:  # noqa: BLE001 - the raise below is the point; this is a courtesy
-                    log.info(f"could not stand it back up ({type(why_up).__name__}: {why_up})")
-            raise Unreachable(f"no pose for {list(names)} leaves the base level (last was {tilt:.0f} deg off)")
-        log.info(f"out of attempts at {tilt:.0f} deg off level, which is workable; going on from here")
+        if fell:  # the last attempt's reading: after right() the live one is the righted robot, level
+            log.warning(f"{why} after {STANCE_ATTEMPTS} attempts; righted rather than working from a fallen base")
+            if upright is None:
+                log.warning("no level pose is known to right it at")
+            raise Unreachable(f"no pose for {list(names)} leaves the base level ({why})")
+        log.info(f"out of attempts ({why}), which is workable; going on from here")
         return pose
+
+    def fallen(self) -> bool:
+        """Whether the last settle read was a fall or a topple, not a workable tilt (settled_level's numbers)."""
+        settle = getattr(self.sim, "last_settle", None) or {}
+        return settle.get("drop_m", 0.0) > FALL_DROP or settle.get("tilt_deg", 0.0) >= TOPPLED_DEG
+
+    def right(self, pose) -> None:
+        try:
+            if self.sim.right_robot(float(pose[0]), float(pose[1]), float(pose[2])):
+                self.last_level = tuple(float(v) for v in pose)
+        except Exception as why:  # noqa: BLE001 - best effort; the search and the round report what follows
+            log.warning(f"could not right the robot ({type(why).__name__}: {why})")
 
     def has_arm(self, arm: str) -> bool:
         return arm in self.planners
 
     def use_arm(self, arm: str) -> None:
         if arm != self.sim.arm:
+            # the new planner locks this arm at its ready posture; a sticky grasp leaves it wherever it closed
+            if not self.sim.return_to_ready(note=f"{self.sim.arm} arm back to ready before the {arm} arm plans"):
+                log.warning(f"the {self.sim.arm} arm could not get back to its ready posture before the {arm} arm plans")
             self.sim.adopt_embodiment(self.planners[arm][1]["embodiment"])
+            self.sim.move_planner = self.planners[arm][0]
 
     # ---------------------------------------------------------------- planning rounds
     def plan_and_execute(self, atoms: list[dict], arm: str = "left", floor: bool = False) -> dict:
@@ -340,6 +358,8 @@ class Episode:
                 self.sim, self.args, client, round_dir, atoms, self.knowledge, floor=floor, score=False, record=False
             )
             record["env_steps"] = result.get("execution", {}).get("env_steps")
+            if result.get("execution", {}).get("error"):
+                record["error"] = result["execution"]["error"]
             # the step the plan began executing from: knowledge older than this predates what the plan did
             record["executed_from"] = result.get("execution", {}).get("start_step")
         except EpisodeOver:
@@ -350,6 +370,14 @@ class Episode:
         except Exception as e:  # noqa: BLE001 - one failed round must not end the instance
             log.exception(f"round {i} {atom_text(atoms)} failed")
             record["error"] = f"{type(e).__name__}: {e}"
+            if "No satisfying particles" in str(e) and "time budget" not in str(e):
+                # A compartment floor too small for the item, or already full: the next try uses the hull's top,
+                # which is what 747 of last week's 768 executed inside-rounds landed with (r1pro.inside_regions).
+                # Not on a timeout (the region was never fully tried), and only for pairs this round sent one for.
+                refused = self.sim.__dict__.setdefault("region_refused", set())
+                sent = getattr(self.sim, "region_sent", set())
+                refused.update(tuple(a["args"]) for a in atoms
+                               if a["predicate"] == "inside" and len(a["args"]) == 2 and tuple(a["args"]) in sent)
             if isinstance(e, GoalNotVisible):
                 for name in atom_objects(atoms):
                     self.blind.setdefault(name, set()).add(self.stance_key())
@@ -481,9 +509,9 @@ class Episode:
             if self.holding(bddl):
                 return True
             # M2T2 proposes grasps from the point cloud and a flat object -- a book lying down, a board game --
-            # gives it no side a parallel jaw can get under, so the round fails before the arm moves. Press the
-            # open hand onto its top face and close instead (the user's instruction, 2026-09-14). Only for the
-            # shape the planner cannot serve: press_grasp returns False without moving for anything not flat.
+            # gives it no side a parallel jaw can get under. The sticky fallback reaches a clear standoff,
+            # closes, then seeks gentle finger contact with a physical surface. It stops advancing at contact
+            # rather than pushing the open gripper into the target.
             try:
                 # The pressed grasp physically takes the object -- close_on presses until the assist reports it
                 # holds -- but nothing wrote the robot's OWN hand record, which is only ever written by
@@ -494,10 +522,20 @@ class Episode:
                 # the simulator's grasp assist, which stays diagnostic (scene.check_hands).
                 support = self.support_of(bddl)  # None when it was never perceived: nothing to spare
                 pressed_from = self.sim.n_steps
-                if self.sim.press_grasp(self.sim.arm, bddl, spare=(support,) if support else ()):
+                self.sim.move_planner = self.planners[self.sim.arm][0]  # for an approach no straight ramp can make
+                pressed = self.sim.press_grasp(self.sim.arm, bddl, spare=(support,) if support else ())
+                taken = getattr(self.sim.robot, "_ag_obj_in_hand", {}).get(self.sim.arm)
+                if pressed:
+                    self.note_pressed_grasp(bddl, after=pressed_from)
+                elif taken is not None and taken is self.sim.scene_object(bddl):
+                    # the hand closes before it approaches, so the assist can take the target on the way in and
+                    # the close at the precontact pose is then refused (the finger is already in it): the target
+                    # IS in the closed hand. It went unrecorded and ended assembling_gift_baskets at step 1031 of
+                    # 39090 on "an unconfirmed grasp on pillar_candle_88" (2026-09-22)
+                    log.info(f"{bddl}: the assist took it on the way in; recording it by the usual rule")
                     self.note_pressed_grasp(bddl, after=pressed_from)
                 if self.holding(bddl):
-                    log.info(f"{bddl}: taken by pressing the hand onto it, which is how a flat object is held")
+                    log.info(f"{bddl}: taken by the contact-seeking sticky grasp")
                     self.records.append(
                         {
                             "round": len(self.records),
@@ -508,6 +546,34 @@ class Episode:
                         }
                     )
                     return True
+                # Sticky attachment can succeed on the wrong object, or disagree with localization. Let go of it
+                # where it is (it was never lifted) before another approach; only a hand that will not let go
+                # blocks the episode.
+                attached = getattr(self.sim.robot, "_ag_obj_in_hand", {}).get(self.sim.arm)
+                if attached is not None:
+                    from omnigibson.tiptop.run import DROP_STEPS
+
+                    log.info(f"{bddl}: the assist holds {attached.name}, which the hand record does not; letting go")
+                    self.sim.hold(DROP_STEPS, self.sim.OPEN)
+                    attached = getattr(self.sim.robot, "_ag_obj_in_hand", {}).get(self.sim.arm)
+                    if attached is not None:
+                        raise TransferBlocked(
+                            f"pickup of {bddl} left an unconfirmed grasp on {attached.name}; object retained"
+                        )
+                # A failed pressed grasp leaves the hand where the contact seek stopped: down at the floor for a
+                # tile, and every stance after it refused for fingers at the floor (laying_tile_floors, 2026-09-22)
+                self.sim.return_to_ready(note=f"back to ready after the pressed grasp of {bddl}",
+                                         allowed_contacts=self.sim.retreat_contacts(bddl))
+                # the closed hand pushed against things on the way back and the assist can take one: left attached
+                # and unrecorded it rode into every later landing check (setup_a_bar 302 ran no round, 2026-09-23)
+                stray = getattr(self.sim.robot, "_ag_obj_in_hand", {}).get(self.sim.arm)
+                if stray is not None and not self.holding(bddl):
+                    from omnigibson.tiptop.run import DROP_STEPS
+
+                    log.info(f"{bddl}: the assist took {stray.name} on the way back; letting go")
+                    self.sim.hold(DROP_STEPS, self.sim.OPEN)
+            except TransferBlocked:
+                raise
             except Exception as why:  # noqa: BLE001 - a fallback must not end the instance
                 log.warning(f"{bddl}: the pressed grasp failed ({type(why).__name__}: {why})")
         log.warning(f"{bddl}: not in the hand after {self.rounds} pick rounds")
@@ -547,9 +613,15 @@ class Episode:
         return bool(held)
 
     def put_down(self, bddl: str, support: str, floor: bool | None = None) -> bool:
-        """Put the held object on ``support``; done when the hand is empty, wherever the object landed (the point
-        is a free hand)."""
-        return self.achieve([atom("ontop", bddl, support)], floor=floor, done=lambda: not self.holding(bddl))
+        """Place the object on the requested support and verify both placement and release."""
+        placed = self.achieve(
+            [atom("ontop", bddl, support)],
+            floor=floor,
+            done=lambda: not self.holding(bddl) and self.goal_already_holds("ontop", bddl, support),
+        )
+        if not placed and self.is_floor(support):  # free_hand walks off instead of trying the same spot again
+            self.__dict__.setdefault("floor_failed_at", set()).add(self.stance_key())
+        return placed
 
     # ---------------------------------------------------------------- the robot's own record
     def holding(self, bddl: str) -> bool:
@@ -562,9 +634,11 @@ class Episode:
         return [self.sim.bddl_names[label] for label in self.sim.hands() if label in self.sim.bddl_names]
 
     def release(self, steps: int = 45) -> None:
-        """Open the planned hand where it is and let whatever it holds fall (the last resort when no put-down
-        plan exists); the hand is then held open for ``steps`` env steps so the object clears it, and the record
-        of that hand is cleared."""
+        """Explicitly open the planned hand and wait ``steps`` for release.
+
+        The task runner does not use this as recovery for a failed placement. Such a failure retains its object
+        and destination; opening at an arbitrary pose is not a validated put-down.
+        """
         self.sim.video_caption = f"release [{self.sim.arm} arm]"
         self.sim.hold(steps, self.sim.OPEN)
         for label, arm in list(self.sim.hands().items()):
@@ -628,14 +702,14 @@ class Episode:
     def walk_to_floor(self, name: str) -> bool:
         """Teleport to somewhere on the floor ``name``, so a thing carried there can be set down on it.
 
-        Returns False when the floor cannot be located, and the caller keeps the old behaviour of setting the
-        item down where the robot already stands. A floor is a wide, flat object, so the stance search is given
+        Returns False when the floor cannot be located; the caller retains the object. A floor is a wide, flat
+        object, so the stance search is given
         its centre to aim at rather than the whole of it.
         """
         try:
             obj = self.sim.scene_object(name)
         except Exception as exc:  # noqa: BLE001 - a floor the scope does not resolve to a simulated object
-            log.info(f"cannot locate {name} ({exc}); putting the item down where the robot stands")
+            log.info(f"cannot locate {name} ({exc}); retaining the held item")
             return False
         if obj is None:
             return False
@@ -643,20 +717,20 @@ class Episode:
             self.stand_for(name)
             return True
         except Unreachable as exc:
-            log.info(f"no stance reaches {name} ({exc}); putting the item down where the robot stands")
+            log.info(f"no stance reaches {name} ({exc}); retaining the held item")
             return False
 
     def goal_already_holds(self, predicate: str, item: str, container: str) -> bool:
         """Whether the goal's own atom for this pair holds right now, by the task's evaluator.
 
-        Privileged in the same way ``switched_on`` is, and used for the same narrow purpose: not spending a
-        transfer on something the goal already has. The geometric stand-in it replaces could not tell one floor
+        Privileged in the same way ``switched_on`` is. Used to skip completed work and verify the exact
+        destination after placement, including named floors and inside versus ontop. The geometric stand-in it replaces could not tell one floor
         from another -- ``near_floor`` asks only how low a thing stands and ``placed`` reads a floor target as
         "the hand let go of it" -- so a task that asks for things to be carried to a DIFFERENT room's floor was
         read as already finished. bringing_in_wood is that task and it ran no rounds at all.
 
-        At evaluation this verdict would have to come from the robot's own localization. It is only ever used to
-        skip work, never to claim credit: the score comes from the simulator's own check either way.
+        At evaluation this verdict would have to come from the robot's own localization. The benchmark score
+        comes from the simulator's final check independently of this per-transfer verdict.
         """
         try:
             return bool(self.sim.holds(predicate, item, container))
@@ -731,19 +805,6 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         action="store_true",
         help="tell the planner about the furniture standing near the robot (held_labels -> cuTAMP statics), so it "
         "plans around the room instead of through it; costs a mask per obstacle in every capture",
-    )
-    p.add_argument(
-        "--inside-region",
-        action="store_true",
-        help="plan an inside() goal onto the container's own open compartment floor instead of onto its convex "
-        "hull's lid, using the fillable meta link OmniGibson's Inside state is itself defined against",
-    )
-    p.add_argument(
-        "--room",
-        action="store_true",
-        help="send that same furniture to the planner as collision MESHES over the sim_scene channel, which "
-        "bypasses perception entirely (no mask, no depth-point threshold, no workspace crop) -- unlike "
-        "--obstacles, which offers labels and delivered 2 obstacles out of 32 when it was measured",
     )
     p.add_argument(
         "--summarize",
@@ -850,6 +911,13 @@ def main(argv=None) -> None:
                 reason = "strategy finished"
             except EpisodeOver as e:
                 reason = e.reason
+            except TransferBlocked as e:
+                reason = f"blocked: {e}"
+                log.warning(reason)
+                if episode is not None:
+                    episode.records.append(
+                        {"blocked_transfer": str(e), "step": sim.n_steps, "hands": dict(sim.hands())}
+                    )
             except Exception as e:  # noqa: BLE001 - score what happened and go on to the next instance
                 log.exception(f"instance {instance_id} crashed")
                 reason = f"crash: {type(e).__name__}: {e}"
@@ -878,6 +946,7 @@ def main(argv=None) -> None:
                     "max_steps": max_steps,
                     "wall_time_s": round(time.time() - t0, 1),
                     "knowledge": knowledge.report(),
+                    "collision_map": "simulator_physical" if sim.send_room else None,
                     "teleports": sim.teleports,
                     "goal": goal,
                     "video": None if video is None else str(Path(video.path).relative_to(out_dir)),
@@ -911,6 +980,7 @@ def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> d
         "task": args.task_name,
         "mode": args.mode,
         "knowledge": args.knowledge,
+        "collision_map": "simulator_physical" if getattr(args, "room", False) else None,
         "grasping_mode": args.grasping_mode,
         "rounds": args.rounds,
         "max_steps": max_steps,
