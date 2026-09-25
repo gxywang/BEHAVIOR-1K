@@ -104,12 +104,15 @@ class Episode:
             self.last_level = None
 
     # ---------------------------------------------------------------- moving
-    def open_up(self, name: str, fraction: float | None = None) -> bool:
+    def open_up(self, name: str, fraction: float | None = None, single_round: bool = False) -> bool:
         """Stand at ``name`` and open it, by ``fraction`` of its joint's range (the scored atom's worth by default).
 
         Reading the joint back afterwards is privileged, the way the oracle's masks are: the motion reports what
         the joint says, and at evaluation that verdict would have to come from the hand's own travel and a fresh
         look at the container.
+
+        ``single_round`` (the skill bench's legacy baseline): one pull or push from where the robot stands, no
+        stance of its own and no fallback stance, so it compares with a skill that never moves the base.
         """
         from b1k.bridge.articulation import OPEN_FRACTION_SCORED, is_open
         from omnigibson.tiptop.articulation import openable_joints
@@ -118,7 +121,8 @@ class Episode:
             self.sim.video_caption = f"close {name}"
             for j in openable_joints(self.sim.scene_object(name)):
                 if is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]):
-                    result = self.sim.push_joint(self.sim.arm, name, j, j["closed"])
+                    one = {"stand": False} if single_round else {}  # no stance of its own
+                    result = self.sim.push_joint(self.sim.arm, name, j, j["closed"], **one)
                     self.records.append({"close": name, **result, "step": self.sim.n_steps})
                     if not result.get("reached"):
                         log.info(f"{name}.{j['name']} did not shut: {result.get('why') or 'the joint stopped short'}")
@@ -136,7 +140,11 @@ class Episode:
             fraction=hint.get("fraction", OPEN_FRACTION_SCORED if fraction is None else fraction),
             joint=hint.get("joint"),
             height=hint.get("height"),
+            stand=not single_round,
         )
+        if single_round:
+            self.records.append({"open": name, **result, "step": self.sim.n_steps, "single_round": True})
+            return bool(result.get("opened"))
         # The opening stance is chosen because the PULL solves from it (stance_for_grasp), and nothing checks that
         # the arm can get to where the pull starts. store_honey's drawer is the case: the stance reports "15 of 15
         # pull waypoints solve (80% of the range)" and then the hand stops 40 cm short of the standoff. It fails
@@ -548,20 +556,23 @@ class Episode:
                 break
         return False
 
-    def pick(self, bddl: str, into: str | None = None) -> bool:
+    def pick(self, bddl: str, into: str | None = None, single_round: bool = False) -> bool:
         """The object in the planned hand after up to ``--rounds`` pick rounds, each from a fresh base pose (a pick
         that fails, no plan or the object hidden, is retried from somewhere else). False when no pose reaches it.
         ``into``: where it is bound for; a roof within the hand stack over that or over where it rests (a shelf,
         a fridge bay: ``sim.side_entry``) has the planner take it from the side, this round only
-        (``OracleKnowledge.describe`` -> ``request["side_grasp"]``)."""
+        (``OracleKnowledge.describe`` -> ``request["side_grasp"]``).
+        ``single_round`` (the skill bench's legacy baseline): one round from where the robot stands, with no
+        stand_for and no hidden push, so it compares with a skill that never moves the base."""
         side = any(self.sim.side_entry(bddl, c) for c in (into, self.support_of(bddl)) if c and not self.is_floor(c))
-        for _ in range(self.rounds):
+        for _ in range(1 if single_round else self.rounds):
             try:
-                self.stand_for(bddl)
+                if not single_round:
+                    self.stand_for(bddl)
             except Unreachable as e:
                 log.warning(f"{bddl}: {e}")
                 return False
-            if self.sim.push_face(bddl) is not None:
+            if not single_round and self.sim.push_face(bddl) is not None:
                 # a flat item under a shelf board offers no pinch: slid to the board's edge first (N-push), so the
                 # round after it can take the overhang; push_face is None again once it hangs over the edge
                 self.achieve([atom("push", bddl)])

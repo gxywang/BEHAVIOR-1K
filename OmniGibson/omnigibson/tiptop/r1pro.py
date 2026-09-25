@@ -2539,7 +2539,7 @@ class R1ProSim(TiptopSim):
         out.sort(key=lambda g: g["rank"])
         return out
 
-    def push_joint(self, arm: str, name: str, joint: dict, target: float) -> dict:
+    def push_joint(self, arm: str, name: str, joint: dict, target: float, stand: bool = True) -> dict:
         """Push ``name``'s moving link to joint value ``target`` with the closed hand: a close is a push (5 of
         13,362 demo closes grasp, and the simulator has no latch), and so is widening a door past where the pull
         reached. The hand comes in along the link's motion onto the face that trails it (``push_grasps``) and
@@ -2556,7 +2556,7 @@ class R1ProSim(TiptopSim):
         # limit), which nothing opens after: the retreat and the next fold would drag the door back open
         self.block_grasping(arm)
         try:
-            run = self._drive_joint(arm, obj, grasps, name, take_hold=False)
+            run = self._drive_joint(arm, obj, grasps, name, stand=stand, take_hold=False)
         finally:
             self.unblock_grasping()
         if "plan" not in run:
@@ -5306,6 +5306,30 @@ class R1ProSim(TiptopSim):
         a[idx[f"gripper_{self.other_arm}"]] = float(self.other_gripper)
         # base: HolonomicBaseJointController in position mode takes deltas, zeros hold the base still
         return {self.robot.name: a}
+
+    def step_action(self, a23):
+        """One env step with a whole 23-D action in the Runtime's layout (b1k.runtime.compose.ACTION_SLICES), the
+        skill bench's DirectConnector's step. Both gripper commands are kept, so R1ProSim's own steps after it
+        (a legacy run) hold the hands where the Runtime left them."""
+        from b1k.runtime.compose import ACTION_SLICES
+
+        idx, a23 = self.robot.controller_action_idx, np.asarray(a23, dtype=np.float32).reshape(-1)
+        a = th.zeros(self.robot.action_dim, dtype=th.float32)
+        for group, s in ACTION_SLICES.items():
+            a[idx[group]] = th.as_tensor(a23[s])
+        self.last_gripper = float(a23[ACTION_SLICES[f"gripper_{self.arm}"]][0])
+        self.other_gripper = float(a23[ACTION_SLICES[f"gripper_{self.other_arm}"]][0])
+        return self.step_env({self.robot.name: a})
+
+    def commanded_targets(self) -> dict:
+        """The last env step's action per ACTION_SLICES group (HostHooks: the latch re-seeds from it after a run that
+        stepped the sim itself); {} before the first step."""
+        if self.last_action is None:
+            return {}
+        from b1k.runtime.compose import ACTION_SLICES
+
+        a, idx = self.last_action[self.robot.name], self.robot.controller_action_idx
+        return {group: a[idx[group]].cpu().numpy().astype(np.float32) for group in ACTION_SLICES}
 
     def view_sensor(self, name: str):
         return self.shadows[VIEW_OPTICS[name]]

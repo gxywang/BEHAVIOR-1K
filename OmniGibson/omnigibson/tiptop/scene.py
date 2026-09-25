@@ -280,6 +280,7 @@ class TiptopSim:
         self.stop_when_done = False  # raise EpisodeOver when the task reports success or its step limit (benchmark)
         self.video_caption = None  # what the robot is doing now, one line, set by the driver (run.py, bench.py)
         self.last_obs = None
+        self.last_action = None  # the action of the last env step (step_env)
         self.last_gripper = self.OPEN
         self.last_capture_rgb = None  # the last frame capture() rendered, for saving next to an error
         self.capture_object_aabb_min_z = {}  # where each tracked object rested at the last capture
@@ -341,7 +342,12 @@ class TiptopSim:
 
     def step(self, q_arm, gripper: float):
         self.last_gripper = float(gripper)
-        action = self.action(q_arm, gripper)
+        return self.step_env(self.action(q_arm, gripper))
+
+    def step_env(self, action: dict):
+        """One env step with a whole action dict, kept in ``last_action``: after a run that stepped the sim itself,
+        the skill bench's Runtime continues from what was last commanded (HostHooks.commanded_targets)."""
+        self.last_action = action
         self.last_obs, reward, terminated, truncated, info = self.env.step(action)
         if self.episode_open:
             self.n_steps += 1

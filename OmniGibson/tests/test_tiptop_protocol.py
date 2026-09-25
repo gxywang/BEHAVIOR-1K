@@ -642,6 +642,7 @@ def test_step_counts_and_scores_only_while_the_episode_is_open():
         last_gripper=1.0,
     )
     sim.action = lambda q, g: TiptopSim.action(sim, q, g)
+    sim.step_env = lambda a: TiptopSim.step_env(sim, a)
     sim.frame_caption = lambda: TiptopSim.frame_caption(sim)
     TiptopSim.step(sim, [0.0, 0.0], 1.0)
     assert sim.n_steps == 1 and fed == [False]
