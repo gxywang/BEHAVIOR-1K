@@ -888,8 +888,97 @@ def test_a_look_from_before_the_plan_does_not_judge_what_the_plan_did():
     note_hands(sim, pick, Executor(), Remembered(on_the_floor, 401), after=400)
     assert sim.hands() == {} and sim.opened, "a fresh look that puts it elsewhere means the hand is on something else"
     # a live reading carries no step and always counts
-    live = {"can.n.01_1": {"center": np.array([1.02, 0.0, 0.78]), "lo": 0, "hi": 0}}
+    c = np.array([1.02, 0.0, 0.78])
+    live = {"can.n.01_1": {"center": c, "lo": c - 0.03, "hi": c + 0.03}}
     assert in_hand_by_localization(Sim(0.03), type("Live", (), {"localize": lambda self, *n: live})(), "can.n.01_1", "left", after=400)
+
+
+def test_a_large_object_held_at_its_edge_is_at_the_hand_though_its_centre_is_not():
+    """organizing_school_stuff (manip1g 2026-09-24, rounds 3, 5, 7): the carryall (39 x 32 x 48 cm) picked by its
+    handle and the folder (30 x 34 cm) pinched at a corner each closed with the assist's weld in place, and
+    note_hands then called each a miss -- "the hand closed but the object is not at the hand" -- and opened the
+    hand on it: the carryall ended on the floor 0.4 m from where it stood, the folder tilted against the bed. The
+    rule was the box CENTRE within HOLD_RADIUS = 0.15 m of the hand; a large object held at its edge has its
+    centre 20+ cm from the hand, so its every real hold read as a miss. The rule is now the hand point's distance
+    to the localized box (0 inside it) within HOLD_MARGIN, in both of note_hands' passes; the centre rule stays for
+    a source that gives a point and no extent."""
+    from omnigibson.tiptop.run import HOLD_MARGIN, HOLD_RADIUS, in_hand_by_localization, note_hands
+
+    class Sim:
+        arm = "left"
+        OPEN = 1.0
+
+        def __init__(self, hand, finger):
+            self.held_objects, self.bddl_names = {}, {"carryall_1": "carryall.n.01_1"}
+            self.hand, self.finger, self.opened = np.asarray(hand, float), finger, []
+
+        tracked_label = staticmethod(lambda name: name.replace(".n.01_", "_"))
+        base_to_world = staticmethod(lambda p: np.asarray(p, float))
+
+        def eef_pose_base(self, arm):
+            m = np.eye(4)
+            m[:3, 3] = self.hand
+            return m
+
+        def grasp_sensed(self, arm):
+            return self.finger > 0.006
+
+        def finger_width(self, arm):
+            return self.finger
+
+        def hands(self):
+            return dict(self.held_objects)
+
+        def check_hands(self):
+            pass
+
+        def hold(self, n_steps, gripper=None):
+            self.opened.append((n_steps, gripper))
+
+    class Knowledge:
+        def __init__(self, lo, hi):
+            self.lo, self.hi = np.asarray(lo, float), np.asarray(hi, float)
+
+        def localize(self, *names):
+            return {n: {"center": (self.lo + self.hi) / 2, "lo": self.lo, "hi": self.hi} for n in names}
+
+        def picked(self, *a):
+            pass
+
+    class Executor:
+        close_eef = np.eye(4)
+
+    pick = [{"predicate": "holding", "args": ["carryall.n.01_1"]}]
+    carryall = Knowledge([0.80, -0.16, 0.0], [1.19, 0.16, 0.48])  # its box, standing; the handle is its top edge
+    by_the_handle = [1.0, 0.0, 0.47]
+    assert np.linalg.norm(carryall.localize("x")["x"]["center"] - by_the_handle) > HOLD_RADIUS, "the old rule's miss"
+    assert in_hand_by_localization(Sim(by_the_handle, 0.014), carryall, "carryall.n.01_1", "left") is True
+    sim = Sim(by_the_handle, finger=0.014)  # the strap between the fingers
+    note_hands(sim, pick, Executor(), carryall)
+    assert sim.hands() == {"carryall_1": "left"} and sim.opened == [], "held by its handle: do not drop it"
+    # the second pass, on a later plan: the record stays while the box stays at the hand
+    note_hands(sim, [], Executor(), carryall)
+    assert sim.hands() == {"carryall_1": "left"}
+    # a folder pinched at a corner with the fingertips: the hand point 1.8 cm outside the box on two axes
+    folder = Knowledge([0.85, -0.17, 0.75], [1.15, 0.17, 0.78])
+    assert in_hand_by_localization(Sim([1.168, 0.188, 0.765], 0.036), folder, "carryall.n.01_1", "left") is True
+    # a genuine miss: the hand back at the ready posture, the carryall left standing 0.5 m from it
+    sim = Sim([0.5, 0.0, 0.9], finger=0.014)
+    assert in_hand_by_localization(sim, carryall, "carryall.n.01_1", "left") is False
+    note_hands(sim, pick, Executor(), carryall)
+    assert sim.hands() == {} and sim.opened, "not at the hand: the hand is on something else and must open"
+    # an object that left the hand (fell) leaves the record in the second pass
+    sim = Sim(by_the_handle, finger=0.014)
+    note_hands(sim, pick, Executor(), carryall)
+    note_hands(sim, [], Executor(), Knowledge([0.30, -0.16, 0.0], [0.69, 0.16, 0.48]))  # on the floor, 0.3 m off
+    assert sim.hands() == {}
+    # just outside the margin is a miss; a source that gives a point and no extent keeps the centre rule
+    above = [1.0, 0.0, 0.48 + HOLD_MARGIN + 0.005]
+    assert in_hand_by_localization(Sim(above, 0.014), carryall, "carryall.n.01_1", "left") is False
+    point = type("Point", (), {"localize": lambda self, *n: {n[0]: {"center": np.array([1.0, 0.0, 0.24])}}})()
+    near, off = [1.0, 0.0, 0.24 + HOLD_RADIUS - 0.01], [1.0, 0.0, 0.24 + HOLD_RADIUS + 0.01]
+    assert in_hand_by_localization(Sim(near, 0.014), point, "carryall.n.01_1", "left") is True
+    assert in_hand_by_localization(Sim(off, 0.014), point, "carryall.n.01_1", "left") is False
 
 
 def test_the_oracle_sends_nearby_furniture_to_the_planner_and_only_what_a_view_actually_shows():

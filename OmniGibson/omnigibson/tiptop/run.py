@@ -704,18 +704,28 @@ def do_execute(
     return result
 
 
-HOLD_RADIUS = 0.15  # m: an object localized within this distance of the hand after a pick is in it
+# m: how far the hand point may sit outside the object's localized box and still hold it. The hand point is the
+# R1Pro's <arm>_eef_link, the fixed frame 6 cm ahead of <arm>_gripper_link between the finger pads; the finger
+# meshes reach 1.8 cm past it along the approach and are 3.8 cm wide across it, so a pad pinching a corner or an
+# edge leaves the point at most ~2.6 cm outside the object itself, and the world box is never smaller than the
+# object. 5 cm is twice that. A missed object stays on its support 0.7-0.9 m from the base while the hand goes back
+# to the ready posture ~0.4-0.5 m ahead of it: its box stays well over 5 cm from the hand.
+HOLD_MARGIN = 0.05
+HOLD_RADIUS = 0.15  # m: for a source that localizes to a point with no lo/hi, the centre within this of the hand
 DROP_STEPS = 45  # env steps the hand is held open after a pick that closed on the wrong thing (Episode.release)
 
 
 def in_hand_by_localization(sim, knowledge, bddl: str, arm: str, after=None) -> bool | None:
-    """Whether the object is at the hand of ``arm``, by where the knowledge source localizes it: its box centre
-    within ``HOLD_RADIUS`` of the hand. None when the source cannot localize it: never perceived, or -- with
-    ``after``, the env step the hand started moving at -- not seen since. A source that remembers its last look
-    (the onboard source, whose look is the capture the plan was made from) knows where the object WAS, and
-    where it was before the hand closed says nothing about whether the hand has it now: read as live, it would
-    call every real pick a miss and open the hand on it. A live reading (the oracle) carries no step and
-    always counts."""
+    """Whether the object is at the hand of ``arm``, by where the knowledge source localizes it: the hand point
+    within ``HOLD_MARGIN`` of its box (0 with the hand inside it), or -- for a source that gives a point and no
+    extent -- its centre within ``HOLD_RADIUS``. The box, not the centre: a 39 x 32 x 48 cm carryall held by its
+    handle or a 30 x 34 cm folder pinched at a corner has its centre 20+ cm from the hand, and the centre rule
+    called three such real holds misses and opened the hand on them (organizing_school_stuff 2026-09-24).
+    None when the source cannot localize it: never perceived, or -- with ``after``, the env step the hand
+    started moving at -- not seen since. A source that remembers its last look (the onboard source, whose look is
+    the capture the plan was made from) knows where the object WAS, and where it was before the hand closed says
+    nothing about whether the hand has it now: read as live, it would call every real pick a miss and open the
+    hand on it. A live reading (the oracle) carries no step and always counts."""
     try:
         box = knowledge.localize(bddl).get(bddl)
     except NotImplementedError:
@@ -723,7 +733,11 @@ def in_hand_by_localization(sim, knowledge, bddl: str, arm: str, after=None) -> 
     if box is None or (after is not None and box.get("step") is not None and box["step"] <= after):
         return None
     hand = sim.base_to_world(sim.eef_pose_base(arm)[:3, 3])
-    return bool(np.linalg.norm(np.asarray(box["center"], dtype=np.float64) - hand) < HOLD_RADIUS)
+    if "lo" not in box or "hi" not in box:
+        return bool(np.linalg.norm(np.asarray(box["center"], dtype=np.float64) - hand) < HOLD_RADIUS)
+    lo, hi = (np.asarray(box[k], dtype=np.float64) for k in ("lo", "hi"))
+    outside = np.maximum(0.0, np.maximum(lo - hand, hand - hi))  # per axis, all zero with the hand inside the box
+    return bool(np.linalg.norm(outside) < HOLD_MARGIN)
 
 
 def note_hands(sim, atoms: list[dict], executor, knowledge, after=None) -> None:
