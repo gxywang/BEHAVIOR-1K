@@ -7,10 +7,13 @@ JSON per rollout as ``omnigibson.eval.eval``. What differs, and is written into 
 in-process by a task runner (strategies.py) that teleports the base instead of navigating, and the planner may
 be told what the simulator knows (``--knowledge oracle``: masks and button poses). Both are stand-ins for parts of
 the pipeline that do not exist yet, so a number from this benchmark is an upper bound for the manipulation part,
-not a challenge score.
+not a challenge score. ``--locomotion drive`` (the default) replaces the teleport with a nav2py drive on the
+challenge's velocity-controlled base (drive.py; needs ``--nav-map-root`` and nav2py on PYTHONPATH);
+``--locomotion teleport`` keeps the stand-in for a like-for-like comparison.
 
   OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.bench --task-name turning_on_radio --instances 0 1 2 \\
-      --host localhost --port 8765 --knowledge oracle --grasping-mode sticky --out-dir runs/bench_radio
+      --host localhost --port 8765 --knowledge oracle --grasping-mode assisted --out-dir runs/bench_radio \\
+      --nav-map-root /path/to/3dmap/maps
 """
 
 import argparse
@@ -27,6 +30,7 @@ import numpy as np
 import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
+from omnigibson.tiptop.r1pro import DriveFailed
 from b1k.bridge.protocol import bddl_category
 from b1k.bridge.judgement import (  # FLOOR_LEVEL and UNSATISFIED_SHOWN moved with the geometry and the
     FLOOR_LEVEL,  # verdict they parameterize; both are re-exported here, where callers still read them
@@ -214,7 +218,7 @@ class Episode:
         so such a pose is treated as occupied and the search is asked for another (2026-09-13).
         """
         avoid = self.stood.setdefault(names, [])
-        self.sim.video_caption = f"teleport: stand for {', '.join(names)}"
+        self.sim.video_caption = f"{self.args.locomotion}: stand for {', '.join(names)}"
         try:  # where the robot stood before the search, which it was working from
             was_pos, was_quat = self.sim.robot.get_position_orientation()
             was = (float(was_pos[0]), float(was_pos[1]), float(T.quat2euler(was_quat)[2]))
@@ -241,14 +245,30 @@ class Episode:
                     log.info(f"could not stand it back up ({type(why_up).__name__}: {why_up})")
         for attempt in range(STANCE_ATTEMPTS):
             try:
-                pose = self.sim.place_robot_for(*names, avoid=avoid)
-            except RuntimeError as e:
-                log.info(f"{e}; widening the search to {REACH_FAR} m")
                 try:
-                    pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid)
-                except RuntimeError as far:
-                    self.records.append({"stand_for": list(names), "error": str(far), "step": self.sim.n_steps})
-                    raise Unreachable(str(far)) from far
+                    pose = self.sim.place_robot_for(*names, avoid=avoid)
+                except DriveFailed:
+                    raise
+                except RuntimeError as e:
+                    log.info(f"{e}; widening the search to {REACH_FAR} m")
+                    try:
+                        pose = self.sim.place_robot_for(*names, reach=REACH_FAR, avoid=avoid)
+                    except DriveFailed:
+                        raise
+                    except RuntimeError as far:
+                        self.records.append({"stand_for": list(names), "error": str(far), "step": self.sim.n_steps})
+                        raise Unreachable(str(far)) from far
+            except DriveFailed as gone:
+                # The third outcome a teleport never had: the stance was chosen but not reached. It is a stance to
+                # avoid, and the search runs again from wherever the drive stopped.
+                avoid.append((gone.x, gone.y))
+                self.records.append(
+                    {"stand_for": list(names), "drive": gone.result, "error": str(gone), "step": self.sim.n_steps}
+                )
+                if attempt + 1 < STANCE_ATTEMPTS:
+                    log.warning(f"{gone}; standing somewhere else ({attempt + 1}/{STANCE_ATTEMPTS})")
+                    continue
+                raise Unreachable(f"no stance for {list(names)} was reached: {gone}") from gone
             avoid.append((pose["x"], pose["y"]))
             self.sim.hold(self.args.settle_steps, self.sim.last_gripper)  # a held object keeps its gripper closed
             level, why = self.sim.settled_level(pose["x"], pose["y"])
@@ -722,7 +742,22 @@ def parse_args(argv=None, require_strategy: bool = True) -> argparse.Namespace:
         action="store_true",
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",
     )
+    p.add_argument(
+        "--locomotion",
+        choices=("drive", "teleport"),
+        default="drive",
+        help="how the base reaches a stance: 'drive' through nav2py on the challenge's velocity-controlled base "
+        "(drive.py), 'teleport' places it there (the stand-in every number before 2026-09-17 was measured with)",
+    )
+    p.add_argument(
+        "--nav-map-root",
+        default=None,
+        help="directory holding <scene>/navigation_2d/ (the 3dmap artifact the drive plans on); required with "
+        "--locomotion drive",
+    )
     args = p.parse_args(argv)
+    if args.locomotion == "drive" and not args.nav_map_root and not args.summarize:
+        p.error("--locomotion drive needs --nav-map-root")
     # A task description is what the RUNNER needs to sequence a task; a tool that only loads the scene (the
     # drawer rig, a probe) needs none, and refusing to parse its arguments kept those tools to the eight tasks
     # that happen to have been written up (2026-09-13).
@@ -770,6 +805,10 @@ def main(argv=None) -> None:
         if press_client is not None:
             planners["right"] = (press_client, press_meta)
         sim = build_r1pro_sim(args, metadata["embodiment"], max_steps=max_steps)
+        if args.locomotion == "drive":
+            from omnigibson.tiptop.drive import BaseDriver
+
+            sim.driver = BaseDriver(sim, args.nav_map_root)
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
         strategy = strategy_for(
@@ -787,6 +826,7 @@ def main(argv=None) -> None:
             sim.reset_embodiment(metadata["embodiment"])
             knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             metrics = [AgentMetric(human), TaskMetric(human)]
+            sim.drives, sim.drive_failures = 0, 0
             sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps)  # from here on every step counts
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")
             if video is not None:
@@ -849,7 +889,11 @@ def main(argv=None) -> None:
                     "max_steps": max_steps,
                     "wall_time_s": round(time.time() - t0, 1),
                     "knowledge": knowledge.report(),
+                    "grasping_mode": args.grasping_mode,
+                    "locomotion": args.locomotion,
                     "teleports": sim.teleports,
+                    "drives": sim.drives,
+                    "drive_failures": sim.drive_failures,
                     "goal": goal,
                     "video": None if video is None else str(Path(video.path).relative_to(out_dir)),
                     "rounds": episode.records if episode is not None else [],
@@ -860,7 +904,8 @@ def main(argv=None) -> None:
             results.append(result)
             log.info(
                 f"RESULT instance {instance_id}: q_score {result.get('q_score', {}).get('final')} success {success} "
-                f"steps {steps}/{max_steps} ({reason}); teleports {sim.teleports}; {result['bench']['wall_time_s']}s"
+                f"steps {steps}/{max_steps} ({reason}); teleports {sim.teleports}, drives {sim.drives} "
+                f"({sim.drive_failures} failed); {result['bench']['wall_time_s']}s"
                 + (f"; {what_failed(result)}" if not success else "")
             )
             write_summary(out_dir, args, results, max_steps)
@@ -883,6 +928,7 @@ def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> d
         "mode": args.mode,
         "knowledge": args.knowledge,
         "grasping_mode": args.grasping_mode,
+        "locomotion": args.locomotion,
         "rounds": args.rounds,
         "max_steps": max_steps,
         "instances": len(results),
@@ -896,6 +942,8 @@ def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> d
                 "steps": r["steps"],
                 "reason": r["bench"]["reason"],
                 "teleports": r["bench"]["teleports"],
+                "drives": r["bench"].get("drives", 0),
+                "drive_failures": r["bench"].get("drive_failures", 0),
                 "wall_time_s": r["bench"]["wall_time_s"],
                 "what_failed": what_failed(r),
             }

@@ -122,13 +122,15 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="choose the base pose once so every ITEM and the TARGET are in the left arm's reach; a single name "
         "for a one-object task (navigation stand-in; alternative to --near / --robot-pose)",
     )
+    from omnigibson.tiptop.knowledge import SOURCES  # the registry: the bridge's sources plus the simulator's oracle
+
     p.add_argument(
         "--knowledge",
         default="oracle",
-        choices=["oracle", "onboard"],
+        choices=sorted(SOURCES),
         help="what the planner is told beyond the image: 'oracle' reads the simulator (instance masks, button poses; "
         "privileged, for development), 'onboard' sends only the task's object names, the goal and the gripper "
-        "state, and the planner's detector does the rest",
+        "state, and the planner's detector does the rest; the choices follow knowledge.py's registry",
     )
     r1.add_argument(
         "--seg-instance",

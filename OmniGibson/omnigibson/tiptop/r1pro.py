@@ -326,6 +326,18 @@ SHIFT_LIMIT = 0.02  # m it may slide while settling before the same is true
 # last one was adopted. It was then measured at 7967 of an episode's 16946 steps and removed for a day, but the
 # cost was ramping it at the CAPTURE cap of 0.6 rad/s; folding in over the robot's own base is the opposite
 # motion, runs at travel speed and costs about a quarter as much. See place_robot for the full write-up.
+BASE_MAX_LINEAR, BASE_MAX_ANGULAR = 0.75, 1.0  # m/s, rad/s: eval/r1pro.yaml's base command_output_limits
+
+
+class DriveFailed(RuntimeError):
+    """The base could not be driven to a stance (``move_base`` with a driver): the third outcome a teleport never
+    had. ``x, y, yaw`` is the stance asked for and ``result`` the driver's report."""
+
+    def __init__(self, x: float, y: float, yaw: float, result: dict):
+        super().__init__(f"could not drive to ({x:.2f}, {y:.2f}): {result.get('state')} {result.get('reason') or ''}".strip())
+        self.x, self.y, self.yaw, self.result = float(x), float(y), float(yaw), result
+
+
 FOLD_OVERHANG = 0.07  # m the folded upper body still reaches beyond the base: what the teleport actually lands as
 # Opening a container: how finely the joint's path is followed, and the holds around it. The steps matter more
 # than they look -- the hand is holding the link, so a coarse path drags it through poses its joint does not
@@ -560,11 +572,15 @@ def make_r1pro_env_config(
                     },
                 },
                 "controller_config": {
-                    "base": {
+                    "base": {  # the challenge's own base controller (eval/r1pro.yaml): a stance is driven to
                         "name": "HolonomicBaseJointController",
-                        "motor_type": "position",
-                        "command_input_limits": None,
-                        "command_output_limits": None,
+                        "motor_type": "velocity",
+                        "vel_kp": 150,
+                        "command_input_limits": [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
+                        "command_output_limits": [
+                            [-BASE_MAX_LINEAR, -BASE_MAX_LINEAR, -BASE_MAX_ANGULAR],
+                            [BASE_MAX_LINEAR, BASE_MAX_LINEAR, BASE_MAX_ANGULAR],
+                        ],
                     },
                     "trunk": dict(jc),
                     "arm_left": dict(jc),
@@ -671,6 +687,9 @@ class R1ProSim(TiptopSim):
         self.q_home = None
         self.blocked_swings = 0  # capture swings stopped against something this instance (see capture)
         self._scene_meshes = {}  # object name -> (box stamp, world trimesh) for the arm's collision check
+        self.driver = None  # a drive.BaseDriver: move_base drives when set, teleports when not
+        self._base_command = None  # body-frame (vx, vy, wz) for this step's base action (step_base); None holds still
+        self.drives, self.drive_failures = 0, 0  # base drives this episode, and those that did not arrive
         self._init_state()
         # The challenge evaluator (and JoyLo) give the base 250 kg; with the asset's default mass the leaning
         # challenge torso posture tips the whole robot over backwards.
@@ -1619,7 +1638,10 @@ class R1ProSim(TiptopSim):
             pose, chosen, jaw_world = self.stance_for_grasp(obj, grasps, arm=arm)
             if pose is None:
                 return {"opened": False, "why": f"no stance in front of {name} lets the arm reach its handle and pull"}
-            self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
+            try:
+                self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
+            except DriveFailed as why:
+                return {"opened": False, "why": f"the opening stance was not reached: {why}"}
             self.hold(OPEN_SETTLE_STEPS, self.OPEN)
         # solve from where the robot actually stands (a teleport settles a little off the pose asked for), seeded
         # from the ready posture as the stance search was, not from the travel fold the arms are in now
@@ -1938,8 +1960,10 @@ class R1ProSim(TiptopSim):
             )
 
     def place_robot(self, x: float, y: float, yaw: float, note: str = "", unfold: bool = True) -> dict:
-        """Teleport the base to a floor pose (the navigation stand-in). OmniGibson moves an object held by the
-        grasp assist along with the robot, so a carried object stays in the gripper.
+        """Move the base to a floor pose -- a drive when ``self.driver`` is set, else a teleport (the navigation
+        stand-in) -- and return where it actually stands. OmniGibson moves an object held by the grasp assist along
+        with the robot, so a carried object stays in the gripper. Raises ``DriveFailed`` when a drive does not
+        arrive; a teleport always does.
 
         The arms come in over the base for the teleport (``fold_for_travel``) and go back out only if the way back
         is clear (``unfold_after_travel``). A teleport does not sweep -- it materialises the robot wherever it
@@ -1954,6 +1978,9 @@ class R1ProSim(TiptopSim):
         """
         unfold_to = self.fold_for_travel()
         self.move_base(x, y, yaw)
+        # A drive arrives near, not at; everything below and every caller reads where the base actually is.
+        pos, quat = self.base_pose()
+        x, y, yaw = float(pos[0]), float(pos[1]), float(T.quat2euler(quat)[2])
         self.look_target, self.look_names = None, ()  # a base-frame target from the previous pose means nothing here
         # third-person view for the overview camera (video, Rerun mirror) and the Isaac Sim viewport when there is
         # one: over the robot's left shoulder at the workspace ("shoulder"), or from ahead and to the right looking
@@ -2007,18 +2034,25 @@ class R1ProSim(TiptopSim):
         +-1.0 rad/s in yaw, so a stance can only ever be driven to. ``best_base_pose`` still chooses WHERE, and is
         pose-invariant, so it survives that change untouched.
 
-        Three things a teleport gives callers for free that a drive does not, all of which are assumptions
-        somewhere else in this file rather than here:
-          * it is EXACT -- ``place_robot`` returns the requested pose, and the avoid list, ``settled_level`` and
-            ``last_level`` all read it as where the robot is. A drive arrives near, not at; those four readers
-            want the measured pose (``base_pose``) once that is true.
-          * it is INSTANT -- no steps pass, so nothing in the scene moves while the robot travels.
-          * it ALWAYS ARRIVES -- there is no "could not get there", so no caller handles one.
+        Three things a teleport gives callers for free that a drive does not:
+          * it is EXACT -- a drive arrives near, not at, so ``place_robot`` returns the MEASURED pose and the avoid
+            list, ``settled_level`` and ``last_level`` read that.
+          * it is INSTANT -- a drive spends env steps of the episode's budget, and the scene moves meanwhile.
+          * it ALWAYS ARRIVES -- a drive raises ``DriveFailed``, which the stance search treats as a stance to avoid.
+        With ``self.driver`` set (bench --locomotion drive) this drives through nav2py (drive.py); without, it
+        still teleports, so a like-for-like run against the teleport numbers stays one flag away.
         """
-        quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
-        self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
-        self.robot.keep_still()
-        self.teleports += 1
+        if self.driver is None:
+            quat = T.euler2quat(th.tensor([0.0, 0.0, float(yaw)]))
+            self.robot.set_position_orientation(position=th.tensor([x, y, 0.0]), orientation=quat)
+            self.robot.keep_still()
+            self.teleports += 1
+            return
+        result = self.driver.drive(x, y, yaw, hold_q=[float(v) for v in self.q_arm()], gripper=self.last_gripper)
+        self.drives += 1
+        if not result["arrived"]:
+            self.drive_failures += 1
+            raise DriveFailed(x, y, yaw, result)
 
     def log_teleport_contacts(self) -> dict:
         """MEASUREMENT ONLY (dev/stance, 2026-09-14): what the robot is physically touching right after a teleport
@@ -3375,8 +3409,22 @@ class R1ProSim(TiptopSim):
         a[idx[f"gripper_{self.arm}"]] = float(gripper)
         a[idx["arm_right"]] = th.tensor([targets[j] for j in self.robot.arm_joint_names["right"]], dtype=th.float32)
         a[idx[f"gripper_{self.other_arm}"]] = float(self.other_gripper)
-        # base: HolonomicBaseJointController in position mode takes deltas, zeros hold the base still
+        # base: the challenge's velocity controller; commands in [-1, 1] scale to its output limits, zeros hold still
+        if self._base_command is not None:
+            vx, vy, wz = self._base_command
+            a[idx["base"]] = th.tensor(
+                [vx / BASE_MAX_LINEAR, vy / BASE_MAX_LINEAR, wz / BASE_MAX_ANGULAR], dtype=th.float32
+            ).clamp(-1.0, 1.0)
         return {self.robot.name: a}
+
+    def step_base(self, base, q_arm, gripper: float):
+        """One env step with the base commanded at body-frame ``base`` = (vx, vy, wz) in m/s and rad/s, the planned
+        joints held at ``q_arm``: the drive's step. Every other step holds the base still."""
+        self._base_command = base
+        try:
+            return self.step(q_arm, gripper)
+        finally:
+            self._base_command = None
 
     def view_sensor(self, name: str):
         return self.shadows[VIEW_OPTICS[name]]
