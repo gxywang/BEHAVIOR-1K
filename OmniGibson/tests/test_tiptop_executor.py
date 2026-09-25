@@ -368,3 +368,46 @@ def test_the_motion_audit_gives_a_placenear_target_finger_allowance():
     source = open(__import__("omnigibson.tiptop.r1pro", fromlist=["x"]).__file__).read()
     pattern = re.search(r're\.match\(r"(\^\(Pick[^"]+)"', source)[1]
     assert re.match(pattern, "PlaceNear(bowl_1, grasp0, pose2, sink_1, bowl_1, q1)")[2].strip() == "bowl_1"
+
+
+def test_do_execute_keeps_hold_for_a_stamp_or_a_pour_and_blocks_the_grasp_assist_for_a_push(monkeypatch, tmp_path):
+    """T3 (run.do_execute): a stamp or a pour plays the plan cut by keep_holding (no gripper open, the approach
+    reversed) so the tool stays in the hand; a push, like a press, runs with the grasp assist blocked (a sticky
+    finger would weld the book it slides); a placement does neither."""
+    from types import SimpleNamespace
+
+    import omnigibson.tiptop.executor as executor
+    import omnigibson.tiptop.run as run
+
+    played, calls = [], []
+
+    class Executor:
+        close_eef = None
+
+        def __init__(self, sim, gripper_hold_steps=0):
+            pass
+
+        def execute(self, plan):
+            played.append([s["type"] for s in plan["steps"]])
+            return {"completed": True}
+
+    monkeypatch.setattr(executor, "PlanExecutor", Executor)
+    monkeypatch.setattr(run, "note_hands", lambda *a, **k: None)
+    leg = lambda a, b: {"type": "trajectory", "label": "Place(x, g, p, y, q)", "positions": np.linspace(a, b, 3)[:, None],
+                        "velocities": None, "dt": 0.02}  # fmt: skip
+    plan = {"version": "1.1.0", "q_init": np.zeros(1), "gripper_init": "closed", "steps": [
+        leg(0.0, 1.0), leg(1.0, 1.5), {"type": "gripper", "label": "Place(x, g, p, y, q)", "action": "open"}, leg(1.5, 0.0)]}  # fmt: skip
+    sim = SimpleNamespace(n_steps=0, arm="left", held_objects={}, object_poses_world=lambda: {},
+                          block_grasping=lambda arm: calls.append(("block", arm)), unblock_grasping=lambda: calls.append("unblock"))  # fmt: skip
+    args = SimpleNamespace(goal="", activity=False, gripper_hold_steps=0, no_video=True, grasping_mode="sticky")
+    atom = lambda p, *a: {"predicate": p, "args": list(a)}
+    run.do_execute(sim, args, tmp_path, plan, "t", atoms=[atom("stamp", "brush_1", "shoe_1")], record=False)
+    run.do_execute(sim, args, tmp_path, plan, "t", atoms=[atom("pour", "cheese_1", "dough_1")], record=False)
+    assert played == [["trajectory"] * 4] * 2 and calls == []
+    run.do_execute(sim, args, tmp_path, plan, "t", atoms=[atom("push", "comic_book_3")], record=False)
+    assert played[-1] == ["trajectory", "trajectory", "gripper", "trajectory"] and calls == [("block", "left"), "unblock"]
+    run.do_execute(sim, args, tmp_path, plan, "t", atoms=[atom("on", "book_1", "table")], record=False)
+    assert played[-1] == played[-2] and len(calls) == 2
+    args.grasping_mode = "physical"  # no assist to block
+    run.do_execute(sim, args, tmp_path, plan, "t", atoms=[atom("push", "comic_book_3")], record=False)
+    assert len(calls) == 2

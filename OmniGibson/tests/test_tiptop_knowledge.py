@@ -1223,3 +1223,20 @@ def test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_
     req = _request()
     source.describe(goal, req, {})
     assert req["side_grasp"] == ["book_1"]
+
+
+def test_an_inside_round_names_the_container_that_got_no_region_so_the_planner_keeps_the_footprint_inside_it():
+    """inside(a, b) reaches the planner as on(a, b), which it cannot tell from a book to stack on (E-stack judges a
+    stack by the centre alone, tiptop_run stack_surfaces): a container that got no region is named on `inside`; one
+    with a region is already kept out by its place_surfaces entry."""
+    goal = [{"predicate": "inside", "args": ["book.n.01_1", "wicker_basket.n.01_1"]}]
+    sim = _Sim(_masks(book_1=20, wicker_basket_1=20))
+    req = _request()
+    make_knowledge("oracle", sim, goal).describe(goal, req, {})
+    assert req["inside"] == ["wicker_basket_1"] and "place_surfaces" not in req
+    sim.send_inside = True
+    box = {"dims": [0.1, 0.1, 0.02], "pose": [0.8, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]}
+    sim.inside_regions = lambda atoms, oracle=None: {"wicker_basket_1": box}
+    req = _request()
+    make_knowledge("oracle", sim, goal).describe(goal, req, {})
+    assert "inside" not in req and list(req["place_surfaces"]) == ["wicker_basket_1"]

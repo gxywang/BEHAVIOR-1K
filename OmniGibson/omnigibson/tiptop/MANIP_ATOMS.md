@@ -12,6 +12,41 @@ Data rule every item follows: environment geometry (walls, floors, fixed-base fu
 objects are known only by the points the cameras saw (`scene.seen_boxes`, depth under masks; the planner's perceived
 clouds and hulls); privileged simulator state enters only through `OracleKnowledge` hints, named as such.
 
+## Summary (2026-09-25, end of the build)
+
+- Built, in four tiers and a review fix pass: 27 of the spec's 29 build items. Tier 1 A-assist, E-tip, E-part, E-near,
+  E-conj, E-pressface, E-region; tier 2 F-reader, F-revopen, F-close, E-side, W-seq; tier 3 W-goals, W-ipress, W-dwell,
+  E-yaw, E-stamp, E-knife, N-touch, E-heat, E-aim, E-attach; tier 4 E-level, E-stack, E-6dof, N-push, N-rotate (pour
+  and the recipe). Not built: N-bimanual and N-transport (dropped in DESIGN.md; 2 tasks). cuTAMP: patches cutamp-19 ..
+  cutamp-24 in `tiptop/install/patches/`; the sweep3 source (`runs/collision_audit/sweep3l_20260923/source/cutamp`)
+  plus cutamp-17 .. 24 applied in order `diff -r`-equals `tiptop/cutamp/cutamp`.
+- Tests, all offline: bridge + policy `OmniGibson/tests/test_tiptop_*.py` 468 passed (401 before the branch); planner +
+  cuTAMP `tiptop/tests/` minus `test_tiptop_h5.py` 196 passed, 5 deselected (171 before). Lint: no new ruff findings on
+  the changed OmniGibson files against their versions at the branch base 029240a2b (the 9 that remain predate it);
+  `test_tiptop_protocol.py` re-formatted, the one changed file that was format-clean at the base.
+- Per-task readiness (the table at the end, from `runs/skill_gap_20260924/atomic/per_task.json`): 98 of 100 tasks have
+  every build item they were blocked on; putting_away_Halloween_decorations needs N-bimanual, carrying_out_garden_furniture
+  N-transport and N-bimanual. "Built" means offline-tested, never run in the simulator.
+- Nothing on this branch has run in the simulator: every item is unit-tested, replayed on recorded requests (CPU) or
+  probed with a few cuRobo tensors on GPU 2. What needs a sim run once the eval frees GPUs, in order:
+  1. A planned-grasp run under `--grasping-mode assisted` (A-assist, E-tip, E-part, E-side): the 13 step-1 tasks and
+     the thin-sheet probe (tiles, eraser, paintbrush, magazine, jigsaw), judged by `read_run.py` against sweep4. The
+     questions: do the part grasps and side grasps weld (two fingers and the ray), does the fingertip touch pass the
+     bridge's validation and the sim, does E-part take what the sticky press used to take.
+  2. The kitchen chain (tier 2): freeze_fruit or storing_food (petcxr / dszchb): open -> side pick -> stance reuse ->
+     push close; store_honey for the drawer path; one place into a bookcase bay with a side-grasped item.
+  3. The goal sub-plans (tier 3): clean_a_keyboard (stamp, keep_holding), wash_a_baseball_cap (load, push close,
+     in_place press), halve_an_egg (cut in the open fridge), cook_bacon (heat region, knob press, dwell), freeze_pies
+     (the dwell), one attach round (the camera on its tripod) and one aim round (the atomizer).
+  4. Tier 4: sorting_books_on_shelf (a flat book pushed to the edge, the overhang pinch), make_pizza (pour, recipe order),
+     a loaded plate carried under `level`, roses into a vase on end.
+- Known gaps no sim run closes by itself (the tiers' open lists, still open): (1) `Episode.support_of` answers the floor
+  for an item on a shelf inside a shut container, so W-seq's source open never fires live (the Kitchen fake answers from
+  the :init); (2) `OracleKnowledge.appeared()` names only :init futures, so four dicing tasks stop after the slice and
+  make_pizza's recipe cannot fire; (3) every recorded book-on-book round has the placing hand inside the bookcase at the
+  place pose (compartment reach); (4) curobo imports from the main tree's editable install even under the worktree
+  PYTHONPATH. The review outcome and the per-task table are at the end of this file.
+
 ## Tier 1 (2026-09-24): A-assist, E-tip, E-part, E-near, E-conj, E-pressface, E-region, auto spec
 
 Commits: c207733 / d91c899e5 (first pass) and this section's second-pass commit in both repos (the near aim uncapped,
@@ -37,7 +72,9 @@ and `cutamp-20-near-aim-half-of-allowed.patch`. Suites after integration: bridge
   `motion_solver._non_contact_spheres` is a line over it), `CostFunction.__init__` (`self._fingers`, a zero-activation
   world checker `world.touch_fn` cached per world), `_validate_rollout` (`self._at_pick`, the Pick timesteps),
   `collision_costs` (at Pick timesteps the finger spheres leave `robot_to_world` with radius -1 and their centres are
-  checked as 1 mm spheres at zero activation: touch, not 1 mm in). `cutamp/motion_solver.py: _validate_lift` (the
+  checked as 1 mm spheres at zero activation: touch, not 1 mm in; since the fix pass, cutamp-24, only against the
+  object's resting supports: against every other static the fingers are checked whole, with those supports switched
+  off for that call). `cutamp/motion_solver.py: _validate_lift` (the
   "robot touches its support" check runs on non-carried, non-finger spheres), the Pick terminal approach (the
   object's `_resting_contacts` disabled for the terminal `plan_pose`, `_validate_contact_motion` per support, re-enabled
   in `finally`, the Push stroke's shape).
@@ -244,7 +281,9 @@ Nothing in this tier ran in the simulator; every "unproven" line below is the sa
   (`solve_pull`'s body check). `bench.py: Episode.open_up(name, 0.0)` routes to it: every joint of the container that
   `is_open` from its closed end is pushed to its `"closed"` value, records get `{"close": name, ...}`, and it returns
   `is_shut(name)`.
-- Reads: the moving link's mesh (fixed: the map); the joint read-back after the push (privileged, as it always was).
+- Reads: the moving link's mesh (the map for a fixed container; for a movable one -- laptop, toolbox, jar -- the
+  same unnamed oracle read `container_grasps` has always made, see the `openable_joints` ponytail note); the joint
+  read-back after the push (privileged, as it always was).
 - Tests: `test_tiptop_articulation.py::test_a_door_open_80_deg_is_pushed_on_the_face_that_trails_its_motion_whichever_way_it_goes`,
   `test_tiptop_presweep_fixes.py::test_closing_pushes_every_open_joint_to_its_closed_end_and_a_roofed_pick_is_marked_for_the_side_grasp`
   (a lid 2 % from its upper closed end is left alone).
@@ -264,8 +303,9 @@ Nothing in this tier ran in the simulator; every "unproven" line below is the sa
   `perception_wrapper.extract_gt_detections` reads the key.
 - cuTAMP (cutamp-21): `motion_solver._lift_height` reads the approach axis from the kinematic state it already
   computes (`ee_pose` @ inverse(`world.tool_from_ee`), column z); |z . up| < 0.7 (within ~45 deg of horizontal; the
-  45 deg edge kind at 0.7071 keeps LIFT_HEIGHT) steps 1 cm up to 5 cm, else the old 5 cm steps to 30 cm. The Place is
-  untouched (approach and retreat along the gripper axis).
+  45 deg edge kind at 0.7071 keeps LIFT_HEIGHT) steps 1 cm up to 30 cm (the 5 cm cap of the first cut went in the fix
+  pass, cutamp-24: a roof is never exempt, so cuRobo refuses a lift into it either way), else the old 5 cm steps to
+  30 cm. The Place is untouched (approach and retreat along the gripper axis).
 - Bridge: `r1pro.py: HAND_STACK = 0.21`, `roof_over(mesh, centre, half, z_lo, z_hi)` (3 x 3 rays up over the
   rectangle's inner half) and `R1ProSim.side_entry(item, container)`: the container must be `fixed_base` (a movable's
   mesh is never read), the rectangle is `inside_rect`'s, the band is [floor + `item_height`, + HAND_STACK + HEADROOM].
@@ -282,7 +322,7 @@ Nothing in this tier ran in the simulator; every "unproven" line below is the sa
 - Tests: `tiptop/tests/test_support_surface_fallback.py::test_a_standing_book_gets_side_grasps_and_side_grasp_makes_them_certain`
   (a 22 x 3 x 30 cm book on edge: 4 side grasps from its two ends, then 1.0 with the label marked, M2T2's 0.6 and an
   unmarked book's 0.2 untouched), `tiptop/tests/test_lift_off_support.py::test_a_side_grasped_lift_stops_at_the_first_clear_centimetre`
-  (5 mm in the desk: LIFT_HEIGHT top-down, 0.01 sideways; 3.5 cm in: 0.04; 15 cm in: the 0.05 cap);
+  (5 mm in the desk: LIFT_HEIGHT top-down, 0.01 sideways; 3.5 cm in: 0.04; 15 cm in: 0.15);
   `test_tiptop_presweep_fixes.py::test_side_entry_is_a_roof_within_the_hand_stack_over_the_item_and_an_open_top_or_a_movable_has_none`,
   `::test_the_stance_a_container_was_opened_from_is_stood_at_again_before_any_search`, the side-mark half of
   `::test_closing_pushes_every_open_joint_...`; `test_tiptop_knowledge.py::test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_from_the_side`;
@@ -637,9 +677,10 @@ push, pour, level carry or book-on-book placement has ever executed.
   the placed object's AABB centre (`get_aabb_from_spheres`: the column the simulator's VerticalAdjacency ray runs
   down, adjacency.py:93-95, on_top.py:43-52) from the OBB shrunk by `placement_shrink_dist` and clamped at 0,
   instead of the per-sphere sum. Two deviations from the spec text, deliberate: the AABB centre, not the sphere
-  centroid (the sim's ray origin); and the 1 cm shrink kept as the in_xy margin, because the live tolerance is 1e-2
-  (planning.py:114), so with no margin a centre 1 cm past the perceived footprint would satisfy and on a true edge the
-  book tips and the ray misses. Clamping instead of shrinking the OBB means a sliver narrower than 2 cm no longer
+  centroid (the sim's ray origin); and the centre's bound is the OBB shrunk by TWO `placement_shrink_dist` (since the
+  fix pass, cutamp-24: the checker's 1e-2 in_xy tolerance, planning.py:114, spends one shrink, so with one alone a
+  centre 1 mm inside the perceived edge satisfied; the other keeps the centre of mass a shrink inside the edge, where a
+  book on a book tips). Clamping instead of shrinking the OBB means a sliver narrower than 2 cm no longer
   raises "Shrunk OBB ... half extents <= 0" (28 such plan losses in sweep3's planner logs). The PlaceNear ring uses
   the same unshrunk OBB.
 - Planner (`tiptop_run.create_tamp_environment(fixed=)`): `env.stack_surfaces` = {perceived on() targets} minus the
@@ -769,3 +810,289 @@ push, pour, level carry or book-on-book placement has ever executed.
   under `--grasping-mode assisted`: sorting_books_on_shelf (a push of a flat book, the board above, the overhang
   pinch), make_pizza (pour, recipe order), a loaded plate carried under `level`, and roses into a vase on end.
 - curobo still imports from the main tree's editable install (tier 2 note); nothing in this tier touches it.
+
+## Review outcome and fix pass (2026-09-25)
+
+Four review agents (bridge, policy, planner server, cuTAMP; a compliance grep and a mutation pass over the tests) read
+the branch after tier 4; a skeptic pass then refuted or confirmed each finding, and one coder per area fixed what was
+confirmed. Nothing ran in the simulator. The four areas below; the integration notes at the end.
+
+### Bridge
+
+Suite after: bridge 467 passed. Scratch: `runs/manip_atoms_20260924/fix-bridge/`.
+
+- N-push (`push_face`): a push needs an item wider than the jaw both ways (HANDLE_JAW - HANDLE_JAW_MARGIN: a die,
+  a stapler, a banana, an ice cube are pinched as they are) and the board's edge within PUSH_MAX_DEPTH 0.5 m of
+  stroke (a board game 1.2 m down a bed, a tray 2.3 m down a bar: not a compartment). The edge is found on the
+  board itself: rays down onto its top along the stroke to where they stop landing, or the wall the stroke meets
+  first. The old ray from 5 mm inside the board missed otwukr's thinner shelves on EVERY recorded book, so the
+  box-corner fallback the review objected to was what pushed the books (`push_probe.py`); it is gone. NOT the
+  review's roof-within-the-hand-stack test: sweep4's books sit 25-28 cm under the next board (`push_gates.out`),
+  more than HAND_STACK + HEADROOM, and that gate refused every one of them; the push is for what a pinch cannot
+  take, roof or no roof. Replay over sweep4's first three holding rounds per episode
+  (`push_false_positives_after.out` against the review's `push_false_positives.out`): 38 book pushes as before
+  (two swapped: a 6 cm-wide comic is pinched as it is, and the real edge moves two books across the overhang line),
+  at 0.02-0.15 m to the shelf's real edge (the box corner had them 0.08-0.44), and of the 16 that were not books
+  one stays: a 23 x 20 cm board game pushed 8 cm to the bed's edge (0.9 m before), which is what a pinch needs of it.
+- E-6dof (`inside_region`): stood on end only when the diagonal of the two longest seen extents is longer than the
+  rectangle's (it lies at no angle) AND its centre on end stays under the ceiling, where the scorer's Inside looks
+  for it (was: longest extent against the narrower side, which stood a 22 x 18 cm puzzle 22 cm tall in a
+  25 x 18.8 x 11.6 cm toy box it had been placed into flat). A 12 x 10 cm cheese slice in a 10 x 11 cm basket
+  rectangle still stands: it fits the rectangle no way round, and the planner keeps the whole footprint inside a
+  region. `upright_rule_fixed.out` replays the rule over sweep4's inside rounds against the review's
+  `upright_rule.out`.
+- E-level (`place_robot`): carrying a level load the arm is not folded for the teleport and not unfolded after (the
+  fold tips a load held level 60 deg on the way, fold_tilt.out); `level_held(arm)` is the one test the three guards
+  share.
+- E-knife (`knife_region`): a strip (food + knife length) along the world axis nearest the knife's long axis by
+  (food + knife width) across, the knife turned onto it (rotation about z, STAMP_YAW_TOL): every accepted placement
+  crosses the food (`knife_strip_miss.out`: 0.0% miss; the square let 31-36% lie beside it).
+- E-side / W-seq (`bench.stand_for`): the reused opening stance sets the look target again (`R1ProSim.look_at`, which
+  `place_robot_for` uses too); `place_robot` clears it, and the captures were aiming at the holding hand.
+- F-revopen: the edge grip comes DOWN over the panel and leaves upward (`approach` on the grasp dict, up for the
+  edge; `solve_pull`'s standoff, `close_on`'s nudge and the retreat follow the plan's `approach`); its tips and
+  `push_grasps`' column come from the link's extent along the face's up, not `handle_on`'s vertex mean (26 cm off on
+  gjeoer); a lid's partial pull is refused (`min_fraction` = LID_FRACTION: released short of balance it falls shut and
+  the shut underside is inside the box for the push); the push continuation runs only on a pull that stopped SHORT.
+- F-close (`push_joint`): the push runs under `block_grasping(arm)` (sticky welds what one closed finger touches for
+  0.3 s, and nothing opened the hand after).
+- Compliance: `inside_rect` takes the item's height from the captures' points (`item_height`), never its simulator
+  AABB (`side_entry` built on that read).
+- Cleanups: `box_corners` for every corner enumeration (no `itertools`), `Rotation.align_vectors` in
+  `upright_rotation`, `stamp_region` / `attach_target` extents as `|R| @ half`, VACUUM_HOVER deleted,
+  `OracleKnowledge.particles(target)`, `bench.fixture_for` on the cached `strategies.taxonomy()`, `tilt_wrist(arm)`
+  and `bay(link, lo, hi, near)` without the knobs nobody set.
+- Tests added: push false positives, the level fold, the push hint's depth, the region routing and aim yaw, the
+  petcxr bay through `inside_rect`, region rotations on a turned base, `tilt_wrist`; `container_grasps` under both
+  grasp modes on a top-heavy door, `solve_pull`'s standoff and the lid rule, the overshoot, the blocked push,
+  `openable_joints` on a fake object; `Episode.satisfied` for intents and attached, `do_execute`'s keep-hold and
+  push block, a covered goal's aim; the Kitchen fake no longer answers runner-only predicates.
+- Not done: PT-4 (`joint_frame`'s wxyz round trip lives in `b1k/bridge/articulation.py`, policy); C3 stays a
+  documented deferral (the movable's joints and moving-link mesh are the reads `container_grasps` always made).
+
+### cuTAMP (`install/patches/cutamp-24-fingers-against-statics-lift-uncapped-stack-inset.patch`)
+
+Suite after: planner 196 passed, 5 deselected. Scratch: `runs/manip_atoms_20260924/fix_cutamp/`. The review's finding on
+each tier-1..4 cuTAMP item, and what changed:
+
+- E-tip (`cost_function.py`): the fingers are points only against the object's resting supports; against every other
+  static they are checked whole, with those supports switched off on the shared checker for that call (`_grasp_exempt`:
+  grasp -> the picked object's resting statics, from `motion_solver._resting_contacts`; `enable_obstacle` toggles, no
+  second checker). Confirmed by a cuRobo probe (`probe_wall3.out`, r1pro_left MotionGen on GPU 2): a fingertip 3 mm into
+  a 6 cm slab behind the object at the Pick goal fails the terminal plan IK_FAIL 3/3 (0 mm: 3/3), so a particle the old
+  point check scored 0 was never plannable; the tips lead the palm only along the approach axis (69 mm), so the wall a
+  finger can be in with the palm clear is the one behind the object. Test:
+  `test_movable_surface_cover.py::test_at_the_pick_a_fingertip_may_touch_the_desk_and_the_palm_may_not` gains a
+  backsplash (a finger 6 mm in -> > 0 at the Pick, was 0; in the desk still 0; the desk back on after).
+- E-side (`motion_solver._lift_height`): the 5-step cap is gone; a near-horizontal grasp steps 1 cm up to 30 cm. A
+  roof is never exempt, so cuRobo refuses a lift into it either way; the cap only turned "first clear centimetre" into
+  "fail past 5 cm". Replay `corn_first_clear.out` (sweep4 sorting_vegetables_i1 13-22-23, sweet_corn_2 on bok_choy_3,
+  the real `_resting_contacts` / `_obstacle_cost` on the recorded env): first clear centimetre 0.12 m; the cap returned
+  0.05 with the cover still inside, which `_validate_lift` refuses. No recorded pick is shown to be won by it (that corn
+  round was refused by the bridge for the head camera anyway).
+- E-stack (`cost_function.py`): `bound = half - 2 * shrink`, clamped at 0. The comment had called one shrink the
+  margin, but the checker's 1 cm tolerance spent all of it: a centre 1 mm inside the perceived edge satisfied. Now a
+  centre 2 cm inside costs 0.0, 5 mm inside 0.015 (refused); a sliver target still collapses to its centre line. Test
+  expectations updated (sample fractions loosened for 64 unseeded draws).
+- N-push (`motion_solver.py` Push): `push_depths` is bound once; a client's stroke slides the button and its host ahead
+  of the hand (the palm ends 7 cm past the face, where the book was), so after the stroke and the way back only the
+  host's resting supports (`unmoved`) are validated; a real button (no client depth) still validates button, host and
+  supports. `test_a_push_stroke_travels_the_asked_depth_with_the_hosts_supports_exempt` records the checked names and
+  asserts `["board", "board"]`.
+- Test gaps the review found (T9, T10, T11), closed: the level hold is asserted on exactly the Place's three legs of
+  nine over a six-operator skeleton; the MotionGen level test uses a motion the plain query cannot pass (yaw -90 deg,
+  15 cm forward, 20 cm down: plain tilts 9-14 deg, level 0.35-0.5 deg, 3 runs each, `probe.out` / `probe3.out`; the
+  5 deg bound unchanged); the bottle test runs `RolloutFunction` and asserts the Place carries the region's R (the y
+  axis up, the approach along the turned z); a Pick's event order is asserted (approach plan, supports off, terminal
+  plan, checked, on; then off / lift / on; the wall never off). `rollout.place_pose` writes the rotation block in place
+  (-3 lines).
+- Not chased: the probe's approach plans fail IK at 6-9 mm penetration for a reason nobody followed (the 3 mm terminal
+  failure is what the finding needed). `present_held`'s LEVEL_TILT (bridge) has no test of its own.
+
+### Planner server (`tiptop/tiptop_run.py`, `planning.py`, `perception_wrapper.py`)
+
+Scratch: `runs/manip_atoms_20260924/fix-server/` (11 of 11 one-edit mutants killed, each by the intended test alone).
+
+- `inside` on the wire: the request may carry `inside: [labels]`, the on() targets the item goes INTO (an inside()
+  container the client sent no region for; the wire maps inside / pour / stamp / ... all to on(), so
+  `create_tamp_environment` could not tell such a container from a book to stack on). `extract_gt_detections` parses
+  it, `run_perception` hands it on, `create_tamp_environment(inside=)` subtracts it from `env.stack_surfaces`. Confirmed
+  from the code: the bridge's refused-region retry, its container-also-support case and an `inside_rect` None all sent
+  inside() with no region, and under the stack rule the acceptance is the centre within the shrunk footprint at
+  tolerance 1e-2 (a centre on the rim passes; the per-sphere rule kept the whole item over the shrunk footprint). The
+  one recorded case never ran the optimiser (250/256 satisfying at init), so no rim placement is on record: the rule
+  was fixed, not a measured regression. With the key absent nothing changes; the bridge half is below.
+- `run_planning` deep-copies the stock tolerance dicts: its first call used to write the 2e-3 NearPlacement tolerance
+  into cuTAMP's module-level default (every call set the same values, so no plan changed; the stock dicts stay stock).
+- `weld_ok` / `part_grasps` read `JAW`; the `jaw` parameter and its 11 call sites are gone.
+- Tests added: `test_hidden_held_geometry.py::test_the_requests_knowledge_reaches_the_scene_and_the_env` (run_perception
+  end to end: a standing book's 4 side grasps at 1.0, a bin's 8 edge grasps at PART_GRASP_CONFIDENCE, `env.level`,
+  `env.push_depths` from a button's depth, `env.stack_surfaces` empty through `fixed` and `inside`; the test patches
+  `fingertip_in_tool` to r1pro's press point, since the test config's fr3 has no container press point),
+  `test_serialize_plan.py::test_run_planning_refuses_a_near_placement_past_the_aimed_gap` (the recorded 4.4 cm soda-can
+  cost refused at 2e-3, accepted by the stock dicts), `test_support_surface_fallback.py::test_the_support_is_the_fitted_plane_for_an_object_resting_on_it`
+  (a RANSAC plane with 1 mm noise under the picking_up_toys puzzle box: 8 corner grasps, tips at 0.012 - RAY_BEHIND_TIPS
+  + 0.001, identical to `support_z=0.0`; the two mutants give 0), `test_inside_region.py` (a can on a bucket named
+  `inside` is no stack surface; the wire keeps `inside`).
+
+### Policy (`b1k/bridge/strategies.py`, `articulation.py`, `protocol.py`)
+
+Scratch: `runs/manip_atoms_20260924/fixpass-policy/` (`before_after_dryrun.diff`: every task's problem0.bddl on the
+Kitchen fake with the LIVE scope, i.e. no synthesized halves and no substance in the scope, before vs after).
+
+- `Runner.transfer`: the target container's own enclosure is opened first (`reach_into(container)` before `open_up`):
+  can_meat's jars sit shut inside a shut cabinet, and a lid is not reached through the door (dry run: open(cabinet_1)
+  -> open(hinged_jar_2) -> ..., was the jar first). `reach_into` opens outermost first (a tupperware's lid is not
+  reached through the fridge door). The source open still walks `Episode.support_of` (open item 1 above).
+- `Runner.warm`: a toggleable heat source without a door (the lighter) is switched on at rest BEFORE anything is set on
+  it, since its button is on the face the newspaper would cover; an openable one (microwave, oven) still after loading,
+  shut first. on_fire: the firewood the goal places on the newspaper is not carried to the lighter (setting_the_fire:
+  press on, newspaper to the lighter, dwell, firewood onto the newspaper, press off). cook_bacon / cook_broccolini /
+  cook_cabbage now press the stove before the tray or pan goes on it.
+- `Runner.cut`: contains(bag, cooked__popcorn): the raw popcorn is a substance no hand carries and the scope never
+  lists, so the container filled with it is what is cooked (make_microwave_popcorn: open(microwave) -> bag inside ->
+  close -> press -> dwell; was "no popcorn to cut"). `Runner.recipe`: a substance input (the grated cheese) is matched
+  through the container the episode reads as `filled` with it, named `<synset>_1`; inputs and counts are by synset,
+  not category. On the live scope make_pizza's simple_pizza now fits (before: "no cut, cook or recipe makes it").
+- `Runner.clean`: a stamp pass stops when the budget share is spent and placements remain (polishing_shoes: a particle
+  no flat stamp reaches cost every round left; 35 of 300 shoes). `Runner.dwell(final=True)` for the run's last wait is
+  bounded by the steps left alone, not the 0.6 share (the pies froze in none of the runs that reached it past the
+  share, 7286 steps unused); `budget_spent(ep)` is the one test both read.
+- `has_ability` answers a scene name (stove_ykretu_0, `Episode.fixture_for`'s) by its category's synset.
+- `articulation.opening_travel` / `is_open` take `closed` (the reader always supplies it); the undirected fallback
+  branches are deleted. `protocol.FLOOR_CATEGORIES` += "driveway" (chopping_wood stands on one).
+- Dry run: 0 of 100 raise; the rounds change on can_meat, cook_bacon, cook_broccolini, cook_cabbage,
+  make_microwave_popcorn, make_pizza and setting_the_fire, nowhere else.
+
+### Integration (final)
+
+- `inside`, the bridge half: `OracleKnowledge.describe` writes `request["inside"]` = the containers of the round's
+  inside() atoms (tracked labels) minus the labels that got a region; `protocol.KNOWLEDGE_JSON_KEYS` and
+  `request_from_observation` carry it, so an `obs.h5` replays it. Tests:
+  `test_tiptop_knowledge.py::test_an_inside_round_names_the_container_that_got_no_region_so_the_planner_keeps_the_footprint_inside_it`,
+  the `inside` half of `test_tiptop_protocol.py::test_the_side_grasp_labels_survive_the_h5_so_a_side_entry_round_replays_exactly`.
+- Suites: bridge 468 passed; planner 196 passed, 5 deselected (`runs/manip_atoms_20260924/final/*.out`).
+- Lint: `ruff check` on the changed OmniGibson files vs their versions at 029240a2b: no new findings; 9 pre-existing
+  (unused imports in `bench.py` and `r1pro.py`, the F405 in `knowledge.py`, the F811 in `test_tiptop_knowledge.py`).
+  `ruff format --check`: 10 of the changed files were already unformatted at the base (the `# fmt: skip` style) and
+  are left so; `test_tiptop_protocol.py` was clean and is clean again.
+- Compliance grep of the branch diff (both repos) for object-mesh reads and privileged state: every added
+  `collision_mesh_world` / `mesh.vertices` read in the bridge is behind `obj.fixed_base` (`side_entry`, `push_face`,
+  `shelf_of` through `inside_rect`, `heat_region`) or on the oracle route (`button_world` <- `button_hints` <-
+  `OracleKnowledge.describe`; the button's face is oracle class in DESIGN 1.1); the moving-link meshes of
+  `container_grasps` / `push_grasps` are the documented deferral (a movable container's joints and link mesh, the read
+  `container_grasps` always made); `look_at`'s `aabb_center` and `rests_against`'s `obj.aabb` are pre-branch reads
+  moved out of `place_robot_for` / `lift_held`. The planner and cuTAMP diffs add no mesh read. Privileged state outside
+  `knowledge.py`: `Episode.after_transition` -> `knowledge.appeared()`; `inside_regions(oracle=)` -> `particles`,
+  `projection_box`, `heat_link`, `nozzle`, `attach_frames`; `ToggledOn` only inside `button_world`.
+- cuTAMP series: cutamp-24 is the snapshot-to-source diff of `cost_function.py`, `motion_solver.py`, `rollout.py`;
+  the pre-branch source plus cutamp-17 .. 24 in order equals `tiptop/cutamp/cutamp` (`diff -r`, no differences).
+
+## Per-task readiness
+
+From `runs/skill_gap_20260924/atomic/per_task.json` against the items built. Class: 1 pick/place with existing atoms,
+2 pick/place with extensions, 3 pick/place plus press or articulation, 4 a new atom. "Built" is offline-tested only:
+nothing has run in the simulator. Bold marks an item not built. The caveats are the open items above, by task.
+
+| task | class | build items it was blocked on | status |
+|---|---|---|---|
+| assembling_gift_baskets | 2 | A-assist, E-part | built |
+| attach_a_camera_to_a_tripod | 2 | A-assist, E-yaw, W-goals | built |
+| boxing_books_up_for_storage | 4 | A-assist, N-push | built |
+| boxing_food_after_dinner | 3 | A-assist, E-side, W-seq, F-reader, F-revopen, F-close | built; source open (open item 1): items start inside a shut container |
+| bringing_in_wood | 1 | A-assist | built |
+| bringing_paper_to_recycling | 3 | A-assist, E-tip, E-part, F-reader, F-revopen, F-close, W-seq | built |
+| bringing_water | 3 | A-assist, E-side, W-seq, F-reader, F-revopen, F-close | built; source open (open item 1): items start inside a shut container |
+| can_meat | 3 | A-assist, E-part, E-side, W-seq, F-reader, F-revopen, F-close | built; source open (open item 1): items start inside a shut container |
+| canning_food | 3 | A-assist, E-part, E-side, E-knife, E-level, W-seq, W-goals, F-reader, F-revopen, F-close | built; dice stops after the slice; `filled` / `not contains` have no sub-plan; source open (open item 1): items start inside a shut container |
+| carrying_in_groceries | 3 | A-assist, E-side, E-region, F-reader, F-revopen, F-close, W-seq | built |
+| carrying_out_garden_furniture | 4 | A-assist, **N-transport**, **N-bimanual**, E-region | not built: N-transport, N-bimanual |
+| chop_an_onion | 2 | A-assist, E-tip, E-part, E-knife, W-goals | built; dice stops after the slice (`appeared()` names only :init futures) |
+| chopping_wood | 2 | A-assist, E-part, E-knife, W-goals | built |
+| clean_a_keyboard | 2 | A-assist, E-part, E-stamp, W-goals | built |
+| clean_a_patio | 2 | A-assist, E-stamp, W-goals | built |
+| clean_a_trumpet | 2 | A-assist, E-stamp, W-goals | built |
+| clean_boxing_gloves | 3 | A-assist, E-part, E-side, F-reader, F-revopen, F-close, W-seq, W-ipress, W-goals | built |
+| clean_up_broken_glass | 1 | A-assist | built |
+| clean_up_your_desk | 3 | A-assist, E-tip, E-part, E-side, F-reader, F-close | built |
+| clean_your_rusty_garden_tools | 3 | A-assist, E-stamp, F-reader, F-revopen, F-close, W-seq, W-goals | built; source open (open item 1): items start inside a shut container |
+| cleaning_up_branches_and_twigs | 3 | A-assist, E-part, F-reader, F-revopen | built |
+| cleaning_up_plates_and_food | 3 | A-assist, E-level, E-side, E-region, F-reader, F-revopen, F-close, W-seq | built |
+| clearing_food_from_table_into_fridge | 3 | A-assist, E-part, E-side, E-region, F-reader, F-revopen, F-close, W-seq | built |
+| collecting_aluminum_cans | 1 | A-assist | built |
+| collecting_childrens_toys | 2 | A-assist, E-tip, E-part, E-side | built |
+| composting_waste | 1 | A-assist | built |
+| cook_a_brisket | 3 | A-assist, E-tip, E-part, E-side, E-heat, F-reader, F-revopen, W-seq, W-ipress, W-goals | built; source open (open item 1): items start inside a shut container |
+| cook_a_frozen_pie | 3 | A-assist, E-tip, E-part, E-side, E-heat, F-reader, F-revopen, W-seq, W-ipress, W-goals | built; source open (open item 1): items start inside a shut container |
+| cook_bacon | 3 | A-assist, E-side, E-heat, F-reader, F-revopen, F-close, W-seq, W-ipress, W-goals | built; source open (open item 1): items start inside a shut container |
+| cook_broccolini | 3 | A-assist, E-tip, E-heat, W-ipress, W-goals | built |
+| cook_brussels_sprouts | 4 | A-assist, E-side, N-touch, F-reader, F-revopen, F-close, W-seq, W-ipress, W-dwell, W-goals | built; source open (open item 1): items start inside a shut container |
+| cook_cabbage | 3 | A-assist, E-tip, E-part, E-side, E-heat, E-knife, F-reader, F-revopen, W-seq, W-ipress, W-goals | built; dice stops after the slice (`appeared()` names only :init futures); source open (open item 1): items start inside a shut container |
+| cook_hot_dogs | 3 | A-assist, E-side, E-heat, F-reader, F-revopen, W-seq, W-ipress, W-goals | built; takes the in-scope microwave, not the study's burner route; source open (open item 1): items start inside a shut container |
+| dispose_of_batteries | 1 | A-assist | built |
+| dispose_of_glass | 1 | A-assist | built |
+| freeze_fruit | 3 | A-assist, E-side, W-seq, F-reader, F-revopen, F-close | built; source open (open item 1): items start inside a shut container |
+| freeze_pies | 3 | A-assist, E-tip, E-part, E-side, F-reader, F-revopen, F-close, W-seq, W-dwell, W-goals | built; source open (open item 1): items start inside a shut container |
+| getting_organized_for_work | 2 | A-assist, E-tip, E-part, E-near, E-conj, E-stack | built |
+| halve_an_egg | 4 | A-assist, E-side, N-touch, F-reader, F-revopen, W-seq, W-goals | built; source open (open item 1): items start inside a shut container |
+| hanging_pictures | 2 | A-assist, E-yaw, W-goals | built |
+| hiding_Easter_eggs | 2 | A-assist, E-part, E-region, E-near, E-conj | built |
+| installing_a_fax_machine | 3 | A-assist, E-part | built |
+| installing_a_modem | 3 | A-assist, E-near, E-conj | built |
+| installing_a_scanner | 3 | A-assist, E-part, E-near, E-pressface | built |
+| installing_smoke_detectors | 2 | A-assist, E-tip, E-part, E-6dof, W-goals | built |
+| laying_tile_floors | 2 | A-assist, E-tip, E-part, E-near, E-conj | built |
+| loading_the_car | 3 | A-assist, E-part, F-reader, F-revopen | built |
+| make_cabinet_doors | 2 | A-assist, E-6dof, W-goals | built |
+| make_gift_bags_for_baby_showers | 3 | A-assist, E-tip, E-part, W-seq | built; source open (open item 1): items start inside a shut container |
+| make_microwave_popcorn | 3 | A-assist, E-part, E-heat, W-ipress, W-goals | built; the bag is cooked in the microwave (the raw popcorn is a substance) |
+| make_pizza | 4 | A-assist, E-tip, E-side, E-level, N-touch, N-rotate, F-reader, F-revopen, F-close, W-seq, W-ipress, W-goals | built; the halves get no name live, so the recipe cannot fire (`appeared()`); source open (open item 1): items start inside a shut container |
+| make_rose_centerpieces | 2 | A-assist, E-6dof | built |
+| moving_boxes_to_storage | 2 | A-assist, E-part, E-stack | built |
+| organizing_art_supplies | 2 | A-assist, E-tip, E-part | built |
+| organizing_school_stuff | 2 | A-assist, E-tip, E-part | built |
+| outfit_a_basic_toolbox | 3 | A-assist, F-reader, F-revopen, F-close, W-seq | built |
+| packing_meal_for_delivery | 2 | A-assist, E-part | built |
+| picking_up_toys | 2 | A-assist, E-tip, E-part | built |
+| picking_up_trash | 1 | A-assist | built |
+| polishing_shoes | 2 | A-assist, E-stamp, E-near, E-conj, W-goals | built |
+| preparing_lunch_box | 3 | A-assist, E-tip, E-part, E-side, F-reader, F-revopen, F-close, W-seq | built; source open (open item 1): items start inside a shut container |
+| put_together_a_basic_pruning_kit | 3 | A-assist, F-reader, F-revopen, F-close, W-seq | built |
+| putting_away_Halloween_decorations | 4 | A-assist, E-part, E-region, E-near, **N-bimanual**, F-close, W-seq | not built: N-bimanual |
+| putting_away_toys | 1 | A-assist | built |
+| putting_dirty_dishes_in_sink | 1 | A-assist | built |
+| putting_dishes_away_after_cleaning | 3 | A-assist, E-side, F-reader, F-revopen, F-close, W-seq | built |
+| putting_shoes_on_rack | 2 | A-assist, E-part, E-region, E-near, E-conj | built |
+| putting_up_Christmas_decorations_inside | 2 | A-assist, E-tip, E-part, E-region, E-near | built |
+| re_shelving_library_books | 2 | A-assist, E-tip, E-part, E-side | built |
+| rearrange_your_room | 2 | A-assist, E-part | built |
+| rearranging_kitchen_furniture | 3 | A-assist, E-part, E-side, F-reader, F-revopen, F-close, W-seq | built |
+| scrubbing_bathroom_floor | 2 | A-assist, E-stamp, W-goals | built |
+| set_up_a_coffee_station_in_your_kitchen | 2 | A-assist, E-tip, E-part, E-near | built |
+| setting_mousetraps | 1 | A-assist | built |
+| setting_the_fire | 3 | A-assist, E-tip, E-part, E-side, E-pressface, W-ipress, W-dwell, W-goals | built; the newspaper is lit at the lighter; its fireplace placement is the transfers' |
+| setting_the_table | 4 | A-assist, E-tip, E-side, E-near, N-push, F-reader, F-revopen, W-seq | built; source open (open item 1): items start inside a shut container |
+| setup_a_bar_for_a_cocktail_party | 2 | A-assist, E-near, E-conj | built |
+| slicing_vegetables | 3 | A-assist, E-tip, E-side, E-knife, F-reader, F-revopen, F-close, W-seq, W-goals | built; dice stops after the slice (`appeared()` names only :init futures); source open (open item 1): items start inside a shut container |
+| sorting_books_on_shelf | 4 | A-assist, N-push, E-stack, E-side | built; book-on-book rounds: the placing hand is inside the bookcase at the place pose (compartment reach) |
+| sorting_bottles_cans_and_paper | 2 | A-assist, E-tip, E-part | built |
+| sorting_household_items | 2 | A-assist, E-tip, E-part, E-near, E-conj, E-6dof | built |
+| sorting_vegetables | 2 | A-assist, E-part | built |
+| spraying_for_bugs | 3 | A-assist, E-yaw, W-ipress, W-goals | built |
+| spraying_fruit_trees | 3 | A-assist, E-yaw, W-ipress, W-goals | built |
+| stacking_wood | 2 | A-assist, E-part, E-stack | built |
+| store_batteries | 3 | A-assist | built |
+| store_honey | 3 | A-assist | built |
+| store_produce | 3 | A-assist, E-side, F-reader, F-revopen | built |
+| storing_food | 3 | A-assist, E-part, E-side, F-reader, F-revopen | built |
+| sweeping_garage | 2 | A-assist, E-part, E-stamp, W-goals | built |
+| thawing_frozen_food | 3 | A-assist, E-side, E-level, F-reader, F-revopen, F-close, W-seq, W-dwell, W-goals | built; source open (open item 1): items start inside a shut container |
+| tidying_bathroom | 2 | A-assist, E-part | built |
+| tidying_bedroom | 2 | A-assist, E-tip, E-part, E-near | built |
+| tidying_living_room | 2 | A-assist, E-tip, E-part, E-side | built |
+| turning_on_radio | 3 | A-assist | built |
+| turning_out_all_lights_before_sleep | 3 | E-pressface | built |
+| unloading_the_car | 3 | A-assist, E-part, E-near, F-reader, F-revopen, W-seq | built; source open (open item 1): items start inside a shut container |
+| vacuuming_floors | 3 | A-assist, E-part, E-stamp, W-ipress, W-goals | built |
+| wash_a_baseball_cap | 3 | A-assist, E-part, E-side, F-reader, F-revopen, F-close, W-seq, W-ipress, W-goals | built |
+| wash_dog_toys | 3 | A-assist, E-part, E-side, F-reader, F-revopen, F-close, W-seq, W-ipress, W-goals | built; source open (open item 1): items start inside a shut container |

@@ -58,33 +58,32 @@ def test_rotation_about_a_zero_axis_is_the_identity_not_a_crash():
     assert np.allclose(rotation_about([0.0, 0.0, 0.0], 1.0), np.eye(3))
 
 
-def test_travel_goes_toward_whichever_limit_is_nearer_so_either_hinging_works():
+def test_travel_goes_away_from_the_closed_limit_so_either_hinging_works():
     # a drawer closed at its lower limit opens by going up the range
-    assert opening_travel("prismatic", 0.0, 0.4, position=0.0, fraction=0.5) == pytest.approx(0.2)
+    assert opening_travel("prismatic", 0.0, 0.4, position=0.0, fraction=0.5, closed=0.0) == pytest.approx(0.2)
     # a door closed at its UPPER limit opens by going down it
-    assert opening_travel("revolute", -1.6, 0.0, position=0.0, fraction=0.5) == pytest.approx(-0.8)
+    assert opening_travel("revolute", -1.6, 0.0, position=0.0, fraction=0.5, closed=0.0) == pytest.approx(-0.8)
 
 
 def test_opening_a_closed_drawer_by_a_fraction_means_that_fraction_of_its_range():
     # store_honey's cabinet: four drawers, range [0, 0.39], all resting closed. 80% open is 0.312 m of travel --
     # the earlier version answered 0.078, being the distance to a target 80% of the way from the FAR limit
-    assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=0.80) == pytest.approx(0.312, abs=1e-6)
-    assert opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=OPEN_FRACTION_SCORED) == pytest.approx(
-        0.312, abs=1e-6
-    )
+    for fraction in (0.80, OPEN_FRACTION_SCORED):
+        travel = opening_travel("prismatic", 0.0, 0.39, position=0.0, fraction=fraction, closed=0.0)
+        assert travel == pytest.approx(0.312, abs=1e-6)
 
 
 def test_a_partly_open_joint_travels_only_the_rest_of_the_way():
-    assert opening_travel("prismatic", 0.0, 0.4, position=0.1, fraction=0.5) == pytest.approx(0.1)
+    assert opening_travel("prismatic", 0.0, 0.4, position=0.1, fraction=0.5, closed=0.0) == pytest.approx(0.1)
 
 
 def test_travel_never_asks_for_more_than_the_joint_has():
-    far = opening_travel("prismatic", 0.0, 0.4, position=0.0, fraction=2.0)
+    far = opening_travel("prismatic", 0.0, 0.4, position=0.0, fraction=2.0, closed=0.0)
     assert far == pytest.approx(0.4), "clamped to the limit, not 0.8 m into the cabinet"
 
 
 def test_a_joint_with_no_range_asks_for_no_travel():
-    assert opening_travel("prismatic", 0.3, 0.3, position=0.3, fraction=0.8) == 0.0
+    assert opening_travel("prismatic", 0.3, 0.3, position=0.3, fraction=0.8, closed=0.3) == 0.0
 
 
 def test_both_open_strokes_clear_the_state_threshold_and_stiction():
@@ -103,16 +102,15 @@ def test_both_open_strokes_clear_the_state_threshold_and_stiction():
     assert OPEN_FRACTION_SCORED * 0.39 / 10 > 0.01, "per-step move must be over a centimetre to break stiction"
 
 
-def test_is_open_matches_omnigibsons_five_percent_rule_at_both_ends():
-    assert not is_open(0.0, 0.4, position=0.01)  # 2.5% out: still closed
-    assert is_open(0.0, 0.4, position=0.03)  # 7.5% out: open
-    assert not is_open(0.0, 0.4, position=0.39), "a joint resting at its far limit is closed too"
+def test_is_open_matches_omnigibsons_five_percent_rule_from_the_closed_end():
+    assert not is_open(0.0, 0.4, position=0.01, closed=0.0)  # 2.5% out: still closed
+    assert is_open(0.0, 0.4, position=0.03, closed=0.0)  # 7.5% out: open
+    assert not is_open(0.0, 0.4, position=0.39, closed=0.4), "a joint resting at its closed limit is closed"
 
 
 def test_a_lid_resting_at_its_open_limit_reads_open_and_closes_toward_its_closed_end():
     """A laptop or a car trunk rests at its OPEN limit; OmniGibson's Open state counts from the closed end (the lower
-    limit, or the upper one where the metadata lists the joint with direction -1). Without it both ends read shut."""
-    assert not is_open(0.0, 2.4, position=2.4)  # the symmetric rule, still the default
+    limit, or the upper one where the metadata lists the joint with direction -1)."""
     assert is_open(0.0, 2.4, position=2.4, closed=0.0)  # the laptop at its open limit
     assert not is_open(0.0, 2.4, position=2.4, closed=2.4)  # a door hung the other way, resting shut
     assert opening_travel("revolute", 0.0, 2.4, position=2.4, fraction=0.0, closed=0.0) == pytest.approx(-2.4)
@@ -606,3 +604,206 @@ def test_pressed_grasp_keeps_supports_and_stops_after_a_rejected_approach():
     assert calls[1][1]["exclude"] == {"book"}
     assert calls[2][2][2] == sim.CLOSE  # the transit travels closed
     assert not calls[2][1].get("allowed_contacts")  # and keeps the target collidable
+
+
+# --------------------------------------------------------------- container_grasps and the pull (F-revopen)
+def _door(top_heavy=False):
+    """A 2 cm panel hinged on a vertical axis through the origin, shut along +y, z 0..1, as the link's world mesh.
+    ``top_heavy`` packs vertices into its front layer near the top the way a bevelled door's mesh does (gjeoer's
+    vertex mean sits 26 cm above mid-height, edge_on_assets.out)."""
+    import trimesh
+
+    panel = trimesh.creation.box([0.02, 0.5, 1.0]).apply_translation([0.0, 0.25, 0.5])
+    if top_heavy:
+        strip = trimesh.creation.box([0.008, 0.4, 0.1]).apply_translation([-0.006, 0.25, 0.9])  # inside the front layer
+        for _ in range(3):
+            strip = strip.subdivide()
+        panel = trimesh.util.concatenate([panel, strip])
+    return panel
+
+
+def _door_sim(mesh, grasping_mode):
+    from types import MethodType, SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    lo, hi = mesh.bounds
+    link = SimpleNamespace(name="door", aabb=(th.tensor(lo, dtype=th.float32), th.tensor(hi, dtype=th.float32)))
+    sim = SimpleNamespace(link_trimesh_world=lambda link: mesh, robot=SimpleNamespace(grasping_mode=grasping_mode))
+    sim.surface_point = MethodType(R1ProSim.surface_point, sim)
+    return sim, SimpleNamespace(name="cabinet", links={"door": link})
+
+
+def test_the_grips_offered_on_a_door_come_from_its_edge_not_its_vertex_mean_and_weld_under_assisted():
+    """T6 / ART-1 / ART-2: under assisted grasping only the edge grip is offered on a flat door (a pressed face has
+    no second finger and no ray between the pads); it pinches EDGE_INSET below the link's TOP vertex, the jaw
+    EDGE_THICKNESS behind the face, coming DOWN over the panel (approach up) rather than in along the lead through
+    it. handle_on's face_centre is a vertex mean: 26 cm above mid-height on gjeoer's door it put the old edge grip
+    in the air. A door's travel is clipped to DOOR_TRAVEL_MAX; a lid asks for LID_FRACTION and, since a lid short
+    of balance falls shut, is a plan only when the whole pull solves (min_fraction)."""
+    from omnigibson.tiptop.r1pro import (
+        DOOR_TRAVEL_MAX, EDGE_INSET, EDGE_THICKNESS, LID_FRACTION, OPEN_MIN_FRACTION, R1ProSim,
+    )  # fmt: skip
+
+    door = dict(name="j_door", kind="revolute", axis=[0.0, 0.0, 1.0], origin=[0.0, 0.0, 0.0], lower=0.0, upper=2.4,
+                position=0.0, closed=0.0, link="door")  # fmt: skip
+    hand = np.array([0.0, 0.25, 0.9])
+    for top_heavy in (False, True):
+        sim, obj = _door_sim(_door(top_heavy), "assisted")
+        grasps = R1ProSim.container_grasps(sim, obj, [door], 0.9, hand)
+        assert [g["kind"] for g in grasps] == ["edge"]
+        edge = grasps[0]
+        assert edge["tips"][2] == pytest.approx(1.0 - EDGE_INSET, abs=1e-3), "below the TOP vertex, not the mean"
+        assert abs(edge["tips"][0]) < EDGE_THICKNESS and 0.05 < edge["tips"][1] < 0.45, "the jaw inside the panel"
+        assert np.allclose(edge["into"], [0.0, 0.0, -1.0]) and np.allclose(edge["approach"], [0.0, 0.0, 1.0])
+        assert np.allclose(edge["lead"], [-1.0, 0.0, 0.0], atol=0.05) and np.allclose(edge["jaws"], [edge["lead"], -edge["lead"]])
+        assert edge["travel"] == pytest.approx(DOOR_TRAVEL_MAX) and edge["min_fraction"] == OPEN_MIN_FRACTION
+        # the push column too: on the door, centred on its extent, whatever the mesh's vertex mean
+        pushes = R1ProSim.push_grasps(sim, obj, door, 1.5, hand)
+        heights = [g["tips"][2] for g in pushes]
+        assert all(0.0 <= z <= 1.0 for z in heights) and np.mean(heights) == pytest.approx(0.5, abs=0.02)
+    sim, obj = _door_sim(_door(), "sticky")
+    grasps = R1ProSim.container_grasps(sim, obj, [door], 0.9, hand)
+    assert [g["kind"] for g in grasps][-1] == "edge" and {g["kind"] for g in grasps[:-1]} == {"flat"}
+    assert all(g["tips"][0] == pytest.approx(-0.01, abs=1e-3) and 0.0 < g["tips"][2] < 1.0 for g in grasps[:-1])
+    assert all("approach" not in g and g["min_fraction"] == OPEN_MIN_FRACTION for g in grasps[:-1])
+    lid = dict(door, name="j_lid", axis=[0.0, 1.0, 0.0])  # a horizontal hinge
+    (grasp,) = R1ProSim.container_grasps(_door_sim(_door(), "assisted")[0], obj, [lid], 0.5, hand)
+    assert grasp["travel"] == pytest.approx(LID_FRACTION * 2.4) and grasp["min_fraction"] == LID_FRACTION
+
+
+def test_the_standoff_lies_along_the_grasps_approach_and_a_lid_is_pulled_whole_or_not_at_all():
+    """ART-1 / ART-4: solve_pull puts the standoff OPEN_APPROACH out along the grasp's approach (up for the edge
+    grip; its lead otherwise) and hands the executed motions that direction; a partial pull is kept from
+    min_fraction of the range, which for a lid is the whole pull (10 of 15 waypoints of the car trunk's pull, 57%,
+    was kept and released below its 78% balance)."""
+    from types import SimpleNamespace
+
+    from omnigibson.tiptop.r1pro import LID_FRACTION, OPEN_APPROACH, OPEN_MIN_FRACTION, R1ProSim
+
+    asked, solves = [], [99]
+
+    def solve(pos, quat, seed=None, tolerance_pos=0.0, tolerance_rad=0.0):
+        if len(asked) >= solves[0]:
+            return None
+        asked.append(np.array(pos, dtype=float))
+        return [0.0]
+
+    pull = [pose_matrix([0.5 - 0.02 * i, 0.0, 0.9], [0.0, 0.0, 0.0, 1.0]) for i in range(16)]
+    sim = SimpleNamespace(
+        _grasp_pose_base=lambda arm, g, jaw, base_pose=None: (pull[0][:3, 3], pull[0][:3, :3]),
+        _pull_poses=lambda g, start, base_pose=None: (pull, None, None), container_body=lambda obj, link: None,
+        arm_hits_scene=lambda *a, **k: [], body_hits=lambda *a, **k: False,
+    )  # fmt: skip
+    drawer = dict(kind="prismatic", lower=0.0, upper=0.4, position=0.0)
+    edge = dict(joint=drawer, travel=0.3, kind="edge", lead=[-1.0, 0.0, 0.0], approach=[0.0, 0.0, 1.0], min_fraction=OPEN_MIN_FRACTION)  # fmt: skip
+    solve_pull = lambda g: R1ProSim.solve_pull(sim, SimpleNamespace(solve=solve), g, [0, 0, 1], [0.0], base_pose=(0.0, 0.0, 0.0), aabbs=[])  # fmt: skip
+    plan, _ = solve_pull(edge)
+    assert asked[0] == pytest.approx([0.5, 0.0, 0.9 + OPEN_APPROACH]) and plan["approach"] == pytest.approx([0.0, 0.0, 1.0])
+    asked.clear()
+    plan, _ = solve_pull({k: v for k, v in edge.items() if k != "approach"} | {"kind": "bar"})
+    assert asked[0] == pytest.approx([0.5 - OPEN_APPROACH, 0.0, 0.9]) and plan["approach"] == pytest.approx([-1.0, 0.0, 0.0])
+    trunk = dict(kind="revolute", lower=0.0, upper=2.53, position=0.0)
+    lid = dict(edge, joint=trunk, travel=LID_FRACTION * 2.53, min_fraction=LID_FRACTION)
+    solves[0] = 2 + 10  # the standoff, the grasp and 10 of the 15 waypoints
+    asked.clear()
+    plan, why = solve_pull(lid)
+    assert plan is None and "57% of the range" in why
+    asked.clear()
+    assert solve_pull(dict(lid, min_fraction=OPEN_MIN_FRACTION))[0]["reached"] == 10  # a door: kept, pushed on after
+    solves[0] = 99
+    asked.clear()
+    assert solve_pull(lid)[0]["reached"] == 15
+
+
+def test_a_pull_that_falls_open_past_its_target_is_not_pushed_back(monkeypatch):
+    """ART-5: the push continuation is for a pull that stopped SHORT (a door's arc past any fixed stance). A lid
+    released past balance falls open to its limit, 15% of its range beyond the 0.85 target, and was pushed back."""
+    from types import SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import LID_FRACTION, R1ProSim
+
+    lid = dict(name="j_lid", kind="revolute", axis=[0.0, 1.0, 0.0], origin=[0.0, 0.0, 0.0], lower=0.0, upper=2.967,
+               position=0.0, closed=0.0, link="lid")  # fmt: skip
+    state = [lid]
+    monkeypatch.setattr("omnigibson.tiptop.r1pro.openable_joints", lambda obj: [state[-1]])
+    chosen = dict(joint=lid, travel=LID_FRACTION * 2.967, kind="edge")
+    pushes = []
+    sim = SimpleNamespace(
+        scene_object=lambda name: SimpleNamespace(name="toolbox"),
+        robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))}),
+        container_grasps=lambda *a, **k: [chosen],
+        _drive_joint=lambda *a, **k: {"grasp": chosen, "plan": {"reached": 15}, "waypoints": 15, "why": "", "held": True, "stance": (1.0, 2.0, 0.0)},
+        push_joint=lambda arm, name, j, target: pushes.append(round(target, 3)) or {"reached": True, "position": target, "why": ""},
+    )  # fmt: skip
+    state.append(dict(lid, position=2.967))  # fell open to the limit after the release
+    assert R1ProSim.open_container(sim, "left", "toolbox")["opened"] and pushes == []
+    state.append(dict(lid, position=1.0))  # stopped short at 34%: pushed the rest of the way
+    assert R1ProSim.open_container(sim, "left", "toolbox")["opened"] and pushes == [round(LID_FRACTION * 2.967, 3)]
+
+
+def test_a_push_close_blocks_the_grasp_assist_around_the_whole_motion():
+    """ART-3: under sticky grasping the assist welds what one closed finger touches for 0.3 s -- the door the hand
+    pushes shut -- and nothing opens the hand after; the retreat then dragged the door back open. The push runs
+    with the arm's grasp search blocked, and unblocked whatever ends it."""
+    from types import SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    calls = []
+    joint = dict(name="j_door", lower=0.0, upper=1.6, position=1.2, closed=0.0, link="door")
+    sim = SimpleNamespace(
+        scene_object=lambda name: SimpleNamespace(name="fridge"),
+        robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))}),
+        push_grasps=lambda obj, j, target, hand: [dict(joint=j)],
+        block_grasping=lambda arm: calls.append(("block", arm)), unblock_grasping=lambda: calls.append("unblock"),
+        _drive_joint=lambda *a, **k: calls.append("push") or {"why": "no stance"},
+    )  # fmt: skip
+    assert R1ProSim.push_joint(sim, "left", "fridge", joint, 0.0)["reached"] is False
+    assert calls == [("block", "left"), "push", "unblock"]
+    sim._drive_joint = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stance rejected"))
+    with pytest.raises(RuntimeError):
+        R1ProSim.push_joint(sim, "left", "fridge", joint, 0.0)
+    assert calls[-1] == "unblock"
+    sim.push_grasps = lambda *a: []
+    assert R1ProSim.push_joint(sim, "left", "fridge", joint, 0.0)["reached"] is False and calls[-1] == "unblock"
+
+
+def test_openable_joints_reads_the_joint_frame_and_the_closed_end_off_a_live_object(monkeypatch):
+    """T7 (F-reader): the world axis and hinge come from the parent link's pose composed with the joint's own
+    localPos0 (times the instance scale) and localRot0 (OmniGibson's xyzw); the closed end is the upper limit for a
+    joint the Open metadata lists with direction -1 (laptop_nvulcs, trash_can_ifzxzj), so resting there reads shut."""
+    from types import SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.articulation import openable_joints
+    from omnigibson.utils.constants import JointType
+
+    quarter_xyzw = th.tensor([0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)])  # localRot0: a quarter turn about z
+    joint = SimpleNamespace(joint_type=JointType.JOINT_REVOLUTE, lower_limit=0.0, upper_limit=2.4, axis="X",
+                            body0="/World/laptop/base_link", body1="/World/laptop/lid",
+                            local_position_0=th.tensor([0.3, 0.0, 0.5]), local_orientation_0=quarter_xyzw,
+                            get_state=lambda: (th.tensor([2.4]), None, None))  # fmt: skip
+    links = {name: SimpleNamespace(get_position_orientation=lambda: (th.tensor([1.0, 2.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0])))
+             for name in ("base_link", "lid")}  # fmt: skip
+
+    class Triples(list):  # the direction-annotated metadata: (joint_id, joint_name, direction), read by .items()
+        def items(self):
+            return list(self)
+
+    laptop = SimpleNamespace(name="laptop", joints={"j_lid": joint}, links=links, scale=(2.0, 2.0, 2.0),
+                             metadata={"openable_joint_ids": Triples([(0, "j_lid", -1)])})  # fmt: skip
+    (j,) = openable_joints(laptop)
+    assert np.allclose(j["axis"], [0.0, 1.0, 0.0], atol=1e-6), "the X letter turned by localRot0"
+    assert np.allclose(j["origin"], [1.6, 2.0, 1.0]), "the parent's origin plus localPos0 at the instance's scale"
+    assert j["closed"] == 2.4 and j["link"] == "lid" and j["kind"] == "revolute" and j["position"] == pytest.approx(2.4)
+    assert not is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]), "resting at its closed end"
+    laptop.metadata = {}  # no direction metadata: the lower limit is the closed end
+    assert openable_joints(laptop)[0]["closed"] == 0.0

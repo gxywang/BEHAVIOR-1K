@@ -15,7 +15,6 @@ simulator knows and the robot could not (object poses, button poses, masks, a sw
 ``knowledge.py``'s oracle source and by the base-pose search; both are privileged and say so.
 """
 
-import itertools
 import logging
 import math
 import re
@@ -26,8 +25,11 @@ import numpy as np
 import torch as th
 import yaml
 from bddl.condition_evaluation import HEAD
+from scipy.spatial.transform import Rotation
 
 from b1k.bridge.articulation import (
+    HANDLE_JAW,
+    HANDLE_JAW_MARGIN,
     OPEN_FRACTION_SCORED,
     follow_joint,
     handle_on,
@@ -332,7 +334,6 @@ HAND_STACK = 0.21  # m above the fingertips the wrist's link7 sphere tops out (e
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
 # Regions of the placements made for their effect (inside_regions: stamp, cut, heat, aim, attached)
 STAMP_MARGIN = 0.02  # m an adjacency remover reaches beyond its link's box (PARTICLE_MODIFIER_ADJACENCY_AREA_MARGIN)
-VACUUM_HOVER = 0.012  # m a projection remover rests above the particles: its slab hangs 1-21 mm under it
 STAMP_YAW_TOL = math.radians(5)  # the tool is set down as it is held: its footprint was fitted at that yaw
 HEAT_TOP_ABOVE = 0.05  # m above the heat link the source's cooking surface may stand (a grate over a burner)
 AIM_YAW_TOL = math.radians(15)
@@ -343,6 +344,7 @@ ATTACH_YAW_TOL = math.radians(10)  # the snap allows 15 deg
 # for a pinch to close on; the push is a press (cuTAMP Push) on a 1 cm "button" at its far face
 PUSH_OVERHANG = 0.03
 PUSH_RADIUS = 0.01
+PUSH_MAX_DEPTH = 0.5  # m: a compartment is this deep at most; a longer stroke is down a bed or a bar (0.9-2.3 m, sweep4)
 # N-rotate (spec S38): a pour is the last wrist joint turned this far from a top-down rim grasp, held, and back
 POUR_TILT = math.radians(90)  # 80-110 deg spills a container; joint7 alone has the range
 POUR_HOLD_STEPS = 60  # env steps the tilt is held for the contents to fall (2 s at 30 Hz)
@@ -969,12 +971,15 @@ class R1ProSim(TiptopSim):
     def push_face(self, item: str) -> tuple | None:
         """N-push (spec S05): the face of ``item`` a closed hand pushes to slide it out to its board's edge, as a
         button hint (world position, outward normal, PUSH_RADIUS, depth); None when no push is wanted. Only for a
-        flat item (its thinnest seen-box axis vertical) lying on a board of FIXED furniture (the map's) under another
-        board: nothing a top-down pinch can take (hardbacks were pushed before 1,200 of 1,200 demo picks,
-        boxing_books). The face is the side turned away from the robot, into the compartment, at mid-height, so the
-        stroke runs toward the open front; the depth is the travel that leaves the near edge PUSH_OVERHANG past the
-        board's edge for a pinch to close on -- and None once it does, so a pushed item is not pushed again. The
-        item's shape is its points (``own_box``); the board and its edge are the map's."""
+        flat item (its thinnest seen-box axis vertical) wider than the jaw both ways -- nothing a top-down pinch
+        can take (hardbacks were pushed before 1,200 of 1,200 demo picks, boxing_books); a die on a bed or a
+        banana on a sill is pinched as it is -- lying on a board of FIXED furniture (the map's) under another board
+        (a compartment, spec S05; the books sit 25-28 cm under the next board, more than the hand stack), and at
+        most PUSH_MAX_DEPTH from its edge (a board game 1.2 m down a bed is not a shelf). The face is the side
+        turned away from the robot, into the compartment, at mid-height, so the stroke runs toward the open front;
+        the depth is the travel that leaves the near edge PUSH_OVERHANG past the board's edge for a pinch to close
+        on -- and None once it does, so a pushed item is not pushed again. The item's shape is its points
+        (``own_box``); the board and its edge are the map's."""
         obj = self.scene_object(item)
         box = self.own_box(obj)
         if box is None:
@@ -983,7 +988,9 @@ class R1ProSim(TiptopSim):
         thin = int(np.argmin(hi - lo))
         if abs(rot[2, thin]) < 0.7:
             return None  # standing on edge: a side pinch takes it as it is
-        corners = pos + np.array(list(itertools.product(*zip(lo, hi)))) @ rot.T
+        if float(np.delete(hi - lo, thin).min()) <= HANDLE_JAW - HANDLE_JAW_MARGIN:
+            return None  # narrow enough one way for a top-down pinch across it
+        corners = pos + box_corners(lo, hi) @ rot.T
         centre, bottom = corners.mean(axis=0), float(corners[:, 2].min())
         board = None
         for other, alo, ahi in self.scene_aabbs():
@@ -1000,23 +1007,39 @@ class R1ProSim(TiptopSim):
                 break
         if board is None:
             return None
+        z, blo, bhi, mesh = board
         into = centre[:2] - self.base_pose()[0][:2].cpu().numpy().astype(np.float64)
         into = into / (np.linalg.norm(into) or 1.0)
         # the side face (an axis that is not the thin one) whose outward normal points furthest from the robot
         a, s = max(((a, s) for a in range(3) if a != thin for s in (-1.0, 1.0)), key=lambda t: t[1] * rot[:2, t[0]] @ into)
         n = s * rot[:, a]
-        position = pos + rot @ ((lo + hi) / 2.0) + n * float(hi[a] - lo[a]) / 2.0
+        position = centre + n * float(hi[a] - lo[a]) / 2.0
         u = -n[:2] / (np.linalg.norm(n[:2]) or 1.0)  # the stroke, along the board
-        front = float((corners[:, :2] @ u).max())
-        # the board's edge on the stroke's own line: a ray from just inside the board's top out along the stroke
-        # leaves the board at its edge whatever the case's yaw (boards() keeps only a board's axis-aligned box, which
-        # a case turned 45 deg to the robot inflates by half its width: the book would be pushed off it)
-        z, blo, bhi, mesh = board
-        hits, _, _ = mesh.ray.intersects_location([[*centre[:2], z - 0.005]], [[*u, 0.0]], multiple_hits=True)
-        out = [float((h[:2] - centre[:2]) @ u) for h in hits]
-        edge = float(centre[:2] @ u) + min([d for d in out if d > 0.0], default=float("inf"))
-        if not np.isfinite(edge):
-            edge = max(float(np.array([x, y]) @ u) for x in (blo[0], bhi[0]) for y in (blo[1], bhi[1]))
+        start, front = float(centre[:2] @ u), float((corners[:, :2] @ u).max())
+        # the board's edge on the stroke's own line, whatever the case's yaw (boards() keeps only a board's
+        # axis-aligned box, which a case turned 45 deg to the robot inflates by half its width: the book would be
+        # pushed off it): rays down onto the board's top from along the stroke, 1 cm then 1 mm apart, to where
+        # they stop landing on it, or a wall the stroke meets first (the case's back). A ray from inside the board
+        # missed otwukr's thin shelves and the box's corner stood in for it, 2.3 m down a bar once (sweep4).
+        # Within PUSH_MAX_DEPTH of stroke: further is a bed or a bar, not a compartment.
+        reach = PUSH_MAX_DEPTH - PUSH_OVERHANG + front - start
+
+        def past(ds):  # the first distance along the stroke a ray down no longer lands on the board's top
+            origins = [[*(centre[:2] + u * d), z + BOARD_GAP] for d in ds]
+            hits, rays, _ = mesh.ray.intersects_location(origins, [[0.0, 0.0, -1.0]] * len(origins), multiple_hits=True)
+            # within BOARD_GAP, as boards() groups the faces: otwukr's coarse hull slopes 6 mm under a book
+            landed = {int(r) for r, h in zip(rays, hits) if abs(float(h[2]) - z) <= BOARD_GAP}
+            return next((float(d) for i, d in enumerate(ds) if i not in landed), None)
+
+        end = past(np.arange(0.0, reach, 0.01))
+        if end is not None:
+            end = past(np.arange(end - 0.01, end, 0.001)) or end
+        walls, _, _ = mesh.ray.intersects_location([centre.tolist()], [[*u, 0.0]], multiple_hits=True)
+        wall = min([float((w[:2] - centre[:2]) @ u) for w in walls if float((w[:2] - centre[:2]) @ u) > 0.0], default=None)
+        edge = start + min(d for d in (end, wall) if d is not None) if end is not None or wall is not None else None
+        if edge is None:
+            log.info(f"{item}: no edge of its board within {PUSH_MAX_DEPTH:.1f} m of stroke: not a compartment; no push")
+            return None
         depth = edge + PUSH_OVERHANG - front
         if depth <= 0.0:
             log.info(f"{item} already hangs {front - edge:.3f} m past its board's edge; no push")
@@ -1033,11 +1056,7 @@ class R1ProSim(TiptopSim):
             return None
         _, rot, lo, hi = box
         axis = rot[:, int(np.argmax(hi - lo))]
-        up = np.array([0.0, 0.0, 1.0 if axis[2] >= 0.0 else -1.0])
-        pivot, cos = np.cross(axis, up), float(axis @ up)
-        R = np.eye(3)
-        if np.linalg.norm(pivot) > 1e-9:
-            R = trimesh.transformations.rotation_matrix(math.atan2(float(np.linalg.norm(pivot)), cos), pivot)[:3, :3]
+        R = Rotation.align_vectors([[0.0, 0.0, 1.0 if axis[2] >= 0.0 else -1.0]], [axis])[0].as_matrix()
         base = T.quat2mat(self.base_pose()[1]).cpu().numpy().astype(np.float64)  # world <- base
         return (base.T @ R @ base).tolist()
 
@@ -1062,11 +1081,16 @@ class R1ProSim(TiptopSim):
             f"{2 * half[0]:.2f} x {2 * half[1]:.2f} m, under a ceiling of {ceiling:.3f}"
         )
         region = self.region_box(centre, half, floor, ceiling - floor)
-        # an item longer than the vessel is wide goes in on end (E-6dof): lying, its centre never enters the volume
-        # (roses by flat drop 2/5, spec S21). The planner turns it about its own origin, yaw free.
+        # an item that cannot lie in the rectangle at any angle -- the diagonal of its two longest seen extents is
+        # longer than the rectangle's -- goes in on end (E-6dof), when its centre then still stands under the
+        # ceiling (the scorer's Inside looks for the AABB centre in the volume): lying, its centre never enters the
+        # volume (roses by flat drop 2/5, spec S21). The planner turns it about its own origin, yaw free. A puzzle
+        # that fits the toy box flat lies (it did, sweep4 r04): against the narrower side alone it was stood 22 cm
+        # tall in an 11.6 cm box, and so was a 29 cm board game whose centre on end is 3 cm over the box's walls.
         seen = self.own_box(self.scene_object(item))
-        if seen is not None and float((seen[3] - seen[2]).max()) > 2 * float(half.min()):
-            log.info(f"inside({item}, {container}): {item} is longer than the vessel is wide; stood on end")
+        ext = None if seen is None else np.sort(seen[3] - seen[2])
+        if seen is not None and np.hypot(*ext[1:]) > np.hypot(*(2 * half)) and floor + ext[2] / 2.0 <= ceiling:
+            log.info(f"inside({item}, {container}): {item} cannot lie in the compartment; stood on end")
             region = dict(region, rotation=self.upright_rotation(item), yaw_tolerance=None)
         return region
 
@@ -1089,12 +1113,13 @@ class R1ProSim(TiptopSim):
         log.info(f"{container} has {'a' if roofed else 'no'} roof within {HAND_STACK + HEADROOM:.2f} m over {item} (top z={top:.3f})")
         return roofed
 
-    def bay(self, link, lo, hi, near=None, n: int = 16, levels: int = 8) -> tuple:
+    def bay(self, link, lo, hi, near=None) -> tuple:
         """The compartment of the fillable ``link`` nearest ``near`` (xy; the AABB centre when None): the accepted point
-        of an n x n x levels grid over the AABB (lo, hi) nearest ``near`` (the lowest of equals), the run of accepted
+        of a 16 x 16 x 8 grid over the AABB (lo, hi) nearest ``near`` (the lowest of equals), the run of accepted
         points through it along each axis, and its floor, probed 1 cm at a time straight down from it -- petcxr's two
         columns start 26 cm apart, so the volume's own bottom is the OTHER column's floor, behind the shut door.
         (centre xy, half xy, floor z); the AABB's own when nothing is accepted."""
+        n, levels = 16, 8
         xs, ys, zs = (np.linspace(lo[a], hi[a], m + 2)[1:-1] for a, m in ((0, n), (1, n), (2, levels)))
         accepted = lambda pts: np.asarray(link.check_points_in_volume(th.tensor(pts, dtype=th.float32)))
         ok = accepted([[x, y, z] for x in xs for y in ys for z in zs]).reshape(n, n, levels)
@@ -1166,15 +1191,12 @@ class R1ProSim(TiptopSim):
                     hi[k] = min(hi[k], float(blo[k]))
                 else:
                     lo[k] = max(lo[k], float(bhi[k]))
-        item_obj = self.scene_object(item)
-        if item_obj is None:
-            return None
-        ilo, ihi = (v.cpu().numpy().astype(np.float64) for v in item_obj.aabb)
+        height = self.item_height(item)  # the captures' points, never the item's simulator box (spec 1.1)
         if j is None and obj.fixed_base and hi[2] - lo[2] > SHELF_CASE_HEIGHT:
             # a case of shelves has ONE fillable volume: aim at a reachable compartment, not its bottom board
             # (32 of 32 bookcase regions went to the bottom shelf, IK 0/256, and the fallback landed on the lid).
             # Fixed furniture only: its boards are the scanned map's; a movable bin's mesh is not ours to read.
-            board = self.shelf_of(obj, self.item_height(item), (lo, hi))
+            board = self.shelf_of(obj, height, (lo, hi))
             if board is None:
                 log.info(f"inside({item}, {container}): no shelf of {container} in reach has room for it; no region")
                 return None
@@ -1185,7 +1207,7 @@ class R1ProSim(TiptopSim):
         centre, half, lo[2] = self.bay(link, lo, hi, near=near)
         # where the SCORER will look for the item's AABB centre once it rests on the floor, clamped into the
         # volume so a tall object is still aimed at the floor rather than refused back onto the lid
-        z_rest = min(lo[2] + (ihi[2] - ilo[2]) / 2.0, (lo[2] + hi[2]) / 2.0)
+        z_rest = min(lo[2] + height / 2.0, (lo[2] + hi[2]) / 2.0)
         for _ in range(8):  # shrink until the fillable volume itself accepts all four corners: the scorer's gate
             corners = th.tensor(
                 [[centre[0] + sx * half[0], centre[1] + sy * half[1], z_rest] for sx in (-1, 1) for sy in (-1, 1)],
@@ -1335,7 +1357,7 @@ class R1ProSim(TiptopSim):
         if box is None:
             return None
         pos, rot, lo, hi = box
-        corners = pos + np.array(list(itertools.product(*zip(lo, hi)))) @ rot.T
+        corners = pos + box_corners(lo, hi) @ rot.T
         return corners.min(axis=0), corners.max(axis=0)
 
     def stamp_region(self, tool, target, particles, projection=None) -> dict | None:
@@ -1345,8 +1367,8 @@ class R1ProSim(TiptopSim):
         (particle_modifier.py:524-531), so the footprint is the tool's seen box as it is held plus the margin, and
         the region carries that yaw (rotation identity, STAMP_YAW_TOL) so the fit holds when it lands. A projection
         remover (``projection``: the vacuum's slab, (lo, hi) in its own frame) removes inside that slab instead,
-        which hangs 1-21 mm under its bottom: the fit is the slab's, no margin, and the tool rests VACUUM_HOVER above
-        the particles. The box is the tool centres that cover the cluster, grown by the tool's half extents, since
+        which hangs 1-21 mm under its bottom: the fit is the slab's, no margin, and the tool rests where the slab
+        straddles the particles. The box is the tool centres that cover the cluster, grown by the tool's half extents, since
         the planner keeps every sphere of the object inside a surface (cutamp stable_placement_costs). None when the
         tool has not been seen or nothing is left."""
         box = self.own_box(self.scene_object(tool))
@@ -1356,21 +1378,20 @@ class R1ProSim(TiptopSim):
             log.info(f"stamp({tool}, {target}): {why}; no region")
             return None
         pos, rot, lo, hi = box
-        offsets = (np.array(list(itertools.product(*zip(lo, hi)))) - (lo + hi) / 2.0) @ rot.T  # body about its centre
-        half = offsets.max(axis=0)
+        half = np.abs(rot) @ ((hi - lo) / 2.0)  # the body's world half extents about its centre
         # what the tool removes, relative to its body centre (xy) and to its bottom (z), world axes
         if projection is None:
             reach_lo, reach_hi = -half - STAMP_MARGIN, half + STAMP_MARGIN
             reach_lo[2], reach_hi[2] = -STAMP_MARGIN, 2 * half[2] + STAMP_MARGIN
         else:
-            slab = (np.array(list(itertools.product(*zip(*projection)))) - (lo + hi) / 2.0) @ rot.T
+            slab = (box_corners(*projection) - (lo + hi) / 2.0) @ rot.T
             reach_lo, reach_hi = slab.min(axis=0), slab.max(axis=0)
             reach_lo[2], reach_hi[2] = reach_lo[2] + half[2], reach_hi[2] + half[2]
         size = reach_hi - reach_lo
         # ponytail: greedy over every particle as a corner of the footprint (4 corners), 40 particles at most
         best = []
         for p in particles:
-            for sx, sy in itertools.product((0, 1), (0, 1)):
+            for sx, sy in ((0, 0), (0, 1), (1, 0), (1, 1)):
                 x0, y0 = p[0] - sx * size[0], p[1] - sy * size[1]
                 inside = particles[
                     (particles[:, 0] >= x0 - 1e-9) & (particles[:, 0] <= x0 + size[0] + 1e-9)
@@ -1392,16 +1413,29 @@ class R1ProSim(TiptopSim):
         return dict(region, rotation=np.eye(3).tolist(), yaw_tolerance=STAMP_YAW_TOL)
 
     def knife_region(self, knife, food) -> dict | None:
-        """The placement surface for cut(knife, food): the food's top (its seen box), a square of the knife's length
-        about the food's centre so the knife set down anywhere on it rests on the food: the slicer fires on any
-        knife-link contact while armed (slicer_active.py:72-135), so the place is the cut."""
+        """The placement surface for cut(knife, food): the food's top (its seen box), a strip about the food's
+        centre the knife's length longer than the food along the world axis nearest the knife's long seen axis and
+        the knife's width wider across, the knife turned onto that axis (a rotation about z, the same in the base
+        frame, STAMP_YAW_TOL): a knife set down inside the strip crosses the food, and the slicer fires on any
+        knife-link contact while armed (slicer_active.py:72-135), so the place is the cut. A square of the knife's
+        length, yaw free, let a third of its placements lie beside the food (knife_region_miss.out)."""
         food_box, knife_box = self.seen_aabb(self.scene_object(food)), self.own_box(self.scene_object(knife))
         if food_box is None or knife_box is None:
             log.info(f"cut({knife}, {food}): no capture has seen {food if food_box is None else knife}; no region")
             return None
         lo, hi = food_box
-        length = float((knife_box[3] - knife_box[2]).max())
-        return self.region_box((lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2] + length) / 2.0, float(hi[2]), 0.02)
+        _, rot, klo, khi = knife_box
+        ext = khi - klo
+        along = rot[:2, int(np.argmax(ext))]  # the knife's long axis now, on the floor
+        k = int(np.argmax(np.abs(along)))
+        yaw = (k * math.pi / 2 - math.atan2(along[1], along[0]) + math.pi / 2) % math.pi - math.pi / 2  # either end
+        size = np.array([ext.max(), np.sort(ext)[1]])[[k, 1 - k]]
+        c, s = math.cos(yaw), math.sin(yaw)
+        return dict(
+            self.region_box((lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2] + size) / 2.0, float(hi[2]), 0.02),
+            rotation=[[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            yaw_tolerance=STAMP_YAW_TOL,
+        )
 
     def heat_region(self, item, source, heat_link) -> dict | None:
         """The placement surface for heat(item, source): on the source's top, the item placements whose centre lies
@@ -1482,9 +1516,9 @@ class R1ProSim(TiptopSim):
         R = female[:3, :3] @ male[:3, :3].T
         centre_now = pos + rot @ ((lo + hi) / 2.0)
         centre = female[:3, 3] - R @ (male[:3, 3] - centre_now)  # the body's centre with the male frame on the female
-        offsets = (np.array(list(itertools.product(*zip(lo, hi)))) - (lo + hi) / 2.0) @ (R @ rot).T
-        half = offsets.max(axis=0)[:2] + ATTACH_TOL / math.sqrt(2)
-        top = float(centre[2] + offsets[:, 2].min()) + ATTACH_LIFT
+        ext = np.abs(R @ rot) @ ((hi - lo) / 2.0)  # the body's world half extents once turned
+        half = ext[:2] + ATTACH_TOL / math.sqrt(2)
+        top = float(centre[2] - ext[2]) + ATTACH_LIFT
         base = T.quat2mat(self.base_pose()[1]).cpu().numpy().astype(np.float64)  # world <- base
         log.info(f"attached({child}, {parent}): body centre to {np.round(centre, 2).tolist()}, bottom z={top:.3f}")
         return dict(
@@ -1975,7 +2009,9 @@ class R1ProSim(TiptopSim):
         """Every way of taking hold of ``obj``'s openable links, best first: one dict per (joint, point on the
         handle), each with the joint, its signed ``travel``, the handle's ``kind`` (``articulation.handle_on``),
         the world point the FINGERTIPS go to (``tips``), the approach direction (into the face, ``into``), the
-        jaw directions to try (``jaws``), the press depth for ``grasp_target`` and the leading direction ``lead``.
+        jaw directions to try (``jaws``), the press depth for ``grasp_target``, the leading direction ``lead``,
+        the way the hand comes in and backs out (``approach``: the lead, or up for the edge grip) and the least of
+        the range a partial pull must reach to count (``min_fraction``).
 
         On a bar the tips go ``BAR_TIP_CLEARANCE`` short of the panel behind it, but no more than
         ``BAR_TIP_DEPTH`` behind the bar's front so it is the pads that hold it and the assist's ray between the
@@ -1988,10 +2024,14 @@ class R1ProSim(TiptopSim):
         pressable = getattr(self.robot, "grasping_mode", "sticky") == "sticky"
         for j in joints:
             vertical = j["kind"] == "revolute" and abs(float(j["axis"][2])) >= 0.7
-            want = fraction if vertical or j["kind"] != "revolute" else max(fraction, LID_FRACTION)
+            lid = j["kind"] == "revolute" and not vertical
+            want = max(fraction, LID_FRACTION) if lid else fraction
             travel = opening_travel(j["kind"], j["lower"], j["upper"], j["position"], want, closed=j.get("closed"))
             if vertical:  # what a door's arc leaves beyond this is push_joint's to finish
                 travel = float(np.clip(travel, -DOOR_TRAVEL_MAX, DOOR_TRAVEL_MAX))
+            # a lid released short of balance falls shut (LID_FRACTION), and a shut lid's underside is inside the
+            # box for the push to reach: only the whole pull is a plan for it (the car trunk, loading_the_car)
+            least = LID_FRACTION if lid else OPEN_MIN_FRACTION
             link = obj.links.get(j["link"])
             if link is None or abs(travel) < 1e-4:
                 continue
@@ -2023,7 +2063,7 @@ class R1ProSim(TiptopSim):
                     rank = abs(float(p[2] - hand_world[2])) + abs(o)
                     out.append(
                         dict(joint=j, travel=travel, kind="bar", tips=p, into=into, jaws=[h["jaw"], -h["jaw"]],
-                             press=0.0, lead=lead, rank=(0, rank), handle=h, nudges=1)
+                             press=0.0, lead=lead, rank=(0, rank), handle=h, nudges=1, min_fraction=least)
                     )  # fmt: skip
                 continue
             # a lip or a flat panel: press both pads on the face, at heights along it
@@ -2046,13 +2086,17 @@ class R1ProSim(TiptopSim):
                 out.append(
                     dict(joint=j, travel=travel, kind=h["kind"], tips=on_surface, into=into, jaws=uprights,
                          press=GRASP_PRESS, lead=lead, rank=(1, abs(float(on_surface[2] - hand_world[2]))),
-                         handle=h, nudges=GRASP_NUDGES)
+                         handle=h, nudges=GRASP_NUDGES, min_fraction=least)
                 )  # fmt: skip
-            # the panel's top edge, pinched from above across its thickness: what a flat panel offers a jaw
-            top = face_c + h["up"] * (h["face_extent"][1] / 2.0 - EDGE_INSET) - lead * EDGE_THICKNESS
+            # the panel's top edge, pinched from above across its thickness: what a flat panel offers a jaw. The
+            # edge is the link's highest vertex along the face's up: handle_on's face_centre is a vertex MEAN, 26 cm
+            # above mid-height on gjeoer's door (edge_on_assets.out). The hand comes down onto it and leaves upward.
+            rise = float((verts @ h["up"]).max() - face_c @ h["up"]) - EDGE_INSET
+            top = face_c + h["up"] * rise - lead * EDGE_THICKNESS
             out.append(
                 dict(joint=j, travel=travel, kind="edge", tips=top, into=-h["up"], jaws=[lead, -lead], press=0.0,
-                     lead=lead, rank=(2, abs(float(top[2] - hand_world[2]))), handle=h, nudges=1)
+                     lead=lead, approach=h["up"], rank=(2, abs(float(top[2] - hand_world[2]))), handle=h, nudges=1,
+                     min_fraction=least)
             )  # fmt: skip
         out.sort(key=lambda g: g["rank"])
         return out
@@ -2096,27 +2140,29 @@ class R1ProSim(TiptopSim):
         return follow_joint(start_pose, j["kind"], axis, hinge, grasp["travel"], steps=OPEN_PATH_STEPS), axis, hinge
 
     def solve_pull(self, ik, grasp: dict, jaw_world, seed, base_pose=None, aabbs=None, arm: str = "left", obj=None):
-        """IK for the whole motion of one grasp -- the pre-grasp standoff, the grasp, and every waypoint of the
-        pull -- solved in order, each seeded by the last, with every configuration checked against the scene
-        (the container excepted). None when the standoff or the grasp has no solution or stands in something;
-        otherwise a dict with the solutions, how many pull waypoints solved (``reached``), the poses and why it
-        stopped short. A path that solves only part of the way is kept when it opens at least
-        ``OPEN_MIN_FRACTION`` of the range: the scored atom flips at 5%, and a door's 86 deg arc is beyond
-        any fixed stance.
+        """IK for the whole motion of one grasp -- the pre-grasp standoff (``OPEN_APPROACH`` out along the grasp's
+        ``approach``: its lead, or up for the edge grip, which comes down over the panel), the grasp, and every
+        waypoint of the pull -- solved in order, each seeded by the last, with every configuration checked against
+        the scene (the container excepted). None when the standoff or the grasp has no solution or stands in
+        something; otherwise a dict with the solutions, how many pull waypoints solved (``reached``), the poses
+        and why it stopped short. A path that solves only part of the way is kept when it opens at least the
+        grasp's ``min_fraction`` of the range (``OPEN_MIN_FRACTION`` by default: the scored atom flips at 5%, and
+        a door's 86 deg arc is beyond any fixed stance).
         """
         where, rot = self._grasp_pose_base(arm, grasp, jaw_world, base_pose)
         quat = T.mat2quat(th.tensor(rot, dtype=th.float32)).cpu().numpy()
         grasp_pose = pose_matrix(where, quat)
         j = grasp["joint"]
+        approach = np.asarray(grasp.get("approach", grasp["lead"]), dtype=np.float64)
         if base_pose is None:
             unit = th.tensor([0.0, 0.0, 0.0, 1.0])
             origin = self.to_base(th.tensor([0.0, 0.0, 0.0]), unit)[0].cpu().numpy()
-            lead_b = self.to_base(th.tensor(grasp["lead"], dtype=th.float32), unit)[0].cpu().numpy() - origin
+            approach_b = self.to_base(th.tensor(approach, dtype=th.float32), unit)[0].cpu().numpy() - origin
         else:
             c, s = math.cos(float(base_pose[2])), math.sin(float(base_pose[2]))
-            lead_b = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]]) @ np.asarray(grasp["lead"], dtype=np.float64)
+            approach_b = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]]) @ approach
         standoff = grasp_pose.copy()
-        standoff[:3, 3] = standoff[:3, 3] + lead_b * OPEN_APPROACH
+        standoff[:3, 3] = standoff[:3, 3] + approach_b * OPEN_APPROACH
         at = None if base_pose is None else tuple(float(v) for v in base_pose)
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         clear = [row for row in aabbs if obj is None or row[0] is not obj]
@@ -2152,9 +2198,9 @@ class R1ProSim(TiptopSim):
         reached = len(solutions) - 2  # pull waypoints solved
         span = abs(float(j["upper"] - j["lower"]))
         fraction_done = abs(grasp["travel"]) * reached / (len(pull) - 1) / max(span, 1e-9)
-        if reached < len(pull) - 1 and fraction_done < OPEN_MIN_FRACTION:
+        if reached < len(pull) - 1 and fraction_done < grasp.get("min_fraction", OPEN_MIN_FRACTION):
             return None, f"{why}; only {fraction_done * 100:.0f}% of the range is reachable"
-        return dict(solutions=solutions, poses=poses[: len(solutions)], reached=reached, why=why, lead=lead_b,
+        return dict(solutions=solutions, poses=poses[: len(solutions)], reached=reached, why=why, approach=approach_b,
                     grasp_pose=grasp_pose, fraction=fraction_done), why  # fmt: skip
 
     def stance_for_grasp(
@@ -2362,9 +2408,10 @@ class R1ProSim(TiptopSim):
         out = {"opened": opened, "why": blocked, "joint": j["name"], "position": now["position"], "grip": chosen["kind"],
                "waypoints": done, "solved": plan["reached"], "held": run["held"], "stance": run["stance"]}  # fmt: skip
         # a door's arc runs out of any fixed stance (solve_pull keeps a pull reaching OPEN_MIN_FRACTION): what the
-        # pull left is pushed, on the door's inner face
+        # pull left SHORT is pushed, on the door's inner face; a lid that fell open past its target is left there
         target = float(j["position"] + chosen["travel"])
-        if done and j["kind"] == "revolute" and abs(float(now["position"]) - target) > JOINT_TOL * abs(j["upper"] - j["lower"]):
+        left = (target - float(now["position"])) * math.copysign(1.0, chosen["travel"])
+        if done and j["kind"] == "revolute" and left > JOINT_TOL * abs(j["upper"] - j["lower"]):
             pushed = self.push_joint(arm, name, now, target)
             position = float(pushed.get("position", now["position"]))
             out.update(pushed=pushed, position=position,
@@ -2386,11 +2433,15 @@ class R1ProSim(TiptopSim):
         verts = np.asarray(mesh.vertices, dtype=np.float64)
         motion = leading_direction(j["kind"], j["axis"], j["origin"], verts, travel)
         h = handle_on(verts, -motion)
+        # the column spans the link's own extent along the face's up: handle_on's face_centre is a vertex MEAN,
+        # 26 cm above mid-height on gjeoer's door, and two of five points then hung in the air over it
+        rise = verts @ h["up"]
+        band = max(0.0, float(np.ptp(rise)) / 2.0 - GRASP_COLUMN_INSET)
         face_c = np.asarray(h["face_centre"], dtype=np.float64)
-        band = max(0.0, h["face_extent"][1] / 2.0 - GRASP_COLUMN_INSET)
+        mid = face_c + h["up"] * (float(rise.min() + rise.max()) / 2.0 - float(face_c @ h["up"]))
         out = []
         for s in np.linspace(-band, band, GRASP_COLUMN_SAMPLES):
-            point = self.surface_point(link, face_c + h["up"] * float(s), motion)
+            point = self.surface_point(link, mid + h["up"] * float(s), motion)
             out.append(
                 dict(joint=j, travel=travel, kind="push", tips=point, into=motion, jaws=[np.array([0.0, 0.0, 1.0]), h["side"]],
                      press=0.0, lead=-motion, rank=(0, abs(float(point[2] - hand_world[2]))), handle=h, nudges=0)
@@ -2411,7 +2462,13 @@ class R1ProSim(TiptopSim):
         if not grasps:
             there = abs(float(joint["position"]) - float(target)) <= JOINT_TOL * span
             return {"reached": there, "why": "" if there else f"nothing of {name}.{joint['name']} to push on"}
-        run = self._drive_joint(arm, obj, grasps, name, take_hold=False)
+        # the closed hand on the link for 0.3 s is a sticky weld (one finger, and a fixture's link has no mass
+        # limit), which nothing opens after: the retreat and the next fold would drag the door back open
+        self.block_grasping(arm)
+        try:
+            run = self._drive_joint(arm, obj, grasps, name, take_hold=False)
+        finally:
+            self.unblock_grasping()
         if "plan" not in run:
             return {"reached": False, **run}
         now = next((k for k in openable_joints(obj) if k["name"] == joint["name"]), joint)
@@ -2506,18 +2563,18 @@ class R1ProSim(TiptopSim):
             return {"why": f"handle approach rejected: {stopped[0]}"}
         grabbed = False
         if take_hold:
-            seed, grabbed = self.close_on(arm, ik, obj, j["link"], plan["grasp_pose"], -plan["lead"], plan["solutions"][1],
+            seed, grabbed = self.close_on(arm, ik, obj, j["link"], plan["grasp_pose"], -plan["approach"], plan["solutions"][1],
                                           joints_of, nudges=chosen["nudges"])  # fmt: skip
             if not grabbed:
                 log.info(f"nothing to pull on: the assist never took hold of {name}.{j['name']}")
         # 4. the pull (or the push: the same waypoints with the hand closed)
         done, blocked = self.follow_pull(arm, joints_of, plan, obj, chosen)
-        # 5. let go and back off along the pull, checked like everything else
+        # 5. let go and back off the way the hand came in, checked like everything else
         self.hold(OPEN_SETTLE_STEPS, gripper)
         back = None
         try:
             pos_now, quat_now = ik.fk(plan["solutions"][1 + done], f"{arm}_gripper_link")
-            retreat = ik.solve(np.asarray(pos_now) + plan["lead"] * OPEN_APPROACH, quat_now, seed=plan["solutions"][1 + done],
+            retreat = ik.solve(np.asarray(pos_now) + plan["approach"] * OPEN_APPROACH, quat_now, seed=plan["solutions"][1 + done],
                                tolerance_pos=0.02, tolerance_rad=0.3)  # fmt: skip
             if retreat is not None and not self.arm_hits_scene(arm, ik, retreat, aabbs=[r for r in aabbs if r[0] is not obj]):
                 back = retreat
@@ -2756,10 +2813,20 @@ class R1ProSim(TiptopSim):
                 + ", ".join(f"{name} passes through {blockers}" for name, blockers in hidden.items())
                 + " -- the capture will see nothing of it unless another view does"
             )
-        centre = th.stack([o.aabb_center for o in objects]).mean(dim=0)  # what the wrist cameras look at
+        self.look_at(*names)
+        return pose
+
+    def look_at(self, *names: str) -> None:
+        """What the captures from this stance look at (``look_at_point``, the wrist looks, the head aim): the named
+        objects' centre, in the base frame; ``place_robot`` clears it, so a stance reused (the one a container was
+        opened from) sets it again or the looks turn to the holding hand instead of the bay it places into."""
+        centre = th.stack([self.scene_object(n).aabb_center for n in names]).mean(dim=0)
         self.look_target = self.to_base(centre, th.tensor([0.0, 0.0, 0.0, 1.0]))[0].cpu().numpy()
         self.look_names = tuple(names)
-        return pose
+
+    def level_held(self, arm: str) -> set:
+        """The labels ``arm`` holds that ride level (E-level: a plate under a pizza); empty when none."""
+        return self.level and self.level & {l for l, a in self.hands().items() if a == arm}
 
     def fold_for_travel(self) -> list | None:
         """Bring the arms in over the base before the base teleports; the posture to unfold back to, or None.
@@ -2865,8 +2932,12 @@ class R1ProSim(TiptopSim):
         observation swings were knocking objects about -- a motion out through a scene nobody has planned. Bringing
         the arms in over the robot's own base is the opposite motion, so it runs at its own speed and costs about a
         quarter as much. Coming back out IS a motion into the room, so it is collision-checked first (2026-09-14).
+
+        Carrying a load level (E-level) the arm stays as it is: the fold drives every arm joint to zero, which tips
+        a load held level at the ready posture 60 deg on the way (fold_tilt.out), and the unfold tips it back. The
+        landing check covers the arm and what it carries where they are.
         """
-        unfold_to = self.fold_for_travel()
+        unfold_to = None if self.level_held(self.arm) else self.fold_for_travel()
         try:
             collision = self.base_placement_collision(x, y, yaw)  # the landing posture
             fraction, partway, why = (self.unfold_reach(unfold_to, x, y, yaw) if unfold and collision is None
@@ -3227,7 +3298,7 @@ class R1ProSim(TiptopSim):
         here = np.asarray(seed, dtype=np.float64)
         # the orientation is loose: what matters is that the object is in the picture, not how it is held -- unless
         # the load must stay level (E-level: a plate under a pizza), which bounds the whole turn
-        loose = LEVEL_TILT if self.level and self.level & {l for l, a in self.hands().items() if a == arm} else 1.2
+        loose = LEVEL_TILT if self.level_held(arm) else 1.2
         candidates, unreachable = [], 0
         for offset in PRESENT_OFFSETS:
             target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
@@ -4709,7 +4780,7 @@ class R1ProSim(TiptopSim):
             return False
         if np.max(np.abs(np.subtract(self.q_arm(), self.q_home)), initial=0.0) < 0.02:
             return True
-        if self.level and self.level & {l for l, a in self.hands().items() if a == self.arm}:
+        if self.level_held(self.arm):
             # E-level: the ready posture turns the hand; a load that must stay level stays where it is instead
             ik = self.arm_ik(self.arm, frame=f"{self.arm}_gripper_link", with_torso=True)
             now = self.robot.get_joint_positions()
@@ -4731,11 +4802,12 @@ class R1ProSim(TiptopSim):
         log.info(f"{note}: the straight ramp was stopped ({stopped[0]}); asking the planner")
         return self.planned_approach(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), note=note, goal_q=list(self.q_home))
 
-    def tilt_wrist(self, arm: str, angle: float = POUR_TILT, hold_steps: int = POUR_HOLD_STEPS) -> bool:
-        """N-rotate (spec S38): tip what ``arm`` holds by turning its last wrist joint ``angle`` rad, the way its
-        limit allows, hold ``hold_steps`` for the contents to fall, and turn back. Both ramps are checked like every
+    def tilt_wrist(self, arm: str) -> bool:
+        """N-rotate (spec S38): tip what ``arm`` holds by turning its last wrist joint POUR_TILT, the way its limit
+        allows, hold POUR_HOLD_STEPS for the contents to fall, and turn back. Both ramps are checked like every
         ramp (the carried volume against the scene). False when either was stopped: the hand is then wherever it
         stopped, still holding."""
+        angle, hold_steps = POUR_TILT, POUR_HOLD_STEPS
         name = f"{arm}_arm_joint7"
         if name not in self.planned_joints:
             log.warning(f"{name} is not a planned joint; no wrist tilt")

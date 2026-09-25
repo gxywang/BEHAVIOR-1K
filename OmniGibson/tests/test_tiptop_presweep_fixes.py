@@ -163,7 +163,7 @@ def _placement_sim(blocked_beyond):
         fold_for_travel=lambda: [1.0, 1.0], q_arm=lambda: [0.0, 0.0], base_placement_collision=collide,
         move_base=lambda *a: None, aim_overview=lambda *a: None, overview_view="shoulder",
         unfold_after_travel=unfolds.append, log_teleport_contacts=lambda: None,
-        held_objects={}, _fold_blocked=False, planned_joints=["j1", "j2"],
+        held_objects={}, _fold_blocked=False, planned_joints=["j1", "j2"], arm="left", level_held=lambda arm: set(),
     )
     sim.unfold_reach = MethodType(R1ProSim.unfold_reach, sim)
     return sim, checks, unfolds
@@ -212,6 +212,7 @@ def test_a_folded_arm_is_no_stance_but_the_furthest_partial_unfold_is():
         robot_cam=SimpleNamespace(get_position_orientation=lambda: (th.tensor([0.0, 0.0, 1.4]), th.tensor([0.0, 0, 0, 1]))),
         camera_floor_distance=lambda z: 0.4, best_base_pose=best, hands=lambda: {}, xy_radius=lambda name: 0.1, place_robot=place,
         base_placement_collision=lambda x, y, yaw: None, hidden_from_here=lambda names: {}, to_base=lambda *args: args,
+        look_at=lambda *names: None,
     )
     result = R1ProSim.place_robot_for(sim, "target")
     assert result["x"] == 1.0  # of the two 25% stances, the better-scored (earlier) one
@@ -255,12 +256,14 @@ def test_return_to_ready_ramps_then_asks_the_planner_for_the_ready_configuration
     asked = []
 
     def sim_with(ramp_result, held=None):
-        return SimpleNamespace(
+        sim = SimpleNamespace(
             q_home=[1.0, 2.0], q_arm=lambda: [0.0, 0.0], posture={}, last_gripper=0.0, arm="left", level=set(),
             robot=SimpleNamespace(_ag_obj_in_hand={"left": held}),
             ramp_to=lambda *args, **kwargs: ramp_result,
             planned_approach=lambda where, quat, note, goal_q=None: asked.append(goal_q) or True,
         )
+        sim.level_held = MethodType(R1ProSim.level_held, sim)
+        return sim
 
     assert R1ProSim.return_to_ready(sim_with(None)) and asked == []
     assert R1ProSim.return_to_ready(sim_with(("left_gripper_link intersects booth", 0, 0.0)))
@@ -321,6 +324,7 @@ def test_a_dry_candidate_search_still_takes_the_furthest_partial_unfold():
         robot_cam=SimpleNamespace(get_position_orientation=lambda: (th.tensor([0.0, 0.0, 1.4]), th.tensor([0.0, 0, 0, 1]))),
         camera_floor_distance=lambda z: 0.4, best_base_pose=best, hands=lambda: {}, xy_radius=lambda name: 0.1, place_robot=place,
         base_placement_collision=lambda x, y, yaw: None, hidden_from_here=lambda names: {}, to_base=lambda *args: args,
+        look_at=lambda *names: None,
     )
     assert R1ProSim.place_robot_for(sim, "target")["x"] == 1.0
     assert placed[-1] == (1.0, 0.25)
@@ -482,6 +486,7 @@ def test_a_carrying_robot_takes_any_landing_clear_stance_whatever_the_unfold():
         camera_floor_distance=lambda z: 0.4, xy_radius=lambda name: 0.1, place_robot=place,
         best_base_pose=lambda *a, **k: ((0, 1.0, 0.0, 0.0, [0.5], [0.0], 0.1), {}), hands=lambda: {"toy_1": "left"},
         base_placement_collision=lambda x, y, yaw: None, hidden_from_here=lambda names: {}, to_base=lambda *args: args,
+        look_at=lambda *names: None,
     )
     R1ProSim.place_robot_for(sim, "target")
     assert asked == [0.0]
@@ -639,7 +644,7 @@ def test_the_idle_arm_is_tucked_when_it_rides_the_torso_into_the_handle_approach
     ended on that one refusal. The robot's own pairs are named base, left, right: the idle hand into the base or the
     working forearm is its to fix too. A refusal by the working arm's own hand is not."""
     joint = dict(name="j", kind="prismatic", lower=0.0, upper=0.3, position=0.0, axis=[1, 0, 0], origin=[0, 0, 0],
-                 link="drawer")
+                 link="drawer", closed=0.0)
     state = [joint]
     monkeypatch.setattr("omnigibson.tiptop.r1pro.openable_joints", lambda obj: [state[-1]])
     ramps, tucks = [], []
@@ -651,7 +656,7 @@ def test_the_idle_arm_is_tucked_when_it_rides_the_torso_into_the_handle_approach
         return None
 
     grasp = dict(joint=joint, jaws=[np.array([0.0, 0.0, 1.0])], kind="bar", tips=[0.0, 0.0, 0.8], nudges=0, travel=0.24)
-    plan = dict(solutions=[[0.1], [0.2], [0.3]], reached=1, why="", grasp_pose=np.eye(4), lead=np.array([-1.0, 0.0, 0.0]))
+    plan = dict(solutions=[[0.1], [0.2], [0.3]], reached=1, why="", grasp_pose=np.eye(4), approach=np.array([-1.0, 0.0, 0.0]))
     ik = SimpleNamespace(fk=lambda q, frame: (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])), solve=lambda *a, **k: None)
     sim = SimpleNamespace(
         arm="left", other_arm="right", OPEN=1.0, CLOSE=-1.0, hands=lambda: {}, posture={"right_arm_joint1": 0.0},
@@ -698,7 +703,7 @@ def _region_sim(mesh, base=(0.0, 0.0), objects=None):
     )
     for name in ("to_base", "region_box", "shelf_of", "rest_region", "footprint_region", "floor_surface", "own_box",
                  "item_height", "seen_aabb", "stamp_region", "knife_region", "heat_region", "attach_target", "push_face",
-                 "upright_rotation", "inside_region"):
+                 "upright_rotation", "inside_region", "aim_target"):
         setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
     return sim
 
@@ -741,16 +746,28 @@ def test_a_stamp_box_covers_the_densest_cluster_the_tool_and_its_margin_can_take
     assert region["dims"][:2] == pytest.approx([1.0192, 0.352], abs=1e-6)  # the slab's reach, no margin, plus the body
 
 
-def test_a_knife_is_set_down_on_the_foods_top_over_its_centre():
+def test_a_knife_is_set_down_across_the_foods_top_along_its_own_length():
     """E-knife: the slicer fires on any knife-link contact while armed (slicer_active.py:72-135), so the cut is a
-    placement on the food's top, a square of the knife's length about the food's centre."""
+    placement on the food's top: a strip the knife's length longer than the food one way and its width wider the
+    other, the knife turned along it. A square of the knife's length, yaw free, let a third of the placements the
+    planner accepted lie entirely beside the food (knife_region_miss.out)."""
+    from omnigibson.tiptop.r1pro import STAMP_YAW_TOL
+
     objects = {}
     sim = _region_sim(None, objects=objects)
     objects["onion.n.01_1"] = _seen("onion.n.01_1", [1.0, 0.5, 0.8], [-0.05, -0.05, -0.05], [0.05, 0.05, 0.05], sim)
-    objects["knife.n.01_1"] = _seen("knife.n.01_1", [0.0, 0.0, 1.0], [-0.12, -0.01, -0.005], [0.12, 0.01, 0.005], sim)
+    knife = _seen("knife.n.01_1", [0.0, 0.0, 1.0], [-0.12, -0.01, -0.005], [0.12, 0.01, 0.005], sim)
+    objects["knife.n.01_1"] = knife
     region = sim.knife_region("knife.n.01_1", "onion.n.01_1")
     assert region["pose"][:2] == pytest.approx([1.0, 0.5]) and region["pose"][2] + 0.01 == pytest.approx(0.85)
-    assert region["dims"] == pytest.approx([0.34, 0.34, 0.02])
+    assert region["dims"] == pytest.approx([0.34, 0.12, 0.02])  # along x as the knife lies; a centre inside crosses
+    assert np.allclose(region["rotation"], np.eye(3)) and region["yaw_tolerance"] == STAMP_YAW_TOL
+    yaw60 = th.tensor([0.0, 0.0, np.sin(np.pi / 6), np.cos(np.pi / 6)])  # the knife held 60 deg off x: nearer y
+    knife.get_position_orientation = lambda: (th.tensor([0.0, 0.0, 1.0]), yaw60)
+    region = sim.knife_region("knife.n.01_1", "onion.n.01_1")
+    assert region["dims"] == pytest.approx([0.12, 0.34, 0.02])
+    long_axis = np.array(region["rotation"]) @ [np.cos(np.pi / 3), np.sin(np.pi / 3), 0.0]
+    assert np.abs(long_axis) == pytest.approx([0.0, 1.0, 0.0], abs=1e-9), "turned the short way onto the strip"
     sim.seen_boxes.pop("knife_1")
     assert sim.knife_region("knife.n.01_1", "onion.n.01_1") is None
 
@@ -790,12 +807,12 @@ def test_the_push_face_of_a_book_lying_under_a_shelf_board_points_into_the_compa
     position, normal, radius, depth = sim.push_face("comic_book.n.01_3")
     assert normal == pytest.approx([1.0, 0.0, 0.0]) and radius == PUSH_RADIUS
     assert position == pytest.approx([1.04, 0.1, 0.735])  # its far face, mid-height
-    assert depth == pytest.approx(0.76 - 0.7 + PUSH_OVERHANG)  # near edge 0.76 -> 0.67: 3 cm past the front at 0.7
+    assert depth == pytest.approx(0.76 - 0.7 + PUSH_OVERHANG, abs=2e-3)  # near edge 0.76 -> 0.67: 3 cm past the front at 0.7
     far = _region_sim(case, base=(2.0, 0.0), objects=objects)  # standing behind the case: the other face, the other way
     far.scene_aabbs, far.objects, far.seen_boxes = sim.scene_aabbs, sim.objects, sim.seen_boxes
     position, normal, _, depth = far.push_face("comic_book.n.01_3")
     assert normal == pytest.approx([-1.0, 0.0, 0.0]) and position[0] == pytest.approx(0.76)
-    assert depth == pytest.approx(1.08 - 1.04 + PUSH_OVERHANG)  # the board ends at the back panel's face, not its own end
+    assert depth == pytest.approx(1.08 - 1.04 + PUSH_OVERHANG, abs=2e-3)  # the board ends at the back panel's face, not its own end
     sim.seen_boxes["comic_book_1"] = (np.array([-0.25, -0.1, -0.015]), np.array([0.03, 0.1, 0.015]))  # hangs 5 cm out
     assert sim.push_face("comic_book.n.01_3") is None
     sim.seen_boxes["comic_book_1"] = (np.array([-0.14, -0.1, -0.015]), np.array([0.14, 0.1, 0.015]))
@@ -1015,6 +1032,9 @@ def test_a_lawn_is_the_floor_under_the_robot():
     assert not Episode.is_floor(None, "table.n.02_1")
     sim.env = SimpleNamespace(task=SimpleNamespace(object_scope={"easter_egg.n.01_1": None, "lawn.n.01_1": None}))
     assert R1ProSim.floor_name(sim) == "lawn.n.01_1"  # a scope with no floor at all raised in Episode.__init__
+    # chopping_wood, clean_your_rusty_garden_tools and stacking_wood stand the agent on a driveway, with no floor
+    sim.env.task.object_scope = {"log.n.01_1": None, "driveway.n.01_1": None, "agent.n.01_1": None}
+    assert R1ProSim.floor_name(sim) == "driveway.n.01_1" and Episode.is_floor(None, "driveway.n.01_1")
 
 
 def test_a_movable_tables_slab_is_the_world_box_of_the_points_that_saw_it():
@@ -1147,16 +1167,28 @@ def test_the_stance_a_container_was_opened_from_is_stood_at_again_before_any_sea
     sim = SimpleNamespace(
         place_robot=lambda x, y, yaw, note="": calls.append(("place", x, y, yaw)),
         place_robot_for=lambda *names, **kw: calls.append(("search", names)) or {"x": 9.0, "y": 9.0, "yaw": 0.0},
+        look_at=lambda *names: calls.append(("look", names)),
         hold=lambda n, g: None, last_gripper=None, n_steps=0, settled_level=lambda x, y: (True, ""), robot=None,
+        video_caption="", arm="left",
     )  # fmt: skip
     ep = SimpleNamespace(sim=sim, stood={}, records=[], args=SimpleNamespace(settle_steps=1), last_level=None,
                          fallen=lambda: False, opened_at={"fridge.n.01_1": (1.0, 2.0, 0.5)})  # fmt: skip
     ep.stand_for = MethodType(Episode.stand_for, ep)
-    assert ep.stand_for("fridge.n.01_1") == {"x": 1.0, "y": 2.0, "yaw": 0.5} and calls == [("place", 1.0, 2.0, 0.5)]
+    assert ep.stand_for("fridge.n.01_1") == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+    # place_robot clears the look target: set again here, or the captures aim at the holding hand, not the bay
+    assert calls == [("place", 1.0, 2.0, 0.5), ("look", ("fridge.n.01_1",))]
     ep.stand_for("fridge.n.01_1")  # a second call for the same object stands somewhere else, as ever
     assert calls[-1] == ("search", ("fridge.n.01_1",))
     ep.stand_for("fridge.n.01_1", "jar.n.01_1")  # a pair is the pair's own search
     assert calls[-1] == ("search", ("fridge.n.01_1", "jar.n.01_1"))
+    # the stance is recorded by open_up itself, from what open_container reports; a failed open records nothing
+    ep.opened_at, ep.spec = {}, None
+    sim.open_container = lambda arm, name, **kw: {"opened": True, "stance": (3.0, 4.0, 0.25)}
+    ep.open_up = MethodType(Episode.open_up, ep)
+    assert ep.open_up("fridge.n.01_1") is True and ep.opened_at == {"fridge.n.01_1": (3.0, 4.0, 0.25)}
+    assert ep.stand_for("fridge.n.01_1") == {"x": 3.0, "y": 4.0, "yaw": 0.25} and calls[-2] == ("place", 3.0, 4.0, 0.25)
+    sim.open_container = lambda arm, name, **kw: {"opened": False, "why": "no grasp"}
+    assert ep.open_up("fridge.n.01_1") is False and ep.opened_at == {"fridge.n.01_1": (3.0, 4.0, 0.25)}
 
 
 def test_closing_pushes_every_open_joint_to_its_closed_end_and_a_roofed_pick_is_marked_for_the_side_grasp(monkeypatch):
@@ -1186,3 +1218,203 @@ def test_closing_pushes_every_open_joint_to_its_closed_end_and_a_roofed_pick_is_
     ep.support_of = lambda b: "table.n.02_1"
     ep.pick("book.n.02_1")
     assert marks[1:] == [{"book.n.02_1"}, set()]
+
+
+def test_push_face_leaves_what_a_top_down_pinch_takes_and_gives_up_without_an_edge():
+    """Review of tier 4 (push-face-false-positives): sweep4 replayed, 9 of 16 pushes were on the round's own pick
+    target -- a 4.9 cm die on a bed (a 0.44 m stroke that would tip it off the edge), a stapler, a banana, ice cubes
+    and a tray 2.26 m toward the corner of a bar's box when the edge ray missed, a board game 1.2 m down a bed. A
+    push is for a flat item wider than the jaw both ways, in a compartment (the books sit 25-28 cm under the next
+    board, more than the hand stack: a roof test would refuse the very case), at most PUSH_MAX_DEPTH from an edge
+    found on the board itself."""
+    from omnigibson.tiptop.r1pro import PUSH_MAX_DEPTH
+
+    bookcase = SimpleNamespace(fixed_base=True, category="bookcase")
+    objects = {}
+    sim = _region_sim(_shelves([0.44, 0.72, 1.0]), objects=objects)
+    sim.scene_aabbs = lambda: [(bookcase, np.array([0.69, -0.41, 0.0]), np.array([1.11, 0.41, 1.0]))]
+    die = _seen("die.n.01_1", [0.90, 0.1, 0.744], [-0.0245, -0.0245, -0.024], [0.0245, 0.0245, 0.024], sim)
+    objects["die.n.01_1"] = die
+    assert sim.push_face("die.n.01_1") is None, "a die is flat by its box and in a compartment, and a pinch takes it"
+    sim.seen_boxes["die_1"] = (np.array([-0.14, -0.1, -0.015]), np.array([0.14, 0.1, 0.015]))  # a book's box
+    assert sim.push_face("die.n.01_1") is not None
+    deep = _region_sim(_shelves([0.44, 0.72, 1.0], x=(0.7, 2.0)), objects=objects)  # a bed: 1.3 m deep
+    deep.scene_aabbs = lambda: [(bookcase, np.array([0.69, -0.41, 0.0]), np.array([2.01, 0.41, 1.0]))]
+    deep.objects, deep.seen_boxes = sim.objects, sim.seen_boxes
+    die.get_position_orientation = lambda: (th.tensor([0.7 + PUSH_MAX_DEPTH + 0.3, 0.1, 0.735]), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    assert deep.push_face("die.n.01_1") is None, "a stroke longer than a compartment is deep"
+    # otwukr's shelves are thinner than the 5 mm a ray from inside the board started under: it missed every one and
+    # the board's box corner stood in (which happened to be right for a case square to the robot)
+    thin = _region_sim(_shelves([0.44, 0.72, 1.0], thick=0.004), objects=objects)
+    thin.scene_aabbs, thin.objects, thin.seen_boxes = sim.scene_aabbs, sim.objects, sim.seen_boxes
+    die.get_position_orientation = lambda: (th.tensor([0.90, 0.1, 0.735]), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    assert thin.push_face("die.n.01_1")[3] == pytest.approx(sim.push_face("die.n.01_1")[3], abs=2e-3)
+
+
+def test_a_push_hint_carries_the_strokes_depth_to_the_planner():
+    """button_hints puts push_face's depth on the <item>_button hint (T5); without it cuTAMP strokes its config's
+    1.5 cm (tiptop_sim_r1pro.yml push_depth) and the book never reaches the edge."""
+    from omnigibson.tiptop.r1pro import PUSH_OVERHANG, PUSH_RADIUS
+
+    bookcase = SimpleNamespace(fixed_base=True, category="bookcase")
+    objects = {}
+    sim = _region_sim(_shelves([0.44, 0.72, 1.0]), objects=objects)
+    sim.scene_aabbs = lambda: [(bookcase, np.array([0.69, -0.41, 0.0]), np.array([1.11, 0.41, 1.0]))]
+    objects["comic_book.n.01_3"] = _seen("comic_book.n.01_3", [0.90, 0.1, 0.735], [-0.14, -0.1, -0.015], [0.14, 0.1, 0.015], sim)  # fmt: skip
+    sim.label_of = lambda bddl: "comic_book_3"
+    sim.button_hints = MethodType(R1ProSim.button_hints, sim)
+    hint = sim.button_hints([{"predicate": "push", "args": ["comic_book.n.01_3"]}])["comic_book_3_button"]
+    assert hint["depth"] == pytest.approx(0.76 - 0.7 + PUSH_OVERHANG) and hint["radius"] == PUSH_RADIUS
+    assert hint["position"] == pytest.approx([1.04, 0.1, 0.735]) and hint["normal"] == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_a_level_load_rides_through_the_teleport_unfolded(monkeypatch):
+    """E-level (review level-carry-tipped-by-travel-fold): the fold drives every arm joint to zero, which tips a load
+    held level at the ready posture 60 deg on the way (fold_tilt.out), and the unfold tips it back. Carrying level
+    the arm stays as it is; the landing check covers it where it is."""
+    monkeypatch.setattr("omnigibson.tiptop.r1pro.gm", SimpleNamespace(HEADLESS=True))
+    sim, checks, unfolds = _placement_sim(blocked_beyond=2.0)
+    folds = []
+    sim.fold_for_travel = lambda: folds.append(1) or [1.0, 1.0]
+    sim.level_held = lambda arm: {"plate_1"}
+    sim.stance_ready = None
+    R1ProSim.place_robot(sim, 1.0, 0.0, 0.0)
+    assert folds == [] and unfolds == [] and checks == [None] and sim.stance_ready is None
+    sim.level_held = lambda arm: set()
+    R1ProSim.place_robot(sim, 1.0, 0.0, 0.0)
+    assert folds == [1] and unfolds == [[1.0, 1.0]]
+    held = SimpleNamespace(level={"plate_1", "tray_1"}, hands=lambda: {"plate_1": "left", "tray_1": "right", "cup_1": "left"})
+    assert R1ProSim.level_held(held, "left") == {"plate_1"} and R1ProSim.level_held(held, "right") == {"tray_1"}
+    assert not R1ProSim.level_held(SimpleNamespace(level=set()), "left")
+
+
+def test_a_flat_item_that_fits_the_compartment_lies_and_one_that_fits_neither_way_stands():
+    """Review (upright-rule-fires-on-flat-items): the rule compared the longest extent with the narrower side, so a
+    22 x 18 x 3 cm puzzle that fits the 25 x 18.8 cm toy box lying (and did, sweep4 r04) was stood 22 cm tall in an
+    11.6 cm box, and a 29 cm board game whose centre on end stands 3 cm over the box's walls. Stood on end only when
+    the footprint's diagonal is longer than the rectangle's (it fits lying at no angle) and its centre on end is
+    still under the ceiling (where the scorer's Inside looks for it)."""
+    objects = {}
+    sim = _region_sim(None, objects=objects)
+    objects["jigsaw_puzzle.n.01_1"] = _seen("jigsaw_puzzle.n.01_1", [1.0, 0.5, 0.8], [-0.11, -0.09, -0.015], [0.11, 0.09, 0.015], sim)  # fmt: skip
+    sim.inside_rect = lambda item, container: (np.array([2.0, 1.0]), np.array([0.125, 0.094]), 0.797, 0.913)
+    assert "rotation" not in sim.inside_region("jigsaw_puzzle.n.01_1", "toy_box.n.01_1")
+    sim.inside_rect = lambda item, container: (np.array([2.0, 1.0]), np.array([0.094, 0.125]), 0.797, 0.913)  # turned
+    assert "rotation" not in sim.inside_region("jigsaw_puzzle.n.01_1", "toy_box.n.01_1")
+    sim.seen_boxes["jigsaw_puzzle_1"] = (np.array([-0.15, -0.095, -0.015]), np.array([0.15, 0.095, 0.015]))  # 30 x 19 cm
+    assert "rotation" not in sim.inside_region("jigsaw_puzzle.n.01_1", "toy_box.n.01_1"), "on end its centre is over the walls"
+    sim.inside_rect = lambda item, container: (np.array([2.0, 1.0]), np.array([0.094, 0.125]), 0.797, 0.96)  # a deeper box
+    assert "rotation" in sim.inside_region("jigsaw_puzzle.n.01_1", "toy_box.n.01_1")
+    sim.inside_rect = lambda item, container: (np.array([2.0, 1.0]), np.array([0.0545, 0.056]), 0.6, 0.75)  # a basket's
+    sim.seen_boxes["jigsaw_puzzle_1"] = (np.array([-0.062, -0.0375, -0.01]), np.array([0.062, 0.0375, 0.01]))  # a cheese slice
+    assert "rotation" not in sim.inside_region("jigsaw_puzzle.n.01_1", "toy_box.n.01_1"), "12.4 x 7.5 cm lies in 10.9 x 11.2 across"
+
+
+def test_the_intent_regions_are_routed_by_predicate_and_filed_where_the_wire_names_the_plane():
+    """T8: stamp, cut, heat, aim and attached each take their hint from the oracle and land under the target's
+    label, or under the planner's support label for aim and for a floor target (protocol.tiptop_goal names the
+    plane there); without an oracle none is made. And aim_target's yaw turns the nozzle's spray onto the target."""
+    from b1k.bridge.protocol import PLANNER_SUPPORT
+
+    made = []
+    sim = SimpleNamespace(
+        label_of=lambda bddl: bddl.split(".")[0] + "_1", region_refused=set(),
+        scene_object=lambda name: SimpleNamespace(fixed_base=True),
+        stamp_region=lambda tool, target, particles, projection=None: made.append(("stamp", particles, projection)) or {"r": "stamp"},
+        knife_region=lambda knife, food: {"r": "cut"},
+        heat_region=lambda item, source, link: made.append(("heat", link)) or {"r": "heat"},
+        aim_target=lambda tool, target, nozzle: made.append(("aim", nozzle)) or {"r": "aim"},
+        attach_target=lambda child, parent, frames: made.append(("attach", frames)) or {"r": "attach"},
+    )  # fmt: skip
+    oracle = SimpleNamespace(particles=lambda t: "P", projection_box=lambda i: "SLAB", heat_link=lambda s: "HEAT",
+                             nozzle=lambda t: "NOZ", attach_frames=lambda c, p: "FR")  # fmt: skip
+    regions = lambda p, *a, **kw: R1ProSim.inside_regions(sim, [{"predicate": p, "args": list(a)}], **kw)
+    assert regions("stamp", "vacuum.n.04_1", "floor.n.01_1", oracle=oracle) == {PLANNER_SUPPORT: {"r": "stamp"}}
+    assert regions("stamp", "scrub_brush.n.01_1", "shoe.n.01_1", oracle=oracle) == {"shoe_1": {"r": "stamp"}}
+    assert regions("cut", "knife.n.01_1", "onion.n.01_1", oracle=oracle) == {"onion_1": {"r": "cut"}}
+    assert regions("heat", "pan.n.01_1", "stove.n.01_1", oracle=oracle) == {"stove_1": {"r": "heat"}}
+    assert regions("aim", "atomizer.n.01_1", "plant.n.01_1", oracle=oracle) == {PLANNER_SUPPORT: {"r": "aim"}}
+    assert regions("attached", "alarm.n.01_1", "nail.n.01_1", oracle=oracle) == {"nail_1": {"r": "attach"}}
+    assert made == [("stamp", "P", "SLAB"), ("stamp", "P", "SLAB"), ("heat", "HEAT"), ("aim", "NOZ"), ("attach", "FR")]
+    assert regions("aim", "atomizer.n.01_1", "plant.n.01_1") == {} and regions("stamp", "a.n.01_1", "b.n.01_1") == {}
+    objects = {}
+    real = _region_sim(None, objects=objects)
+    objects["plant.n.01_1"] = _seen("plant.n.01_1", [1.0, 0.5, 0.3], [-0.1, -0.1, -0.3], [0.1, 0.1, 0.3], real)
+    objects["atomizer.n.01_1"] = _seen("atomizer.n.01_1", [0.0, 0.0, 0.1], [-0.03, -0.03, -0.1], [0.03, 0.03, 0.1], real)
+    frame = trimesh.transformations.rotation_matrix(np.pi / 2, [0.0, 1.0, 0.0])  # the nozzle's -z now looks along +x
+    region = real.aim_target("atomizer.n.01_1", "plant.n.01_1", (frame, 0.4))
+    to_target = np.array([1.0, 0.5]) / np.hypot(1.0, 0.5)
+    assert (np.array(region["rotation"]) @ -frame[:3, 2])[:2] == pytest.approx(to_target, abs=1e-9), "spray at the plant"
+    assert np.hypot(*region["pose"][:2]) < np.hypot(1.0, 0.5), "stood on the robot's side of it"
+
+
+def test_the_bay_is_the_one_behind_the_door_furthest_from_its_own_closed_end(monkeypatch):
+    """T12 (E-region petcxr): inside_rect hands bay() the opened door's centre, and the door that is most open is
+    measured from its own closed end (a door hung the other way rests at its upper limit shut). With the AABB centre
+    between petcxr's two columns the tie went to the lower level: the column behind the shut door."""
+    from omnigibson.tiptop import articulation
+
+    def accepts(points):
+        x, z = points.numpy()[:, 0], points.numpy()[:, 2]
+        return th.tensor(((np.abs(x - 0.2) < 0.2) & (z >= 0.0)) | ((np.abs(x - 1.0) < 0.2) & (z >= 0.26)))
+
+    lo, hi = th.tensor([0.0, -0.3, 0.0]), th.tensor([1.2, 0.3, 0.5])
+    fill = SimpleNamespace(name="fill", is_meta_link=True, meta_link_type="fillable", visual_aabb=(lo, hi),
+                           visual_aabb_center=(lo + hi) / 2, visual_aabb_extent=hi - lo, check_points_in_volume=accepts)  # fmt: skip
+    doors = {n: SimpleNamespace(aabb=(th.tensor([x, -0.3, 0.0]), th.tensor([x + 0.05, 0.3, 0.5]))) for n, x in (("left", -0.05), ("right", 1.2))}  # fmt: skip
+    fridge = SimpleNamespace(fixed_base=True, links={"fill": fill, **doors})
+    joints = [dict(name="j_left", kind="revolute", axis=[0, 0, 1], origin=[0, 0, 0], lower=0.0, upper=1.6, position=1.5, closed=1.6, link="left"),
+              dict(name="j_right", kind="revolute", axis=[0, 0, 1], origin=[0, 0, 0], lower=0.0, upper=1.6, position=1.2, closed=0.0, link="right")]  # fmt: skip
+    monkeypatch.setattr(articulation, "openable_joints", lambda obj: joints)
+    sim = SimpleNamespace(scene_object=lambda name: fridge, item_height=lambda name: 0.1)
+    sim.inside_rect, sim.bay = MethodType(R1ProSim.inside_rect, sim), MethodType(R1ProSim.bay, sim)
+    centre, half, floor, ceiling = sim.inside_rect("jar.n.01_1", "fridge.n.01_1")
+    assert centre[0] == pytest.approx(1.0, abs=0.05) and floor == pytest.approx(0.26, abs=0.011) and ceiling == 0.5
+    assert 0.1 < half[0] < 0.2 and half[1] > 0.2  # the run of accepted points about it, shrunk to the corners accepted
+    joints[0]["position"] = 0.3  # the left door 1.3 rad off its own closed end: the most open, its column
+    assert sim.inside_rect("jar.n.01_1", "fridge.n.01_1")[0][0] == pytest.approx(0.2, abs=0.05)
+
+
+def test_region_rotations_are_the_base_frames_on_a_turned_robot():
+    """T13: upright_rotation and attach_target hand the planner a rotation in the BASE frame (its object frame is
+    base-aligned at the capture). Every region test's robot faced world +x, where the frames coincide, so dropping
+    the conversion passed; on a robot yawed 90 deg the unconverted rose stays lying across the vase."""
+    import omnigibson.utils.transform_utils as T
+
+    objects = {}
+    sim = _region_sim(None, objects=objects)
+    yawed = th.tensor([0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)])  # the base turned 90 deg
+    sim.base_pose = lambda: (th.tensor([0.0, 0.0, 0.0]), yawed)
+    base = T.quat2mat(yawed).numpy()
+    yaw30 = th.tensor([0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)])
+    objects["rose.n.01_1"] = sim.objects["rose_1"] = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: (th.tensor([1.0, 0.5, 0.75]), yaw30))  # fmt: skip
+    sim.seen_boxes["rose_1"] = (np.array([-0.15, -0.03, -0.02]), np.array([0.15, 0.03, 0.02]))
+    R_base = np.array(sim.upright_rotation("rose.n.01_1"))
+    long_axis_base = base.T @ T.quat2mat(yaw30).numpy() @ [1.0, 0.0, 0.0]
+    assert R_base @ long_axis_base == pytest.approx([0.0, 0.0, 1.0], abs=1e-6)
+    alarm = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: (th.tensor([0.6, 0.0, 0.019]), th.tensor([0.0, 0.0, 0.0, 1.0])))  # fmt: skip
+    objects["fire_alarm.n.02_1"] = sim.objects["fire_alarm_1"] = alarm
+    sim.seen_boxes["fire_alarm_1"] = (np.array([-0.05, -0.05, -0.019]), np.array([0.05, 0.05, 0.019]))
+    male, female = np.eye(4), trimesh.transformations.rotation_matrix(np.pi / 2, [0.0, 1.0, 0.0])
+    male[:3, 3], female[:3, 3] = [0.6, 0.0, 0.0], [1.0, 0.3, 1.71]
+    region = sim.attach_target("fire_alarm.n.02_1", "wall_nail.n.01_1", (male, female))
+    assert np.allclose(base @ np.array(region["rotation"]) @ base.T, female[:3, :3]), "the nail's frame, in the base's"
+
+
+def test_the_pour_tilts_the_wrist_the_way_its_limit_allows_and_a_stopped_ramp_is_no_pour():
+    """T16 (N-rotate): joint7 within 90 deg of its upper limit tips negative; a ramp the preflight or the block
+    detector stopped reports False, and the wrist is still turned back."""
+    from omnigibson.tiptop.r1pro import POUR_HOLD_STEPS, POUR_TILT
+
+    ramps = []
+    joint = SimpleNamespace(upper_limit=2.0, lower_limit=-2.0)
+    sim = SimpleNamespace(planned_joints=["left_arm_joint1", "left_arm_joint7"], q_arm=lambda: [0.3, 1.0], posture={},
+                          last_gripper=-1.0, robot=SimpleNamespace(joints={"left_arm_joint7": joint}),
+                          ramp_to=lambda q, posture, gripper, settle, note="", **kw: ramps.append((list(q), settle)) or None)  # fmt: skip
+    assert R1ProSim.tilt_wrist(sim, "left") is True
+    assert ramps == [([0.3, 1.0 - POUR_TILT], POUR_HOLD_STEPS), ([0.3, 1.0], ramps[1][1])]  # up would hit the limit
+    sim.q_arm = lambda: [0.3, 0.0]
+    assert R1ProSim.tilt_wrist(sim, "left") and ramps[-2][0] == [0.3, POUR_TILT]
+    sim.ramp_to = lambda q, *a, **kw: ramps.append(list(q)) or ("left_arm_link7 intersects table", 0, 0.0)
+    assert R1ProSim.tilt_wrist(sim, "left") is False and ramps[-1] == [0.3, 0.0]
+    assert R1ProSim.tilt_wrist(SimpleNamespace(planned_joints=["torso_joint1"]), "left") is False

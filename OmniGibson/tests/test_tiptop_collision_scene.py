@@ -572,6 +572,7 @@ def _destination_sim(obstacle, held=None):
         collision_mesh_world=lambda obj: meshes[obj.name],
         scene_aabbs=lambda: [(obj, *meshes[obj.name].bounds) for obj in bodies],
         objects={}, seen_boxes={},  # no capture has seen the held object: its mesh box, as before
+        arm="left", level_held=lambda arm: set(),
     )
     for name in ("_motion_obstacles", "base_placement_collision", "own_box", "carried_volume"):
         setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
@@ -678,7 +679,7 @@ def test_stance_retry_avoids_rejected_landings_without_repeating_motor_attempts(
         scene_object=lambda name: target, grasped_labels=lambda: {}, objects={},
         robot_cam=SimpleNamespace(get_position_orientation=_pose), camera_floor_distance=lambda z: 0.4,
         best_base_pose=best, hands=lambda: {}, xy_radius=lambda name: 0.1, place_robot=place, base_placement_collision=check,
-        hidden_from_here=lambda names: {}, to_base=lambda *args: args,
+        hidden_from_here=lambda names: {}, to_base=lambda *args: args, look_at=lambda *names: None,
     )
     refused = []
     result = R1ProSim.place_robot_for(sim, "target", refused=refused)

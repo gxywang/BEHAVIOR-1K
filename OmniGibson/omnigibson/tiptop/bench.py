@@ -48,6 +48,7 @@ from b1k.bridge.strategies import (
     Unreachable,
     atom,
     atom_objects,
+    taxonomy,
     wants_home_torso,
 )
 from omnigibson.tiptop.run import (
@@ -270,6 +271,7 @@ class Episode:
                 if known is not None and all(np.hypot(known[0] - x, known[1] - y) > 0.05 for x, y in avoid):
                     try:  # the stance it was opened from: the door is open and its inside was reached from there
                         self.sim.place_robot(*known, note=f"stand where {names[0]} was opened from")
+                        self.sim.look_at(*names)  # the captures look at its bay, not at the holding hand
                         pose = {"x": known[0], "y": known[1], "yaw": known[2]}
                     except RuntimeError as why:
                         log.info(f"the stance {names[0]} was opened from is refused now ({why}); searching")
@@ -812,19 +814,17 @@ class Episode:
         door gates the oven's and the microwave's heat, a burner needs none (spec 6.1.6). Tracked under its scene
         name so goal atoms can name it (``toggled_on(stove_ykretu_0)`` translates like a task object's); None when
         the scene has none. Where a fixture stands is the map's; what heats is the taxonomy's."""
-        from bddl.object_taxonomy import ObjectTaxonomy
         from omnigibson.tiptop.articulation import openable_joints
 
-        taxonomy = ObjectTaxonomy()
         boxes = self.boxes(near) if near else {}
         at = boxes[near]["center"][:2] if near in boxes else self.sim.base_pose()[0][:2].cpu().numpy()
         found = []
         for obj in self.sim.env.scene.objects:
             try:
-                synset = taxonomy.get_synset_from_category(obj.category) if getattr(obj, "fixed_base", False) else None
+                synset = taxonomy().get_synset_from_category(obj.category) if getattr(obj, "fixed_base", False) else None
             except ValueError:  # a category the taxonomy maps to more than one synset
                 synset = None
-            if synset is not None and taxonomy.has_ability(synset, ability):
+            if synset is not None and taxonomy().has_ability(synset, ability):
                 centre = obj.aabb_center.cpu().numpy()[:2]
                 found.append((bool(openable_joints(obj)), float(np.linalg.norm(centre - at)), obj.name))
         if not found:

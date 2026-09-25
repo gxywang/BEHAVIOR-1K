@@ -148,8 +148,10 @@ def test_the_side_grasp_labels_survive_the_h5_so_a_side_entry_round_replays_exac
 
     req = _request()
     req["side_grasp"] = ["mug"]  # OracleKnowledge.describe, for a pick round Episode.pick marked
+    req["inside"] = ["bowl"]  # ... and the inside() container of a round that got no region
     save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
-    assert request_from_observation(load_observation_h5(tmp_path / "obs.h5"))["side_grasp"] == ["mug"]
+    out = request_from_observation(load_observation_h5(tmp_path / "obs.h5"))
+    assert out["side_grasp"] == ["mug"] and out["inside"] == ["bowl"]
 
 
 def test_views_ride_along_validated_and_survive_the_h5(tmp_path):
@@ -789,7 +791,13 @@ def test_a_push_is_a_press_on_the_items_own_face_and_a_pour_a_placement_and_thei
     req = _request()
     face = {"position": [0.7, 0.3, 0.72], "normal": [1.0, 0.0, 0.0], "radius": 0.01, "depth": 0.18}
     plain = {"position": [0.6, 0.0, 0.8], "normal": [0.0, -1.0, 0.0], "radius": 0.02}
-    attach_knowledge(req, req["gt_labels"], req["gt_atoms"], masks=req["gt_masks"], buttons={"mug_button": face, "bowl_button": plain})
+    attach_knowledge(
+        req,
+        req["gt_labels"],
+        req["gt_atoms"],
+        masks=req["gt_masks"],
+        buttons={"mug_button": face, "bowl_button": plain},
+    )
     assert req["gt_buttons"]["mug_button"] == face and "depth" not in req["gt_buttons"]["bowl_button"]
     req["level"] = ["bowl"]
     save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
@@ -817,7 +825,9 @@ def test_keep_holding_drops_the_release_and_comes_back_up_the_way_it_went_down()
     assert [s["type"] for s in out["steps"]] == ["trajectory"] * 4 and all(s["label"] == place for s in out["steps"])
     assert np.array_equal(out["steps"][2]["positions"], plan["steps"][1]["positions"][::-1])
     assert np.array_equal(out["steps"][2]["velocities"], -plan["steps"][1]["velocities"][::-1])
-    assert np.array_equal(out["steps"][3]["positions"][-1], plan["steps"][0]["positions"][0])  # back at the approach start
+    assert np.array_equal(
+        out["steps"][3]["positions"][-1], plan["steps"][0]["positions"][0]
+    )  # back at the approach start
     assert plan["steps"][2]["action"] == "open"  # the plan given is untouched
     no_open = dict(plan, steps=plan["steps"][:2])
     assert keep_holding(no_open) is no_open

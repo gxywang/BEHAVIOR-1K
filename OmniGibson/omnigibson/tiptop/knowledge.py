@@ -16,12 +16,12 @@ PRIVILEGED warning still fires from ``make_knowledge`` because the class declare
 The names below are re-exported, so ``from omnigibson.tiptop.knowledge import ...`` is unchanged.
 """
 
-import itertools
 import logging
 
 import numpy as np
 import omnigibson.utils.transform_utils as T
 
+from b1k.bridge.geometry import box_corners
 from b1k.bridge.judgement import highest_support
 from b1k.bridge.knowledge import *  # noqa: F401,F403
 from b1k.bridge.knowledge import KnowledgeSource, SceneKnowledge, register_source
@@ -98,6 +98,11 @@ class OracleKnowledge(KnowledgeSource):
         side = getattr(self.sim, "side_grasp", None)  # Episode.pick marked this round: a roof within the hand stack
         if side:
             request["side_grasp"] = sorted(self.sim.label_of(name) for name in side)
+        # an inside() container that got no region reaches the planner as on(a, b), which it cannot tell from a
+        # book to stack on (E-stack judges those by the centre alone): named, so the whole footprint stays inside
+        inside = {self.sim.tracked_label(a["args"][1]) for a in atoms if a["predicate"] == "inside"} - set(regions)
+        if inside:
+            request["inside"] = sorted(inside)
         counts = {
             name: {label: int(m.sum()) for label, m in zip(labels, view_masks)} for name, view_masks in masks.items()
         }
@@ -196,16 +201,16 @@ class OracleKnowledge(KnowledgeSource):
     # ---------------------------------------------------------------- privileged hints, one named read each
     # Each is what a perception module would later supply (spec 6.2 names the replacement); the regions that use
     # them (r1pro.stamp_region and the others) take the values and stay pure geometry.
-    def particles(self, target: str, system: str | None = None) -> np.ndarray:
-        """(n, 3) world positions of the visual particles attached to ``target`` -- every system's, or one
-        ``system``'s: what a stamp must cover. Later: instance segmentation labels particles by system."""
+    def particles(self, target: str) -> np.ndarray:
+        """(n, 3) world positions of the visual particles attached to ``target``, every system's: what a stamp must
+        cover. Later: instance segmentation labels particles by system."""
         from omnigibson.systems.system_base import VisualParticleSystem
 
         group = VisualParticleSystem.get_group_name(obj=self.sim.scene_object(target))
         found = [
             s.get_group_particles_position_orientation(group)[0].cpu().numpy().astype(np.float64)
-            for name, s in self.sim.env.scene.active_systems.items()
-            if isinstance(s, VisualParticleSystem) and (system is None or name == system) and group in s.groups
+            for s in self.sim.env.scene.active_systems.values()
+            if isinstance(s, VisualParticleSystem) and group in s.groups
         ]
         return np.concatenate(found) if found else np.zeros((0, 3))
 
@@ -261,7 +266,7 @@ class OracleKnowledge(KnowledgeSource):
             return None
         ex = np.asarray(state._projection_mesh_params["extents"], dtype=np.float64) * state.link.scale.cpu().numpy()
         obj_from_link = np.linalg.inv(T.pose2mat(obj.get_position_orientation()).cpu().numpy()) @ _frame(state.link)
-        corners = np.array(list(itertools.product((-ex[0] / 2, ex[0] / 2), (-ex[1] / 2, ex[1] / 2), (-ex[2], 0.0))))
+        corners = box_corners((-ex[0] / 2, -ex[1] / 2, -ex[2]), (ex[0] / 2, ex[1] / 2, 0.0))
         corners = corners @ obj_from_link[:3, :3].T + obj_from_link[:3, 3]
         return corners.min(axis=0), corners.max(axis=0)
 
