@@ -4023,7 +4023,9 @@ class R1ProSim(TiptopSim):
             mesh = self.collision_mesh_world(obj)
             if mesh is not None:
                 obstacles.append((obj.name, mesh))
-                if obj.category == "floors":
+                # fixed ground by height too, as base_placement_collision reads it: the lawn under a patio (top z 0.000)
+                # was "in" the wheels' 2 mm buffer at every garden stance (spraying_for_bugs 301, 2026-09-25)
+                if obj.category == "floors" or getattr(obj, "fixed_base", False) and float(hi[2]) < GROUND_TOP:
                     allowed_contacts.setdefault(obj.name, set()).update(
                         {"base_link", "wheel_motor_link1", "wheel_motor_link2", "wheel_motor_link3"}
                     )

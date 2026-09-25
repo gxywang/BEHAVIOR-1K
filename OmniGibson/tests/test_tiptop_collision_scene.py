@@ -924,6 +924,35 @@ def test_a_loose_tile_at_the_destination_is_ground_for_the_base_but_not_floor_fo
     assert R1ProSim.base_placement_collision(sim, 5.0, 0.0, 0.0) is None
 
 
+def test_the_wheels_may_rest_on_a_lawn_as_on_a_floor():
+    """spraying_for_bugs 301 (2026-09-25): the lawn runs under the patio with its top at z 0.000, the wheel spheres
+    reach 2 mm below the base (their buffer), and every garden stance was refused for 'wheel_motor_link1 intersects
+    lawn_aztwla_0': the atomizer was never reached. Fixed ground by height is floor for the wheels; a loose flat
+    tile is not. The real r1pro spheres."""
+    from pathlib import Path
+
+    from omnigibson.tiptop.collision import JointPathCollision
+
+    r1pro = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro"
+    model = JointPathCollision(r1pro / "urdf/r1pro.urdf", r1pro / "curobo/r1pro_description_curobo_arm_no_torso.yaml",
+                               [f"torso_joint{i}" for i in range(1, 5)])
+    lawn = SimpleNamespace(name="lawn_aztwla_0", category="lawn", fixed_base=True)
+    tile = SimpleNamespace(name="tile_1", category="tile", fixed_base=False)
+    meshes = {"lawn_aztwla_0": _box([40, 40, 0.3], [0, 0, -0.15]), "tile_1": _box([0.4, 0.4, 0.01], [3, 3, 0.005])}
+    sim = SimpleNamespace(
+        arm="left", robot=SimpleNamespace(get_joint_positions=lambda: th.tensor([1.025, -1.45, -0.47, 0.0]),
+                                          _ag_obj_in_hand={}, finger_link_names={"left": []}),
+        joint_index={name: i for i, name in enumerate(model.joint_names)}, _motion_collision_model=lambda: model,
+        base_pose=_pose, collision_mesh_world=lambda obj: meshes[obj.name],
+        scene_aabbs=lambda: [(obj, *meshes[obj.name].bounds) for obj in (lawn, tile)],
+    )
+    sim._motion_obstacles = MethodType(R1ProSim._motion_obstacles, sim)
+    allowed = {}
+    sim._motion_obstacles(set(), allowed)
+    assert allowed == {"lawn_aztwla_0": {"base_link", "wheel_motor_link1", "wheel_motor_link2", "wheel_motor_link3"}}
+    assert R1ProSim.base_placement_collision(sim, 0.0, 0.0, 0.17) is None
+
+
 def test_a_ramp_that_swings_a_hand_into_the_robots_own_head_is_refused():
     """bringing_in_wood 301 (2026-09-23): the capture swing rolled left_arm_joint3 through 3.7 rad and the fingers
     stopped on zed_link, logged 'in the way: nothing the box test sees'; 43 such swings in 30 episodes. The real

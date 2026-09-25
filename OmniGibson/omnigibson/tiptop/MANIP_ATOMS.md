@@ -257,6 +257,11 @@ and `cutamp-20-near-aim-half-of-allowed.patch`. Suites after integration: bridge
 - `b1k/bridge/geometry.py: FLOOR_COVERINGS` has no "lawn", so the stance search's `footprint_blockers` treats the four
   garden lawn bodies of hiding_Easter_eggs as candidate obstacles; whether a base standing on one is refused depends
   on the lawn top vs the base underside. Add "lawn" there only if a run refuses a garden stance for it.
+  manip2 (spraying_for_bugs 301) refused every garden stance for a lawn, but in the landing check, not here (the
+  lawn's box is skipped by HOUSE_AABB_AREA): `_motion_obstacles` let the wheels touch only category "floors", and the
+  lawn under the patio (top z 0.000) was in the wheels' 2 mm buffer. It now lets them touch any fixed body with its
+  top under GROUND_TOP (`test_tiptop_collision_scene.py::test_the_wheels_may_rest_on_a_lawn_as_on_a_floor`).
+  FLOOR_COVERINGS is unchanged.
 - Sweep-level evaluation of every item above waits for the simulator: the A-assist run (the 13 step-1 tasks and the
   thin-sheet probe with `--grasping-mode assisted`, judged by `read_run.py` against sweep4), planned part grasps on
   tile / eraser / paintbrush / magazine / jigsaw_puzzle rounds, and one episode each of hiding_Easter_eggs,
