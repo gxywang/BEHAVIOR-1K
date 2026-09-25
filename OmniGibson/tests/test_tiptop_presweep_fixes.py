@@ -796,6 +796,8 @@ def test_a_lawn_is_the_floor_under_the_robot():
     assert sim.floor_surface()["pose"][2] + 0.01 == pytest.approx(0.05)
     assert Episode.is_floor(None, "lawn.n.01_1") and Episode.is_floor(None, "floor.n.01_2")
     assert not Episode.is_floor(None, "table.n.02_1")
+    sim.env = SimpleNamespace(task=SimpleNamespace(object_scope={"easter_egg.n.01_1": None, "lawn.n.01_1": None}))
+    assert R1ProSim.floor_name(sim) == "lawn.n.01_1"  # a scope with no floor at all raised in Episode.__init__
 
 
 def test_a_movable_tables_slab_is_the_world_box_of_the_points_that_saw_it():

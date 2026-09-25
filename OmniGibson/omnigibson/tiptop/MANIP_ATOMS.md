@@ -14,9 +14,10 @@ clouds and hulls); privileged simulator state enters only through `OracleKnowled
 
 ## Tier 1 (2026-09-24): A-assist, E-tip, E-part, E-near, E-conj, E-pressface, E-region, auto spec
 
-Commit: this section's commit in both repos. cuTAMP: `install/patches/cutamp-19-fingers-touch-the-support-near-aim.patch`.
-Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py` 409 passed (401 before the tier); planner
-`tiptop/tests/` 179 passed, 5 deselected (171 before).
+Commits: c207733 / d91c899e5 (first pass) and this section's second-pass commit in both repos (the near aim uncapped,
+thickness read from the support, a lawn as the only floor). cuTAMP: `install/patches/cutamp-19-fingers-touch-the-support-near-aim.patch`
+and `cutamp-20-near-aim-half-of-allowed.patch`. Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py`
+409 passed (401 before the tier); planner `tiptop/tests/` 180 passed, 5 deselected (171 before).
 
 ### A-assist: every pick is a planner round; the sticky press only under sticky
 
@@ -72,21 +73,34 @@ Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py` 409 passed 
   `filtered_grasps` per label except held labels; the empty-grasps `contacts` shape fixed from (0,0,3) to (0,3).
   Constants `JAW`, `RAY_BEHIND_TIPS`, `FINGER_*` are R1Pro's (ponytail-marked). Support z: the fitted plane's surface
   when the object rests on it (a camera never sees an underside; the paintbrush's lowest seen point was 2 mm above the
-  desk), else the cloud's lowest points.
+  desk), else the cloud's lowest points. Second pass: the thickness is measured from that support, not from the
+  cloud's own z range (a puzzle box 1.2 cm over the plane with 6 mm of it seen is 1.8 cm thick, not under the 7 mm
+  corner gate), and a sheet thinner than ~6 mm takes the tips down onto the support so the near-tip ray runs under
+  its top (S02: tips within height - 4 mm of the support); never so low that the ray leaves the hull.
 - Reads: the object's perceived points and hull only; the RANSAC plane or the client's support box.
 - Tests: `tiptop/tests/test_support_surface_fallback.py`: a book seen from above gets 8 corner pinches with the tips
   2 mm above its bottom and the ray inside the slab; a 10 cm cube gets 8 edge grasps and nothing top-down; a 1 x 14 cm
-  pen gets 8 tip grasps centred within 1 mm, and a finger on it fails `weld_ok`.
+  pen gets 8 tip grasps centred within 1 mm, and a finger on it fails `weld_ok`;
+  `::test_thickness_is_read_from_the_support_and_a_sheet_takes_the_tips_down_to_it` (the puzzle box: 0 grasps from
+  its own 6 mm of cloud, 8 corners with the support given; a 5 mm sheet: 12 tip grasps with the tips on the support).
 - Replay (`T1-planner/part_grasps_eval.out`, CPU, 66 object rows over 27 sweep4 pick rounds): tiles 0 -> 4-6 passing,
-  eraser 0 -> 4, paintbrush 0 -> 6, magazines 0 -> 4-8, markers 0 -> 6, glue stick 0 -> 2, board games 0 -> 6; nothing
-  for sheets under ~6 mm as perceived (newspapers, jigsaw_puzzle_2), bottles and cans stay M2T2's.
+  eraser 0 -> 4, paintbrush 0 -> 6, magazines 0 -> 4-8, markers 0 -> 6, glue stick 0 -> 2, board games 0 -> 6. With
+  the thickness from the support (before copy `part_grasps_eval_c207733.out`): picking_up_toys r01 jigsaw_puzzle_2
+  (the goal, 0 M2T2 grasps; the round failed and fell to the sticky press) 0 -> 6, r08 0 -> 6, sorting_bottles r29
+  magazine_1 0 -> 6; the desk and countertop rows lose their 8 always-refused corner candidates; every other row is
+  unchanged. Still nothing for newspapers (0.4-0.5 cm from the plane, under the 7 mm corner gate); bottles and cans
+  stay M2T2's.
 - Unproven in simulation: whether cuTAMP's IK and gripper-sphere filter keep these poses, and whether they weld under
-  assisted. Not covered: the 6 mm clove and thinner sheets (the ray at tips + 3.9 mm clears them).
+  assisted; for the tips on the support (sheets under ~6 mm) E-tip's touch-not-penetrate check must hold at the Pick
+  timestep, so a plane estimate a few mm high rejects them (no grasp, as today). Not covered: sheets under 7 mm wider
+  than the jaw both ways (newspapers), and slabs 6.5-9.7 cm tall wider than the jaw both ways (a scanner lying flat:
+  the corner kind caps at a finger's length; no measured goal object needed it).
 
 ### E-near: near() lands next to its reference (cuTAMP + planner)
 
 - `cutamp/cost_function.py: near_placement_costs` (metres the two sphere covers' AABB gap exceeds `near_aim` =
-  min(1 cm, mean(dims)/6/2), plus the metres a horizontal ray from either centre misses the other's z range;
+  mean(dims_obj + dims_ref) / 6 / 2, half of what the sim's NextTo allows, uncapped since the second pass (the 1 cm
+  cap `NEAR_GAP_AIM` is deleted, cutamp-20), plus the metres a horizontal ray from either centre misses the other's z range;
   `near_thresholds` deleted), `cutamp/particle_initialization.py: near_ring` and the PlaceNear sampler (xy on the ring
   around the reference's AABB at the object's radial extent + aim, clipped to the surface OBB; `place_cache` keyed by
   references too), `tiptop/planning.py: run_planning` (NearPlacement tolerance 2e-3, the stock 5 cm slack is why
@@ -95,11 +109,14 @@ Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py` 409 passed 
 - Reads: the cuRobo world's sphere covers of the perceived objects.
 - Tests: `test_movable_surface_cover.py::test_a_near_placement_costs_the_gap_past_the_aim_and_a_missed_horizontal_ray`,
   `::test_near_samples_ring_the_reference_inside_the_surface`.
-- Replay (`T1-cutamp/enear.out`, the 7 executed nextto rounds of sweep3): the old cost accepted all 7; the new cost
-  rejects the 5 the simulator failed (gaps 5.8-15.2 cm) and accepts the 2 it passed. The conservative cover pads the
-  planner's gap by ~1 cm, so a 1 cm aim lands ~2 cm in the sim.
-- Unproven in simulation: no near round has been planned live with the new cost; `NEAR_GAP_AIM` is the one knob if
-  placements land too far.
+- Replay (`T1-cutamp/enear.out`, the 7 executed nextto rounds of sweep3, aim 1.6 cm for the soda cans and 2.2 cm for
+  the sandals; the capped 1 cm run kept as `enear_aim_capped_10mm.out`): the old cost accepted all 7; the new cost
+  rejects the 5 the simulator failed (gaps 5.8-15.2 cm) and accepts the 2 it passed. The sphere-surface gap the spec
+  names rejects the same 5 and also the sandal PASS (perceived sphere gap 14 cm where the sim's AABB gap is 2.7 cm),
+  which is why the AABB gap stays. The conservative cover pads the planner's gap by ~1 cm, so the aim lands ~1 cm
+  wider in the sim.
+- Unproven in simulation: no near round has been planned live with the new cost; the `/ 2` in `near_aim` is the one
+  knob if placements land too far or too close.
 
 ### E-conj: a placement round asks for every atom the placement decides (policy + planner + cuTAMP)
 
@@ -129,20 +146,23 @@ Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py` 409 passed 
   (wall switch on a wall, lighter flat and stood on end, washer); `test_tiptop_protocol.py::test_face_normal_local_prefers_the_braced_face_among_those_within_the_markers_radius`.
 - Replay (`T1-bridge/button_faces.out`, 18 assets): 16/18 match the body-only face (the lighter goes to its top face
   by design; the vacuum to +z, 24.6 mm from its marker); the 5 mm stroke now ends past the surface on 18/18 (the washer's
-  marker floats 11.2 mm proud, and its stroke used to stop 6.2 mm short).
+  marker floats 11.2 mm proud, and its stroke used to stop 6.2 mm short). `button_faces_within_radius.out`: the
+  design's `within=radius` (the full marker width) gives 15/18 (the strbnw wall switch flips to its +z top), so half
+  the width stays.
 - Unproven in simulation: no press has run with the projected position.
 
 ### E-region: floor-type supports, movable tables, reachable boards (bridge)
 
 - `b1k/bridge/protocol.py: FLOOR_CATEGORIES = ("floor", "lawn")`; `bench.py: Episode.is_floor`, `r1pro.py: task_scope,
-  floor_name, scope_floor, inside_regions, floor_surface` treat a lawn as ground (hiding_Easter_eggs has no floor).
+  floor_name, scope_floor, inside_regions, floor_surface` and the `track_task_objects` skip list treat a lawn as ground
+  (hiding_Easter_eggs has no floor; `floor_name` raised in `Episode.__init__` on that scope).
   `r1pro.py: footprint_region` gives a movable table's slab from its own seen box (`own_box`, points), None until a
   capture has seen it (putting_up_Christmas_decorations_inside). `r1pro.py: shelf_of` drops boards above
   `PLACE_HEIGHT_MAX = 1.5` m and, when no board is within `BOARD_REACH`, takes the one nearest `PLACE_HEIGHT` anyway
   (the stance search moves the robot; putting_shoes_on_rack IK-failed 6 rounds on a hallstand's 2.37 m top).
 - Reads: the map's AABBs for fixed furniture; `seen_boxes` for a movable table.
-- Tests: `test_tiptop_presweep_fixes.py::test_a_lawn_is_the_floor_under_the_robot`,
-  `::test_a_movable_tables_slab_is_the_world_box_of_the_points_that_saw_it`,
+- Tests: `test_tiptop_presweep_fixes.py::test_a_lawn_is_the_floor_under_the_robot` (`floor_surface`, `is_floor`, and
+  `floor_name` on a scope with eggs and a lawn only), `::test_a_movable_tables_slab_is_the_world_box_of_the_points_that_saw_it`,
   `::test_a_board_above_the_arms_reach_is_never_chosen_even_when_it_is_the_only_one_in_reach`.
 - Replay (`T1-bridge/shelf_of_replay.out`, putting_shoes_on_rack i0 sweep4, decrypted hallstand mesh at each logged
   stance): the 6 rounds that chose 2.373 m now choose 0.973 m (the shelf; the 0.554 m bench when it is in reach).
@@ -161,4 +181,10 @@ Suites after integration: bridge `OmniGibson/tests/test_tiptop_*.py` 409 passed 
   AABB-adjacent body, cuTAMP only the terminal segment against the resting contacts. The planner already kept those
   clear, so the bridge check there was redundant; a finger through a thin wall (cuTAMP's own ceiling) now executes and
   is stopped by the ramp's lag detector instead of refused.
-- Sweep-level evaluation of every item above waits for the simulator.
+- `b1k/bridge/geometry.py: FLOOR_COVERINGS` has no "lawn", so the stance search's `footprint_blockers` treats the four
+  garden lawn bodies of hiding_Easter_eggs as candidate obstacles; whether a base standing on one is refused depends
+  on the lawn top vs the base underside. Add "lawn" there only if a run refuses a garden stance for it.
+- Sweep-level evaluation of every item above waits for the simulator: the A-assist run (the 13 step-1 tasks and the
+  thin-sheet probe with `--grasping-mode assisted`, judged by `read_run.py` against sweep4), planned part grasps on
+  tile / eraser / paintbrush / magazine / jigsaw_puzzle rounds, and one episode each of hiding_Easter_eggs,
+  putting_shoes_on_rack and putting_up_Christmas_decorations_inside for E-region.

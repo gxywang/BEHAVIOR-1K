@@ -783,7 +783,7 @@ class R1ProSim(TiptopSim):
             raise KeyError(f"the task {self.config['task'].get('activity_name')!r} has no floor in its scope")
         return names[0]
 
-    def track_task_objects(self, skip_categories=("table", "floor", "agent")) -> dict:
+    def track_task_objects(self, skip_categories=("table", *FLOOR_CATEGORIES, "agent")) -> dict:
         """Track every task object under its per-instance label ('candle_1'); furniture the items rest on is skipped."""
         self.bddl_names = {}
         for bddl, obj in self.task_scope().items():
