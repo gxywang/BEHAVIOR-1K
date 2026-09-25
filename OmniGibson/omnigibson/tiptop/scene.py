@@ -221,7 +221,7 @@ class EpisodeOver(Exception):
 class TiptopSim:
     """Owns the OmniGibson environment and produces TiPToP observations / executes joint targets."""
 
-    OPEN, CLOSE = 1.0, -1.0  # MultiFingerGripperController binary: command >= 0 opens, < 0 closes
+    OPEN, CLOSE = 1.0, -1.0  # MultiFingerGripperController: +1 opens, -1 closes; smooth mode, a finger position between
     expect_table_z = 0.0  # validate_capture: expected table top height in the base frame (None = no table check)
     mask_labels_as_invalid = ()  # instance labels whose pixels get depth 0 (e.g. the robot seen by its own camera)
     # validate_capture: warn below this fraction of an object's projected AABB being inside the image. Measured on
@@ -432,6 +432,11 @@ class TiptopSim:
         names = self.robot.finger_joint_names[arm or self.robot.default_arm]
         q = self.robot.get_joint_positions()
         return float(sum(float(q[order.index(j)]) for j in names))
+
+    def finger_travel(self, arm: str | None = None) -> float:
+        """How far one finger of ``arm`` moves between the CLOSE and OPEN commands, in metres (its joint range)."""
+        joint = self.robot.joints[self.robot.finger_joint_names[arm or self.robot.default_arm][0]]
+        return float(joint.upper_limit - joint.lower_limit)
 
     def gripper_command(self, arm: str | None = None) -> float:
         """The last gripper command sent to ``arm`` (OPEN or CLOSE): the planned arm's, or the other arm's kept

@@ -522,11 +522,11 @@ def make_r1pro_env_config(
         "command_input_limits": None,
         "command_output_limits": None,
     }
-    gripper = {
+    gripper = {  # the evaluator's (eval/r1pro.yaml): the command in [-1, 1] is the finger position, +1 open, -1 closed
         "name": "MultiFingerGripperController",
-        "mode": "binary",
-        "command_input_limits": None,
-        "command_output_limits": None,
+        "mode": "smooth",
+        "command_input_limits": "default",
+        "command_output_limits": "default",
     }
     unknown = [v for v in (camera, *views) if v not in CAMERA_LINKS]
     if unknown:
