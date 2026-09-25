@@ -520,6 +520,24 @@ def connect_planners(args):
     return client, metadata, press_client, press_meta
 
 
+def check_imports(*planner_metadata: dict | None, root: Path = Path(__file__).resolve().parents[3]) -> str:
+    """Step zero (tiptop/docs/skills/SPEC.md, D25): one log line saying where this process imported b1k from and
+    where each planner imported tiptop and cutamp from (its metadata's ``modules``). Raises unless every one is
+    inside ``root``, the checkout this harness runs from: a worktree whose PYTHONPATH misses it runs the main tree's
+    code, or b1k-submission's (its src/b1k is a symlink to another checkout), and nothing else says so."""
+    import b1k
+
+    files = {"b1k": b1k.__file__}
+    for i, meta in enumerate(m for m in planner_metadata if m is not None):
+        files.update({f"planner{i}.{name}": (meta.get("modules") or {}).get(name) for name in ("tiptop", "cutamp")})
+    line = "imports: " + ", ".join(f"{name}={path}" for name, path in files.items())
+    log.info(line)
+    outside = [name for name, path in files.items() if path is None or not Path(path).resolve().is_relative_to(root)]
+    if outside:
+        raise RuntimeError(f"{', '.join(outside)} not imported from {root}; point PYTHONPATH at it ({line})")
+    return line
+
+
 def perception_report(request: dict, extras: dict, response: dict) -> dict:
     """Pair what the server perceived with the simulator's objects by position, and say what the goal acts on.
 

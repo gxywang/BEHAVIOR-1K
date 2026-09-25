@@ -57,6 +57,7 @@ from omnigibson.tiptop.run import (
     apply_embodiment_posture,
     atom_text,
     build_r1pro_sim,
+    check_imports,
     connect_planners,
     live_round,
     open_state_stream,
@@ -975,6 +976,7 @@ def main(argv=None) -> None:
     exit_code, stream, results = 0, None, []
     try:
         client, metadata, press_client, press_meta = connect_planners(args)
+        check_imports(metadata, press_meta)
         planners = {"left": (client, metadata)}
         if press_client is not None:
             planners["right"] = (press_client, press_meta)
