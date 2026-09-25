@@ -674,7 +674,8 @@ def _door_sim(mesh, grasping_mode):
 
     lo, hi = mesh.bounds
     link = SimpleNamespace(name="door", aabb=(th.tensor(lo, dtype=th.float32), th.tensor(hi, dtype=th.float32)))
-    sim = SimpleNamespace(link_trimesh_world=lambda link: mesh, robot=SimpleNamespace(grasping_mode=grasping_mode))
+    sim = SimpleNamespace(link_trimesh_world=lambda link, collision_only=False: mesh, robot=SimpleNamespace(grasping_mode=grasping_mode),
+                          edge_roofed=lambda obj, moving, point, direction: None)  # fmt: skip
     sim.surface_point = MethodType(R1ProSim.surface_point, sim)
     return sim, SimpleNamespace(name="cabinet", links={"door": link})
 
@@ -816,6 +817,87 @@ def test_a_push_close_blocks_the_grasp_assist_around_the_whole_motion():
     assert calls[-1] == "unblock"
     sim.push_grasps = lambda *a: []
     assert R1ProSim.push_joint(sim, "left", "fridge", joint, 0.0)["reached"] is False and calls[-1] == "unblock"
+
+
+def test_a_handle_beside_a_flush_neighbour_is_judged_by_the_hands_own_clearance_not_the_limbs():
+    """freeze_fruit 301 (manip2): fridge dszchb's bar sits at its door's free edge and bottom_cabinet_fancyy_0,
+    2 m tall, stands flush beside it and 4 cm proud of the door. At the grasp the outer finger's origin is 3.5 cm
+    from the cabinet and the gripper 6.6 cm, and ARM_RADIUS refused 117 of 120 stances ("the arm at the grasp
+    would be in bottom_cabinet_fancyy_0"). solve_pull now judges the hand's links as points within
+    HAND_BODY_CLEARANCE, as body_hits judges them at the container; the limb keeps its radius (offline
+    reproduction on the decrypted assets: a stance in 3 tries, 10 of 15 waypoints, 2026-09-25)."""
+    from types import MethodType, SimpleNamespace
+
+    import trimesh
+
+    from omnigibson.tiptop.r1pro import HAND_BODY_CLEARANCE, HAND_LINKS, R1ProSim
+
+    class Body:
+        name = "neighbour"
+
+    cabinet = trimesh.creation.box([1.0, 0.6, 2.0]).apply_translation([1.0, 0.0, 1.0])  # its face at x = 0.5
+    points = {f"left_arm_link{i}": [0.1 + 0.04 * i, 0.3 - 0.1 * i, 1.4 - 0.05 * i] for i in range(1, 8)}  # the limb clear
+    points.update({f"left_{s}": [0.434, 0.0, 1.1] for s in HAND_LINKS if "arm_link" not in s})  # 6.6 cm, as measured
+    points["left_gripper_finger_link1"] = [0.465, 0.05, 1.05]  # the outer finger 3.5 cm from the cabinet's face
+    ik = SimpleNamespace(fk=lambda q, name: (np.asarray(points[name], float), None))
+    sim = SimpleNamespace(objects={}, hands=lambda: {}, send_room=False, base_to_world=lambda p: np.asarray(p, float),
+                          robot=SimpleNamespace(arm_link_names={"left": [f"left_arm_link{i}" for i in range(1, 8)]}),
+                          collision_mesh_world=lambda obj: cabinet)  # fmt: skip
+    for name in ("_link_points", "_to_world", "arm_points", "held_points"):
+        setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
+    aabbs = [(Body(), cabinet.bounds[0], cabinet.bounds[1])]
+    assert R1ProSim.arm_hits_scene(sim, "left", ik, [0.0], aabbs=aabbs) == ["neighbour"], "the limb's radius refuses it"
+    assert R1ProSim.arm_hits_scene(sim, "left", ik, [0.0], aabbs=aabbs, hand_clearance=HAND_BODY_CLEARANCE) == []
+    points["left_gripper_finger_link1"] = [0.495, 0.05, 1.05]  # 5 mm off the face: in it by any measure
+    assert R1ProSim.arm_hits_scene(sim, "left", ik, [0.0], aabbs=aabbs, hand_clearance=HAND_BODY_CLEARANCE) == ["neighbour"]
+    points["left_gripper_finger_link1"] = [0.465, 0.05, 1.05]
+    points["left_arm_link6"] = [0.46, 0.2, 1.2]  # the wrist 4 cm off the face: the limb's radius still stands
+    assert R1ProSim.arm_hits_scene(sim, "left", ik, [0.0], aabbs=aabbs, hand_clearance=HAND_BODY_CLEARANCE) == ["neighbour"]
+    # and solve_pull asks for exactly that at every pose of the motion
+    seen = []
+    pull = [pose_matrix([0.5 - 0.02 * i, 0.0, 0.9], [0.0, 0.0, 0.0, 1.0]) for i in range(16)]
+    spy = SimpleNamespace(
+        _grasp_pose_base=lambda arm, g, jaw, base_pose=None: (pull[0][:3, 3], pull[0][:3, :3]),
+        _pull_poses=lambda g, start, base_pose=None: (pull, None, None), container_body=lambda obj, link: None,
+        arm_hits_scene=lambda *a, **k: seen.append(k.get("hand_clearance")) or [], body_hits=lambda *a, **k: False,
+    )  # fmt: skip
+    grasp = dict(joint=dict(kind="prismatic", lower=0.0, upper=0.4, position=0.0), travel=0.3, kind="bar", lead=[-1.0, 0.0, 0.0])
+    plan, _ = R1ProSim.solve_pull(spy, SimpleNamespace(solve=lambda *a, **k: [0.0]), grasp, [0, 0, 1], [0.0], base_pose=(0.0, 0.0, 0.0), aabbs=[])
+    assert plan["reached"] == 15 and seen == [HAND_BODY_CLEARANCE] * 17
+
+
+def test_a_panel_edge_under_a_rail_or_the_top_of_a_dome_is_nothing_to_pinch():
+    """storing_food / wash_a_baseball_cap 301 (manip2): under assisted grasping a flat door offers only the edge
+    grip, and every attempt spent 120 stance tries (2 min) learning it cannot be taken. rkgjer's and gjeoer's doors
+    top out under the cabinet's own rail (3.6 cm of air; the wrist sits 7.8 cm above the tips) and then the
+    countertop; ynwamu's porthole is a dome 20 cm deep whose "edge" point hangs in the air in front of it.
+    container_grasps refuses both before any stance is tried; a free-standing panel keeps its edge grip."""
+    from types import MethodType, SimpleNamespace
+
+    import trimesh
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    door = dict(name="j_door", kind="revolute", axis=[0.0, 0.0, 1.0], origin=[0.0, 0.0, 0.0], lower=0.0, upper=2.4,
+                position=0.0, closed=0.0, link="door")  # fmt: skip
+    hand = np.array([0.0, 0.25, 0.9])
+
+    def grips(panel, body=None, scene=()):
+        sim, obj = _door_sim(panel, "assisted")
+        sim.container_body = lambda obj, moving: body
+        sim.scene_aabbs = lambda: [(o, o.mesh.bounds[0], o.mesh.bounds[1]) for o in scene]
+        sim.collision_mesh_world = lambda o: o.mesh
+        sim.edge_roofed = MethodType(R1ProSim.edge_roofed, sim)
+        return [g["kind"] for g in R1ProSim.container_grasps(sim, obj, [door], 0.9, hand)]
+
+    assert grips(_door()) == ["edge"], "a free-standing panel is pinched from above"
+    rail = trimesh.creation.box([0.04, 0.6, 0.036]).apply_translation([0.0, 0.25, 1.018])  # the cabinet's rail over the door
+    assert grips(_door(), body=rail) == []
+    slab = trimesh.creation.box([0.6, 0.6, 0.036]).apply_translation([0.0, 0.25, 1.05])
+    countertop = SimpleNamespace(name="countertop", category="countertop", mesh=slab)
+    assert grips(_door(), scene=[countertop]) == []
+    dome = trimesh.creation.box([0.2, 0.5, 1.0]).apply_translation([0.09, 0.25, 0.5])  # its leading face where the panel's was
+    assert grips(dome) == [], "20 cm of material behind the point is not a panel between the fingers"
 
 
 def test_openable_joints_reads_the_joint_frame_and_the_closed_end_off_a_live_object(monkeypatch):

@@ -1024,6 +1024,47 @@ Kitchen fake with the LIVE scope, i.e. no synthesized halves and no substance in
 - cuTAMP series: cutamp-24 is the snapshot-to-source diff of `cost_function.py`, `motion_solver.py`, `rollout.py`;
   the pre-branch source plus cutamp-17 .. 24 in order equals `tiptop/cutamp/cutamp` (`diff -r`, no differences).
 
+## First sim run (manip2, 2026-09-25): no revolute door opened
+
+Every door-gated task stopped at step 0 with "no stance ... lets the arm reach its handle and pull" after 120 tries,
+`{'the arm': 115-120}`. The key is `why.split(" at ")[0]`, i.e. "the arm at <pose> would be in <X>": a collision,
+not IK. Reproduced offline on CPU (the decrypted assets at the task templates' poses, Lula IK on the R1Pro URDF, the
+logged hand convention, the real `container_grasps` / `solve_pull` / `stance_for_grasp` / `arm_hits_scene` /
+`body_hits` bound onto a fake sim) with the same histograms (fridge: 117 + a 0.92 rad flip, as logged):
+
+- fridge dszchb (freeze_fruit, halve_an_egg): 117 x "the arm at the grasp would be in bottom_cabinet_fancyy_0". The
+  bar is at the door's free edge; fancyy (2 m tall) stands flush beside the fridge and 4 cm proud of the door, and at
+  the grasp the outer finger's origin is 3.5 cm from it (gripper 6.6, realsense 6.8-7.4 cm). `solve_pull` judged the
+  hand's links with the limb's ARM_RADIUS (6 cm) against the scene while `body_hits` allowed them HAND_BODY_CLEARANCE
+  (1 cm) at the container. Fix: `arm_hits_scene(hand_clearance=)` judges the hand's links (HAND_LINKS, and what it
+  holds) as points within that clearance, the limb keeps its radius; `solve_pull` passes HAND_BODY_CLEARANCE. Offline:
+  a stance in 3 tries (13 s), 10 of 15 waypoints (60 deg of the 90 deg pull, 50% of the range; the rest is
+  `push_joint`'s). bottom_cabinet_fancyy_0 itself (storing_food's cabinet.n.01_3, horizontal bars at 0.81 m): 1 try,
+  11 of 15.
+- bottom_cabinet_no_top rkgjer and gjeoer (storing_food, freeze_fruit's source): flat 2.2 cm doors, no handle at all,
+  so under assisted grasping only the edge grip is offered -- and the doors top out under the cabinet's own rail (3.6
+  cm of air) and the countertop, where the wrist (7.8 cm above the tips) cannot be: 114 x "the arm at the grasp would
+  be in countertop_kelzer_0". Nothing a parallel jaw can take under assisted grasping (AG needs two fingers on the link
+  and the pad ray through it; the free edges meet the next door with a 3 mm gap).
+- washer ynwamu (wash_a_baseball_cap): the porthole's face is set 6 cm into the body, its proud part a solid 12-18 cm
+  wide bulge (no bar), and the edge point `handle_on`'s layers produce hangs in the air 8 cm in front of the dome: 109
+  x "in washer_ynwamu_0's body". Not openable by a pinch either.
+- Fix for both: `container_grasps` refuses the edge grip when the panel is not between the fingers (the link's own
+  collision surface within HANDLE_JAW/2 - margin each way along the jaw; the washer reads `[inf, 0.039]`) or when
+  the way down onto the edge is blocked (`edge_roofed`: five rays along the approach against the container's body
+  and the scene's collision meshes within OPEN_APPROACH). All three now return no grasps in 0 s instead of 120 tries
+  (2 min each), and `open_container` answers "no joint of X can be taken hold of".
+- Runner churn (`b1k/bridge/strategies.py`): storing_food retried cabinet.n.01_2 once per item per sweep (16 x 2 min,
+  0 env steps) and never reached fancyy. `Runner.open` counts failed opens per container (`would_not_open`,
+  OPEN_ATTEMPTS = 2, cleared per instance) and `transfer_one` skips a container past the bound, so the demand's
+  other containers get the items; the goal opens and W-seq's source open go through the same memory.
+- Tests: `test_tiptop_articulation.py::test_a_handle_beside_a_flush_neighbour_is_judged_by_the_hands_own_clearance_not_the_limbs`,
+  `::test_a_panel_edge_under_a_rail_or_the_top_of_a_dome_is_nothing_to_pinch`,
+  `test_tiptop_strategies.py::test_a_container_that_would_not_open_is_left_shut_after_the_bound_and_the_items_go_elsewhere`.
+- A sim run must confirm: the fridge's 60 deg pull executes and welds (the fingers 3.5 cm from fancyy at the grasp;
+  the approach is contact-checked, so a brush against it ends in the looking-stance fallback), `push_joint` widens it,
+  and storing_food reaches fancyy's bar doors; the top cabinets (lkxmne, edge at 2.08 m) stay out of reach.
+
 ## Per-task readiness
 
 From `runs/skill_gap_20260924/atomic/per_task.json` against the items built. Class: 1 pick/place with existing atoms,

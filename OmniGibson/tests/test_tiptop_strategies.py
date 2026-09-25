@@ -1030,6 +1030,33 @@ def test_a_container_that_will_not_open_is_not_filled():
     assert "pick" not in [c[0] for c in ep.calls], "nothing should be picked up with nowhere to put it"
 
 
+def test_a_container_that_would_not_open_is_left_shut_after_the_bound_and_the_items_go_elsewhere():
+    """storing_food 301 (manip2): cabinet.n.01_2, a handleless door under a countertop, was retried once per item
+    per sweep, 16 x 2 min of stance search for 0 env steps, and the run never reached the goal's other cabinets.
+    A container that would not open OPEN_ATTEMPTS times is left shut for the instance and the demand's other
+    containers take the items (2026-09-25)."""
+    from b1k.bridge.strategies import OPEN_ATTEMPTS
+
+    items = ["jar.n.01_1", "jar.n.01_2", "bottle.n.01_1", "bottle.n.01_2"]
+    boxes = {"cabinet.n.01_1": box((1.0, 0, 0.5)), "cabinet.n.01_2": box((3.0, 0, 0.5))}
+    for i, item in enumerate(items):
+        boxes[item] = box((0.2 * i, 0.5, 0.8))
+    options = [  # as storing_food grounds: each item may go to any of the cabinets
+        [atom("inside", item, cabinet) for item, cabinet in zip(items, choice)]
+        for choice in itertools.product(["cabinet.n.01_1", "cabinet.n.01_2"], repeat=len(items))
+    ]
+    ep = FakeEpisode(boxes, pick_ok=set(items), place_ok=set(items), shut={"cabinet.n.01_1", "cabinet.n.01_2"})
+    opens = FakeEpisode.open_up
+    ep.open_up = lambda name, fraction=None: (  # cabinet_1 never opens and stays shut
+        opens(ep, name, fraction) if name != "cabinet.n.01_1" else bool(ep.calls.append(("open_up", name, fraction)))
+    )
+    Runner(TaskSpec(task="t", instruction="i", plan="transfer"), options[0], options=options, attempts=2).run(ep)
+    tried = [c[1] for c in ep.calls if c[0] == "open_up"]
+    assert tried.count("cabinet.n.01_1") == OPEN_ATTEMPTS, tried
+    achieved = [c[2] for c in ep.calls if c[0] == "achieve"]
+    assert sorted(a[0] for a in achieved) == sorted(items) and {a[1] for a in achieved} == {"cabinet.n.01_2"}, achieved
+
+
 def test_only_an_inside_placement_waits_for_the_container_to_open():
     """openable() answers "does this have a joint", which is not the question.
 

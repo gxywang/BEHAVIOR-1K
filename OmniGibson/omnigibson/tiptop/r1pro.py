@@ -389,6 +389,7 @@ LID_FRACTION = 0.85  # of the range a lid (horizontal hinge) is opened at least:
 JOINT_TOL = 0.05  # of the range: OmniGibson's own open threshold, and how close a push must bring the joint
 EDGE_INSET = 0.015  # m below a panel's top edge the fingertips pinch it (the "edge" grip)
 EDGE_THICKNESS = 0.01  # ponytail: a panel is assumed 2 cm thick; the jaw is centred 1 cm behind its face
+EDGE_ROOF_SPAN = 0.03  # m either side of the pinch point the way down onto an edge is probed (edge_roofed)
 # A reach ramp that reports a joint behind its target at its LAST step is not a collision on the way: the baseline
 # stopped 'left_arm_joint1 0.12 rad behind at step 121 of 122' and this code 'left_arm_joint2 0.13 rad behind at
 # step 153 of 154' (2026-09-14), a shoulder settling short of a stretched configuration. What matters is where the
@@ -2093,6 +2094,24 @@ class R1ProSim(TiptopSim):
             # above mid-height on gjeoer's door (edge_on_assets.out). The hand comes down onto it and leaves upward.
             rise = float((verts @ h["up"]).max() - face_c @ h["up"]) - EDGE_INSET
             top = face_c + h["up"] * rise - lead * EDGE_THICKNESS
+            # the pinch needs the panel between the fingers: the link's own surface each way along the jaw, within
+            # it. A porthole's "top edge" is the top of a dome 20 cm deep, and handle_on's layers put the point
+            # in the air 8 cm in front of it (washer ynwamu, 2026-09-25); a roof over the edge (a countertop, a
+            # washer's front) leaves the wrist nowhere to be
+            solid = self.link_trimesh_world(link, collision_only=True)
+            reach = [np.inf, np.inf]
+            for k, sign in enumerate((1.0, -1.0)):
+                hits, _, _ = solid.ray.intersects_location(top.reshape(1, 3), (sign * lead).reshape(1, 3)) if solid is not None else ((), None, None)
+                if len(hits):
+                    reach[k] = float(np.min(((np.asarray(hits, dtype=np.float64) - top) @ lead) * sign))
+            roof = self.edge_roofed(obj, j["link"], top, h["up"])
+            if max(reach) > HANDLE_JAW / 2.0 - HANDLE_JAW_MARGIN or roof:
+                log.info(
+                    f"{obj.name}.{j['name']}: nothing a jaw can pinch at its top edge ("
+                    + (f"the way down onto it is blocked by {roof}" if roof else f"no panel within the jaw: {np.round(reach, 3).tolist()} m each way")
+                    + ")"
+                )
+                continue
             out.append(
                 dict(joint=j, travel=travel, kind="edge", tips=top, into=-h["up"], jaws=[lead, -lead], press=0.0,
                      lead=lead, approach=h["up"], rank=(2, abs(float(top[2] - hand_world[2]))), handle=h, nudges=1,
@@ -2100,6 +2119,34 @@ class R1ProSim(TiptopSim):
             )  # fmt: skip
         out.sort(key=lambda g: g["rank"])
         return out
+
+    def edge_roofed(self, obj, moving: str, point, direction, reach: float = OPEN_APPROACH) -> str | None:
+        """What stands within ``reach`` of ``point`` along ``direction``, the way the hand comes down onto a panel's
+        edge: the container's own body (its links other than ``moving``) or a scene object, by name; None when
+        the way is clear. A bottom cabinet's doors top out under its rail and the countertop (rkgjer: 3.5 cm of
+        air over the edge, the wrist 7.8 cm above the tips), a washer's porthole is set 6 cm into its front: a
+        pinch there is no grip at all, and each cost 120 stance tries to learn it (manip2, 2026-09-25). Five rays:
+        the point and ``EDGE_ROOF_SPAN`` to each side of it."""
+        p = np.asarray(point, dtype=np.float64)
+        d = np.asarray(direction, dtype=np.float64)
+        d = d / max(float(np.linalg.norm(d)), 1e-9)
+        a = np.cross(d, [1.0, 0.0, 0.0] if abs(d[0]) < 0.9 else [0.0, 1.0, 0.0])
+        a = a / max(float(np.linalg.norm(a)), 1e-9)
+        b = np.cross(d, a)
+        origins = np.array([p + d * 1e-3 + v * s * EDGE_ROOF_SPAN for v, s in ((a, 0), (a, 1), (a, -1), (b, 1), (b, -1))])
+        lo, hi = np.minimum(p, p + d * reach) - EDGE_ROOF_SPAN, np.maximum(p, p + d * reach) + EDGE_ROOF_SPAN
+        meshes = [(f"{obj.name}'s body", self.container_body(obj, moving))] + [
+            (o.name, self.collision_mesh_world(o))
+            for o, box_lo, box_hi in self.scene_aabbs()
+            if o is not obj and o.category != "floors" and np.all(np.asarray(box_hi) >= lo) and np.all(np.asarray(box_lo) <= hi)
+        ]
+        for name, mesh in meshes:
+            if mesh is None or not len(mesh.faces):
+                continue
+            hits, _, _ = mesh.ray.intersects_location(origins, np.tile(d, (len(origins), 1)))
+            if len(hits) and bool((((np.asarray(hits, dtype=np.float64) - p) @ d) <= reach).any()):
+                return name
+        return None
 
     def _grasp_pose_base(self, arm: str, grasp: dict, jaw_world, base_pose=None) -> tuple:
         """(position, rotation 3x3) of the IK frame, in the base frame, for a grasp dict and a jaw direction.
@@ -2185,7 +2232,9 @@ class R1ProSim(TiptopSim):
             if solutions and float(np.max(np.abs(np.asarray(solution) - np.asarray(solutions[-1])))) > OPEN_JUMP_TOL:
                 why = f"the arm would flip {float(np.max(np.abs(np.asarray(solution) - np.asarray(solutions[-1])))):.2f} rad between waypoints at {i}"
                 break
-            hits = self.arm_hits_scene(arm, ik, solution, aabbs=clear, at=at, mesh=True)
+            # the hand works at the container and, at a door's free edge, beside whatever stands flush with it:
+            # its links keep the body's clearance from the scene too, the limb keeps ARM_RADIUS
+            hits = self.arm_hits_scene(arm, ik, solution, aabbs=clear, at=at, mesh=True, hand_clearance=HAND_BODY_CLEARANCE)
             if not hits and self.body_hits(arm, ik, solution, body, at=at):
                 hits = [f"{obj.name}'s body"]
             if hits:
@@ -3622,8 +3671,9 @@ class R1ProSim(TiptopSim):
         return np.array([x + c * p[0] - sn * p[1], y + sn * p[0] + c * p[1], p[2]], dtype=np.float64)
 
     def arm_hits_scene(
-        self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None, mesh: bool = True
-    ) -> list[str]:
+        self, arm: str, ik: ArmIK, q, aabbs=None, clearance: float = ARM_RADIUS, at=None, mesh: bool = True,
+        hand_clearance: float | None = None,
+    ) -> list[str]:  # fmt: skip
         """Scene objects the whole arm reaches into at joints ``q``: "desk_1".
 
         The arm is the polyline through its link origins (``arm_points``) and each scene box is grown by
@@ -3631,6 +3681,12 @@ class R1ProSim(TiptopSim):
         ``links_in_scene`` tests only the hand's links, and only as points -- but the joints the runs report
         pushing against furniture are the shoulder and elbow (left_arm_joint4, left_arm_joint5, right_arm_joint3),
         which no test covered. Objects a hand holds travel with the arm and do not count.
+
+        ``hand_clearance``: judge the hand's links (``HAND_LINKS``, and what the hand holds) as points within this
+        of a surface instead of as part of the 6 cm limb, the way ``body_hits`` already judges them at the
+        container. A handle sits at a door's free edge, and the next appliance stands flush beside it: at
+        dszchb's bar the outer finger's origin is 3.5 cm from the cabinet alongside, and the limb's radius refused
+        every one of 117 stances (manip2 freeze_fruit, 2026-09-25).
 
         A box is a coarse model of a piece of furniture and the polyline a coarse model of an arm, so this says
         "the arm is inside that object's box", not "the arm is in contact". Before it decides anything, check what
@@ -3640,9 +3696,14 @@ class R1ProSim(TiptopSim):
         aabbs = self.scene_aabbs() if aabbs is None else aabbs
         held = {self.objects[label] for label in self.hands() if label in self.objects}
         points = self.arm_points(arm, ik, q, at=at)
+        hand = []
+        if hand_clearance is not None:
+            limbs = len(self._link_points(ik, q, list(self.robot.arm_link_names[arm]), at))
+            points, hand = points[:limbs], points[limbs:]
         near = [
-            (obj, lo, hi) for obj, lo, hi in aabbs if obj not in held and polyline_hits_box(points, lo, hi, clearance)
-        ]
+            (obj, lo, hi) for obj, lo, hi in aabbs
+            if obj not in held and (polyline_hits_box(points, lo, hi, clearance) or polyline_hits_box(hand, lo, hi, hand_clearance or 0.0))
+        ]  # fmt: skip
         if not (ARM_MESH_CHECK and mesh and near):
             return [obj.name for obj, _, _ in near]
         samples = sample_polyline(points, ARM_SAMPLE_STEP)
@@ -3653,7 +3714,9 @@ class R1ProSim(TiptopSim):
                 if physical is None:  # visual-only geometry has no physical surface
                     continue
                 # Exact cached triangle BVH queries handle long floor/wall triangles without subdivision.
-                if bool((trimesh.proximity.closest_point(physical, samples)[1] <= clearance).any()):
+                if bool((trimesh.proximity.closest_point(physical, samples)[1] <= clearance).any()) or (
+                    bool(hand) and bool((trimesh.proximity.closest_point(physical, np.asarray(hand))[1] <= hand_clearance).any())
+                ):
                     hits.append(obj.name)
             except Exception:
                 hits.append(obj.name)  # extraction/query failure: conservatively keep the box's word
