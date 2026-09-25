@@ -143,7 +143,7 @@ def test_oracle_knowledge_sends_instance_masks_and_every_button_of_the_task():
     assert known.labels == ["radio_1"]  # the candle is out of view and dropped
     assert sim.seen[0] == ["candle_1", "radio_1"] and len(sim.seen[1]) == 1  # the point store saw every view's masks
     assert known.masks.shape == (1, 6, 8) and known.atoms == [{"predicate": "holding", "args": ["radio_1"]}]
-    assert "radio_1_button" in known.buttons and sim.button_calls == [goal]  # the whole task's buttons, every round
+    assert "radio_1_button" in known.buttons and sim.button_calls == [goal + [goal[0]]]  # the task's and the round's
     assert known.in_hand == [] and known.held_labels == [] and known.workspace == sim.workspace()
     req = _request()
     known.attach(req)
@@ -1090,7 +1090,7 @@ def test_an_inside_goal_ships_the_container_interior_only_when_the_flag_is_on():
     goal = [{"predicate": "inside", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]}]
     sim = _Sim(_masks(candle_1=20, wicker_basket_1=30))
     region = {"dims": [0.3, 0.4, 0.1], "pose": [1.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0]}
-    sim.inside_regions = lambda atoms: {"wicker_basket_1": region}
+    sim.inside_regions = lambda atoms, oracle=None: {"wicker_basket_1": region}
     source = make_knowledge("oracle", sim, goal)
 
     req = _request()
@@ -1099,17 +1099,59 @@ def test_an_inside_goal_ships_the_container_interior_only_when_the_flag_is_on():
 
     sim.send_inside = True
     sim.seen, at_region = None, []
-    sim.inside_regions = lambda atoms: at_region.append(sim.seen) or {"wicker_basket_1": region}
+    sim.inside_regions = lambda atoms, oracle=None: at_region.append((sim.seen, oracle)) or {"wicker_basket_1": region}
     req = _request()
     source.describe(goal, req, {})
     assert req["place_surfaces"] == {"wicker_basket_1": region}
-    assert at_region[0] is not None  # the region is chosen after this capture's points are recorded (the item's height)
+    assert at_region[0][0] is not None  # the region is chosen after this capture's points are recorded (item height)
+    assert at_region[0][1] is source  # and the hints a stamp, heat or attach region needs come through the oracle
 
     # a container whose interior cannot be derived leaves the round exactly as it is today
-    sim.inside_regions = lambda atoms: {}
+    sim.inside_regions = lambda atoms, oracle=None: {}
     req = _request()
     source.describe(goal, req, {})
     assert "place_surfaces" not in req
+
+
+def test_the_oracle_describes_the_button_of_a_round_atom_the_goal_never_names():
+    """W-ipress: the stove that cooks is no goal object (Episode.fixture_for tracks it); its press round names it,
+    and the button hints cover the round's atoms as well as the task's."""
+    goal = [{"predicate": "holding", "args": ["frying_pan.n.01_1"]}]
+    sim = _Sim(_masks(frying_pan_1=20))
+    source = make_knowledge("oracle", sim, goal)
+    press = {"predicate": "toggled_on", "args": ["stove.n.01_1"]}
+    known = source.describe([press], _request(), {})  # a button is named by pose, so it needs no pixels
+    assert sim.button_calls[-1] == goal + [press]
+    assert known.atoms == [{"predicate": "pressed", "args": ["stove_1_button"]}]
+
+
+def test_the_oracle_leaves_out_what_it_cannot_resolve_and_tracks_what_a_transition_created():
+    """W-goals: a cut's halves are future objects of the scope until the transition makes them, and the whole is
+    gone after. localize leaves an unresolvable name out (its contract: never a made-up box, never a raise); appeared
+    tracks the new ones one by one and drops the removed one, leaving a fixture fixture_for tracked alone."""
+    import torch as th
+
+    whole = SimpleNamespace(aabb=(th.zeros(3), th.ones(3)), aabb_center=th.full((3,), 0.5))
+    objects = {"onion.n.01_1": whole}
+
+    def scene_object(name):
+        if name not in objects:
+            raise ValueError(f"no object {name!r} in scene")
+        return objects[name]
+
+    sim = SimpleNamespace(scene_object=scene_object)
+    source = OracleKnowledge(sim, [])
+    assert list(source.localize("onion.n.01_1", "half__onion.n.01_1")) == ["onion.n.01_1"]
+    half = object()
+    scope = {"onion.n.01_1": None, "half__onion.n.01_1": half, "half__onion.n.01_2": None}
+    sim.env = SimpleNamespace(task=SimpleNamespace(object_scope=scope))
+    sim.task_scope = lambda: {"half__onion.n.01_1": half}
+    sim.objects = {"onion_1": whole, "stove_ykretu_0": "stove"}
+    sim.bddl_names = {"onion_1": "onion.n.01_1", "stove_ykretu_0": "stove_ykretu_0"}
+    assert source.appeared() == ["half__onion.n.01_1"]
+    assert sim.bddl_names == {"half_onion_1": "half__onion.n.01_1", "stove_ykretu_0": "stove_ykretu_0"}
+    assert sim.objects["half_onion_1"] is half and "onion_1" not in sim.objects
+    assert source.appeared() == []
 
 
 def test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_from_the_side():

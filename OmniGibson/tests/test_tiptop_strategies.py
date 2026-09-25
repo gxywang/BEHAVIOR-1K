@@ -4,11 +4,15 @@ first, items on any support are moved, the hand is freed before a pick, a press 
 placements are judged by geometry on localized boxes."""
 
 import itertools
+from collections import Counter
 
 import numpy as np
 import pytest
+from b1k.bridge.articulation import OPEN_FRACTION_REACH
 
 from omnigibson.tiptop.strategies import (
+    DWELL_STEPS,
+    MAX_STAMPS,
     STRATEGIES,
     TASKS_DIR,
     Runner,
@@ -31,7 +35,19 @@ def box(center, half=(0.05, 0.05, 0.05)):
 class FakeEpisode:
     """An episode whose rounds are scripted: which picks succeed, which places succeed, and where things are."""
 
-    def __init__(self, boxes, pick_ok=(), place_ok=(), unreachable=(), arms=("left", "right"), shut=(), opens_ok=True):
+    def __init__(
+        self,
+        boxes,
+        pick_ok=(),
+        place_ok=(),
+        unreachable=(),
+        arms=("left", "right"),
+        shut=(),
+        opens_ok=True,
+        products=(),
+        ripens=(),
+        stamps_to_clean=1,
+    ):
         self.boxes = dict(boxes)
         self.pick_ok, self.place_ok, self.unreachable = set(pick_ok), set(place_ok), set(unreachable)
         self.arms = set(arms)
@@ -39,6 +55,10 @@ class FakeEpisode:
         self.hand = None
         self.calls = []
         self.shut, self.opens_ok = set(shut), opens_ok
+        self.products = dict(products)  # whole -> what a cut on it creates (after_transition)
+        self.appeared = []
+        self.ripens = dict(ripens)  # (predicate, *args) -> dwells until the fake flips that fact
+        self.stamps_to_clean = stamps_to_clean  # stamps a covered target takes
 
     def is_floor(self, name):
         """Any floor is a floor, not only the one the scope happened to list first (Episode.is_floor)."""
@@ -134,13 +154,33 @@ class FakeEpisode:
         self.floor = name  # the robot now stands on that floor
         return True
 
-    def goal_already_holds(self, predicate, item, container):
+    def goal_already_holds(self, predicate, item, container=None):
         """Whether the goal's atom for this pair holds (Episode.goal_already_holds, which asks the task's own
         evaluator). The fake judges it from the boxes, but a floor target names ONE floor: something lying on
-        floor.n.01_1 does not satisfy a goal that asks for it ontop floor.n.01_2."""
+        floor.n.01_1 does not satisfy a goal that asks for it ontop floor.n.01_2. A one-argument predicate
+        (cooked, real) has no box to read: not yet."""
+        if container is None:
+            return False
         if self.is_floor(container):
             return container == self.floor and self.near_floor(item) and not self.holding(item)
         return self.placed(item, container)
+
+    # transitions and time (the tier-3 Episode additions)
+    def after_transition(self):
+        out, self.appeared = self.appeared, []
+        return out
+
+    def dwell(self, steps):
+        self.calls.append(("dwell", steps))
+        for key in list(self.ripens):
+            self.ripens[key] -= 1
+            if self.ripens[key] <= 0:
+                del self.ripens[key]
+                self.ripen(key)
+        return steps
+
+    def ripen(self, key):
+        pass
 
     def near_floor(self, name):
         from omnigibson.tiptop.bench import FLOOR_LEVEL
@@ -169,8 +209,11 @@ class Kitchen(FakeEpisode):
         super().__init__({}, **kw)
         self.facts = set(facts)
 
-    def goal_already_holds(self, predicate, item, container):
-        return (predicate, item, container) in self.facts
+    def goal_already_holds(self, predicate, item, container=None):
+        return ((predicate, item) if container is None else (predicate, item, container)) in self.facts
+
+    def ripen(self, key):
+        self.facts ^= {key}  # cooked appears; frozen (thawing) goes
 
     def support_of(self, item):
         return next((f[2] for f in self.facts if f[0] in ("ontop", "inside") and f[1] == item), self.floor)
@@ -193,14 +236,31 @@ class Kitchen(FakeEpisode):
     def achieve(self, atoms, arm="left", floor=None):
         self.calls.append(("achieve", tuple(a["predicate"] for a in atoms), tuple(atoms[0]["args"]), arm))
         for a in atoms:
-            if len(a["args"]) == 2:
-                self.facts = {f for f in self.facts if a["args"][0] not in f[1:]} | {(a["predicate"], *a["args"])}
+            p, args = a["predicate"], a["args"]
+            if p == "toggled_on":
+                self.facts ^= {("toggled_on", args[0])}
+            elif p == "stamp":  # the tool stays in the hand; the target is clean after stamps_to_clean stamps
+                self.stamps = getattr(self, "stamps", Counter())
+                self.stamps[args[1]] += 1
+                if self.stamps[args[1]] >= self.stamps_to_clean:
+                    self.facts = {f for f in self.facts if f[:2] != ("covered", args[1])}
+                return True
+            elif p == "cut":  # the whole is gone; what the cut makes lies where it lay; the knife rests there
+                whole = args[1]
+                where = [f for f in self.facts if f[1] == whole]
+                self.facts = {f for f in self.facts if whole not in f[1:]} | {("cut", *args)}
+                for made in self.products.pop(whole, []):
+                    self.appeared.append(made)
+                    self.facts |= {(f[0], made, *f[2:]) for f in where}
+            elif len(args) == 2:  # what rests on or in the moved item rides along (the bacon on its tray); its
+                # own states (cooked) travel with it
+                self.facts = {f for f in self.facts if not (f[1] == args[0] and len(f) == 3)} | {(p, *args)}
         self.hand = None
         return True
 
     def put_down(self, bddl, support, floor=None):
         if super().put_down(bddl, support, floor=floor):
-            self.facts = {f for f in self.facts if bddl not in f[1:]} | {("ontop", bddl, support)}
+            self.facts = {f for f in self.facts if not (f[1] == bddl and len(f) == 3)} | {("ontop", bddl, support)}
         return self.put_down_ok
 
 
@@ -1666,3 +1726,166 @@ def test_a_task_without_a_description_runs_on_its_name():
         "hiding Easter eggs",
         "in_place",
     )
+
+
+# ---------------------------------------------------------------- tier 3: the goal's other atoms (W-goals)
+COUNTER = "countertop.n.01_1"
+FRIDGE = "electric_refrigerator.n.01_1"
+
+
+def rounds_of(ep):
+    """The rounds an episode ran, in order: ('pick', x) or (predicate, *args)."""
+    return [(c[0], c[1]) if c[0] == "pick" else (c[1][0], *c[2]) for c in ep.calls if c[0] in ("pick", "achieve")]
+
+
+def test_a_covered_target_is_stamped_with_the_scopes_remover_until_the_episode_reads_it_clean():
+    """clean_a_keyboard: not covered(keyboard, dust). The remover is the scope object whose synset has the ability
+    (no yaml names it); picked once and held through the stamps (a stamp round keeps hold), set down after, and
+    the stamping stops at MAX_STAMPS when the target never reads clean."""
+    keyboard, cleaner, dust = "keyboard.n.01_1", "pipe_cleaner.n.01_1", "dust.n.01_1"
+    goal = [atom("not", "covered", keyboard, dust)]
+    facts = {("covered", keyboard, dust), ("ontop", cleaner, COUNTER), ("ontop", keyboard, COUNTER)}
+    ep = Kitchen(facts, pick_ok={cleaner}, stamps_to_clean=3)
+    strategy_for("clean_a_keyboard", goal, scope=[keyboard, cleaner, COUNTER]).run(ep)
+    assert rounds_of(ep) == [("pick", cleaner)] + [("stamp", cleaner, keyboard)] * 3, rounds_of(ep)
+    assert ("put_down", cleaner, ep.floor) in ep.calls, "set down once the keyboard is clean"
+    assert ("covered", keyboard, dust) not in ep.facts
+
+    ep = Kitchen(facts, pick_ok={cleaner}, stamps_to_clean=99)
+    strategy_for("clean_a_keyboard", goal, scope=[keyboard, cleaner, COUNTER]).run(ep)
+    assert rounds_of(ep).count(("stamp", cleaner, keyboard)) == MAX_STAMPS
+
+
+def test_a_loaded_washer_is_shut_before_its_one_press():
+    """clean_boxing_gloves: both gloves are particle removers by taxonomy and both are the targets, so nothing in
+    the scope stamps them; the washer takes them (S39). It was opened to load, and it refuses ON while open, so it
+    is shut before the one press that follows the loading."""
+    g1, g2, washer, dust = "boxing_glove.n.01_1", "boxing_glove.n.01_2", "washer.n.03_1", "dust.n.01_1"
+    goal = [atom("not", "covered", g1, dust), atom("not", "covered", g2, dust)]
+    facts = {("covered", g1, dust), ("covered", g2, dust), ("ontop", g1, COUNTER), ("ontop", g2, COUNTER)}
+    ep = Kitchen(facts, pick_ok={g1, g2}, shut={washer})
+    strategy_for("clean_boxing_gloves", goal, scope=[g1, g2, washer, COUNTER]).run(ep)
+    loading = [("pick", g1), ("inside", g1, washer), ("pick", g2), ("inside", g2, washer)]
+    assert rounds_of(ep) == loading + [("toggled_on", washer)], rounds_of(ep)
+    loads = [i for i, c in enumerate(ep.calls) if c[0] == "achieve" and c[1] == ("inside",)]
+    closes = [i for i, c in enumerate(ep.calls) if c == ("open_up", washer, 0.0)]
+    press = next(i for i, c in enumerate(ep.calls) if c[0] == "achieve" and c[1] == ("toggled_on",))
+    assert len(closes) == 1 and max(loads) < closes[0] < press, ep.calls
+
+
+def test_a_diced_goal_cuts_the_whole_in_its_bowl_then_each_half_the_cut_made():
+    """chop_an_onion: real(diced__onion) and contains(bowl, diced__onion). The onion goes into the bowl first, the
+    parer (the scope's slicer) is set down on it, the halves the transition made are learnt from the episode, and
+    each is cut in turn -- with a pick between cuts, which is what re-arms the knife."""
+    onion, parer, bowl = "vidalia_onion.n.01_1", "parer.n.02_1", "bowl.n.01_1"
+    halves = ["half__vidalia_onion.n.01_1", "half__vidalia_onion.n.01_2"]
+    diced = "diced__vidalia_onion.n.01_1"
+    goal = [atom("real", diced), atom("contains", bowl, diced)]
+    facts = {("ontop", onion, COUNTER), ("ontop", parer, COUNTER), ("ontop", bowl, COUNTER)}
+    ep = Kitchen(facts, pick_ok={onion, parer}, products={onion: halves})
+    strategy_for("chop_an_onion", goal, scope=[onion, parer, bowl, COUNTER]).run(ep)
+    assert rounds_of(ep) == [
+        ("pick", onion),
+        ("inside", onion, bowl),
+        ("pick", parer),
+        ("cut", parer, onion),
+        ("pick", parer),
+        ("cut", parer, halves[0]),
+        ("pick", parer),
+        ("cut", parer, halves[1]),
+    ], rounds_of(ep)
+    assert ("cut", parer, halves[1]) in ep.facts and not any(f[1] == onion for f in ep.facts), "the onion is gone"
+
+
+def test_a_half_is_cut_before_it_is_transferred_and_one_that_never_appears_is_not_picked():
+    """halve_an_egg: real(half_1), real(half_2), ontop(half_i, plate), the egg in the fridge. Neither half exists at
+    reset (the :init lists them as future objects), so the cut comes first -- reaching into the fridge for it --
+    and the transfers then move what the episode says appeared, skipping the rest rather than spending picks on a
+    name nothing answers to."""
+    egg, knife, plate, sink = "hard-boiled_egg.n.01_1", "carving_knife.n.01_1", "plate.n.04_1", "sink.n.01_1"
+    halves = ["half__hard-boiled_egg.n.01_1", "half__hard-boiled_egg.n.01_2"]
+    goal = [atom("real", h) for h in halves] + [atom("ontop", h, plate) for h in halves]
+    goal.append(atom("inside", knife, sink))
+    facts = {("inside", egg, FRIDGE), ("ontop", knife, COUNTER), ("ontop", plate, COUNTER)}
+    ep = Kitchen(facts, pick_ok={egg, knife, *halves}, shut={FRIDGE}, products={egg: halves[:1]})
+    strategy_for("halve_an_egg", goal, scope=[egg, knife, plate, sink, FRIDGE]).run(ep)
+    assert rounds_of(ep) == [
+        ("pick", knife),
+        ("cut", knife, egg),
+        ("pick", halves[0]),
+        ("ontop", halves[0], plate),
+        ("pick", knife),
+        ("inside", knife, sink),
+    ], rounds_of(ep)
+    opens = [c for c in ep.calls if c[0] == "open_up"]
+    assert opens == [("open_up", FRIDGE, OPEN_FRACTION_REACH), ("open_up", FRIDGE, 0.0)], opens
+    assert ep.calls.index(opens[0]) < ep.calls.index(("pick", knife)), "the fridge is opened before the cut"
+
+
+def test_cooked_carries_the_tray_to_the_stove_presses_it_once_and_waits():
+    """cook_bacon: cooked(bacon) atoms, the bacon on a tray in the fridge, a stove in the scope. The tray is what
+    is carried (a movable the bacon rests on), once for all the bacon; the knob is pressed once -- not at all when
+    the stove already reads on -- and the runner then dwells until the episode reports the bacon cooked."""
+    bacon = ["bacon.n.01_1", "bacon.n.01_2"]
+    tray, stove = "tray.n.01_1", "stove.n.01_1"
+    goal = [atom("cooked", b) for b in bacon] + [atom("not", "open", FRIDGE)]
+    facts = {("ontop", b, tray) for b in bacon} | {("inside", tray, FRIDGE)}
+    ripens = {("cooked", b): 2 for b in bacon}
+    ep = Kitchen(facts, pick_ok={tray, *bacon}, shut={FRIDGE}, ripens=ripens)
+    strategy_for("cook_bacon", goal, scope=[*bacon, tray, stove, FRIDGE]).run(ep)
+    assert rounds_of(ep) == [("pick", tray), ("heat", tray, stove), ("toggled_on", stove)], rounds_of(ep)
+    assert [c for c in ep.calls if c[0] == "dwell"] == [("dwell", DWELL_STEPS)] * 2
+    opens = [c for c in ep.calls if c[0] == "open_up"]
+    assert opens == [("open_up", FRIDGE, OPEN_FRACTION_REACH), ("open_up", FRIDGE, 0.0)], opens
+    assert all(("cooked", b) in ep.facts for b in bacon)
+
+    ep = Kitchen(facts | {("toggled_on", stove)}, pick_ok={tray}, shut={FRIDGE}, ripens=ripens)
+    strategy_for("cook_bacon", goal, scope=[*bacon, tray, stove, FRIDGE]).run(ep)
+    assert rounds_of(ep) == [("pick", tray), ("heat", tray, stove)], "already on: not pressed"
+
+
+def test_frozen_puts_the_item_in_the_cold_source_shuts_it_and_waits():
+    """frozen(x) with no placement for x: x goes inside the scope's coldSource (opened for it), the fridge is shut
+    at the end like any container the transfers opened, and only then does the runner wait -- frozen does not
+    latch, so the door has to be shut for the dwell to count. When the goal itself places x (freeze_pies: the pie
+    into a tupperware into the fridge), the transfers carry it and the sub-plan carries nothing."""
+    pie, tub = "apple_pie.n.01_1", "tupperware.n.01_1"
+    ep = Kitchen({("ontop", pie, COUNTER)}, pick_ok={pie}, shut={FRIDGE}, ripens={("frozen", pie): 3})
+    strategy_for("freeze_pies", [atom("frozen", pie)], scope=[pie, FRIDGE, COUNTER]).run(ep)
+    kinds = [("close" if c[2] == 0.0 else "open") if c[0] == "open_up" else c[0] for c in ep.calls]
+    assert kinds == ["open", "pick", "stand_for", "achieve", "close", "dwell", "dwell", "dwell"], kinds
+    assert ("frozen", pie) in ep.facts
+
+    goal = [atom("frozen", pie), atom("inside", pie, tub), atom("inside", tub, FRIDGE)]
+    ep = Kitchen({("ontop", pie, COUNTER), ("ontop", tub, COUNTER)}, pick_ok={pie, tub}, shut={FRIDGE})
+    strategy_for("freeze_pies", goal, scope=[pie, tub, FRIDGE, COUNTER]).run(ep)
+    placed = [r for r in rounds_of(ep) if r[0] != "pick"]
+    assert sorted(placed) == [("inside", pie, tub), ("inside", tub, FRIDGE)], "never into the fridge alone"
+
+
+def test_an_attached_goal_is_carried_like_a_placement():
+    camera, tripod = "digital_camera.n.01_1", "camera_tripod.n.01_1"
+    ep = Kitchen({("ontop", camera, COUNTER)}, pick_ok={camera})
+    strategy_for("attach_a_camera_to_a_tripod", [atom("attached", camera, tripod)]).run(ep)
+    assert rounds_of(ep) == [("pick", camera), ("attached", camera, tripod)]
+
+
+def test_on_fire_lights_the_lighter_and_never_carries_off_an_item_already_where_the_goal_wants_it():
+    """setting_the_fire: the firewood starts inside the fireplace, which the goal wants; only the newspaper goes to
+    the lit lighter (the lighter is never picked), the runner waits for it to catch, and the goal's own press then
+    turns the lighter off."""
+    wood, paper, lighter = "firewood.n.01_1", "newspaper.n.03_1", "cigar_lighter.n.01_1"
+    fireplace = "wood_fireplace.n.01_1"
+    goal = [atom("on_fire", wood), atom("on_fire", paper), atom("inside", wood, fireplace)]
+    goal.append(atom("not", "toggled_on", lighter))
+    facts = {("inside", wood, fireplace), ("ontop", paper, COUNTER), ("ontop", lighter, COUNTER)}
+    ep = Kitchen(facts, pick_ok={wood, paper}, ripens={("on_fire", paper): 1, ("on_fire", wood): 2})
+    strategy_for("setting_the_fire", goal, scope=[wood, paper, lighter, fireplace, COUNTER]).run(ep)
+    assert rounds_of(ep) == [
+        ("pick", paper),
+        ("heat", paper, lighter),
+        ("toggled_on", lighter),
+        ("toggled_on", lighter),
+    ], rounds_of(ep)
+    assert ("toggled_on", lighter) not in ep.facts, "on for the paper, off again for the goal"
+    assert ("inside", wood, fireplace) in ep.facts and ("on_fire", wood) in ep.facts

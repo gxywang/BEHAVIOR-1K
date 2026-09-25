@@ -683,9 +683,112 @@ def _region_sim(mesh, base=(0.0, 0.0), objects=None):
         objects={}, seen_boxes={},  # nothing seen by a capture yet
     )
     for name in ("to_base", "region_box", "shelf_of", "rest_region", "footprint_region", "floor_surface", "own_box",
-                 "item_height"):
+                 "item_height", "seen_aabb", "stamp_region", "knife_region", "heat_region"):
         setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
     return sim
+
+
+def _seen(name, at, lo, hi, sim):
+    """A movable the captures saw as the box (lo, hi) in its own frame, standing at ``at`` unturned."""
+    pose = (th.tensor(at), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    obj = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: pose)
+    sim.objects[name.split(".")[0] + "_1"] = obj
+    sim.seen_boxes[name.split(".")[0] + "_1"] = (np.array(lo), np.array(hi))
+    return obj
+
+
+def test_a_stamp_box_covers_the_densest_cluster_the_tool_and_its_margin_can_take_and_no_more():
+    """E-stamp: an adjacency remover deletes every particle inside its link's world AABB grown by 2 cm
+    (particle_modifier.py:524-531). The region is the tool centres that put the cluster inside that box, grown by
+    the tool's half extents (the planner keeps every sphere of the tool inside a surface), at the cluster's own
+    height, holding the yaw the fit was made at. The vacuum removes inside its projection slab instead, offset from
+    its body and hanging 1-21 mm under it: it hovers, halfway into that band."""
+    objects = {}
+    sim = _region_sim(None, objects=objects)
+    brush = ("scrub_brush.n.01_1", [5.0, 5.0, 1.2], [-0.078, -0.024, -0.012], [0.078, 0.024, 0.012])  # hsejyi, scaled
+    objects["scrub_brush.n.01_1"] = _seen(*brush, sim)
+    objects["shoe.n.01_1"] = None
+    patch = np.array([[1.00, 2.00, 0.31], [1.10, 2.00, 0.31], [1.05, 2.05, 0.31], [1.02, 2.03, 0.31], [1.08, 2.01, 0.312]])  # fmt: skip
+    far = np.array([[1.50, 2.00, 0.31], [1.55, 2.02, 0.31], [1.52, 2.04, 0.31]])  # a second, smaller cluster
+    region = sim.stamp_region("scrub_brush.n.01_1", "shoe.n.01_1", np.vstack([far, patch]))
+    assert region["pose"][:2] == pytest.approx([1.05, 2.025]) and region["pose"][2] + 0.01 == pytest.approx(0.31)
+    # tool centres from x 1.002 to 1.098 and y 2.006 to 2.044 put the patch inside the 0.196 x 0.088 reach: the
+    # region is that box plus the brush's own half extents, and a millimetre more would miss a particle
+    assert region["dims"] == pytest.approx([0.252, 0.086, 0.02], abs=1e-6)
+    assert region["rotation"] == np.eye(3).tolist() and region["yaw_tolerance"] == pytest.approx(np.radians(5))
+    assert sim.stamp_region("scrub_brush.n.01_1", "shoe.n.01_1", np.zeros((0, 3))) is None
+    objects["vacuum.n.04_1"] = _seen("vacuum.n.04_1", [0.0, 0.0, 0.3], [-0.5, -0.15, -0.3], [0.5, 0.15, 0.3], sim)
+    slab = (np.array([-0.0006, -0.151, -0.3214]), np.array([0.1186, 0.151, -0.3011]))  # bdmsbr's, in its own frame
+    dust = np.array([[0.00, 0.0, 0.0], [0.10, 0.0, 0.0], [0.05, 0.25, 0.0], [0.02, 0.1, 0.0], [0.9, 0.9, 0.0]])
+    region = sim.stamp_region("vacuum.n.04_1", "floor.n.01_1", dust, projection=slab)
+    assert region["pose"][2] + 0.01 == pytest.approx(0.01125, abs=1e-4)  # hovering: the slab straddles the dust
+    assert region["pose"][:2] == pytest.approx([-0.009, 0.125], abs=1e-6)  # the body sits back from the slab
+    assert region["dims"][:2] == pytest.approx([1.0192, 0.352], abs=1e-6)  # the slab's reach, no margin, plus the body
+
+
+def test_a_knife_is_set_down_on_the_foods_top_over_its_centre():
+    """E-knife: the slicer fires on any knife-link contact while armed (slicer_active.py:72-135), so the cut is a
+    placement on the food's top, a square of the knife's length about the food's centre."""
+    objects = {}
+    sim = _region_sim(None, objects=objects)
+    objects["onion.n.01_1"] = _seen("onion.n.01_1", [1.0, 0.5, 0.8], [-0.05, -0.05, -0.05], [0.05, 0.05, 0.05], sim)
+    objects["knife.n.01_1"] = _seen("knife.n.01_1", [0.0, 0.0, 1.0], [-0.12, -0.01, -0.005], [0.12, 0.01, 0.005], sim)
+    region = sim.knife_region("knife.n.01_1", "onion.n.01_1")
+    assert region["pose"][:2] == pytest.approx([1.0, 0.5]) and region["pose"][2] + 0.01 == pytest.approx(0.85)
+    assert region["dims"] == pytest.approx([0.34, 0.34, 0.02])
+    sim.seen_boxes.pop("knife_1")
+    assert sim.knife_region("knife.n.01_1", "onion.n.01_1") is None
+
+
+def test_a_heat_box_keeps_the_item_inside_the_heat_links_sphere_on_the_cooking_surface():
+    """E-heat: any overlap with the burner's 0.2 m sphere heats the whole object (heat_source_or_sink.py:253-266).
+    The box holds the item's centre inside that sphere at the surface's height, on the map's cooking surface under
+    the link (the grate), not on the back panel that rises within the same radius, nor the drip tray under the grate."""
+    cooktop = trimesh.creation.box([0.6, 0.6, 0.02]).apply_translation([2.0, 1.0, 0.89])
+    tray = trimesh.creation.box([0.2, 0.2, 0.01]).apply_translation([2.0, 1.15, 0.855])  # under the grate's bars
+    panel = trimesh.creation.box([0.6, 0.05, 0.4]).apply_translation([2.0, 1.3, 1.1])
+    cooktop = trimesh.util.concatenate([cooktop, tray])
+    objects = {"stove.n.01_1": SimpleNamespace(fixed_base=True)}
+    sim = _region_sim(trimesh.util.concatenate([cooktop, panel]), objects=objects)
+    objects["frying_pan.n.01_1"] = _seen("frying_pan.n.01_1", [0.0, 0.0, 0.0], [-0.14, -0.14, 0.0], [0.14, 0.14, 0.05], sim)  # fmt: skip
+    link = (np.array([2.0, 1.15, 0.905]), 0.2)
+    region = sim.heat_region("frying_pan.n.01_1", "stove.n.01_1", link)
+    assert region["pose"][2] + 0.01 == pytest.approx(0.90) and region["pose"][:2] == pytest.approx([2.0, 1.15])
+    centres = np.array(region["dims"][:2]) / 2 - 0.14  # how far the pan's centre may go from the link
+    assert np.hypot(*centres) <= 0.2 and centres.min() > 0.13  # every corner inside the disk, most of it used
+    assert sim.heat_region("frying_pan.n.01_1", "stove.n.01_1", None) is None  # an oven heats inside: no near region
+
+
+def test_fixture_for_tracks_the_nearest_doorless_heat_source_so_a_goal_atom_can_name_it(monkeypatch):
+    """W-ipress / E-heat: the burner is outside the BDDL scope in the stove-route tasks (spec 6.1.6). The nearest
+    fixture with the taxonomy's ability is tracked under its scene name, one with no door first (a microwave or oven
+    door gates its heat), and toggled_on(<it>) then translates like any task object's."""
+    from omnigibson.tiptop import articulation
+    from omnigibson.tiptop.bench import Episode
+
+    def fixture(name, category, at, door=False):
+        centre = th.tensor([*at, 0.9])
+        return SimpleNamespace(name=name, category=category, fixed_base=True, aabb_center=centre, door=door)
+
+    microwave = fixture("microwave_hjjxmi_0", "microwave", (1.0, 0.0), door=True)
+    stove = fixture("stove_ykretu_0", "stove", (3.0, 0.0))
+    fridge = fixture("fridge_dszchb_0", "fridge", (0.5, 0.0), door=True)
+    table = SimpleNamespace(name="table_7", category="breakfast_table", fixed_base=False)  # movable: never a fixture
+    monkeypatch.setattr(articulation, "openable_joints", lambda obj: [{"name": "j_door"}] if obj.door else [])
+    objects = {o.name: o for o in (microwave, stove, fridge)}
+    sim = SimpleNamespace(
+        env=SimpleNamespace(scene=SimpleNamespace(objects=[table, microwave, stove, fridge])),
+        base_pose=lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0])),
+        objects={}, bddl_names={"frying_pan_1": "frying_pan.n.01_1"}, scene_object=lambda name: objects[name],
+    )  # fmt: skip
+    sim.track, sim.tiptop_goal = MethodType(R1ProSim.track, sim), MethodType(R1ProSim.tiptop_goal, sim)
+    ep = SimpleNamespace(sim=sim, boxes=lambda *names: {})
+    ep.fixture_for = MethodType(Episode.fixture_for, ep)
+    assert ep.fixture_for("heatSource", near="frying_pan.n.01_1") == "stove_ykretu_0"  # 3 m off beats 1 m: no door
+    assert ep.fixture_for("coldSource") == "fridge_dszchb_0" and ep.fixture_for("particleRemover") is None
+    labels, atoms = sim.tiptop_goal([{"predicate": "toggled_on", "args": ["stove_ykretu_0"]}], category_level=False)
+    assert atoms == [{"predicate": "pressed", "args": ["stove_ykretu_0_button"]}] and "stove_ykretu_0" in labels
+    assert sim.objects["stove_ykretu_0"] is stove and sim.bddl_names["frying_pan_1"] == "frying_pan.n.01_1"
 
 
 def _aabb(lo, hi, fixed_base=True):

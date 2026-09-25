@@ -752,6 +752,52 @@ def test_resampling_plays_at_planned_speed_and_every_sample_is_on_the_checked_pa
     assert (len(result) - 2) * control_dt < (len(path) - 1) * 0.02 <= (len(result) - 1) * control_dt + 1e-8
 
 
+def test_the_effect_predicates_translate_to_on_and_aim_names_the_support_plane():
+    """Tier 3's runner predicates (stamp, cut, heat, aim) and BDDL's attached all reach the wire as on(a, b): the
+    bridge's region box says where (r1pro.inside_regions). aim stands the tool on the planner's support plane near
+    the target, so like under it names the plane; a stamp on a floor names the plane too."""
+    from omnigibson.tiptop.protocol import INTENT_PREDICATES, KEEP_HOLD_PREDICATES, PLANNER_SUPPORT, tiptop_goal
+
+    names = {"scrub_brush_1": "scrub_brush.n.01_1", "shoe_1": "shoe.n.01_1", "knife_1": "knife.n.01_1",
+             "onion_1": "onion.n.01_1", "frying_pan_1": "frying_pan.n.01_1", "stove_ykretu_0": "stove_ykretu_0",
+             "atomizer_1": "atomizer.n.01_1", "tree_1": "tree.n.01_1", "camera_1": "digital_camera.n.01_1",
+             "tripod_1": "camera_tripod.n.01_1"}  # fmt: skip
+    goal = [{"predicate": p, "args": list(a)} for p, *a in (
+        ("stamp", "scrub_brush.n.01_1", "shoe.n.01_1"), ("cut", "knife.n.01_1", "onion.n.01_1"),
+        ("heat", "frying_pan.n.01_1", "stove_ykretu_0"), ("aim", "atomizer.n.01_1", "tree.n.01_1"),
+        ("attached", "digital_camera.n.01_1", "camera_tripod.n.01_1"), ("stamp", "scrub_brush.n.01_1", "floor.n.01_1"),
+    )]  # fmt: skip
+    _, out = tiptop_goal(goal, names, False)
+    assert [a["predicate"] for a in out] == ["on"] * 6
+    assert [a["args"] for a in out] == [["scrub_brush_1", "shoe_1"], ["knife_1", "onion_1"], ["frying_pan_1", "stove_ykretu_0"],
+                                        ["atomizer_1", PLANNER_SUPPORT], ["camera_1", "tripod_1"], ["scrub_brush_1", PLANNER_SUPPORT]]  # fmt: skip
+    assert set(INTENT_PREDICATES) == {"stamp", "cut", "heat", "aim"} and KEEP_HOLD_PREDICATES == ("stamp",)
+
+
+def test_keep_holding_drops_the_release_and_comes_back_up_the_way_it_went_down():
+    """A stamp removes on arrival, so the tool is never let go: the plan loses its open and everything after, and
+    the approach and terminal legs return reversed, ending at the approach's first waypoint."""
+    from omnigibson.tiptop.protocol import keep_holding
+
+    def leg(label, a, b, n=4):
+        q = np.linspace(a, b, n, dtype=np.float32)[:, None].repeat(2, 1)
+        v = np.full((n, 2), b - a, np.float32)
+        return {"type": "trajectory", "label": label, "positions": q, "velocities": v, "dt": 0.02}
+
+    place = "Place(scrub_brush_1, grasp0, pose1, shoe_1, q1)"
+    plan = {"version": "1.1.0", "q_init": np.zeros(2), "gripper_init": "closed", "steps": [
+        leg(place, 0.0, 1.0), leg(place, 1.0, 1.5), {"type": "gripper", "label": place, "action": "open"},
+        leg("GoToInitial(q0)", 1.5, 1.0), leg("GoToInitial(q0)", 1.0, 0.0)]}  # fmt: skip
+    out = keep_holding(plan)
+    assert [s["type"] for s in out["steps"]] == ["trajectory"] * 4 and all(s["label"] == place for s in out["steps"])
+    assert np.array_equal(out["steps"][2]["positions"], plan["steps"][1]["positions"][::-1])
+    assert np.array_equal(out["steps"][2]["velocities"], -plan["steps"][1]["velocities"][::-1])
+    assert np.array_equal(out["steps"][3]["positions"][-1], plan["steps"][0]["positions"][0])  # back at the approach start
+    assert plan["steps"][2]["action"] == "open"  # the plan given is untouched
+    no_open = dict(plan, steps=plan["steps"][:2])
+    assert keep_holding(no_open) is no_open
+
+
 def test_under_is_a_placement_on_the_planners_support_plane():
     """under(x, f) had no translation (setting_mousetraps: 'no sub-plan for goal atoms ['under']' in 9 episodes).
     It is a floor placement inside f's footprint: the client sends that floor as the support plane, and the atom

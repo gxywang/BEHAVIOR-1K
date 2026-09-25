@@ -369,3 +369,213 @@ Nothing in this tier ran in the simulator; every "unproven" line below is the sa
 - Live checks when a sim slot is free: one fridge task (freeze_fruit or storing_food, petcxr / dszchb) for the open ->
   side pick -> stance reuse -> push close chain under `--grasping-mode assisted`; store_honey for the unchanged drawer
   path; a standing-book or cup pick with `side_grasp` set; one place into a bookcase bay with a side-grasped item.
+
+## Tier 3 (2026-09-25): W-goals, W-ipress, W-dwell, E-yaw, E-stamp, E-knife + N-touch, E-heat, E-aim, E-attach
+
+The goal sub-plans (DESIGN.md section 5). cuTAMP: `install/patches/cutamp-22-place-rotation.patch` (tier 2 took 21, so
+this tier's patch is 22, not the 21 DESIGN.md names). Suites after integration: bridge 438 passed (422 after tier 2);
+planner 184 passed, 5 deselected (182 after tier 2). Integration wired two things the packages asked for:
+`tests/test_presweep_planner.py`'s fake world gets an `env` (the new yaw loop in `stable_placement_costs` reads
+`world.env` the way `near_placement_costs` already did; the real TAMPWorld always has one), and
+`tiptop/planning.py: run_planning` sets `constraint_to_tol[StablePlacement][f"{obj}_yaw"] = 0.0` for every object in
+`env.place_rotation`, which is the checker's default value, so plans are unchanged and its per-plan "No tolerance found"
+line is gone. Nothing in this tier ran in the simulator; no stamp, cut, heat, aim, attach or dwell round has ever
+executed, and every "unproven" line below is that fact.
+
+### E-yaw: a placement carries a rotation and a yaw band (cuTAMP + planner)
+
+- cuTAMP: `rollout.py: place_pose(env, obj, p)` = `action_4dof_to_mat4x4(p) @ R4(R)` for `obj in env.place_rotation`
+  (obj -> (R 3x3 on the device, yaw tolerance in radians or None)); `RolloutFunction`'s Place, `motion_solver.py`'s
+  Place (`world_from_obj`) and `particle_initialization.py`'s Place use it. The Place sampler stands the spheres rotated
+  by R on the surface (its bottom offset and radial extent, and the PlaceNear ring's `radial`, are the rotated
+  shape's); the yaw is redrawn uniformly in [-tol, tol] when tol is not None (free when None); the collision filter and
+  IK run on the rotated pose. `cost_function.py: stable_placement_costs` adds `f"{obj}_yaw" = relu(|yaw| - tol)` per
+  StablePlacement constraint whose object has a tol, yaw = atan2 of the placed pose's rotation block times R^T (summed
+  when the same object is placed twice in one skeleton). Without the key every path is the old code.
+- Planner: `tiptop_run.py: create_tamp_environment` copies each `place_surfaces` box and pops `rotation` /
+  `yaw_tolerance` before `Cuboid(**box)` (support-label and hull-replacement branches alike); `rotations[label] =
+  (tensor_args.to_device(rotation), tol)`; every `on(x, label)` atom with x a movable sets `place_rotation[x]`;
+  `env.place_rotation` is set next to `env.near_also` ({} when no region carries one). `planning.py: run_planning`:
+  the `{obj}_yaw` tolerance (integration, above).
+- Reads: only the two keys on the region box the bridge sends (`stamp_region`, `aim_target`, `attach_target` below);
+  nothing from the simulator or a mesh on the planner side. The keys ride inside `place_surfaces`, already in
+  `KNOWLEDGE_JSON_KEYS`, so a recorded request replays them.
+- Tests: `tiptop/tests/test_movable_surface_cover.py::test_a_place_rotation_lays_the_object_down_on_the_surface_and_bounds_its_yaw`
+  (R = 90 deg about x, tol 0.2, on a fake world: the neck level with the base, the lowest rotated sphere the sampler's
+  1-10 mm plus activation above the top, every yaw within +-0.2; `bottle_yaw` = [0, 0, 0.3] for yaws 0.1, -0.2, 0.5);
+  `tiptop/tests/test_inside_region.py::test_a_region_rotation_is_the_placed_objects_not_the_cuboids` (the Cuboid's
+  dims/pose equal the slab's, `place_rotation["jar_1"]` a (3, 3) device tensor with tol 0.2, None without
+  `yaw_tolerance`); `::test_without_the_key_nothing_changes` asserts `place_rotation == {}`.
+- Replay (`T3-cutamp/eyaw_*.out`, GPU 2, a few tensors: sweep4 assembling_gift_baskets_i0_0924_003546 round 3
+  inside(candle_1, wicker_basket_2), seed 2302, 256 particles, 200 Adam steps): no key reproduces the pre-edit snapshot
+  and the server's live log exactly (1 sampled -> 132 satisfying, yaws spread -127..165 deg). 20 deg +-10 deg (the
+  design's numbers): 0/256 sampled and 0/256 optimised, all lost to `wicker_basket_2_in_xy`: the candle's 252-sphere
+  footprint spans 11.5-11.8 cm at world yaw 10-30 deg against the 13.2 x 9.9 cm compartment and fits only at 50-75,
+  140-165, 230-255, 320-345 deg (`yaw_fit.out`), so the constraint refuses an orientation that does not fit, which is
+  right. 60 deg +-10 deg: 7/256 sampled (7/7 within), 215/256 after 200 steps, 215/215 within [50, 70] deg (before:
+  31/132 within, by chance). `T3-planner/place_rotation_eval.out`: 11/11 recorded inside rounds with a region build
+  the same env apart from `place_rotation` once a rotation is added to their box; HEAD raised `TypeError` on the Cuboid.
+- Unproven in simulation: any rotated placement. The bridge has to choose a band the footprint fits (an
+  `attach_target` sizes its box for the rotated body; a stamp's identity rotation is the fit itself), or the round has
+  no satisfying particle by design.
+
+### E-stamp: a stamp is a placement over the densest particle cluster the tool covers (protocol + bridge + policy)
+
+- `b1k/bridge/protocol.py`: `INTENT_PREDICATES = ("stamp", "cut", "heat", "aim")`, `KEEP_HOLD_PREDICATES = ("stamp",)`;
+  `tiptop_goal` maps attached/stamp/cut/heat -> on(x, y) and aim -> on(tool, PLANNER_SUPPORT) (the `under` branch);
+  `keep_holding(plan)` on a parsed plan drops the last gripper `open` and everything after it and appends the two
+  trajectories before it reversed (positions flipped, velocities negated and flipped); no `open` -> the same plan,
+  warned. `run.py: do_execute` applies it when a round atom's predicate is in KEEP_HOLD_PREDICATES. `bench.py:
+  Episode.satisfied`: an intent predicate is satisfied by its round having run without error (open loop, like a press;
+  what it changed is the evaluator's); `attached` joins `under` as evaluator-only.
+- `r1pro.py: inside_regions(atoms, oracle=None)` splits the intent atoms out of `pairs` (a floor stamp target no longer
+  triggers `floor_surface`) and dispatches stamp/cut/heat/aim/attached to the region functions below over hints fetched
+  through `oracle` (the describing OracleKnowledge), keyed by the target's label, or PLANNER_SUPPORT for aim and for a
+  floor target; with no oracle they get none. `seen_aabb(obj)` is the world AABB of `own_box` (`footprint_region` uses
+  it). `stamp_region(tool, target, particles, projection=None)`: greedy densest cluster (every particle as one of the
+  4 footprint corners, ponytail-marked) that fits the tool's world box as held + `STAMP_MARGIN` 2 cm (an adjacency
+  remover's rule, particle_modifier.py:524-531) or the projection slab with no margin; box = the covering tool centres
+  grown by the tool's half extents (cuTAMP keeps every sphere inside the surface); top = the cluster's lowest particle,
+  or for a projection remover the middle of the slab's straddle band (`VACUUM_HOVER`); `rotation` identity,
+  `yaw_tolerance` `STAMP_YAW_TOL` 5 deg, so the tool lands at the yaw the fit was made at.
+- Policy (`b1k/bridge/strategies.py`): `strategy_for(..., scope=())`, `Runner.scope` (BDDL names at reset, from
+  `bench.main`'s `sorted(sim.task_scope())`), `Runner.real` = scope plus what `ep.after_transition()` names;
+  `transfer_one` skips a demand item not in `real`. `Runner.run`: opens -> `run_goals` -> transfers -> closes ->
+  presses -> a final `dwell(state_atoms())`. `run_goals` groups the goal: `not covered` -> `clean()`: remover = a scope
+  particleRemover that is not itself a target (gloves, caps and teddies are removers by taxonomy),
+  `press_instrumental` when toggleable, one pick, `stamp()` per target (`stand_for` / `walk_to_floor` for a floor,
+  `achieve([stamp(tool, t)])`, stop when the evaluator reads clean, at `MAX_STAMPS` 20, or after `attempts` consecutive
+  failed rounds), `free_hand`; no remover -> the washer (category "washer", transition_rules.WasherRule): every target
+  inside, one `press_instrumental` (which shuts it first). `has_ability(name, ability)` reads bddl's ObjectTaxonomy.
+- Reads: `OracleKnowledge.particles(target, system=None)` (every visual system's group on the target, or one system's:
+  privileged, named) and `projection_box(tool)` (the remover's projection cube hung below its meta link, in the tool
+  frame, from `_projection_mesh_params`: privileged, named; None for an adjacency remover); the tool's seen box
+  (points). "Still covered" is `Episode.goal_already_holds`, the existing evaluator read.
+- Tests: `test_tiptop_presweep_fixes.py::test_a_stamp_box_covers_the_densest_cluster_the_tool_and_its_margin_can_take_and_no_more`
+  (a brush over a 5-particle patch beats a 3-particle one: a 0.252 x 0.086 box at the patch's height, a millimetre
+  more would miss a particle; the vacuum's slab hovering 11 mm up, the body set back from the slab);
+  `test_tiptop_protocol.py::test_the_effect_predicates_translate_to_on_and_aim_names_the_support_plane`,
+  `::test_keep_holding_drops_the_release_and_comes_back_up_the_way_it_went_down`;
+  `test_tiptop_strategies.py::test_a_covered_target_is_stamped_with_the_scopes_remover_until_the_episode_reads_it_clean`,
+  `::test_a_loaded_washer_is_shut_before_its_one_press`.
+- Replay (`T3-bridge/stamp_counts.out`, CPU, the study's particle dumps, 300 instances per task; stamps until no
+  particle is left, by `stamp_region`'s clustering at the tool's yaw 0 or 90, vs the study's greedy set cover which
+  also turned the tool 45 deg): within +-1 of the study on clean_a_keyboard 299/300, scrubbing_bathroom_floor 298/300,
+  vacuuming_floors 300/300, garden tools 291-298/300 (one fewer on most: the footprint is the tool's own box);
+  sweeping_garage 180/300 and clean_a_patio 100/300, 1-2 stamps more than the study (300/300 when the 45 deg yaw is
+  allowed too; the broom is long and the region holds one yaw). `keep_holding.out`: on the 9 executed place plans of
+  sweep4 assembling_gift_baskets the cut plan ends 0 rad from the approach's first waypoint and the seams add no joint
+  step beyond the plan's own.
+- Unproven in simulation: a pick of a brush, broom or vacuum under assisted grasping (two fingers and the ray); a stamp
+  planned as a Place landing within the margin at the cluster's height; `keep_holding` played by the executor; the
+  vacuum's hover and its switch; a floor stamp through the PLANNER_SUPPORT region.
+
+### E-knife + N-touch: a cut is the knife set down on the food (bridge + policy)
+
+- `r1pro.py: knife_region(knife, food)`: the food's seen top, a square of the food's extent plus the knife's longest
+  seen extent about the food's centre (the slicer fires on any knife-link contact while armed, slicer_active.py:72-135:
+  the place is the cut). Policy `cut()`: real(x) / contains(c, x) with x a half__/sliced__/diced__ category (cooked__
+  stripped) -> the scope wholes of the base category; the whole into c first for contains; `carry("cut", knife,
+  whole)` then `self.real |= ep.after_transition()`; diced: cut each appeared half__<base> (the pick between cuts
+  re-arms the knife); a cooked__ product then `warm()`s the container waiting on real(product). `transfer()`: the
+  verdict for a non-place predicate is the round having run; `reach_into(ep, name, support)` (factored out of the
+  source open) walks up to 3 supports and is applied to the target's enclosure too (a knife set down on an egg still
+  in the fridge). `holds(ep, predicate, *args)` takes unary atoms and reads a TypeError as not holding.
+- Reads: the knife's and food's seen boxes (points); `OracleKnowledge.appeared()` (privileged, named: task-scope
+  objects that exist and were not tracked, tracked one by one under their labels; a scope entry that became None is
+  dropped); `OracleKnowledge.localize` leaves out a name `scene_object` cannot resolve instead of raising.
+  `Episode.after_transition()` -> `knowledge.appeared()` (`KnowledgeSource.appeared()` -> []).
+- Tests: `test_tiptop_presweep_fixes.py::test_a_knife_is_set_down_on_the_foods_top_over_its_centre`;
+  `test_tiptop_knowledge.py::test_the_oracle_leaves_out_what_it_cannot_resolve_and_tracks_what_a_transition_created`;
+  `test_tiptop_strategies.py::test_a_diced_goal_cuts_the_whole_in_its_bowl_then_each_half_the_cut_made`,
+  `::test_a_half_is_cut_before_it_is_transferred_and_one_that_never_appears_is_not_picked`.
+- Replay: none for the region (no recorded round cuts). `T3-policy/dryrun.txt` (every task's problem0.bddl grounded
+  offline on a Kitchen from its :init, 0 of 100 raise): the onion into the bowl first, four logs, the egg in the opened
+  fridge then the halves onto the plate, five vegetables, steak and pineapple, four sprouts then the tupperware into
+  the oven.
+- Unproven in simulation: whether a knife placed flat on a fruit makes knife-link contact while armed; the re-arm (60
+  steps without contact) between cuts; `appeared()` live after a slice. Known gap (ponytail note in `cut()`): a half
+  gets a BDDL name only when the :init lists it as a future object; chop_an_onion, slicing_vegetables, cook_cabbage and
+  canning_food list only the diced__ systems, so their dice stops after the slice.
+
+### E-heat, W-ipress, W-dwell, frozen, on_fire (bridge + policy)
+
+- `r1pro.py: heat_region(item, source, heat_link)`: the square inscribed in the heat sphere at the cooking surface's
+  height, grown by the item's seen half extents; the top from 9 rays down at and around the link on a fixed source's
+  map mesh (a grate, not the panel behind or the drip tray under), capped at link z + `HEAT_TOP_ABOVE` 5 cm, or a
+  movable source's seen top; None with no link (an oven heats inside: the policy routes `inside` there).
+  `bench.py: Episode.fixture_for(ability, near=None)`: the nearest fixed-base scene object whose category's synset has
+  the taxonomy ability, one without an openable joint first, tracked under its scene name (`sim.track(name)`,
+  `bddl_names[name] = name`) so `toggled_on(stove_ykretu_0)` translates; `Episode.dwell(steps)`: `sim.hold` with the
+  last gripper command, capped by the steps left; `Episode.goal_already_holds(predicate, *args)` any arity.
+  `knowledge.py: OracleKnowledge.describe` calls `button_hints(self.goal + atoms)`, so an instrumental press of a
+  fixture the goal never names has its button described.
+- Policy `warm(predicate, items)`: source = a scope heatSource, doorless first, else `ep.fixture_for`; route `inside`
+  for an openable source else `heat`; carrier = the movable support of the item (not a taxonomy sceneObject) else the
+  item, falling back to the item when the carrier cannot be taken; skips an item whose state holds or that already sits
+  where a goal placement wants it; `press_instrumental(source)` once after the carries; inline `dwell` until the atoms
+  hold. frozen: the same into the coldSource, no press, no carry for an item the goal itself places (freeze_pies), the
+  dwell at the end behind the shut door. `press_instrumental(ep, obj)`: skipped when `ep.switched_on(obj)`; an openable
+  that is not shut is closed first (a microwave or washer refuses ON while open); `run_press(style="in_place")`.
+  `dwell(ep, atoms)`: `ep.dwell(30)` while an atom (or its negation) does not hold, bounded by `MAX_DWELL_STEPS` 600
+  and `spend_what_is_left`'s 0.6 budget share; stops when the episode returns fewer steps than asked.
+- Reads: `OracleKnowledge.heat_link(source)` (HeatSourceOrSink.link world xyz and distance_threshold; None when
+  requires_inside: privileged, named); a fixed source's collision mesh (map); the item's seen box; `ep.switched_on`
+  (the existing privileged read); bddl's taxonomy (task class).
+- Tests: `test_tiptop_presweep_fixes.py::test_a_heat_box_keeps_the_item_inside_the_heat_links_sphere_on_the_cooking_surface`
+  (the grate, not the tray under it or the panel behind; every corner within the 0.2 m disk, most of it used),
+  `::test_fixture_for_tracks_the_nearest_doorless_heat_source_so_a_goal_atom_can_name_it` (a stove 3 m off beats a
+  microwave 1 m off; a movable table is never a fixture; the pressed atom translates);
+  `test_tiptop_knowledge.py::test_the_oracle_describes_the_button_of_a_round_atom_the_goal_never_names`;
+  `test_tiptop_strategies.py::test_cooked_carries_the_tray_to_the_stove_presses_it_once_and_waits`,
+  `::test_frozen_puts_the_item_in_the_cold_source_shuts_it_and_waits`,
+  `::test_on_fire_lights_the_lighter_and_never_carries_off_an_item_already_where_the_goal_wants_it`.
+- Replay (`T3-bridge/heat_disk.out`, CPU, the study's burner link positions with a cooking surface 5 mm under the
+  link): cook_bacon, cook_broccolini, cook_cabbage: every pan centre the region allows is within 0.200 m of the link
+  and the square uses 64 % of the disk; 89/300 cook_bacon instances start with the pan already in the disk (45/300 in
+  the region), 0/300 for the other two. `T3-policy/dryrun.txt`: bacon's tray to the stove, knob press, dwell; brisket
+  and pie into the oven, close, press, dwell, then out to the board or tray; hot dogs and popcorn into the microwave;
+  broccolini's plate to the stove; cabbage and chili into the pan, cut, pan to the stove; freeze_pies transfers only,
+  close, dwell; setting_the_fire: three items to the lighter, press on, dwell, transfers, press off.
+- Unproven in simulation: all of it: the heat placement staying in the sphere after the release, the in_place knob
+  press on a stove, `fixture_for` live, the dwell counts (hot dogs 298-322 steps in the study). Known: cook_hot_dogs and
+  make_microwave_popcorn take the in-scope microwave, not the study's burner route (the burner route needs
+  `fixture_for`, which fires only when the scope has no heatSource); setting_the_fire lights the newspaper at the
+  lighter and never moves it into the fireplace.
+
+### E-aim and E-attach: the tool turned at its target, the child at the parent's frame (bridge + policy)
+
+- `r1pro.py: aim_target(tool, target, nozzle)`: a box on the robot's side of the target within the nozzle's reach, at
+  the target's bottom height under PLANNER_SUPPORT, `rotation` = the yaw that turns the nozzle's -z direction now onto
+  the target, `yaw_tolerance` `AIM_YAW_TOL` 15 deg. `attach_target(child, parent, frames)`: R = R_F R_M^T; the child's
+  body centre with the male frame on the female one; half extents of the rotated body plus `ATTACH_TOL` 5 cm / sqrt 2;
+  top = the aligned bottom + `ATTACH_LIFT` 1 cm (at or above, never below: the snap allows 5 cm); `rotation` in the base
+  frame (base^T R base), `yaw_tolerance` `ATTACH_YAW_TOL` 10 deg (the snap allows 15). Policy `coat()`: the scope's
+  particleApplier, `press_instrumental` at rest, `carry("aim", tool, t)` per still-uncovered target; `attached` is a
+  transfer (`PLACE_PREDICATES += "attached"`), judged by the evaluator alone.
+- Reads: `OracleKnowledge.nozzle(tool)` (the ParticleApplier meta link's frame and the projection extent along -z) and
+  `attach_frames(child, parent)` (the first free (male, female) pair from AttachedTo's own candidates): privileged,
+  named; seen boxes otherwise; the robot's base pose.
+- Tests: `test_tiptop_strategies.py::test_an_attached_goal_is_carried_like_a_placement`; the protocol test above (aim
+  -> on(tool, table), attached -> on). `aim_target` and `attach_target` themselves have no unit test.
+- Replay: none.
+- Unproven in simulation: all of it. The frame convention (the planner's object frame is base-aligned at the capture,
+  R applied about the object's origin under the particle's yaw) has been checked on paper against `place_pose` only.
+
+### Open after tier 3
+
+- `appeared()` cannot name a half with no future entry in the :init; four dicing tasks stop after the slice.
+- `Episode.support_of` for an item inside a container (tier 2's open item) is still open: `reach_into` walks
+  `support_of`, which answers the floor for an item on a shelf inside a shut cabinet, so that source open is dead live.
+- `aim_target` / `attach_target`: no unit test, no replay; whether the attach rotation leaves the child's footprint
+  fitting its region is by construction only.
+- The `{obj}_yaw` tolerance is 0.0 (exact). If live plans lose particles at the checker to optimiser noise, a 1e-2 rad
+  slack in `planning.run_planning` is the one-line change.
+- The carrier rule reads fixed vs movable off the taxonomy's sceneObject ability, not `obj.fixed_base` (the policy has
+  no fixed_base channel); a fixed fillable without sceneObject is tried and falls back to the item after a failed pick.
+- `filled` and `not contains` have no sub-plan (canning_food); make_pizza's real(pizza) is a recipe transition (tier 4).
+- Live checks when a sim slot is free, all under `--grasping-mode assisted`: clean_a_keyboard (stamp, keep_holding),
+  wash_a_baseball_cap (load, push-close, in_place press), halve_an_egg (cut in the open fridge, halves appear,
+  transfers), cook_bacon (tray to the heat region, knob press, dwell), freeze_pies (the dwell within the 0.6 budget
+  share), one attach round (a camera on its tripod) and one aim round (the atomizer) for the rotation on the wire.
+- curobo still imports from the main tree's editable install (tier 2 note); nothing in this tier touches it.

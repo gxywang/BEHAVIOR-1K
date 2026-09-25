@@ -27,7 +27,7 @@ import numpy as np
 import omnigibson.utils.transform_utils as T
 
 from omnigibson.tiptop.knowledge import GoalNotVisible
-from b1k.bridge.protocol import FLOOR_CATEGORIES, bddl_category
+from b1k.bridge.protocol import FLOOR_CATEGORIES, INTENT_PREDICATES, bddl_category
 from b1k.bridge.judgement import (  # FLOOR_LEVEL and UNSATISFIED_SHOWN moved with the geometry and the
     FLOOR_LEVEL,  # verdict they parameterize; both are re-exported here, where callers still read them
     UNSATISFIED_SHOWN,  # noqa: F401
@@ -443,13 +443,16 @@ class Episode:
                 ok = self.holding(args[0])
             elif predicate == "nextto" and len(args) == 2:
                 ok = self.beside(args[0], args[1], after=after)
-            elif predicate in PLACE_PREDICATES and len(args) == 2:
+            elif predicate in (*PLACE_PREDICATES, "attached") and len(args) == 2:
                 # and the task's own evaluator: the geometry takes an item up to 15 cm over the target's top as
                 # in it, and 16 of 18 executed inside(x, bookcase) rounds ended on the top board (2026-09-23).
-                # under(x, f) has no box geometry (the item is below f's bottom): the evaluator alone
+                # under(x, f) has no box geometry (the item is below f's bottom) and attached(x, y) is a snap of
+                # meta links no box can see: the evaluator alone
                 ok = self.goal_already_holds(predicate, *args) and (
-                    predicate == "under" or self.placed(args[0], args[1], after=after)
+                    predicate in ("under", "attached") or self.placed(args[0], args[1], after=after)
                 )
+            elif predicate in INTENT_PREDICATES:
+                ok = ran  # a stamp, cut, heat or aim is open loop like a press: what it changed is the evaluator's
             elif predicate == "open" and args:
                 ok = not self.is_shut(args[0])
             elif predicate == "not" and len(args) >= 2 and args[0] == "open":
@@ -770,8 +773,9 @@ class Episode:
             log.info(f"no stance reaches {name} ({exc}); retaining the held item")
             return False
 
-    def goal_already_holds(self, predicate: str, item: str, container: str) -> bool:
-        """Whether the goal's own atom for this pair holds right now, by the task's evaluator.
+    def goal_already_holds(self, predicate: str, *args: str) -> bool:
+        """Whether the goal's own atom holds right now, by the task's evaluator (any arity: ``real(x)``,
+        ``covered(t, s)``, ``ontop(x, y)``).
 
         Privileged in the same way ``switched_on`` is. Used to skip completed work and verify the exact
         destination after placement, including named floors and inside versus ontop. The geometric stand-in it replaces could not tell one floor
@@ -783,10 +787,54 @@ class Episode:
         comes from the simulator's final check independently of this per-transfer verdict.
         """
         try:
-            return bool(self.sim.holds(predicate, item, container))
+            return bool(self.sim.holds(predicate, *args))
         except Exception as exc:  # noqa: BLE001 - an unknown predicate or an object the scope does not name
-            log.debug(f"cannot judge {predicate}({item}, {container}) yet ({exc}); treating it as still to do")
+            log.debug(f"cannot judge {predicate}({', '.join(args)}) yet ({exc}); treating it as still to do")
             return False
+
+    def fixture_for(self, ability: str, near: str | None = None) -> str | None:
+        """The scene fixture (fixed base: part of the map) nearest ``near`` (a task object; else the robot) whose
+        category's synset has the BDDL ``ability`` ("heatSource", "coldSource"), one with no openable joint first: a
+        door gates the oven's and the microwave's heat, a burner needs none (spec 6.1.6). Tracked under its scene
+        name so goal atoms can name it (``toggled_on(stove_ykretu_0)`` translates like a task object's); None when
+        the scene has none. Where a fixture stands is the map's; what heats is the taxonomy's."""
+        from bddl.object_taxonomy import ObjectTaxonomy
+        from omnigibson.tiptop.articulation import openable_joints
+
+        taxonomy = ObjectTaxonomy()
+        boxes = self.boxes(near) if near else {}
+        at = boxes[near]["center"][:2] if near in boxes else self.sim.base_pose()[0][:2].cpu().numpy()
+        found = []
+        for obj in self.sim.env.scene.objects:
+            try:
+                synset = taxonomy.get_synset_from_category(obj.category) if getattr(obj, "fixed_base", False) else None
+            except ValueError:  # a category the taxonomy maps to more than one synset
+                synset = None
+            if synset is not None and taxonomy.has_ability(synset, ability):
+                centre = obj.aabb_center.cpu().numpy()[:2]
+                found.append((bool(openable_joints(obj)), float(np.linalg.norm(centre - at)), obj.name))
+        if not found:
+            log.info(f"no fixed {ability} in the scene")
+            return None
+        door, dist, name = min(found)
+        self.sim.track(name)
+        self.sim.bddl_names[name] = name
+        log.info(f"{ability} for {near or 'the robot'}: {name}, {dist:.2f} m away{' (behind a door)' if door else ''}")
+        return name
+
+    def after_transition(self) -> list[str]:
+        """The BDDL names a transition just created (the halves of a cut), now tracked; [] from a source that cannot
+        tell (``KnowledgeSource.appeared``)."""
+        return self.knowledge.appeared()
+
+    def dwell(self, steps: int) -> int:
+        """Hold still for ``steps`` env steps, or what the episode has left: the clock is the ingredient of a cook
+        or a freeze (hot dogs 298-322 steps, spec S39). Returns the steps held."""
+        left = self.sim.max_steps - self.sim.n_steps if getattr(self.sim, "max_steps", None) else int(steps)
+        steps = max(0, min(int(steps), left))
+        self.sim.video_caption = f"dwell {steps} steps"
+        self.sim.hold(steps, self.sim.last_gripper)
+        return steps
 
     def near_floor(self, name: str) -> bool | None:
         """Whether a target stands on the floor (its bottom within ``FLOOR_LEVEL`` of z = 0), or is the floor;
@@ -907,7 +955,11 @@ def main(argv=None) -> None:
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
         strategy = strategy_for(
-            args.task_name, task_goal_atoms(sim), options=task_goal_options(sim), attempts=args.attempts_per_item
+            args.task_name,
+            task_goal_atoms(sim),
+            options=task_goal_options(sim),
+            attempts=args.attempts_per_item,
+            scope=sorted(sim.task_scope()),  # the objects that exist at reset: a cut's halves are not among them
         )
         for index, instance_id in zip(args.instances, instance_ids):
             t0 = time.time()

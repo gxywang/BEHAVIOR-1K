@@ -653,9 +653,11 @@ def do_execute(
     reports the goal objects' poses only. ``record`` writes the execution as ``<out_dir>/<tag>.mp4`` (unless
     --no-video). ``extra`` is saved with the result."""
     from omnigibson.tiptop.executor import PlanExecutor, check_success
-    from b1k.bridge.protocol import plan_summary
+    from b1k.bridge.protocol import KEEP_HOLD_PREDICATES, keep_holding, plan_summary
 
     atoms = parse_goal(args.goal) if atoms is None else list(atoms)
+    if any(atom["predicate"] in KEEP_HOLD_PREDICATES for atom in atoms):
+        plan = keep_holding(plan)  # a stamp removes on arrival: the tool stays in the hand and comes back up
     log.info(f"executing plan: {plan_summary(plan)}")
     # the press runs its planned stroke: nothing tells the executor when the switch flips (that would be the
     # simulator's answer, which a policy does not get); the switch state is logged afterwards for the record only

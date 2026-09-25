@@ -16,15 +16,22 @@ PRIVILEGED warning still fires from ``make_knowledge`` because the class declare
 The names below are re-exported, so ``from omnigibson.tiptop.knowledge import ...`` is unchanged.
 """
 
+import itertools
 import logging
 
 import numpy as np
+import omnigibson.utils.transform_utils as T
 
 from b1k.bridge.knowledge import *  # noqa: F401,F403
 from b1k.bridge.knowledge import KnowledgeSource, SceneKnowledge, register_source
-from b1k.bridge.protocol import PLANNER_SUPPORT, capture_views
+from b1k.bridge.protocol import PLANNER_SUPPORT, bddl_label, capture_views, label_category
 
 log = logging.getLogger(__name__)
+
+
+def _frame(link) -> np.ndarray:
+    """A link's world pose as a 4x4."""
+    return T.pose2mat(link.get_position_orientation()).cpu().numpy().astype(np.float64)
 
 
 @register_source
@@ -59,8 +66,10 @@ class OracleKnowledge(KnowledgeSource):
         # i.e. 2 mm above its LID. The same channel carries a fixture's board for touching(a, b), a named table's
         # top and the floor under a fixture for under(a, b) (r1pro.inside_regions). Privileged, like the button
         # poses; written on the request as `room` is, since attach_knowledge only carries the fixed set of keys.
-        # After remember_seen: the board is chosen by the item's height as this capture's points see it too.
-        regions = self.sim.inside_regions(atoms) if getattr(self.sim, "send_inside", False) else {}
+        # After remember_seen: the board is chosen by the item's height as this capture's points see it too. The
+        # regions of a stamp, cut, heat, aim or attach round need this source's hints (particles, heat link, frames):
+        # fetched through `oracle`, so each privileged read has one name (section 1.6 of the build design).
+        regions = self.sim.inside_regions(atoms, oracle=self) if getattr(self.sim, "send_inside", False) else {}
         if regions:
             request["place_surfaces"] = regions
         side = getattr(self.sim, "side_grasp", None)  # Episode.pick marked this round: a roof within the hand stack
@@ -127,7 +136,9 @@ class OracleKnowledge(KnowledgeSource):
             atoms=tiptop_atoms,
             masks=masks[primary][keep],
             view_masks={name: view_masks[keep] for name, view_masks in masks.items() if name != primary},
-            buttons=self.sim.button_hints(self.goal, category_level=False),
+            # the task's buttons every round, and this round's own: an instrumental press of a fixture the goal
+            # never names (the stove that cooks, tracked by Episode.fixture_for) has its button described too
+            buttons=self.sim.button_hints(self.goal + list(atoms), category_level=False),
             held_labels=sorted(set(held) | set(seen_obstacles)),
             in_hand=in_hand,
             workspace=self.sim.workspace(floor),
@@ -136,7 +147,102 @@ class OracleKnowledge(KnowledgeSource):
     def localize(self, *bddl_names):
         out = {}
         for name in bddl_names:
-            obj = self.sim.scene_object(name)
+            try:
+                obj = self.sim.scene_object(name)
+            except ValueError:  # a transition product that has not appeared, or a whole a cut removed: left out
+                continue
             lo, hi = [v.cpu().numpy().astype(np.float64) for v in obj.aabb]
             out[name] = {"center": obj.aabb_center.cpu().numpy().astype(np.float64), "lo": lo, "hi": hi}
         return out
+
+    # ---------------------------------------------------------------- privileged hints, one named read each
+    # Each is what a perception module would later supply (spec 6.2 names the replacement); the regions that use
+    # them (r1pro.stamp_region and the others) take the values and stay pure geometry.
+    def particles(self, target: str, system: str | None = None) -> np.ndarray:
+        """(n, 3) world positions of the visual particles attached to ``target`` -- every system's, or one
+        ``system``'s: what a stamp must cover. Later: instance segmentation labels particles by system."""
+        from omnigibson.systems.system_base import VisualParticleSystem
+
+        group = VisualParticleSystem.get_group_name(obj=self.sim.scene_object(target))
+        found = [
+            s.get_group_particles_position_orientation(group)[0].cpu().numpy().astype(np.float64)
+            for name, s in self.sim.env.scene.active_systems.items()
+            if isinstance(s, VisualParticleSystem) and (system is None or name == system) and group in s.groups
+        ]
+        return np.concatenate(found) if found else np.zeros((0, 3))
+
+    def heat_link(self, source: str):
+        """(world xyz, radius m): the source's live heat link and how far it heats (HeatSourceOrSink.link, the first
+        heatsource meta link, and its distance_threshold); None for a source that heats what is inside it (an oven, a
+        microwave: a placement inside, not near). Later: burner detection."""
+        from omnigibson.object_states import HeatSourceOrSink
+
+        state = self.sim.scene_object(source).states.get(HeatSourceOrSink)
+        if state is None or state.requires_inside:
+            return None
+        return _frame(state.link)[:3, 3], float(state.distance_threshold)
+
+    def attach_frames(self, child: str, parent: str):
+        """(male 4x4, female 4x4) world frames of the first free pair of attachment meta links between ``child`` and
+        ``parent`` (AttachedTo's own candidates); None when they have none. Later: part detection."""
+        from omnigibson.object_states import AttachedTo
+
+        child_obj, parent_obj = self.sim.scene_object(child), self.sim.scene_object(parent)
+        if AttachedTo not in child_obj.states or AttachedTo not in parent_obj.states:
+            return None
+        state, parent_state = child_obj.states[AttachedTo], parent_obj.states[AttachedTo]
+        for male, females in (state._get_parent_candidates(parent_obj) or {}).items():
+            for female in sorted(females):
+                if parent_state.children.get(female) is None:
+                    return _frame(state.links[male]), _frame(parent_state.links[female])
+        return None
+
+    def nozzle(self, tool: str):
+        """(4x4 world frame, reach m) of the tool's particle applier: it sprays down the frame's -z for the
+        projection mesh's height (particle_modifier.py:141-148, 434-444); None for a tool that applies by contact.
+        Later: part detection."""
+        from omnigibson.object_states import ParticleApplier
+
+        state = self.sim.scene_object(tool).states.get(ParticleApplier)
+        params = getattr(state, "_projection_mesh_params", None)
+        if params is None:
+            return None
+        return _frame(state.link), float(params["extents"][2]) * float(state.link.scale[2])
+
+    def projection_box(self, tool: str):
+        """(lo, hi) in the tool's own frame: the box its particle remover's projection volume fills, hung below the
+        meta link (tip at the link origin, down its -z: particle_modifier.py:434-444) -- the vacuum's removal slab,
+        1-21 mm under its bottom (surface_verify_vacuum_usd.out); None for an adjacency remover, which takes its
+        whole link. Later: part detection."""
+        from omnigibson.object_states import ParticleRemover
+        from omnigibson.utils.constants import ParticleModifyMethod
+
+        obj = self.sim.scene_object(tool)
+        state = obj.states.get(ParticleRemover)
+        if state is None or state.method != ParticleModifyMethod.PROJECTION:
+            return None
+        ex = np.asarray(state._projection_mesh_params["extents"], dtype=np.float64) * state.link.scale.cpu().numpy()
+        obj_from_link = np.linalg.inv(T.pose2mat(obj.get_position_orientation()).cpu().numpy()) @ _frame(state.link)
+        corners = np.array(list(itertools.product((-ex[0] / 2, ex[0] / 2), (-ex[1] / 2, ex[1] / 2), (-ex[2], 0.0))))
+        corners = corners @ obj_from_link[:3, :3].T + obj_from_link[:3, 3]
+        return corners.min(axis=0), corners.max(axis=0)
+
+    def appeared(self) -> list[str]:
+        """BDDL names of task objects that now exist and were not tracked -- what a transition created (the halves of
+        a cut) -- tracked here one by one under their labels (track_task_objects would wipe what fixture_for tracked);
+        an object a transition removed (the whole) is dropped. Later: detection by category."""
+        scope = self.sim.env.task.object_scope
+        new = []
+        for bddl, obj in self.sim.task_scope().items():
+            if bddl not in self.sim.bddl_names.values() and label_category(bddl) != "table":
+                label = bddl_label(bddl)
+                self.sim.objects[label], self.sim.bddl_names[label] = obj, bddl
+                new.append(bddl)
+        for label, bddl in list(self.sim.bddl_names.items()):
+            if bddl in scope and scope[bddl] is None:
+                self.sim.objects.pop(label, None)
+                self.sim.bddl_names.pop(label)
+                log.info(f"{bddl} is gone (a transition removed it); no longer tracked")
+        if new:
+            log.info(f"appeared: {new}, now tracked")
+        return sorted(new)

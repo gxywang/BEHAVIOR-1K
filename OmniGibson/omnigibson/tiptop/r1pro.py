@@ -92,6 +92,7 @@ from b1k.bridge.geometry import (  # noqa: F401
 )
 from b1k.bridge.protocol import (
     FLOOR_CATEGORIES,
+    INTENT_PREDICATES,
     PLANNER_SUPPORT,
     SUPPORT_CATEGORIES,
     add_view,
@@ -329,6 +330,15 @@ HAND_STACK = 0.21  # m above the fingertips the wrist's link7 sphere tops out (e
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
 # over the left shoulder at the workspace, "front" looks back at the chest so both hands and what they hold are in view
+# Regions of the placements made for their effect (inside_regions: stamp, cut, heat, aim, attached)
+STAMP_MARGIN = 0.02  # m an adjacency remover reaches beyond its link's box (PARTICLE_MODIFIER_ADJACENCY_AREA_MARGIN)
+VACUUM_HOVER = 0.012  # m a projection remover rests above the particles: its slab hangs 1-21 mm under it
+STAMP_YAW_TOL = math.radians(5)  # the tool is set down as it is held: its footprint was fitted at that yaw
+HEAT_TOP_ABOVE = 0.05  # m above the heat link the source's cooking surface may stand (a grate over a burner)
+AIM_YAW_TOL = math.radians(15)
+ATTACH_TOL = 0.05  # m the male meta link may be off the female one for AttachedTo to snap (attached_to.py:34)
+ATTACH_LIFT = 0.01  # m above the aligned height the child is set: at or above, never below (spec 6.2 Attach)
+ATTACH_YAW_TOL = math.radians(10)  # the snap allows 15 deg
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 LOCKED_DRIFT = 0.015  # rad a locked joint may sit off the planner's model before it is driven back
 FALL_DROP = 0.05  # m below the teleport height: the base is falling, not settling
@@ -1149,21 +1159,23 @@ class R1ProSim(TiptopSim):
         obj = self.scene_object(name)
         if obj.fixed_base:
             lo, hi = (v.cpu().numpy().astype(np.float64) for v in obj.aabb)
-        elif (box := self.own_box(obj)) is not None:
-            pos, rot, blo, bhi = box
-            corners = pos + np.array(list(itertools.product(*zip(blo, bhi)))) @ rot.T
-            lo, hi = corners.min(axis=0), corners.max(axis=0)
+        elif (box := self.seen_aabb(obj)) is not None:
+            lo, hi = box
         else:
             log.info(f"{name} is movable and no capture has seen it: its top is not the map's to read; no region")
             return None
         return self.region_box((lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2]) / 2.0, float(hi[2]) if z is None else z, 0.02)
 
-    def inside_regions(self, atoms: list[dict]) -> dict:
+    def inside_regions(self, atoms: list[dict], oracle=None) -> dict:
         """``place_surfaces`` for the goal: the interior of every inside(a, b) container and a board of every
         touching(a, b) fixture, keyed by b's request label; under the planner's own support label the floor for
         a goal that puts something on the floor, the floor inside b's footprint for under(a, b), or the named
-        table's top for ontop(a, table)."""
+        table's top for ontop(a, table). The placements made for their effect -- stamp, cut, heat, aim, attached
+        -- get their region from the geometry below over a hint fetched through ``oracle`` (the describing
+        OracleKnowledge: particles, heat link, frames); with no oracle they get none."""
         pairs = [(a["predicate"], *a["args"]) for a in atoms if len(a.get("args", ())) == 2]
+        intents = [t for t in pairs if t[0] in (*INTENT_PREDICATES, "attached")]
+        pairs = [t for t in pairs if t not in intents]
         supports = {c for p, _, c in pairs if p != "inside"}
         out = {}
         # a fixture's footprint is read off its box only when it is part of the scanned map (fixed base)
@@ -1191,7 +1203,186 @@ class R1ProSim(TiptopSim):
             if region is not None:
                 out[self.label_of(container)] = region
                 self.region_sent.add((item, container))
+        for predicate, item, target in intents if oracle is not None else ():
+            if predicate == "stamp":
+                region = self.stamp_region(item, target, oracle.particles(target), oracle.projection_box(item))
+            elif predicate == "cut":
+                region = self.knife_region(item, target)
+            elif predicate == "heat":
+                region = self.heat_region(item, target, oracle.heat_link(target))
+            elif predicate == "aim":
+                region = self.aim_target(item, target, oracle.nozzle(item))
+            else:
+                region = self.attach_target(item, target, oracle.attach_frames(item, target))
+            if region is not None:  # the wire names the plane for aim and for a floor target (protocol.tiptop_goal)
+                floor = predicate == "aim" or bddl_category(target) in FLOOR_CATEGORIES
+                out[PLANNER_SUPPORT if floor else self.label_of(target)] = region
         return out
+
+    def seen_aabb(self, obj) -> tuple | None:
+        """The world box of the points the captures saw ``obj`` by, at its pose now (``own_box``): (lo, hi); None
+        until a capture has seen it."""
+        box = self.own_box(obj)
+        if box is None:
+            return None
+        pos, rot, lo, hi = box
+        corners = pos + np.array(list(itertools.product(*zip(lo, hi)))) @ rot.T
+        return corners.min(axis=0), corners.max(axis=0)
+
+    def stamp_region(self, tool, target, particles, projection=None) -> dict | None:
+        """The placement surface for stamp(tool, target): over the densest cluster of ``particles`` ((n, 3) world)
+        the tool's footprint covers, at the cluster's own height, so the tool set down there removes it. An
+        adjacency remover takes every particle inside its link's world box grown by STAMP_MARGIN
+        (particle_modifier.py:524-531), so the footprint is the tool's seen box as it is held plus the margin, and
+        the region carries that yaw (rotation identity, STAMP_YAW_TOL) so the fit holds when it lands. A projection
+        remover (``projection``: the vacuum's slab, (lo, hi) in its own frame) removes inside that slab instead,
+        which hangs 1-21 mm under its bottom: the fit is the slab's, no margin, and the tool rests VACUUM_HOVER above
+        the particles. The box is the tool centres that cover the cluster, grown by the tool's half extents, since
+        the planner keeps every sphere of the object inside a surface (cutamp stable_placement_costs). None when the
+        tool has not been seen or nothing is left."""
+        box = self.own_box(self.scene_object(tool))
+        particles = np.asarray(particles, dtype=np.float64).reshape(-1, 3)
+        if box is None or not len(particles):
+            why = "no capture has seen the tool" if box is None else "nothing to remove"
+            log.info(f"stamp({tool}, {target}): {why}; no region")
+            return None
+        pos, rot, lo, hi = box
+        offsets = (np.array(list(itertools.product(*zip(lo, hi)))) - (lo + hi) / 2.0) @ rot.T  # body about its centre
+        half = offsets.max(axis=0)
+        # what the tool removes, relative to its body centre (xy) and to its bottom (z), world axes
+        if projection is None:
+            reach_lo, reach_hi = -half - STAMP_MARGIN, half + STAMP_MARGIN
+            reach_lo[2], reach_hi[2] = -STAMP_MARGIN, 2 * half[2] + STAMP_MARGIN
+        else:
+            slab = (np.array(list(itertools.product(*zip(*projection)))) - (lo + hi) / 2.0) @ rot.T
+            reach_lo, reach_hi = slab.min(axis=0), slab.max(axis=0)
+            reach_lo[2], reach_hi[2] = reach_lo[2] + half[2], reach_hi[2] + half[2]
+        size = reach_hi - reach_lo
+        # ponytail: greedy over every particle as a corner of the footprint (4 corners), 40 particles at most
+        best = []
+        for p in particles:
+            for sx, sy in itertools.product((0, 1), (0, 1)):
+                x0, y0 = p[0] - sx * size[0], p[1] - sy * size[1]
+                inside = particles[
+                    (particles[:, 0] >= x0 - 1e-9) & (particles[:, 0] <= x0 + size[0] + 1e-9)
+                    & (particles[:, 1] >= y0 - 1e-9) & (particles[:, 1] <= y0 + size[1] + 1e-9)
+                ]  # fmt: skip
+                inside = inside[inside[:, 2] <= inside[:, 2].min() + size[2]]  # within the tool's reach upward too
+                if len(inside) > len(best):
+                    best = inside
+        cluster = np.asarray(best)
+        centres_lo, centres_hi = cluster.max(axis=0) - reach_hi, cluster.min(axis=0) - reach_lo  # covering centres
+        # the tool's bottom: resting on the particles' surface, or hovering where the slab straddles them
+        top = max(float(cluster[:, 2].min()), float((centres_lo[2] + centres_hi[2]) / 2.0))
+        centre, extent = (centres_lo[:2] + centres_hi[:2]) / 2.0, (centres_hi[:2] - centres_lo[:2]) / 2.0 + half[:2]
+        log.info(
+            f"stamp({tool}, {target}): {len(cluster)} of {len(particles)} particles under one stamp at "
+            f"({centre[0]:.2f}, {centre[1]:.2f}), z={top:.3f} world, {2 * extent[0]:.2f} x {2 * extent[1]:.2f} m"
+        )
+        region = self.region_box(centre, extent, top, 0.02)
+        return dict(region, rotation=np.eye(3).tolist(), yaw_tolerance=STAMP_YAW_TOL)
+
+    def knife_region(self, knife, food) -> dict | None:
+        """The placement surface for cut(knife, food): the food's top (its seen box), a square of the knife's length
+        about the food's centre so the knife set down anywhere on it rests on the food: the slicer fires on any
+        knife-link contact while armed (slicer_active.py:72-135), so the place is the cut."""
+        food_box, knife_box = self.seen_aabb(self.scene_object(food)), self.own_box(self.scene_object(knife))
+        if food_box is None or knife_box is None:
+            log.info(f"cut({knife}, {food}): no capture has seen {food if food_box is None else knife}; no region")
+            return None
+        lo, hi = food_box
+        length = float((knife_box[3] - knife_box[2]).max())
+        return self.region_box((lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2] + length) / 2.0, float(hi[2]), 0.02)
+
+    def heat_region(self, item, source, heat_link) -> dict | None:
+        """The placement surface for heat(item, source): on the source's top, the item placements whose centre lies
+        in the heat sphere (``heat_link``: (world xyz, radius); any overlap with it heats the whole object,
+        heat_source_or_sink.py:253-266), grown by the item's seen box so the whole item is accepted there. The top is
+        the source's map mesh under the sphere for a fixture (a stove's grate), its seen box for a movable."""
+        if heat_link is None:
+            return None
+        centre, radius = np.asarray(heat_link[0], dtype=np.float64), float(heat_link[1])
+        obj = self.scene_object(source)
+        if obj.fixed_base:  # rays down at the link and around it: the grate over a burner, not the panel behind it
+            angles = np.arange(0, 6.28, 0.785)
+            ring = [centre[:2]] + [centre[:2] + 0.04 * np.array([math.cos(a), math.sin(a)]) for a in angles]
+            origins = [[x, y, centre[2] + HEAT_TOP_ABOVE] for x, y in ring]
+            down = [[0.0, 0.0, -1.0]] * len(origins)
+            hits, _, _ = self.collision_mesh_world(obj).ray.intersects_location(origins, down)
+            top = float(hits[:, 2].max()) if len(hits) else float(centre[2])
+        elif (box := self.seen_aabb(obj)) is not None:
+            top = float(box[1][2])
+        else:
+            log.info(f"heat({item}, {source}): {source} is movable and no capture has seen it; no region")
+            return None
+        item_box = self.seen_aabb(self.scene_object(item))
+        if item_box is None:
+            log.info(f"heat({item}, {source}): no capture has seen {item}; no region")
+            return None
+        reach = math.sqrt(max(radius**2 - (top - centre[2]) ** 2, 0.0)) / math.sqrt(2)  # the square inside the sphere
+        if reach <= 0.0:
+            log.info(f"heat({item}, {source}): the surface at z={top:.3f} is out of the heat sphere; no region")
+            return None
+        log.info(f"heat({item}, {source}): within {radius:.2f} m of the heat link (z={centre[2]:.3f}) at z={top:.3f}")
+        return self.region_box(centre[:2], (item_box[1][:2] - item_box[0][:2]) / 2.0 + reach, top, 0.02)
+
+    def aim_target(self, tool, target, nozzle) -> dict | None:
+        """The placement surface for aim(tool, target): the tool stood on the target's support on the robot's side
+        of it, within the nozzle's reach (``nozzle``: (4x4 world frame, reach m); it sprays down the frame's -z),
+        turned so the spray points at the target: the region carries the yaw that turns the nozzle's direction now
+        onto the target, with AIM_YAW_TOL. Under the planner's support label (the wire says on(tool, table)): the
+        target's bottom is that support's height."""
+        if nozzle is None:
+            return None
+        frame, reach = np.asarray(nozzle[0], dtype=np.float64), float(nozzle[1])
+        target_box, tool_box = self.seen_aabb(self.scene_object(target)), self.seen_aabb(self.scene_object(tool))
+        if target_box is None or tool_box is None:
+            log.info(f"aim({tool}, {target}): no capture has seen {target if target_box is None else tool}; no region")
+            return None
+        lo, hi = target_box
+        centre = (lo[:2] + hi[:2]) / 2.0
+        u = self.base_pose()[0][:2].cpu().numpy().astype(np.float64) - centre  # toward the robot
+        u = u / (np.linalg.norm(u) or 1.0)
+        face = float(np.abs(u) @ ((hi[:2] - lo[:2]) / 2.0))  # the target's box along u
+        half = reach / 2.0 + (tool_box[1][:2] - tool_box[0][:2]) / 2.0
+        direction = -frame[:3, 2]
+        yaw = math.atan2(-u[1], -u[0]) - math.atan2(direction[1], direction[0])  # about z: the same in the base frame
+        c, s = math.cos(yaw), math.sin(yaw)
+        log.info(f"aim({tool}, {target}): within {reach:.2f} m on the robot's side, turned {math.degrees(yaw):.0f} deg")
+        return dict(
+            self.region_box(centre + u * (face + reach / 2.0), half, float(lo[2]), 0.02),
+            rotation=[[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            yaw_tolerance=AIM_YAW_TOL,
+        )
+
+    def attach_target(self, child, parent, frames) -> dict | None:
+        """The placement surface for attached(child, parent): where the child's body must rest for its male meta link
+        to land within ATTACH_TOL of the parent's female one (``frames``: (male 4x4, female 4x4), world), turned so
+        the frames align: the region carries R = R_F R_M^T -- the child as held, turned onto the female frame; the
+        planner's object frame is base-aligned at the capture, so this is the rotation it applies -- in the base
+        frame, with ATTACH_YAW_TOL. Its top sets the child ATTACH_LIFT above the aligned height: at or above, since
+        the poster has 3.2 cm of margin downward (spec 6.2 Attach) and the snap allows 5 cm."""
+        if frames is None:
+            return None
+        male, female = (np.asarray(f, dtype=np.float64) for f in frames)
+        box = self.own_box(self.scene_object(child))
+        if box is None:
+            log.info(f"attached({child}, {parent}): no capture has seen {child}; no region")
+            return None
+        pos, rot, lo, hi = box
+        R = female[:3, :3] @ male[:3, :3].T
+        centre_now = pos + rot @ ((lo + hi) / 2.0)
+        centre = female[:3, 3] - R @ (male[:3, 3] - centre_now)  # the body's centre with the male frame on the female
+        offsets = (np.array(list(itertools.product(*zip(lo, hi)))) - (lo + hi) / 2.0) @ (R @ rot).T
+        half = offsets.max(axis=0)[:2] + ATTACH_TOL / math.sqrt(2)
+        top = float(centre[2] + offsets[:, 2].min()) + ATTACH_LIFT
+        base = T.quat2mat(self.base_pose()[1]).cpu().numpy().astype(np.float64)  # world <- base
+        log.info(f"attached({child}, {parent}): body centre to {np.round(centre, 2).tolist()}, bottom z={top:.3f}")
+        return dict(
+            self.region_box(centre[:2], half, top, 0.02),
+            rotation=(base.T @ R @ base).tolist(),
+            yaw_tolerance=ATTACH_YAW_TOL,
+        )
 
     def floor_surface(self, within: str | None = None) -> dict:
         """A placement slab on the floor (base frame, top face at the floor under the base): in front of the robot
