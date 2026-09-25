@@ -118,6 +118,9 @@ class _Sim:
     def label_of(self, bddl):
         return bddl.replace(".n.01_", "_")
 
+    def tracked_label(self, name):
+        return self.label_of(name)
+
     def workspace(self, floor=False):
         return [[0.35, -0.8, -0.05 if floor else 0.25], [1.3, 0.8, 1.6]]
 
@@ -251,7 +254,7 @@ class _Episode(Episode):
 
     def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=(), rounds=2):
         self.rounds = rounds  # no Episode.__init__: there is no simulator behind this one
-        self.sim = SimpleNamespace(side_entry=lambda item, container: False)
+        self.sim = SimpleNamespace(side_entry=lambda item, container: False, push_face=lambda bddl: None)
         self.args = SimpleNamespace(grasping_mode="sticky")  # the press fallback is tried (and fails: no sim behind it)
         self.outcomes = list(outcomes)
         self.arms = set(arms)
@@ -1152,6 +1155,59 @@ def test_the_oracle_leaves_out_what_it_cannot_resolve_and_tracks_what_a_transiti
     assert sim.bddl_names == {"half_onion_1": "half__onion.n.01_1", "stove_ykretu_0": "stove_ykretu_0"}
     assert sim.objects["half_onion_1"] is half and "onion_1" not in sim.objects
     assert source.appeared() == []
+
+
+def test_a_carrier_with_passengers_is_sent_level_and_its_passengers_ride_under_its_label_once_in_hand():
+    """E-level (spec S22): a plate under a pizza is `level` on the request from its pick round on (the lift and every
+    carry hold roll and pitch; rigid passengers slide at ~27 deg), the bridge's ramps read the same set (sim.level),
+    and once the plate is in the hand the pizza's pixels are the plate's: what the hand carries, not a body standing
+    at the hand for the planner to avoid. Passengers come from localization alone (judgement.highest_support)."""
+    import torch as th
+
+    goal = [{"predicate": "inside", "args": ["plate.n.01_1", "fridge.n.01_1"]}]
+    masks = _masks(plate_1=20, bowl_1=5, fridge_1=8)
+    masks["pizza_1"] = np.zeros((6, 8), bool)
+    masks["pizza_1"].flat[20:30] = True  # its own pixels, beside the plate's
+    sim = _Sim(masks)
+    sim.bddl_names = {label: label.replace("_", ".n.01_") for label in masks}
+    boxes = {
+        "plate.n.01_1": ([0.5, 0.0, 0.80], [0.8, 0.3, 0.82]),
+        "pizza.n.01_1": ([0.55, 0.05, 0.82], [0.75, 0.25, 0.85]),  # resting on the plate
+        "bowl.n.01_1": ([1.0, 0.0, 0.80], [1.1, 0.1, 0.90]),  # beside it
+        "fridge.n.01_1": ([1.5, -0.5, 0.0], [2.2, 0.5, 1.8]),
+    }
+    sim.scene_object = lambda name: SimpleNamespace(
+        aabb=(th.tensor(boxes[name][0]), th.tensor(boxes[name][1])), aabb_center=th.tensor(boxes[name]).mean(0)
+    )
+    source = make_knowledge("oracle", sim, goal)
+    req = _request()
+    known = source.describe([{"predicate": "holding", "args": ["plate.n.01_1"]}], req, {})  # the pick round
+    assert req["level"] == ["plate_1"] and sim.level == {"plate_1"}
+    assert "pizza_1" in known.labels, "on the shelf the pizza is still a body of its own"
+    sim.held_objects = {"plate_1": "left"}
+    req = _request()
+    known = source.describe(goal, req, {})  # carried: the pizza rides under the plate's label
+    assert req["level"] == ["plate_1"] and known.labels == ["bowl_1", "fridge_1", "plate_1"]
+    assert known.masks[known.labels.index("plate_1")].sum() == 30
+    sim.held_objects = {"bowl_1": "left"}
+    req = _request()
+    source.describe([{"predicate": "inside", "args": ["bowl.n.01_1", "fridge.n.01_1"]}], req, {})
+    assert "level" not in req and sim.level == set(), "nothing rests on the bowl"
+
+
+def test_a_region_above_the_planners_box_raises_the_box_over_it():
+    """E-6dof: the wall nail of installing_smoke_detectors stands at 1.71 m and the planner's crop ends at 1.60 m, so
+    its points -- and with them the attach region keyed by its label -- were cropped out of every view."""
+    goal = [{"predicate": "attached", "args": ["candle.n.01_1", "wicker_basket.n.01_1"]}]
+    sim = _Sim(_masks(candle_1=20, wicker_basket_1=30))
+    sim.tiptop_goal = lambda atoms, category_level: (["candle_1", "wicker_basket_1"], [{"predicate": "on", "args": ["candle_1", "wicker_basket_1"]}])  # fmt: skip
+    sim.send_inside = True
+    high = {"dims": [0.1, 0.1, 0.02], "pose": [0.8, 0.0, 1.66, 1.0, 0.0, 0.0, 0.0], "rotation": np.eye(3).tolist()}
+    sim.inside_regions = lambda atoms, oracle=None: {"wicker_basket_1": high}
+    known = make_knowledge("oracle", sim, goal).describe(goal, _request(), {})
+    assert known.workspace[1][2] == pytest.approx(1.67 + 0.3) and known.workspace[0] == [0.35, -0.8, 0.25]
+    sim.inside_regions = lambda atoms, oracle=None: {"wicker_basket_1": dict(high, pose=[0.8, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0])}
+    assert make_knowledge("oracle", sim, goal).describe(goal, _request(), {}).workspace == sim.workspace()
 
 
 def test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_from_the_side():

@@ -545,6 +545,10 @@ class Episode:
             except Unreachable as e:
                 log.warning(f"{bddl}: {e}")
                 return False
+            if self.sim.push_face(bddl) is not None:
+                # a flat item under a shelf board offers no pinch: slid to the board's edge first (N-push), so the
+                # round after it can take the overhang; push_face is None again once it hangs over the edge
+                self.achieve([atom("push", bddl)])
             # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
             self.sim.side_grasp = {bddl} if side else set()
             self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
@@ -664,6 +668,16 @@ class Episode:
                 log.info(f"the {self.sim.arm} hand is shut on something that is not {bddl}; opening it before going on")
                 self.sim.hold(DROP_STEPS, self.sim.OPEN)
         return bool(held)
+
+    def pour(self, item: str, target: str) -> bool:
+        """Tip what the hand holds out over ``target`` (N-rotate, spec S38): a keep-hold placement of ``item`` on it
+        (``pour`` reaches the planner as on(item, target); ``run.do_execute`` cuts the plan with ``keep_holding`` so
+        the hand stops above the target, still holding), then the wrist turns, waits and turns back
+        (``sim.tilt_wrist``). False when the round did not run or a turn was stopped; the item stays in the hand."""
+        if not self.achieve([atom("pour", item, target)]):
+            return False
+        self.sim.video_caption = f"pour {item} over {target} [{self.sim.arm} arm]"
+        return bool(self.sim.tilt_wrist(self.sim.arm))
 
     def put_down(self, bddl: str, support: str, floor: bool | None = None) -> bool:
         """Place the object on the requested support and verify both placement and release."""

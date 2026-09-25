@@ -579,3 +579,193 @@ executed, and every "unproven" line below is that fact.
   transfers), cook_bacon (tray to the heat region, knob press, dwell), freeze_pies (the dwell within the 0.6 budget
   share), one attach round (a camera on its tripod) and one aim round (the atomizer) for the rotation on the wire.
 - curobo still imports from the main tree's editable install (tier 2 note); nothing in this tier touches it.
+
+## Tier 4 (2026-09-25): E-level, E-stack, E-6dof, N-push, N-rotate (pour and the recipe)
+
+cuTAMP: `install/patches/cutamp-23-level-carry-stack-centre-push-depth.patch` (E-level, E-stack, N-push depth; every
+change reads an env attribute with a getattr default, so it is inert until the planner sets it). Suites after
+integration: bridge 445 passed (438 after tier 3); planner 190 passed, 5 deselected (184 after tier 3). Lint: no new
+findings on the changed OmniGibson files. Integration wired nothing new: what each package asked of the others had
+landed in the same step (`level` and a button's `depth` on the wire, `env.level` / `env.push_depths` /
+`env.stack_surfaces` from the planner, `Episode.pour` in the bench). Nothing in this tier ran in the simulator; no
+push, pour, level carry or book-on-book placement has ever executed.
+
+### E-level: a loaded carrier is carried level (oracle + bridge + planner + cuTAMP)
+
+- Oracle (`knowledge.py: OracleKnowledge.passengers(label)`): the tracked labels whose localized box rests on the
+  carrier's (`judgement.highest_support`: bottom within -2..+15 cm of its top, centre over it). `describe` writes
+  `request["level"]` for every in-hand carrier and the `holding(x)` target that has passengers, sets `sim.level`, and
+  once the carrier is in the hand merges each passenger's mask rows into the carrier's in every view (the pizza's
+  pixels become the plate's: what the hand carries, not a body standing at the hand for the planner to avoid). The
+  workspace top is raised to 0.3 m over the highest region top when a region lies above it (the 1.71 m nail of
+  installing_smoke_detectors was cropped out of every view).
+- Wire (`protocol.py`): `level` in `KNOWLEDGE_JSON_KEYS` and `request_from_observation`'s copy list.
+  Planner (`perception_wrapper.extract_gt_detections`): `level` is a trigger key, returned as `gt["level"]`;
+  `tiptop_run.create_tamp_environment(level=)` sets `env.level` (set of labels).
+- cuTAMP (`motion_solver.py: _level_query(plan_config, tensor_args)`): the plan config cloned with
+  `PoseCostMetric(hold_partial_pose=True, hold_vec_weight=[1,1,0,0,0,0], project_to_goal_frame=False)`; `solve_curobo`
+  tracks `held` (initial_holding, set at a Pick's attach, cleared at a Place's detach) and `plan_pose` swaps in the
+  level query for every leg while `held in env.level`. Deliberately NOT projected to the goal frame: unprojected,
+  cuRobo's rotation error is in the world frame (pose_distance_kernel.cu:196-221), so [1,1,0] pins world roll and
+  pitch and frees yaw; projected, `MotionGen.update_pose_cost_metric` refuses any goal whose orientation differs
+  from the start's by more than 0.05 rad, which every yawing approach does.
+- Bridge (`r1pro.py`): `LEVEL_TILT` 20 deg (rigid passengers slide at ~27 deg, inferred); `present_held` solves with
+  `tolerance_rad` 20 deg instead of 1.2 when the arm holds a level label; `return_to_ready` refuses (returns False,
+  the hand stays) when the ready posture would tip the load past 20 deg (`held_tilt(quat_from, quat_to)`: the angle
+  the load's up axis leaves the vertical by; a turn about the vertical tips nothing).
+- Reads: localization boxes (the existing oracle read) for the passengers; nothing from a mesh.
+- Tests: `test_tiptop_knowledge.py::test_a_carrier_with_passengers_is_sent_level_and_its_passengers_ride_under_its_label_once_in_hand`,
+  `::test_a_region_above_the_planners_box_raises_the_box_over_it`;
+  `test_tiptop_presweep_fixes.py::test_return_to_ready_ramps_then_asks_the_planner_for_the_ready_configuration`
+  (the rolled ready posture refused, the yawed one taken); `tiptop/tests/test_inside_region.py::test_level_push_depths_and_stack_surfaces_reach_the_env`,
+  `::test_the_wire_keeps_a_button_depth_the_level_labels_and_the_rooms_fixed_labels`;
+  `tiptop/tests/test_lift_off_support.py::test_a_level_held_lift_keeps_the_hand_level_while_it_yaws` (a real
+  r1pro_left MotionGen in a far-away placeholder world: a 10 cm lift that also yaws 60 deg succeeds under
+  `_level_query` with the hand's z axis tilting < 5 deg), `::test_a_held_plate_in_level_makes_every_query_the_level_one`
+  (wiring: a held plate in env.level gives the closing retreat hold_vec_weight [1,1,0,0,0,0]; unlisted, the old
+  [0.1,0.1,0.1,0.1,0.1,0]).
+- Replay (`T4-cutamp/level_probe.out`, GPU 2): the one real plan above, max tilt 0.18 deg under the level query
+  (0.37 deg for the plain query on the same motion; 62 waypoints, 2.0 s vs 0.2 s).
+- Unproven in simulation: a loaded plate carried under `level` (whether the passenger stays on through the pick's
+  lift, the carry and the place; whether the 20 deg bound is right); the mask merge in a live capture; the raised
+  workspace on the nail.
+
+### E-stack: a placement on a perceived movable is judged by its centre (cuTAMP + planner)
+
+- cuTAMP (`cost_function.py`, `particle_initialization.py`): for a surface in `env.stack_surfaces`, `get_object_obb`
+  is built with shrink 0 (sampler and cost) and `stable_placement_costs` scores `{surface}_in_xy` as the distance of
+  the placed object's AABB centre (`get_aabb_from_spheres`: the column the simulator's VerticalAdjacency ray runs
+  down, adjacency.py:93-95, on_top.py:43-52) from the OBB shrunk by `placement_shrink_dist` and clamped at 0,
+  instead of the per-sphere sum. Two deviations from the spec text, deliberate: the AABB centre, not the sphere
+  centroid (the sim's ray origin); and the 1 cm shrink kept as the in_xy margin, because the live tolerance is 1e-2
+  (planning.py:114), so with no margin a centre 1 cm past the perceived footprint would satisfy and on a true edge the
+  book tips and the ray misses. Clamping instead of shrinking the OBB means a sliver narrower than 2 cm no longer
+  raises "Shrunk OBB ... half extents <= 0" (28 such plan losses in sweep3's planner logs). The PlaceNear ring uses
+  the same unshrunk OBB.
+- Planner (`tiptop_run.create_tamp_environment(fixed=)`): `env.stack_surfaces` = {perceived on() targets} minus the
+  `place_surfaces` labels (container regions, the support box) minus `fixed` (the room map's fixed-base task labels,
+  `gt["fixed"]` from `extract_gt_detections`, read off `room[..].fixed_base`, a map read). The support plane is never
+  in `surfaces`. `apply_room_object_roles` (websocket server) computes the same fixed set afterwards for
+  `env.fixed_labels`; the duplicate exists because `create_tamp_environment` runs first.
+- Reads: labels only; the target's hull is the perception pipeline's (depth under masks).
+- Tests: `tiptop/tests/test_movable_surface_cover.py::test_a_same_size_book_stack_has_satisfying_placements` (real
+  ParticleInitializer + `stable_placement_costs`: a same-size book on a book, per-sphere rule every sample > 1e-2,
+  stack rule > 90 % <= 1e-2 with support <= 1e-2; a book on an 8 x 2.4 cm sliver samples without raising and > 50 %
+  place; a centre 3 cm past the sliver's edge costs the overhang past the margin); `test_inside_region.py` (above:
+  on(cup, book) is a stack, on(jar, cabinet) with a region box, on(vase, shelf) fixed and on(book, table) are not).
+- Replay (`T4-cutamp/estack_*.out`, GPU 2, 256 particles, 200 steps, seed 2302, the six recorded book-on-book
+  requests of sweep4 sorting_books_on_shelf_i1_0924_120416): `{surface}_in_xy` satisfying, sampled -> optimised,
+  before -> after: comic_book_2 on comic_book_3 seen as 8 x 2.4 cm, 0 -> 0 before, 174 -> 233 after (other stance
+  99 -> 203); notebook_2 on notebook_1 seen as 2.6 x 7.2 cm, 0 -> 0 before, 226 -> 256 after; notebook_1 seen as
+  13 x 23 cm, 15 -> 251 before, 244 -> 256 after; the remaining two 246 -> 255 and 240 -> 255. Overall satisfying
+  stays 0 on all six: the binding constraint after the change is `robot_to_world` (4-8 of 256), the placing hand
+  inside `sim_bookcase_otwukr_3` at the place pose for 22-31 of the 32 best particles, live as well (planner.log
+  robot_to_world 0/256 on all six rounds). E-stack removes the in_xy blocker; the compartment reach (tier 2 open
+  item 3) still blocks these rounds. The control (worktree code, key unset) reproduces the before numbers exactly.
+- Unproven in simulation: whether a stack placed with its centre over a sliver footprint survives the drop; a same-size
+  top book may be placed with its centre anywhere over the seen footprint (no centring term), overhanging up to half
+  its length.
+
+### E-6dof: an item longer than its vessel is wide goes in on end (bridge)
+
+- `r1pro.py: upright_rotation(item)`: the base-frame 3x3 rotation turning the longest seen-box axis vertical the
+  shorter way round; `inside_region` adds `rotation=upright_rotation(item), yaw_tolerance=None` when the item's
+  longest extent exceeds the vessel's narrower side (roses by flat drop 2/5, spec S21). The attach rotation
+  (tier 3's `attach_target`, R = R_F R_M^T) already carries roll and pitch; the smoke detector's parent is
+  wall_nail.n.01_1, so the workspace raise above is what it needed.
+- Reads: the item's seen box (points); the vessel's interior from tier 1's `inside_rect`.
+- Tests: `test_tiptop_presweep_fixes.py::test_a_rose_longer_than_the_vase_is_wide_is_stood_on_end_yaw_free_and_a_nail_target_hangs_the_alarm_vertical`
+  (R turns the rose's long axis onto +z and is a proper rotation; a short item lies; the alarm's region rotation is
+  the nail's frame, its top 5 cm below the nail plus `ATTACH_LIFT`).
+- Replay: none.
+- Unproven in simulation: a rose planned on end into a vase (the sampler's rotated footprint against a 12 cm mouth),
+  the alarm hung vertical on the nail.
+
+### N-push: a flat item under a shelf board is slid out to the board's edge (bridge + protocol + planner + cuTAMP)
+
+- Bridge (`r1pro.py: push_face(item)`): from the item's `own_box` (points), only for a flat item (its thinnest
+  seen-box axis vertical) lying on a board of FIXED furniture (the map's `boards()`) under another board; the face
+  is the side turned away from the robot, at mid-height, so the stroke runs toward the open front; the depth leaves
+  the near edge `PUSH_OVERHANG` 3 cm past the board's edge on the stroke's own line (a ray on the map mesh from just
+  inside the board's top out along the stroke; the board's axis-aligned box as fallback); None when it already hangs
+  over (self-limiting), when standing on edge, on an open top board or on a movable case. `button_hints` describes a
+  `push` atom through it (`<item>_button`, radius `PUSH_RADIUS` 1 cm, depth). `bench.py: Episode.pick` runs
+  `achieve([push(item)])` after `stand_for` whenever `push_face(item)` is not None (each attempt). `run.py:
+  do_execute` blocks the grasp assist during a push as during a press.
+- Wire (`protocol.py`): `tiptop_goal` maps push(x) -> pressed(<x>_button); `push` in `INTENT_PREDICATES` (satisfied
+  by having run); `attach_knowledge` validates an optional `depth` > 0 and keeps it in the rebuilt button.
+  Planner: `_parse_buttons` keeps `depth`; `run_perception` passes `push_depths={label: depth}` from the given
+  buttons; `create_tamp_environment(push_depths=)` sets `env.push_depths`.
+- cuTAMP (`motion_solver.py` Push): `travel = standoff + env.push_depths.get(button, config.push_depth)`; the stroke's
+  exempt list is `[button, *hosts, *resting supports of every movable host]` via the existing `_resting_contacts`
+  (the fingers at a flat book's mid-height reach its shelf board), each still checked by `_validate_contact_motion`.
+- Reads: the item's points; the map (fixed fixture meshes and boxes); the robot's base pose.
+- Tests: `test_tiptop_presweep_fixes.py::test_the_push_face_of_a_book_lying_under_a_shelf_board_points_into_the_compartment_with_the_travel_to_its_edge`
+  (face, normal, depth against a three-board case; the other face from behind the case; None once hanging over, on
+  edge, on the top board, on a movable case), `::test_a_flat_book_under_a_shelf_board_is_pushed_out_before_its_pick_round_and_a_pour_tilts_after_its_round`;
+  `test_tiptop_protocol.py::test_a_push_is_a_press_on_the_items_own_face_and_a_pour_a_placement_and_their_keys_survive_the_h5`;
+  `tiptop/tests/test_lift_off_support.py::test_a_push_stroke_travels_the_asked_depth_with_the_hosts_supports_exempt`
+  (solve_curobo with cuRobo stubbed: the stroke is standoff + 0.05 along the hover's z; between hover and stroke
+  exactly {book_button, book, board} are off, the roof is not, all back on before the retreat).
+- Replay (`T4-bridge/push_faces.out`, CPU: the 11 recorded holding rounds of sweep4 sorting_books_on_shelf
+  i0_0924_003716, the books' clouds from depth under the oracle masks against the room map's bookcases): every book
+  on a roofed board gets a face pointing into the case, depth 0.13-0.44 m, its near edge ending 3 cm past the
+  board's edge; 5 of 70 book views get no push (a box seen too thin to be flat, or not over a roofed board).
+  `T4-planner/replay_press_depth.out`: the two recorded radio requests parsed before and after adding `depth`; the
+  one changed key is `buttons.radio_receiver_1_button.depth`. No recorded push of a movable exists to replay.
+- Unproven in simulation: all of it: whether the assisted hand at a book's mid-height clears the board above, whether
+  `_validate_contact_motion` passes with the board exempt, whether the book slides (friction) rather than tips, and
+  whether the pinch on the 3 cm overhang welds under assisted grasping.
+
+### N-rotate: a pour, and the recipe that needs it (protocol + bridge + policy)
+
+- Wire (`protocol.py`): pour(x, y) -> on(x, y); `pour` in `INTENT_PREDICATES` and `KEEP_HOLD_PREDICATES` (the plan is
+  cut with `keep_holding`: the hand stops above the target, still holding). Bridge (`r1pro.py`): `inside_regions`
+  gives a pour no region (the target's own hull top); `tilt_wrist(arm)` ramps `<arm>_arm_joint7` by `POUR_TILT` 90 deg
+  the way its limit allows, holds `POUR_HOLD_STEPS` 60, ramps back, both through `ramp_to` (checked). `bench.py:
+  Episode.pour(item, target)` = `achieve([pour(item, target)])` then `sim.tilt_wrist(sim.arm)`.
+- Policy (`strategies.py`): `Runner.cut` hands a real(x) that no cut or cook makes to `Runner.recipe(ep, product)`:
+  bddl's own cooking recipes (`bddl.transition_rules.load_cooking_recipes`, cached) for x's category that the scope
+  can supply (make_pizza gets `simple_pizza`, not `pizza`, which needs tomato sauce and marjoram); the recipe's
+  input_states name the root (the dough) and how each input goes on it: `ontop` inputs first (a half__ one cut first,
+  `cut(limit=ceil(n/2))`, then n items of that category carried onto the root), then `covered` inputs (a diced__ one
+  diced in a scope bowl that is not the recipe's vessel and poured; a substance poured from the container the
+  episode reads as `filled` with it, skipped when the root already reads covered); the knife goes back to its support
+  after every cut (left on the half it blocks the half's pick, left in the bowl it is poured onto the dough); then
+  `warm(ep, "cooked", [root], wait=[real(product)])` bakes the vessel and `self.real` learns the product from
+  `ep.after_transition()`. `Runner.pour(ep, x, target)`: pick x (`reach_into`), `stand_for(target)`, `ep.pour`,
+  `free_hand`. The three push tasks have no runner-side push step (`Episode.pick` pushes).
+- Reads: BDDL scope names, the taxonomy, bddl's heat_cook.json (task class); which container holds the cheese is the
+  existing `Episode.goal_already_holds("filled", c, x)` verdict; no particle read in the policy.
+- Tests: `test_tiptop_strategies.py::test_a_recipe_tops_the_dough_then_pours_over_it_and_bakes_the_sheet` (the exact
+  event list on the Kitchen fake: pepperoni on the dough; mushroom cut, knife back, half on the dough; cheese poured;
+  onion into the bowl, cut x3, knife back, bowl poured; sheet into the oven, press, dwell; the goal's ontop(pizza,
+  sheet); both emptied containers set down; the oven shut before its press); the two bridge tests named under
+  N-push (`Episode.pour`, the wire).
+- Replay (`T4-policy/dryrun.txt`, CPU, every task's problem0.bddl grounded on the Kitchen fake): 0 of 100 raise;
+  make_pizza went from "real(pizza): no cut or cook makes it; (no rounds)" to the 34-round plan in
+  `dryrun_make_pizza.txt`. The harness synthesizes halves for a sliceable whole the :init lists no futures for, which
+  adds cut(half) rounds to can_meat, chop_an_onion and cook_cabbage relative to tier 3's dry run (a harness change,
+  not a policy one).
+- Unproven in simulation: a keep-hold placement over the dough's hull (which the planner now judges by the E-stack
+  centre rule, the dough being a perceived movable on() target), the wrist tilt spilling the tupperware's contents
+  onto the dough, the diced onion staying in the bowl through its carry, `after_transition` naming the pizza.
+
+### Open after tier 4
+
+- `OracleKnowledge.appeared()` names only scope futures: make_pizza's :init lists only the pizza, so neither the
+  mushroom halves nor the onion halves get a name live, and without a named half__mushroom the recipe's ontop(half,
+  dough) is never carried and simple_pizza cannot fire (the dry run synthesizes the halves). Tier 3's open item 1,
+  now load-bearing: naming a transition's products by category is the next bridge item.
+- Every recorded book-on-book round stays unplannable after E-stack: the placing hand is inside the bookcase mesh at
+  the place pose (robot_to_world), tier 2's open item 3 (stance / side entry into a compartment).
+- `gt["fixed"]` (perception_wrapper) and `apply_room_object_roles`'s `fixed_labels` (websocket server) are the same
+  room read twice; fold them if the server is ever refactored so the roles are applied before `create_tamp_environment`.
+- The recipe's heat source is `Runner.source` (the scope's doorless heatSource first), not the recipe's heatsource
+  synset; the dicing bowl is the first fillable, non-openable scope object that is not the recipe's vessel
+  (ponytail-marked); emptied containers go to the floor; the recipe's unary input_states (cooked) are not checked.
+- No sampler bias toward the middle of a stack footprint; add a centring term only if a live stack topples.
+- No push of a movable, no pour and no level carry is recorded anywhere; the live checks when a sim slot is free,
+  under `--grasping-mode assisted`: sorting_books_on_shelf (a push of a flat book, the board above, the overhang
+  pinch), make_pizza (pour, recipe order), a loaded plate carried under `level`, and roses into a vase on end.
+- curobo still imports from the main tree's editable install (tier 2 note); nothing in this tier touches it.

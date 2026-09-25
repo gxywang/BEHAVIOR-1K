@@ -339,6 +339,16 @@ AIM_YAW_TOL = math.radians(15)
 ATTACH_TOL = 0.05  # m the male meta link may be off the female one for AttachedTo to snap (attached_to.py:34)
 ATTACH_LIFT = 0.01  # m above the aligned height the child is set: at or above, never below (spec 6.2 Attach)
 ATTACH_YAW_TOL = math.radians(10)  # the snap allows 15 deg
+# N-push (spec S05): a flat item under a shelf board is slid out until this much of it hangs past the board's edge,
+# for a pinch to close on; the push is a press (cuTAMP Push) on a 1 cm "button" at its far face
+PUSH_OVERHANG = 0.03
+PUSH_RADIUS = 0.01
+# N-rotate (spec S38): a pour is the last wrist joint turned this far from a top-down rim grasp, held, and back
+POUR_TILT = math.radians(90)  # 80-110 deg spills a container; joint7 alone has the range
+POUR_HOLD_STEPS = 60  # env steps the tilt is held for the contents to fall (2 s at 30 Hz)
+# E-level (spec S22): a carrier with passengers (a plate under a pizza) may tip at most this far in the bridge's own
+# held motions; rigid passengers slide at ~27 deg (default friction, inferred)
+LEVEL_TILT = math.radians(20)
 OVERVIEW_OFFSETS = {"shoulder": (-1.5, 1.1, 1.7, 0.7, 0.55), "front": (1.15, -0.75, 1.35, 0.3, 0.9)}
 LOCKED_DRIFT = 0.015  # rad a locked joint may sit off the planner's model before it is driven back
 FALL_DROP = 0.05  # m below the teleport height: the base is falling, not settling
@@ -497,6 +507,14 @@ def boards(vertices, faces) -> list[tuple]:
         ]
         result.append((zt, lo, hi, min(over, default=float("inf"))))
     return result
+
+
+def held_tilt(quat_from, quat_to) -> float:
+    """How far (rad) a load held level at gripper orientation ``quat_from`` (xyzw) tips when the gripper turns to
+    ``quat_to``: the angle its up axis leaves the vertical by. A turn about the vertical tips nothing."""
+    a, b = (T.quat2mat(th.as_tensor(np.asarray(q, dtype=np.float32))).numpy().astype(np.float64) for q in (quat_from, quat_to))
+    up = b @ (a.T @ np.array([0.0, 0.0, 1.0]))
+    return float(math.acos(float(np.clip(up[2], -1.0, 1.0))))
 
 
 def roof_over(mesh, centre_xy, half_xy, z_lo: float, z_hi: float) -> bool:
@@ -763,6 +781,7 @@ class R1ProSim(TiptopSim):
         self.send_obstacles = False  # tell the planner about the room's furniture (--obstacles); measured, not assumed
         self.send_room = False  # privileged physical collision map, independent of masks and viewer (--room)
         self.send_inside = False  # plan inside() onto the compartment floor (--inside-region)
+        self.level = set()  # labels carried level (a plate under a pizza; OracleKnowledge.describe): held ramps refuse a tilt
         self.overview = self.env.external_sensors.get(OVERVIEW_CAM)
         self.objects = {}
         self.context = {}  # furniture shown in the Rerun mirror (track_context)
@@ -918,13 +937,17 @@ class R1ProSim(TiptopSim):
             # atoms and nothing else -- produced ZERO button hints and every round died on "goal objects
             # ['switch_1_button'] were not found in any of the 3 view(s)". The button is named by pose, never
             # segmented, so no hint means no press (2026-09-15).
-            if atom["predicate"] == "toggled_on" and atom["args"]:
+            if atom["predicate"] in ("toggled_on", "push") and atom["args"]:
                 bddl = atom["args"][0]
             elif atom["predicate"] == "not" and atom["args"][:1] == ["toggled_on"] and len(atom["args"]) > 1:
                 bddl = atom["args"][1]
             else:
                 continue
-            pos_w, n_world, radius = self.button_world(bddl)
+            # a push (N-push) is a press on the item's own face, with the stroke's depth: from its points, not a mesh
+            hint = self.push_face(bddl) if atom["predicate"] == "push" else (*self.button_world(bddl), None)
+            if hint is None:
+                continue
+            pos_w, n_world, radius, depth = hint
             identity = th.tensor([0.0, 0.0, 0.0, 1.0])
             pos_b, _ = self.to_base(th.tensor(pos_w, dtype=th.float32), identity)
             tip_b, _ = self.to_base(th.tensor(pos_w + n_world, dtype=th.float32), identity)
@@ -933,13 +956,90 @@ class R1ProSim(TiptopSim):
                 "position": [float(v) for v in pos_b],
                 "normal": [float(v) for v in (tip_b - pos_b)],
                 "radius": radius,
+                **({"depth": float(depth)} if depth is not None else {}),
             }
             log.info(
                 f"button of {bddl}: {button_label(label)} at {np.round(out[button_label(label)]['position'], 3).tolist()} "
                 f"(base), normal {np.round(out[button_label(label)]['normal'], 2).tolist()}, "
                 f"radius {out[button_label(label)]['radius']:.3f} m"
+                + (f", pushed {depth:.3f} m past it" if depth is not None else "")
             )
         return out
+
+    def push_face(self, item: str) -> tuple | None:
+        """N-push (spec S05): the face of ``item`` a closed hand pushes to slide it out to its board's edge, as a
+        button hint (world position, outward normal, PUSH_RADIUS, depth); None when no push is wanted. Only for a
+        flat item (its thinnest seen-box axis vertical) lying on a board of FIXED furniture (the map's) under another
+        board: nothing a top-down pinch can take (hardbacks were pushed before 1,200 of 1,200 demo picks,
+        boxing_books). The face is the side turned away from the robot, into the compartment, at mid-height, so the
+        stroke runs toward the open front; the depth is the travel that leaves the near edge PUSH_OVERHANG past the
+        board's edge for a pinch to close on -- and None once it does, so a pushed item is not pushed again. The
+        item's shape is its points (``own_box``); the board and its edge are the map's."""
+        obj = self.scene_object(item)
+        box = self.own_box(obj)
+        if box is None:
+            return None
+        pos, rot, lo, hi = box
+        thin = int(np.argmin(hi - lo))
+        if abs(rot[2, thin]) < 0.7:
+            return None  # standing on edge: a side pinch takes it as it is
+        corners = pos + np.array(list(itertools.product(*zip(lo, hi)))) @ rot.T
+        centre, bottom = corners.mean(axis=0), float(corners[:, 2].min())
+        board = None
+        for other, alo, ahi in self.scene_aabbs():
+            if other is obj or not getattr(other, "fixed_base", False) or not alo[2] <= bottom <= ahi[2]:
+                continue
+            if not ((alo[:2] <= centre[:2]).all() and (centre[:2] <= ahi[:2]).all()):
+                continue
+            mesh = self.collision_mesh_world(other)
+            for z, blo, bhi, ceiling in boards(mesh.vertices, mesh.faces) if mesh is not None else ():
+                under = abs(z - bottom) <= STANDS_ON_TOL and (blo <= centre[:2]).all() and (centre[:2] <= bhi).all()
+                if under and ceiling < float("inf"):
+                    board = (z, blo, bhi, mesh)
+            if board is not None:
+                break
+        if board is None:
+            return None
+        into = centre[:2] - self.base_pose()[0][:2].cpu().numpy().astype(np.float64)
+        into = into / (np.linalg.norm(into) or 1.0)
+        # the side face (an axis that is not the thin one) whose outward normal points furthest from the robot
+        a, s = max(((a, s) for a in range(3) if a != thin for s in (-1.0, 1.0)), key=lambda t: t[1] * rot[:2, t[0]] @ into)
+        n = s * rot[:, a]
+        position = pos + rot @ ((lo + hi) / 2.0) + n * float(hi[a] - lo[a]) / 2.0
+        u = -n[:2] / (np.linalg.norm(n[:2]) or 1.0)  # the stroke, along the board
+        front = float((corners[:, :2] @ u).max())
+        # the board's edge on the stroke's own line: a ray from just inside the board's top out along the stroke
+        # leaves the board at its edge whatever the case's yaw (boards() keeps only a board's axis-aligned box, which
+        # a case turned 45 deg to the robot inflates by half its width: the book would be pushed off it)
+        z, blo, bhi, mesh = board
+        hits, _, _ = mesh.ray.intersects_location([[*centre[:2], z - 0.005]], [[*u, 0.0]], multiple_hits=True)
+        out = [float((h[:2] - centre[:2]) @ u) for h in hits]
+        edge = float(centre[:2] @ u) + min([d for d in out if d > 0.0], default=float("inf"))
+        if not np.isfinite(edge):
+            edge = max(float(np.array([x, y]) @ u) for x in (blo[0], bhi[0]) for y in (blo[1], bhi[1]))
+        depth = edge + PUSH_OVERHANG - front
+        if depth <= 0.0:
+            log.info(f"{item} already hangs {front - edge:.3f} m past its board's edge; no push")
+            return None
+        log.info(f"push {item}: its far face at {np.round(position, 3).tolist()}, {depth:.3f} m toward the board's edge")
+        return position, n, PUSH_RADIUS, float(depth)
+
+    def upright_rotation(self, item: str) -> list | None:
+        """E-6dof (spec S21): the rotation (base frame, 3x3) that stands ``item`` on end -- its longest seen-box axis
+        turned vertical the shorter way round -- for a rose or a toothbrush going into a narrow vessel; yaw is the
+        planner's. None until a capture has seen it."""
+        box = self.own_box(self.scene_object(item))
+        if box is None:
+            return None
+        _, rot, lo, hi = box
+        axis = rot[:, int(np.argmax(hi - lo))]
+        up = np.array([0.0, 0.0, 1.0 if axis[2] >= 0.0 else -1.0])
+        pivot, cos = np.cross(axis, up), float(axis @ up)
+        R = np.eye(3)
+        if np.linalg.norm(pivot) > 1e-9:
+            R = trimesh.transformations.rotation_matrix(math.atan2(float(np.linalg.norm(pivot)), cos), pivot)[:3, :3]
+        base = T.quat2mat(self.base_pose()[1]).cpu().numpy().astype(np.float64)  # world <- base
+        return (base.T @ R @ base).tolist()
 
     def tracked_label(self, name: str) -> str:
         """The tracked label of an object named in a goal atom: BDDL name -> per-instance label; a label stays."""
@@ -961,7 +1061,14 @@ class R1ProSim(TiptopSim):
             f"inside({item}, {container}): placing at ({centre[0]:.2f}, {centre[1]:.2f}), floor z={floor:.3f} world, "
             f"{2 * half[0]:.2f} x {2 * half[1]:.2f} m, under a ceiling of {ceiling:.3f}"
         )
-        return self.region_box(centre, half, floor, ceiling - floor)
+        region = self.region_box(centre, half, floor, ceiling - floor)
+        # an item longer than the vessel is wide goes in on end (E-6dof): lying, its centre never enters the volume
+        # (roses by flat drop 2/5, spec S21). The planner turns it about its own origin, yaw free.
+        seen = self.own_box(self.scene_object(item))
+        if seen is not None and float((seen[3] - seen[2]).max()) > 2 * float(half.min()):
+            log.info(f"inside({item}, {container}): {item} is longer than the vessel is wide; stood on end")
+            region = dict(region, rotation=self.upright_rotation(item), yaw_tolerance=None)
+        return region
 
     def side_entry(self, item: str, container: str) -> bool:
         """Whether ``item`` goes into or comes out of ``container`` sideways: a FIXED container (its mesh is the
@@ -1212,6 +1319,8 @@ class R1ProSim(TiptopSim):
                 region = self.heat_region(item, target, oracle.heat_link(target))
             elif predicate == "aim":
                 region = self.aim_target(item, target, oracle.nozzle(item))
+            elif predicate == "pour":
+                region = None  # held over the target's own hull top (keep_holding stops the place above it)
             else:
                 region = self.attach_target(item, target, oracle.attach_frames(item, target))
             if region is not None:  # the wire names the plane for aim and for a floor target (protocol.tiptop_goal)
@@ -3116,11 +3225,13 @@ class R1ProSim(TiptopSim):
         side = 1.0 if arm == "left" else -1.0
         base = np.array([PRESENT_POINT[0], side * PRESENT_POINT[1], PRESENT_POINT[2]], dtype=np.float64)
         here = np.asarray(seed, dtype=np.float64)
+        # the orientation is loose: what matters is that the object is in the picture, not how it is held -- unless
+        # the load must stay level (E-level: a plate under a pizza), which bounds the whole turn
+        loose = LEVEL_TILT if self.level and self.level & {l for l, a in self.hands().items() if a == arm} else 1.2
         candidates, unreachable = [], 0
         for offset in PRESENT_OFFSETS:
             target = base + np.array([offset[0], side * offset[1], offset[2]], dtype=np.float64)
-            # the orientation is loose: what matters is that the object is in the picture, not how it is held
-            solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.04, tolerance_rad=1.2)
+            solution = ik.solve(target, quat_xyzw, seed=seed, tolerance_pos=0.04, tolerance_rad=loose)
             if solution is None:
                 unreachable += 1
                 continue
@@ -4598,6 +4709,16 @@ class R1ProSim(TiptopSim):
             return False
         if np.max(np.abs(np.subtract(self.q_arm(), self.q_home)), initial=0.0) < 0.02:
             return True
+        if self.level and self.level & {l for l, a in self.hands().items() if a == self.arm}:
+            # E-level: the ready posture turns the hand; a load that must stay level stays where it is instead
+            ik = self.arm_ik(self.arm, frame=f"{self.arm}_gripper_link", with_torso=True)
+            now = self.robot.get_joint_positions()
+            q_now = [float(now[self.joint_index[j]]) for j in ik.arm_joints]
+            home = dict(zip(self.planned_joints, self.q_home))
+            tilt = held_tilt(ik.fk(q_now)[1], ik.fk([home.get(j, v) for j, v in zip(ik.arm_joints, q_now)])[1])
+            if tilt > LEVEL_TILT:
+                log.info(f"{note}: the ready posture would tip the level load {math.degrees(tilt):.0f} deg; staying here")
+                return False
         stopped = self.ramp_to(list(self.q_home), self.posture, self.last_gripper, OPEN_SETTLE_STEPS, note=note,
                                max_vel=STICKY_LIFT_VEL, allowed_contacts=allowed_contacts)  # fmt: skip
         if stopped is None:
@@ -4609,6 +4730,27 @@ class R1ProSim(TiptopSim):
             return False
         log.info(f"{note}: the straight ramp was stopped ({stopped[0]}); asking the planner")
         return self.planned_approach(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), note=note, goal_q=list(self.q_home))
+
+    def tilt_wrist(self, arm: str, angle: float = POUR_TILT, hold_steps: int = POUR_HOLD_STEPS) -> bool:
+        """N-rotate (spec S38): tip what ``arm`` holds by turning its last wrist joint ``angle`` rad, the way its
+        limit allows, hold ``hold_steps`` for the contents to fall, and turn back. Both ramps are checked like every
+        ramp (the carried volume against the scene). False when either was stopped: the hand is then wherever it
+        stopped, still holding."""
+        name = f"{arm}_arm_joint7"
+        if name not in self.planned_joints:
+            log.warning(f"{name} is not a planned joint; no wrist tilt")
+            return False
+        i = self.planned_joints.index(name)
+        q = [float(v) for v in self.q_arm()]
+        joint = self.robot.joints[name]
+        room_up, room_down = float(joint.upper_limit) - q[i], q[i] - float(joint.lower_limit)
+        tipped = list(q)
+        tipped[i] += angle if room_up >= angle or room_up >= room_down else -angle
+        stopped = self.ramp_to(tipped, self.posture, self.last_gripper, hold_steps, note=f"tip the {arm} wrist to pour",
+                               max_vel=STICKY_LIFT_VEL)  # fmt: skip
+        back = self.ramp_to(q, self.posture, self.last_gripper, OPEN_SETTLE_STEPS, note=f"{arm} wrist back level",
+                            max_vel=STICKY_LIFT_VEL)  # fmt: skip
+        return stopped is None and back is None
 
     def planned_standoff(self, arm: str, ik, joints_of, q_standoff, name: str) -> bool:
         """The planner's path to a handle's pre-solved standoff where no straight reach is clear; False without one.

@@ -771,7 +771,32 @@ def test_the_effect_predicates_translate_to_on_and_aim_names_the_support_plane()
     assert [a["predicate"] for a in out] == ["on"] * 6
     assert [a["args"] for a in out] == [["scrub_brush_1", "shoe_1"], ["knife_1", "onion_1"], ["frying_pan_1", "stove_ykretu_0"],
                                         ["atomizer_1", PLANNER_SUPPORT], ["camera_1", "tripod_1"], ["scrub_brush_1", PLANNER_SUPPORT]]  # fmt: skip
-    assert set(INTENT_PREDICATES) == {"stamp", "cut", "heat", "aim"} and KEEP_HOLD_PREDICATES == ("stamp",)
+    assert set(INTENT_PREDICATES) == {"stamp", "cut", "heat", "aim", "push", "pour"}
+    assert KEEP_HOLD_PREDICATES == ("stamp", "pour")
+
+
+def test_a_push_is_a_press_on_the_items_own_face_and_a_pour_a_placement_and_their_keys_survive_the_h5(tmp_path):
+    """Tier 4: push(x) reaches the planner as pressed(x_button) -- the item's far face, described by r1pro.push_face
+    with the stroke's depth, which attach_knowledge validates and keeps (it rebuilds every button) -- and pour(x, y)
+    as on(x, y), a keep-hold placement. `level` names the objects carried level and replays like side_grasp."""
+    from omnigibson.tiptop.protocol import attach_knowledge, request_from_observation, tiptop_goal
+
+    names = {"comic_book_3": "comic_book.n.01_3", "cheese_1": "grated_cheese.n.01_1", "dough_1": "pizza_dough.n.01_1"}
+    goal = [{"predicate": "push", "args": ["comic_book.n.01_3"]},
+            {"predicate": "pour", "args": ["grated_cheese.n.01_1", "pizza_dough.n.01_1"]}]  # fmt: skip
+    assert tiptop_goal(goal, names, False)[1] == [{"predicate": "pressed", "args": ["comic_book_3_button"]},
+                                                  {"predicate": "on", "args": ["cheese_1", "dough_1"]}]  # fmt: skip
+    req = _request()
+    face = {"position": [0.7, 0.3, 0.72], "normal": [1.0, 0.0, 0.0], "radius": 0.01, "depth": 0.18}
+    plain = {"position": [0.6, 0.0, 0.8], "normal": [0.0, -1.0, 0.0], "radius": 0.02}
+    attach_knowledge(req, req["gt_labels"], req["gt_atoms"], masks=req["gt_masks"], buttons={"mug_button": face, "bowl_button": plain})
+    assert req["gt_buttons"]["mug_button"] == face and "depth" not in req["gt_buttons"]["bowl_button"]
+    req["level"] = ["bowl"]
+    save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
+    again = request_from_observation(load_observation_h5(tmp_path / "obs.h5"))
+    assert again["gt_buttons"]["mug_button"]["depth"] == 0.18 and again["level"] == ["bowl"]
+    with pytest.raises(ValueError, match="depth"):
+        attach_knowledge(req, [], [], buttons={"b": dict(face, depth=0.0)})
 
 
 def test_keep_holding_drops_the_release_and_comes_back_up_the_way_it_went_down():

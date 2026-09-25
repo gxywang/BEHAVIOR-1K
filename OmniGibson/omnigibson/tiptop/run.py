@@ -662,8 +662,10 @@ def do_execute(
     # the press runs its planned stroke: nothing tells the executor when the switch flips (that would be the
     # simulator's answer, which a policy does not get); the switch state is logged afterwards for the record only
     press_targets = [atom["args"][0] for atom in atoms if atom["predicate"] == "toggled_on"] if args.activity else []
+    pushes = [atom["args"][0] for atom in atoms if atom["predicate"] == "push"]  # a slide to the shelf's edge (N-push)
     executor = PlanExecutor(sim, gripper_hold_steps=args.gripper_hold_steps)
-    block = press_targets and args.grasping_mode != "physical"  # the press closes the gripper; it must not grasp
+    # the press and the push close the gripper; neither must grasp (a sticky assist takes what one finger touches)
+    block = (press_targets or pushes) and args.grasping_mode != "physical"
     with sim.recording(out_dir / f"{tag}.mp4") if record and not args.no_video else nullcontext():
         if block:
             sim.block_grasping(sim.arm)

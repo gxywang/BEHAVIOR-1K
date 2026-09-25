@@ -256,7 +256,7 @@ def test_return_to_ready_ramps_then_asks_the_planner_for_the_ready_configuration
 
     def sim_with(ramp_result, held=None):
         return SimpleNamespace(
-            q_home=[1.0, 2.0], q_arm=lambda: [0.0, 0.0], posture={}, last_gripper=0.0, arm="left",
+            q_home=[1.0, 2.0], q_arm=lambda: [0.0, 0.0], posture={}, last_gripper=0.0, arm="left", level=set(),
             robot=SimpleNamespace(_ag_obj_in_hand={"left": held}),
             ramp_to=lambda *args, **kwargs: ramp_result,
             planned_approach=lambda where, quat, note, goal_q=None: asked.append(goal_q) or True,
@@ -270,6 +270,20 @@ def test_return_to_ready_ramps_then_asks_the_planner_for_the_ready_configuration
     assert asked == [[1.0, 2.0]]
     home = SimpleNamespace(q_home=[1.0, 2.0], q_arm=lambda: [1.0, 2.0])
     assert R1ProSim.return_to_ready(home)  # already there: nothing moves
+    # E-level: a load carried level (a plate under a pizza) is not turned toward the ready posture past 20 deg
+    ramps = []
+    sim = sim_with(None, held=object())
+    sim.level, sim.hands, sim.ramp_to = {"plate_1"}, lambda: {"plate_1": "left"}, lambda *a, **k: ramps.append(a) or None
+    sim.planned_joints, sim.joint_index = ["j1", "j2"], {"j1": 0, "j2": 1}
+    sim.robot.get_joint_positions = lambda: th.tensor([0.0, 0.0])
+    flat, rolled = [0.0, 0.0, 0.0, 1.0], [np.sin(np.pi / 4), 0.0, 0.0, np.cos(np.pi / 4)]  # the hand rolled 90 deg
+    yawed = [0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4)]  # turned about the vertical: the load stays level
+    sim.arm_ik = lambda arm, frame=None, with_torso=False: SimpleNamespace(
+        arm_joints=["j1", "j2"], fk=lambda q: (np.zeros(3), rolled if list(q) == [1.0, 2.0] else flat))
+    assert not R1ProSim.return_to_ready(sim) and ramps == []
+    sim.arm_ik = lambda arm, frame=None, with_torso=False: SimpleNamespace(
+        arm_joints=["j1", "j2"], fk=lambda q: (np.zeros(3), yawed if list(q) == [1.0, 2.0] else flat))
+    assert R1ProSim.return_to_ready(sim) and len(ramps) == 1
 
 
 def test_switching_planners_brings_the_first_arm_back_to_ready_first():
@@ -359,7 +373,7 @@ def _pick_ep(attached_first, target, releases=True, grasping_mode="sticky"):
             sim.robot._ag_obj_in_hand["left"] = None
 
     sim = SimpleNamespace(
-        arm="left", n_steps=0, OPEN=1.0, held_objects={},
+        arm="left", n_steps=0, OPEN=1.0, held_objects={}, push_face=lambda bddl: None,
         robot=SimpleNamespace(_ag_obj_in_hand={"left": attached_first}),
         press_grasp=lambda arm, bddl, spare=(): False, scene_object=lambda name: target, hold=hold,
         return_to_ready=lambda note, allowed_contacts=None: calls.append(("ready", note, allowed_contacts)) or True,
@@ -683,7 +697,8 @@ def _region_sim(mesh, base=(0.0, 0.0), objects=None):
         objects={}, seen_boxes={},  # nothing seen by a capture yet
     )
     for name in ("to_base", "region_box", "shelf_of", "rest_region", "footprint_region", "floor_surface", "own_box",
-                 "item_height", "seen_aabb", "stamp_region", "knife_region", "heat_region"):
+                 "item_height", "seen_aabb", "stamp_region", "knife_region", "heat_region", "attach_target", "push_face",
+                 "upright_rotation", "inside_region"):
         setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
     return sim
 
@@ -757,6 +772,103 @@ def test_a_heat_box_keeps_the_item_inside_the_heat_links_sphere_on_the_cooking_s
     centres = np.array(region["dims"][:2]) / 2 - 0.14  # how far the pan's centre may go from the link
     assert np.hypot(*centres) <= 0.2 and centres.min() > 0.13  # every corner inside the disk, most of it used
     assert sim.heat_region("frying_pan.n.01_1", "stove.n.01_1", None) is None  # an oven heats inside: no near region
+
+
+def test_the_push_face_of_a_book_lying_under_a_shelf_board_points_into_the_compartment_with_the_travel_to_its_edge():
+    """N-push (spec S05): a flat book on a roofed board of the map's bookcase is pushed on the face turned away from
+    the robot, at mid-height, until its near edge hangs PUSH_OVERHANG past the board's front edge, where a pinch can
+    close on it. A book already hanging over, one standing on edge, one on the open top board or on a movable shelf
+    gets no push; from the far side of the case the other face is pushed."""
+    from omnigibson.tiptop.r1pro import PUSH_OVERHANG, PUSH_RADIUS
+
+    case = _shelves([0.44, 0.72, 1.0])  # boards x 0.7..1.1, the open front toward the robot at x 0.7
+    bookcase = SimpleNamespace(fixed_base=True, category="bookcase")
+    objects = {}
+    sim = _region_sim(case, objects=objects)
+    sim.scene_aabbs = lambda: [(bookcase, np.array([0.69, -0.41, 0.0]), np.array([1.11, 0.41, 1.0]))]
+    objects["comic_book.n.01_3"] = _seen("comic_book.n.01_3", [0.90, 0.1, 0.735], [-0.14, -0.1, -0.015], [0.14, 0.1, 0.015], sim)  # fmt: skip
+    position, normal, radius, depth = sim.push_face("comic_book.n.01_3")
+    assert normal == pytest.approx([1.0, 0.0, 0.0]) and radius == PUSH_RADIUS
+    assert position == pytest.approx([1.04, 0.1, 0.735])  # its far face, mid-height
+    assert depth == pytest.approx(0.76 - 0.7 + PUSH_OVERHANG)  # near edge 0.76 -> 0.67: 3 cm past the front at 0.7
+    far = _region_sim(case, base=(2.0, 0.0), objects=objects)  # standing behind the case: the other face, the other way
+    far.scene_aabbs, far.objects, far.seen_boxes = sim.scene_aabbs, sim.objects, sim.seen_boxes
+    position, normal, _, depth = far.push_face("comic_book.n.01_3")
+    assert normal == pytest.approx([-1.0, 0.0, 0.0]) and position[0] == pytest.approx(0.76)
+    assert depth == pytest.approx(1.08 - 1.04 + PUSH_OVERHANG)  # the board ends at the back panel's face, not its own end
+    sim.seen_boxes["comic_book_1"] = (np.array([-0.25, -0.1, -0.015]), np.array([0.03, 0.1, 0.015]))  # hangs 5 cm out
+    assert sim.push_face("comic_book.n.01_3") is None
+    sim.seen_boxes["comic_book_1"] = (np.array([-0.14, -0.1, -0.015]), np.array([0.14, 0.1, 0.015]))
+    on_edge = (th.tensor([0.90, 0.1, 0.82]), th.tensor([np.sin(np.pi / 4), 0.0, 0.0, np.cos(np.pi / 4)]))  # rolled 90 deg
+    objects["comic_book.n.01_3"].get_position_orientation = lambda: on_edge
+    assert sim.push_face("comic_book.n.01_3") is None
+    objects["comic_book.n.01_3"].get_position_orientation = lambda: (th.tensor([0.90, 0.1, 1.015]), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    assert sim.push_face("comic_book.n.01_3") is None  # the top board: a pinch from above takes it
+    objects["comic_book.n.01_3"].get_position_orientation = lambda: (th.tensor([0.90, 0.1, 0.735]), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    bookcase.fixed_base = False
+    assert sim.push_face("comic_book.n.01_3") is None  # a movable case's boards are not the map's to read
+
+
+def test_a_flat_book_under_a_shelf_board_is_pushed_out_before_its_pick_round_and_a_pour_tilts_after_its_round():
+    """N-push: Episode.pick slides the item out first when push_face says so, once (it hangs over the edge after);
+    N-rotate: Episode.pour is the keep-hold round over the target, then the wrist tilt."""
+    from omnigibson.tiptop.bench import Episode
+    from b1k.bridge.strategies import atom
+
+    rounds, tilts = [], []
+    ep, _ = _pick_ep(attached_first=None, target=SimpleNamespace(name="comic_book_3"), grasping_mode="assisted")
+    faces = iter([("face", "normal", 0.01, 0.09), None])
+    ep.sim.push_face = lambda bddl: next(faces)
+    ep.sim.side_entry = lambda item, container: False
+    ep.rounds = 2
+    ep.plan_and_execute = lambda atoms, floor=False: rounds.append(atoms)
+    ep.achieve = lambda atoms: rounds.append(atoms) or True
+    assert ep.pick("comic_book.n.01_3") is False
+    hold = atom("holding", "comic_book.n.01_3")
+    assert rounds == [[atom("push", "comic_book.n.01_3")], [hold], [hold]]
+    ep.sim.tilt_wrist = lambda arm: tilts.append(arm) or True
+    ep.sim.video_caption = None
+    ep.pour = MethodType(Episode.pour, ep)
+    assert ep.pour("grated_cheese.n.01_1", "pizza_dough.n.01_1") is True
+    assert rounds[-1] == [atom("pour", "grated_cheese.n.01_1", "pizza_dough.n.01_1")] and tilts == ["left"]
+    ep.achieve = lambda atoms: False
+    assert ep.pour("grated_cheese.n.01_1", "pizza_dough.n.01_1") is False and tilts == ["left"]
+
+
+def test_a_rose_longer_than_the_vase_is_wide_is_stood_on_end_yaw_free_and_a_nail_target_hangs_the_alarm_vertical():
+    """E-6dof (spec S21): upright_rotation turns the seen box's longest axis vertical the shorter way round;
+    inside_region carries it, yaw free, only for an item longer than the vessel's narrower side (roses by flat drop
+    2/5). attach_target carries roll and pitch too: the fire alarm's male frame onto the wall nail's, turned 90 deg,
+    its bottom set where the disc hangs."""
+    from omnigibson.tiptop.r1pro import ATTACH_LIFT, ATTACH_TOL
+    import omnigibson.utils.transform_utils as T
+
+    objects = {}
+    sim = _region_sim(None, objects=objects)
+    yaw30 = th.tensor([0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)])
+    rose = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: (th.tensor([1.0, 0.5, 0.75]), yaw30))
+    objects["rose.n.01_1"] = sim.objects["rose_1"] = rose
+    sim.seen_boxes["rose_1"] = (np.array([-0.15, -0.03, -0.02]), np.array([0.15, 0.03, 0.02]))
+    R = np.array(sim.upright_rotation("rose.n.01_1"))
+    assert R @ T.quat2mat(yaw30).numpy() @ [1.0, 0.0, 0.0] == pytest.approx([0.0, 0.0, 1.0], abs=1e-9)
+    assert np.allclose(R @ R.T, np.eye(3)) and np.linalg.det(R) == pytest.approx(1.0)
+    sim.inside_rect = lambda item, container: (np.array([2.0, 1.0]), np.array([0.06, 0.06]), 0.554, 0.723)  # a 12 cm vase
+    region = sim.inside_region("rose.n.01_1", "vase.n.01_1")
+    assert region["rotation"] == R.tolist() and region["yaw_tolerance"] is None
+    assert region["pose"][:2] == pytest.approx([2.0, 1.0]) and region["dims"][:2] == pytest.approx([0.12, 0.12])
+    sim.seen_boxes["rose_1"] = (np.array([-0.05, -0.03, -0.02]), np.array([0.05, 0.03, 0.02]))  # a short item lies
+    assert "rotation" not in sim.inside_region("rose.n.01_1", "vase.n.01_1")
+    alarm = SimpleNamespace(fixed_base=False, get_position_orientation=lambda: (th.tensor([0.6, 0.0, 0.019]), th.tensor([0.0, 0.0, 0.0, 1.0])))  # fmt: skip
+    objects["fire_alarm.n.02_1"] = sim.objects["fire_alarm_1"] = alarm
+    sim.seen_boxes["fire_alarm_1"] = (np.array([-0.05, -0.05, -0.019]), np.array([0.05, 0.05, 0.019]))  # a disc, flat
+    male = np.eye(4)
+    male[:3, 3] = [0.6, 0.0, 0.0]  # on the disc's back
+    female = trimesh.transformations.rotation_matrix(np.pi / 2, [0.0, 1.0, 0.0])  # the nail: z turned onto x
+    female[:3, 3] = [1.0, 0.3, 1.71]
+    region = sim.attach_target("fire_alarm.n.02_1", "wall_nail.n.01_1", (male, female))
+    assert np.allclose(region["rotation"], female[:3, :3])
+    assert region["pose"][2] + 0.01 == pytest.approx(1.71 - 0.05 + ATTACH_LIFT)  # hanging vertical: 5 cm below the nail
+    assert region["dims"][:2] == pytest.approx([2 * (0.019 + ATTACH_TOL / np.sqrt(2)), 2 * (0.05 + ATTACH_TOL / np.sqrt(2))])
 
 
 def test_fixture_for_tracks_the_nearest_doorless_heat_source_so_a_goal_atom_can_name_it(monkeypatch):

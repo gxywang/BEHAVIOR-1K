@@ -214,6 +214,15 @@ class Kitchen(FakeEpisode):
 
     def ripen(self, key):
         self.facts ^= {key}  # cooked appears; frozen (thawing) goes
+        if key[0] == "real":
+            self.appeared.append(key[1])  # a recipe's product now exists (Episode.after_transition names it)
+
+    def pour(self, x, target):
+        """Episode.pour: a keep-hold round over the target and the wrist ramp; what x is filled with covers the
+        target, and x stays in the hand."""
+        self.calls.append(("pour", x, target))
+        self.facts |= {("covered", target, f[2]) for f in self.facts if f[:2] == ("filled", x)}
+        return True
 
     def support_of(self, item):
         return next((f[2] for f in self.facts if f[0] in ("ontop", "inside") and f[1] == item), self.floor)
@@ -246,9 +255,10 @@ class Kitchen(FakeEpisode):
                     self.facts = {f for f in self.facts if f[:2] != ("covered", args[1])}
                 return True
             elif p == "cut":  # the whole is gone; what the cut makes lies where it lay; the knife rests there
-                whole = args[1]
+                knife, whole = args
                 where = [f for f in self.facts if f[1] == whole]
-                self.facts = {f for f in self.facts if whole not in f[1:]} | {("cut", *args)}
+                self.facts = {f for f in self.facts if whole not in f[1:] and (f[1] != knife or len(f) != 3)}
+                self.facts |= {("cut", *args)}
                 for made in self.products.pop(whole, []):
                     self.appeared.append(made)
                     self.facts |= {(f[0], made, *f[2:]) for f in where}
@@ -1889,3 +1899,53 @@ def test_on_fire_lights_the_lighter_and_never_carries_off_an_item_already_where_
     ], rounds_of(ep)
     assert ("toggled_on", lighter) not in ep.facts, "on for the paper, off again for the goal"
     assert ("inside", wood, fireplace) in ep.facts and ("on_fire", wood) in ep.facts
+
+
+# ---------------------------------------------------------------- tier 4: a recipe's product (N-rotate: pour)
+def test_a_recipe_tops_the_dough_then_pours_over_it_and_bakes_the_sheet():
+    """make_pizza: real(pizza), which no cut makes -- bddl's simple_pizza recipe does (a pepperoni and a mushroom
+    half ontop the dough, grated cheese and diced onion covering it, the cookie sheet in the oven). Toppings first,
+    the mushroom cut and the knife put back before its half is taken; then the pours: the cheese from the tupperware
+    the episode reads as filled with it, the onion diced in the scope's bowl (never the knife on the sliceable dough)
+    and the bowl tipped once the knife is out of it; then the sheet is baked like a cooked() item, and the pizza the
+    oven made is learnt from the episode so the goal's own placement can find it."""
+    dough, cheese, sheet, oven = "pizza_dough.n.01_1", "grated_cheese.n.01_1", "cookie_sheet.n.01_1", "oven.n.01_1"
+    bowl, knife, pizza = "bowl.n.01_1", "carving_knife.n.01_1", "pizza.n.01_1"
+    onion, onion_halves = "vidalia_onion.n.01_1", ["half__vidalia_onion.n.01_1", "half__vidalia_onion.n.01_2"]
+    mushroom, mushroom_halves = "mushroom.n.05_1", ["half__mushroom.n.01_1", "half__mushroom.n.01_2"]
+    pepperoni, tubs = ["pepperoni.n.01_1", "pepperoni.n.01_2"], ["tupperware.n.01_1", "tupperware.n.01_2"]
+    goal = [atom("real", pizza), atom("ontop", pizza, sheet)]
+    facts = {("ontop", dough, sheet), ("ontop", sheet, COUNTER), ("filled", tubs[0], cheese)}
+    facts |= {("inside", tubs[0], FRIDGE), ("inside", mushroom, tubs[1]), ("inside", tubs[1], FRIDGE)}
+    facts |= {("inside", p, FRIDGE) for p in pepperoni}
+    facts |= {("ontop", onion, COUNTER), ("ontop", knife, COUNTER), ("ontop", bowl, COUNTER)}
+    scope = [dough, cheese, *pepperoni, mushroom, onion, sheet, knife, bowl, *tubs, FRIDGE, oven, COUNTER]
+    ep = Kitchen(
+        facts,
+        pick_ok={*scope, *onion_halves, *mushroom_halves, pizza},
+        shut={FRIDGE, oven},
+        products={onion: onion_halves, mushroom: mushroom_halves},
+        ripens={("real", pizza): 1},
+    )
+    strategy_for("make_pizza", goal, scope=scope).run(ep)
+    events = [(c[1][0], *c[2]) if c[0] == "achieve" else c for c in ep.calls if c[0] in ("achieve", "pour", "dwell")]
+    assert events == [
+        ("ontop", pepperoni[0], dough),
+        ("cut", knife, mushroom),
+        ("ontop", knife, COUNTER),
+        ("ontop", mushroom_halves[0], dough),
+        ("pour", tubs[0], dough),
+        ("inside", onion, bowl),
+        ("cut", knife, onion),
+        ("cut", knife, onion_halves[0]),
+        ("cut", knife, onion_halves[1]),
+        ("ontop", knife, COUNTER),
+        ("pour", bowl, dough),
+        ("inside", sheet, oven),
+        ("toggled_on", oven),
+        ("dwell", DWELL_STEPS),
+        ("ontop", pizza, sheet),
+    ], events
+    assert ("covered", dough, cheese) in ep.facts and ("real", pizza) in ep.facts
+    assert [c[1] for c in ep.calls if c[0] == "put_down"] == [tubs[0], bowl], "the emptied containers are set down"
+    assert ep.calls.index(("open_up", oven, 0.0)) < ep.calls.index(("achieve", ("toggled_on",), (oven,), "left"))

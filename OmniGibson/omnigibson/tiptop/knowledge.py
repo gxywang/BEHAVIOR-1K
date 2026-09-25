@@ -22,6 +22,7 @@ import logging
 import numpy as np
 import omnigibson.utils.transform_utils as T
 
+from b1k.bridge.judgement import highest_support
 from b1k.bridge.knowledge import *  # noqa: F401,F403
 from b1k.bridge.knowledge import KnowledgeSource, SceneKnowledge, register_source
 from b1k.bridge.protocol import PLANNER_SUPPORT, bddl_label, capture_views, label_category
@@ -60,6 +61,21 @@ class OracleKnowledge(KnowledgeSource):
         masks = {
             name: self.sim.oracle_masks(view, view_extras, labels, meshes=meshes) for name, view, view_extras in views
         }
+        held, in_hand = self.hands()
+        # E-level: a carrier with passengers (localized resting on it: a plate under a pizza) is kept level by the
+        # planner (`level`, for the pick's lift and every carry), and once in the hand its passengers ride under its
+        # label: part of what the hand carries, not bodies standing at the hand for the planner to avoid
+        lifted = set(in_hand) | {self.sim.tracked_label(a["args"][0]) for a in atoms if a["predicate"] == "holding"}
+        level = {label: riders for label in lifted if (riders := self.passengers(label))}
+        if level:
+            request["level"] = sorted(level)
+            log.info(f"carried level: {level}")
+            for carrier in set(level) & set(in_hand):
+                for view_masks in masks.values():
+                    for rider in level[carrier]:
+                        view_masks[labels.index(carrier)] |= view_masks[labels.index(rider)]
+                        view_masks[labels.index(rider)] = False
+        self.sim.level = set(level)
         self.sim.remember_seen(views, labels, masks)  # the objects' shapes, as the depth under these masks sees them
         # The interior of a container an inside() goal names, as its placement surface. The planner has no
         # containment predicate, so inside(a, b) arrives as on(a, b) and is answered against b's own convex hull,
@@ -70,8 +86,15 @@ class OracleKnowledge(KnowledgeSource):
         # regions of a stamp, cut, heat, aim or attach round need this source's hints (particles, heat link, frames):
         # fetched through `oracle`, so each privileged read has one name (section 1.6 of the build design).
         regions = self.sim.inside_regions(atoms, oracle=self) if getattr(self.sim, "send_inside", False) else {}
+        workspace = self.sim.workspace(floor)
         if regions:
             request["place_surfaces"] = regions
+            # a region above the planner's box (a nail at 1.71 m, installing_smoke_detectors) is cropped out of the
+            # views with its target: the box reaches over the highest region's top, so the target has points
+            top = max(box["pose"][2] + box["dims"][2] / 2.0 for box in regions.values())
+            if top + 0.3 > workspace[1][2]:
+                workspace[1][2] = top + 0.3
+                log.info(f"the planner's workspace is raised to z={workspace[1][2]:.2f} for a region at {top:.2f}")
         side = getattr(self.sim, "side_grasp", None)  # Episode.pick marked this round: a roof within the hand stack
         if side:
             request["side_grasp"] = sorted(self.sim.label_of(name) for name in side)
@@ -98,7 +121,7 @@ class OracleKnowledge(KnowledgeSource):
         # ['tile_3'] are not visible in any view ['head', 'left_wrist', 'right_wrist'] (empty masks)" while
         # tile_3 was in the gripper. It cost every placement of a carried object, which is exactly what the
         # pressed grasp has just started producing more of (2026-09-15).
-        carried = set(sum(self.hands(), []))
+        carried = set(held) | set(in_hand)
         rescued = sorted((({a for atom in tiptop_atoms for a in atom["args"]}) & carried) - set(visible))
         if rescued:
             log.info(f"{rescued} carry no mask because the robot is holding them; the planner is told so")
@@ -120,7 +143,6 @@ class OracleKnowledge(KnowledgeSource):
         log.info(f"out of every view: {hidden or 'none'}")
         keep = [labels.index(label) for label in visible]
         primary = views[0][0]
-        held, in_hand = self.hands()
         seen_obstacles = [o for o in obstacles if o in visible]
         if obstacles:
             log.info(
@@ -141,7 +163,23 @@ class OracleKnowledge(KnowledgeSource):
             buttons=self.sim.button_hints(self.goal + list(atoms), category_level=False),
             held_labels=sorted(set(held) | set(seen_obstacles)),
             in_hand=in_hand,
-            workspace=self.sim.workspace(floor),
+            workspace=workspace,
+        )
+
+    def passengers(self, label: str) -> list[str]:
+        """Labels of the tracked objects resting on ``label``'s box by localization (``judgement.highest_support``:
+        bottom within -2..+15 cm of its top, centre over it): what a plate or a sheet carries (E-level)."""
+        names = getattr(self.sim, "bddl_names", {})  # label -> BDDL name (a tabletop sim tracks none)
+        if label not in names:
+            return []
+        boxes = self.localize(*names.values())
+        carrier = boxes.get(names[label])
+        if carrier is None:
+            return []
+        return sorted(
+            other
+            for other, bddl in names.items()
+            if other != label and bddl in boxes and highest_support(boxes[bddl], {label: carrier}) == label
         )
 
     def localize(self, *bddl_names):
