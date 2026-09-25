@@ -143,14 +143,27 @@ class Episode:
         # opened the same drawer 3 times out of 3 (13.0, 12.9 and 30.1 cm of travel, 2026-09-13/14). So when the
         # approach is what failed, stand the old way and pull again from there. A fallback, not a replacement:
         # the pull-solving stance is still tried first and still wins wherever it works.
+        # Every way the arm fails to get from that stance to the hold is the same failure: the stance refused, the
+        # reach refused or stopped short, no approach at all, and the straight approach from the standoff refused.
+        # The last one was final: the planner's "(any configuration)" reach put the arm at the standoff in another
+        # IK branch, the approach solved from the first branch swung the camera into the torso ("handle approach
+        # rejected: left_realsense_link intersects torso_link2"), and store_honey 301 ended at 240 steps, while the
+        # run whose planned reach was itself rejected fell back and opened the drawer (2026-09-24/25).
         why_not = str(result.get("why") or "")
-        if not result.get("opened") and ("on the way to the standoff" in why_not or "stance rejected" in why_not):
+        short_of_hold = ("stance rejected", "on the way to the standoff", "no collision-free approach",
+                         "handle approach rejected")  # fmt: skip
+        if not result.get("opened") and any(s in why_not for s in short_of_hold):
             self.records.append({"open": name, **result, "step": self.sim.n_steps})  # the first attempt's verdict
             log.info(
                 f"{name}: the opening stance solves the pull but the arm cannot reach its start "
                 f"({result.get('why')}); standing the way the runner stands to look, and pulling from there"
             )
             try:
+                # The search frames its candidates through the head camera as the torso holds it NOW. An executed
+                # reach leaves the torso bent over the standoff (camera at 1.21 m, not 1.40), and from there the
+                # same instance's retry rejected all 5948 candidates as out of the camera's frame. Ready first, as
+                # a pick does before its destination search.
+                self.sim.return_to_ready(note=f"ready posture before standing to look at {name}")
                 self.stand_for(name)
                 retry = self.sim.open_container(
                     self.sim.arm,

@@ -376,6 +376,9 @@ def test_a_drawer_the_opening_stance_cannot_reach_is_pulled_from_the_looking_sta
                                                 "(leg 1 of 1, hand 40.1 cm short)"}
             return self.second
 
+        def return_to_ready(self, note="", allowed_contacts=None):
+            return True
+
     class Ep:
         open_up = Episode.open_up
 
@@ -408,6 +411,46 @@ def test_a_drawer_the_opening_stance_cannot_reach_is_pulled_from_the_looking_sta
     ep.sim = SimOther(None)
     assert ep.open_up("cabinet.n.01_1") is False
     assert ep.sim.calls == [True], "only a standoff failure is worth standing again for"
+
+
+def test_a_handle_approach_rejected_after_the_standoff_reach_falls_back_to_the_looking_stance_from_ready():
+    """store_honey 301, twice (manip1g and manip2, 2026-09-25): the straight reach was refused, the planner's
+    "(any configuration)" path reached the standoff in another IK branch, and the straight approach solved from the
+    first branch was refused -- "handle approach rejected: left_realsense_link intersects torso_link2". That was
+    final (q 0.0 at 240 steps), while the run whose planned path was itself rejected got the looking-stance
+    fallback and opened the drawer (manip1, 2026-09-24). Same failure -- the arm cannot get from the opening stance
+    to the hold -- same fallback. And the fallback stands from the ready posture: the executed reach left the torso
+    bent (head camera 1.21 m), and the retry's search from there rejected all 5948 candidates as out of frame."""
+    from omnigibson.tiptop.bench import Episode
+
+    calls = []
+
+    class Sim:
+        arm, n_steps, video_caption = "left", 0, ""
+
+        def open_container(self, arm, name, fraction=None, joint=None, height=None, stand=True):
+            calls.append(("open", stand))
+            if stand:
+                return {"opened": False, "why": "handle approach rejected: left_realsense_link intersects torso_link2"}
+            return {"opened": True, "position": 0.31}
+
+        def return_to_ready(self, note="", allowed_contacts=None):
+            return calls.append(("ready",)) or True
+
+    class Ep:
+        open_up = Episode.open_up
+
+        def __init__(self):
+            self.sim, self.spec, self.records = Sim(), None, []
+
+        def stand_for(self, *names):
+            calls.append(("stand", names))
+            return {}
+
+    ep = Ep()
+    assert ep.open_up("cabinet.n.01_1") is True
+    assert calls == [("open", True), ("ready",), ("stand", ("cabinet.n.01_1",)), ("open", False)]
+    assert len(ep.records) == 2 and ep.records[1]["after_standoff_failed"]
 
 
 def test_a_pressed_grasp_that_worked_is_entered_in_the_hand_record():
