@@ -55,6 +55,7 @@ class ArmIK:
         """``arm_joints``: the configuration space, in URDF order; ``fixed``: the values of the robot's other
         movable joints; ``frame``: the URDF link the targets are for (a camera link)."""
         self.arm_joints = list(arm_joints)
+        self.fixed = dict(fixed)
         self.frame = frame
         rules = "\n".join(f"  - {{name: {name}, rule: fixed, value: {float(value)}}}" for name, value in fixed.items())
         description = (

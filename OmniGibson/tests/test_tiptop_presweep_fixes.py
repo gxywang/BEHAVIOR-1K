@@ -248,6 +248,8 @@ def test_planned_standoff_asks_for_the_presolved_configuration_in_planner_joint_
     assert R1ProSim.planned_standoff(sim, "left", ik, joints_of, [0.3, 0.7], "cabinet")
     assert asked == [[0.7, 0.3], None]  # the pre-solved configuration first, then any configuration at the pose
     assert not R1ProSim.planned_standoff(sim, "right", ik, joints_of, [0.3, 0.7], "cabinet")
+    # the fingers as the approach will have them: a bar's jaw, not reopened (the planner plans with them as they are)
+    assert R1ProSim.planned_standoff(sim, "left", ik, joints_of, [0.3, 0.7], "cabinet", 0.1) and held[-1] == 0.1
 
 
 def test_return_to_ready_ramps_then_asks_the_planner_for_the_ready_configuration():
@@ -665,7 +667,7 @@ def test_the_idle_arm_is_tucked_when_it_rides_the_torso_into_the_handle_approach
         robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))},
                               get_joint_positions=lambda: th.zeros(1)),
         container_grasps=lambda obj, joints, fraction, hand_world, height=None: [grasp],
-        arm_ik=lambda arm, frame=None, with_torso=False: ik, ik_joint_names=lambda arm, with_torso=False: ["left_arm_joint1"],
+        arm_ik=lambda arm, frame=None, with_torso=False, fingers=None: ik, ik_joint_names=lambda arm, with_torso=False: ["left_arm_joint1"],
         scene_aabbs=lambda: [], solve_pull=lambda ik, g, jaw, seed, **kwargs: (plan, ""),
         reach_plan=lambda *a, **kwargs: [], planned_standoff=lambda *a: True, _targets_from=lambda joints_of, q: q,
         container_body=lambda obj, link: None,

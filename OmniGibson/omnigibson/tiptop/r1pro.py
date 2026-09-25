@@ -383,6 +383,10 @@ OPEN_FOLLOW_TOL = 0.02  # m the hand may get ahead of a drawer by before the pul
 OPEN_FOLLOW_TOL_RAD = 0.05  # the same for a door, in radians of the hinge
 OPEN_MIN_FRACTION = 0.20  # of the joint's range: the shortest pull worth making when the arm cannot follow it all
 OPEN_STANCE_TRIES = 120  # (stance, grasp) pairs solved for before a container is given up on
+# of the pull's waypoints a plan must reach to be taken at once; a shorter one is kept while the search goes on. With
+# the ramps' preflight in solve_pull the first plan for store_honey's slgzfc drawer stopped at 5 of 15 (the idle hand
+# into the base as the torso leans back) and the fifth, 15 cm along the bar, pulled all 15 (offline, 2026-09-25)
+OPEN_TAKE_AT = 0.5
 DOOR_TRAVEL_MAX = math.pi / 2  # rad a side-hinged door is pulled at most: the arc beyond is outside any fixed stance
 LID_FRACTION = 0.85  # of the range a lid (horizontal hinge) is opened at least: past every balance angle measured
 # (car 78%, toolbox / bins / jar under 50%, close/lid_geometry.out); short of it the lid falls shut
@@ -401,6 +405,10 @@ BAR_TIP_CLEARANCE = 0.005  # m the fingertips stop short of the panel behind a b
 BAR_TIP_DEPTH = 0.03  # m behind a bar's front the fingertips go at most, so the pads hold it and the assist's ray
 # between them crosses it (fridge/petcxr's bar stands 6 cm out; the pads are 1.8 cm long)
 BAR_END_INSET = 0.03  # m kept clear of a bar's ends
+# m of room each side of a bar the fingers come in with: the jaw opens to the bar, not fully. Fully open the R1Pro's
+# finger links sit 6.3 cm out: under fancyy's wall oven the upper finger was in the oven on the approach from both
+# stances storing_food took (manip2, 2026-09-25); at the bar plus this, the same stances pull 7 and 15 waypoints
+BAR_JAW_ROOM = 0.01
 HAND_BODY_CLEARANCE = 0.01  # m the hand's link origins keep from the container's own body (the hand works at it)
 STANCE_AHEAD = (0.55, 0.65, 0.45, 0.75, 0.85)  # m the handle is ahead of the base, first choice first
 STANCE_SIDE = (0.15, 0.25, 0.05, 0.35, -0.05)  # m the handle is to the LEFT of the base (the left arm opens)
@@ -2056,6 +2064,10 @@ class R1ProSim(TiptopSim):
                 tips_s = max(h["panel"] + BAR_TIP_CLEARANCE, h["front"] - BAR_TIP_DEPTH)
                 if height is not None:
                     log.info(f"{obj.name}.{j['name']}: the task names z {height:.3f}; a bar sets its own height, ignored")
+                # the jaw comes in open to the bar's width plus BAR_JAW_ROOM a side, not fully: a handle sits at a
+                # door's free edge, next to whatever stands beside the door (jaw_open, in finger joint metres: the
+                # pads are 2 x the joint value apart)
+                jaw_open = float(min(h["extent"][0], h["extent"][1])) / 2.0 + BAR_JAW_ROOM
                 for o in offsets:
                     p = np.asarray(h["point"], dtype=np.float64) + along * (mid + o - float(h["point"] @ along))
                     p = p + lead * (tips_s - float(p @ lead))
@@ -2064,7 +2076,7 @@ class R1ProSim(TiptopSim):
                     rank = abs(float(p[2] - hand_world[2])) + abs(o)
                     out.append(
                         dict(joint=j, travel=travel, kind="bar", tips=p, into=into, jaws=[h["jaw"], -h["jaw"]],
-                             press=0.0, lead=lead, rank=(0, rank), handle=h, nudges=1, min_fraction=least)
+                             press=0.0, lead=lead, rank=(0, rank), handle=h, nudges=1, min_fraction=least, jaw_open=jaw_open)
                     )  # fmt: skip
                 continue
             # a lip or a flat panel: press both pads on the face, at heights along it
@@ -2190,8 +2202,8 @@ class R1ProSim(TiptopSim):
         """IK for the whole motion of one grasp -- the pre-grasp standoff (``OPEN_APPROACH`` out along the grasp's
         ``approach``: its lead, or up for the edge grip, which comes down over the panel), the grasp, and every
         waypoint of the pull -- solved in order, each seeded by the last, with every configuration checked against
-        the scene (the container excepted). None when the standoff or the grasp has no solution or stands in
-        something; otherwise a dict with the solutions, how many pull waypoints solved (``reached``), the poses
+        the scene (the container excepted) and every motion between them as the ramps will preflight it
+        (``ramp_refusal``). None when the standoff or the grasp has no solution or stands in something; otherwise a dict with the solutions, how many pull waypoints solved (``reached``), the poses
         and why it stopped short. A path that solves only part of the way is kept when it opens at least the
         grasp's ``min_fraction`` of the range (``OPEN_MIN_FRACTION`` by default: the scored atom flips at 5%, and
         a door's 86 deg arc is beyond any fixed stance).
@@ -2240,6 +2252,14 @@ class R1ProSim(TiptopSim):
             if hits:
                 why = f"the arm at {'the standoff' if i == 0 else 'the grasp' if i == 1 else f'pull waypoint {i - 1}'} would be in {hits[0]}"
                 break
+            # the ramps that execute the motion preflight the WHOLE robot as its collision spheres: the torso, the
+            # head, the idle arm and the fingers at their opening, none of which the polyline above sees. At fancyy
+            # the idle right hand was in the cabinet on the approach, at dszchb the outer finger in the cabinet
+            # beside the bar, from stances this search had taken (manip2 and offline, 2026-09-25)
+            refused = self.ramp_refusal(ik, solutions[-1], solution, at, arm, obj, None if i == 1 else j.get("link")) if solutions else ""
+            if refused:
+                why = f"{refused} at {'the approach' if i == 1 else f'pull waypoint {i - 1}'}"
+                break
             solutions.append([float(v) for v in solution])
             q = solutions[-1]
         if len(solutions) < 2:
@@ -2261,17 +2281,40 @@ class R1ProSim(TiptopSim):
 
         Candidates put the handle ``STANCE_AHEAD`` ahead of the base and ``STANCE_SIDE`` to its left, facing the
         face; each is refused for its footprint first (``_footprint_free``: the base must not overlap the
-        container or anything else), then by ``solve_pull`` at that pose. This replaces standing by
-        ``best_base_pose`` at the container's centroid, which is built for looking at things and stood the rig
-        0.9 m from a drawer front, at furniture backs and against walls.
+        container or anything else), then by ``solve_pull`` at that pose. The first plan that pulls
+        ``OPEN_TAKE_AT`` of the way is taken, else the furthest-pulling one in ``limit`` tries. This replaces
+        standing by ``best_base_pose`` at the container's centroid, which is built for looking at things and stood
+        the rig 0.9 m from a drawer front, at furniture backs and against walls.
         """
         aabbs = self.scene_aabbs()
-        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=with_torso)
+        iks = {}  # by the grasp's jaw opening: the hand is judged at the opening it will come in with
         joints_of = self.ik_joint_names(arm, with_torso=with_torso)
         seed = [float(self.q_home[self.planned_joints.index(j)]) if j in self.planned_joints else 0.0 for j in joints_of]
         tried, footprints = 0, {}
-        refused = {}
+        refused, examples = {}, {}  # the reason up to " at " -> count, and the first full reason behind it
+        best = None  # the plan that pulls furthest; one short of OPEN_TAKE_AT is taken only once the tries are spent
+
+        def found():
+            (x, y, yaw), grasp, jaw, plan, ahead, side, at_try = best
+            log.info(
+                f"stance for {obj.name}.{grasp['joint']['name']}: ({x:.2f}, {y:.2f}) yaw {math.degrees(yaw):.0f} deg, "
+                f"handle {ahead:.2f} m ahead and {side:+.2f} m left; {plan['reached']} of {OPEN_PATH_STEPS - 1} pull "
+                f"waypoints solve ({plan['fraction'] * 100:.0f}% of the range) at try {at_try} of {tried}"
+                + (f"; stops because {plan['why']}" if plan["why"] else "")
+            )
+            return (x, y, yaw), grasp, jaw
+
+        def none():
+            top = sorted(refused.items(), key=lambda kv: -kv[1])[:5]
+            # "the arm" hid WHAT the arm would be in for a whole sim run (manip2, 2026-09-25): the full text once
+            log.info(f"no stance for {obj.name} after {tried} tries: {dict(top)}" + (f"; e.g. {examples[top[0][0]]}" if top and top[0][0] in examples else ""))
+            return None, None, None
+
         for grasp in grasps:
+            opening = grasp.get("jaw_open")
+            if opening not in iks:
+                iks[opening] = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=with_torso, fingers=opening)
+            ik = iks[opening]
             lead = np.asarray(grasp["lead"], dtype=np.float64).copy()
             lead[2] = 0.0
             if float(np.linalg.norm(lead)) < 1e-6:  # a lid: come at it from where the robot stands
@@ -2300,21 +2343,16 @@ class R1ProSim(TiptopSim):
                             tried += 1
                             plan, why = self.solve_pull(ik, grasp, jaw, seed, base_pose=(float(xy[0]), float(xy[1]), yaw),
                                                         aabbs=aabbs, arm=arm, obj=obj)  # fmt: skip
-                            if plan is not None:
-                                log.info(
-                                    f"stance for {obj.name}.{grasp['joint']['name']}: ({xy[0]:.2f}, {xy[1]:.2f}) yaw "
-                                    f"{math.degrees(yaw):.0f} deg, handle {ahead:.2f} m ahead and {side:+.2f} m left; "
-                                    f"{plan['reached']} of {OPEN_PATH_STEPS - 1} pull waypoints solve "
-                                    f"({plan['fraction'] * 100:.0f}% of the range) after {tried} tries"
-                                    + (f"; stops because {plan['why']}" if plan["why"] else "")
-                                )
-                                return (float(xy[0]), float(xy[1]), float(yaw)), grasp, jaw
-                            refused[why.split(" at ")[0][:60]] = refused.get(why.split(" at ")[0][:60], 0) + 1
+                            if plan is not None and (best is None or plan["reached"] > best[3]["reached"]):
+                                best = ((float(xy[0]), float(xy[1]), float(yaw)), grasp, jaw, plan, ahead, side, tried)
+                            if best is not None and best[3]["reached"] >= OPEN_TAKE_AT * (OPEN_PATH_STEPS - 1):
+                                return found()
+                            if plan is None:
+                                refused[why.split(" at ")[0][:60]] = refused.get(why.split(" at ")[0][:60], 0) + 1
+                                examples.setdefault(why.split(" at ")[0][:60], why)
                             if tried >= limit:
-                                log.info(f"no stance for {obj.name} after {tried} tries: {dict(sorted(refused.items(), key=lambda kv: -kv[1])[:5])}")
-                                return None, None, None
-        log.info(f"no stance for {obj.name} after {tried} tries: {dict(sorted(refused.items(), key=lambda kv: -kv[1])[:5])}")
-        return None, None, None
+                                return found() if best is not None else none()
+        return found() if best is not None else none()
 
     def reach_plan(self, arm: str, ik, joints_of, q_to, exclude=(), aabbs=None, body=None) -> list:
         """Legs (each a full solution over ``joints_of``) that take the arm from where it is to ``q_to`` without
@@ -2442,6 +2480,9 @@ class R1ProSim(TiptopSim):
             already = any(is_open(j["lower"], j["upper"], j["position"], closed=j.get("closed")) for j in joints)
             return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
         run = self._drive_joint(arm, obj, grasps, name, stand=stand)
+        # a bar's jaw_open is a command short of OPEN, which the assist reads as a grasp and grasp_sensed as a hand
+        # closed on something: whatever an early return left, the next motion starts from OPEN
+        self.last_gripper = self.OPEN
         if "plan" not in run:
             return {"opened": False, **run}
         chosen, plan, done, blocked = run["grasp"], run["plan"], run["waypoints"], run["why"]
@@ -2538,8 +2579,16 @@ class R1ProSim(TiptopSim):
         the other hand holds something: a carried item rides its lean. A dict with "why" alone when it stops
         short; else grasp, plan, waypoints, why, held, stance."""
         torso = self.other_arm not in self.hands().values()
-        gripper = self.OPEN if take_hold else self.CLOSE
-        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=torso)
+        iks = {}  # by the grasp's jaw opening, as stance_for_grasp judges them
+
+        def ik_for(g):
+            opening = g.get("jaw_open")
+            if opening not in iks:
+                iks[opening] = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=torso, fingers=opening)
+            return iks[opening]
+
+        # the fingers come in at the grasp's opening (a bar: jaw_open) or open; closed for a push
+        grip = lambda g: (self.OPEN if g.get("jaw_open") is None else self.jaw_command(arm, g["jaw_open"])) if take_hold else self.CLOSE  # fmt: skip
         joints_of = self.ik_joint_names(arm, with_torso=torso)
         chosen, jaw_world, plan, pose = None, None, None, None
         if stand:
@@ -2550,7 +2599,7 @@ class R1ProSim(TiptopSim):
                 self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
             except RuntimeError as exc:  # BasePlacementCollision or an unvalidated destination
                 return {"why": f"opening stance rejected ({exc})"}
-            self.hold(OPEN_SETTLE_STEPS, gripper)
+            self.hold(OPEN_SETTLE_STEPS, grip(chosen))
         # solve from where the robot actually stands (a teleport settles a little off the pose asked for), seeded
         # from the ready posture as the stance search was, not from the travel fold the arms are in now
         q = self.robot.get_joint_positions()
@@ -2563,13 +2612,14 @@ class R1ProSim(TiptopSim):
         candidates = [(chosen, jaw_world)] if chosen is not None else []
         candidates += [(g, jaw) for g in grasps for jaw in g["jaws"] if g is not chosen]
         for g, jaw in candidates[: OPEN_STANCE_TRIES]:
-            plan, why = self.solve_pull(ik, g, jaw, seed, aabbs=aabbs, arm=arm, obj=obj)
+            plan, why = self.solve_pull(ik_for(g), g, jaw, seed, aabbs=aabbs, arm=arm, obj=obj)
             if plan is not None:
                 chosen, jaw_world = g, jaw
                 break
             log.info(f"{name}.{g['joint']['name']}: {why}; trying the next grasp")
         if plan is None:
             return {"why": f"no grasp on {name} solves from here"}
+        ik, gripper = ik_for(chosen), grip(chosen)
         j = chosen["joint"]
         log.info(
             f"taking hold of {name}.{j['name']} by its {chosen['kind']} at {np.round(chosen['tips'], 3).tolist()} "
@@ -2580,14 +2630,14 @@ class R1ProSim(TiptopSim):
         legs = self.reach_plan(
             arm, ik, joints_of, plan["solutions"][0], exclude=(obj.name,), aabbs=aabbs, body=self.container_body(obj, j["link"])
         )
-        if not legs and not self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name):
+        if not legs and not self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name, gripper):
             return {"why": f"no collision-free approach to {name}"}
         for k, leg in enumerate(legs):
             stopped = self.ramp_to(self._targets_from(joints_of, leg), self.posture, gripper, OPEN_SETTLE_STEPS,
                                    note=f"reach the standoff of {name} (leg {k + 1} of {len(legs)})", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
             if stopped is not None and " intersects " in stopped[0]:
                 # refused before it moved: the straight leg sweeps the cabinet (store_honey, 2026-09-22)
-                if self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name):
+                if self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name, gripper):
                     break
             if stopped is not None:
                 q_now = self.robot.get_joint_positions()
@@ -2599,6 +2649,20 @@ class R1ProSim(TiptopSim):
                             "why": f"{stopped[0]} stopped following on the way to the standoff (leg {k + 1} of {len(legs)}, "
                                    f"hand {off * 100:.1f} cm short)"}  # fmt: skip
                 log.info(f"{stopped[0]} settled {stopped[2]:.2f} rad short at the end of the reach; the hand is {off * 100:.1f} cm off the standoff, going on")
+        # The reach can leave the arm in another IK branch than the plan's: the planner's "(any configuration)"
+        # path to the standoff, or a leg that settled short. A straight approach from there to the plan's grasp
+        # swept the elbow through the torso ("handle approach rejected: left_arm_link6 intersects torso_link4",
+        # storing_food's fancyy, manip2 2026-09-25). So when the arm is off the plan's standoff, the grasp and the pull
+        # are solved again from where it IS, and taken when the standoff they start from is this posture.
+        q_now = self.robot.get_joint_positions()
+        here = [float(q_now[self.joint_index[jn]]) for jn in joints_of]
+        if float(np.max(np.abs(np.asarray(here) - np.asarray(plan["solutions"][0])))) > RAMP_BLOCK_TOL:
+            again, why_again = self.solve_pull(ik, chosen, jaw_world, here, aabbs=aabbs, arm=arm, obj=obj)
+            if again is not None and float(np.max(np.abs(np.asarray(again["solutions"][0]) - np.asarray(here)))) <= OPEN_JUMP_TOL:
+                log.info(f"{name}: the reach left the arm off the plan's standoff; from where it is {again['reached']} of {OPEN_PATH_STEPS - 1} pull waypoints solve (the plan had {plan['reached']})")
+                plan = again
+            else:
+                log.info(f"{name}: the reach left the arm off the plan's standoff and the pull does not solve from there ({why_again or 'another branch'}); keeping the plan")
         approach = lambda: self.ramp_to(self._targets_from(joints_of, plan["solutions"][1]), self.posture, gripper,
                                         OPEN_SETTLE_STEPS, note=f"approach the handle of {name}", max_vel=OPEN_MAX_JOINT_VEL,
                                         allowed_contacts=self.grasp_contacts(arm, obj))  # fmt: skip
@@ -2618,7 +2682,9 @@ class R1ProSim(TiptopSim):
                 log.info(f"nothing to pull on: the assist never took hold of {name}.{j['name']}")
         # 4. the pull (or the push: the same waypoints with the hand closed)
         done, blocked = self.follow_pull(arm, joints_of, plan, obj, chosen)
-        # 5. let go and back off the way the hand came in, checked like everything else
+        # 5. let go and back off the way the hand came in, checked like everything else. Fully open: the assist
+        # reads any command short of it as a grasp and never releases (robot.py _handle_assisted_grasping)
+        gripper = self.OPEN if take_hold else self.CLOSE
         self.hold(OPEN_SETTLE_STEPS, gripper)
         back = None
         try:
@@ -3283,9 +3349,9 @@ class R1ProSim(TiptopSim):
         trunk = list(getattr(self.robot, "trunk_joint_names", []) or []) if with_torso else []
         return [j for j in trunk if j in self.urdf_joints] + list(self.robot.arm_joint_names[arm])
 
-    def arm_ik(self, arm: str, frame: str | None = None, with_torso: bool = False) -> ArmIK:
-        """Inverse kinematics for ``arm``'s joints with every other joint held where it is now, solving for
-        ``frame`` (its wrist camera's link by default).
+    def arm_ik(self, arm: str, frame: str | None = None, with_torso: bool = False, fingers: float | None = None) -> ArmIK:
+        """Inverse kinematics for ``arm``'s joints with every other joint held where it is now (its fingers at
+        ``fingers`` when given), solving for ``frame`` (its wrist camera's link by default).
 
         ``with_torso``: solve for the four torso joints as well, 11 degrees of freedom instead of 7. The torso is
         NOT locked -- the embodiment plans all four of its joints and locks only the right arm and the fingers
@@ -3300,7 +3366,18 @@ class R1ProSim(TiptopSim):
         fixed = {
             name: float(q[i]) for name, i in self.joint_index.items() if name in self.urdf_joints and name not in joints
         }
+        if fingers is not None:  # the hand judged at the opening it will come in with (a bar's jaw_open)
+            fixed.update({name: float(fingers) for name in self.robot.finger_joint_names[arm] if name in fixed})
         return ArmIK(self.robot.urdf_path, joints, fixed, frame=frame or CAMERA_LINKS[f"{arm}_wrist"])
+
+    def jaw_command(self, arm: str, opening: float | None) -> float:
+        """The gripper command that holds ``arm``'s fingers at joint value ``opening`` (m): the smooth controller
+        and ``_motion_finger_ranges`` both read a command as linear over the finger joint's range. None: OPEN."""
+        if opening is None:
+            return self.OPEN
+        joint = self.robot.joints[self.robot.finger_joint_names[arm][0]]
+        lo, hi = float(joint.lower_limit), float(joint.upper_limit)
+        return float(np.clip(-1.0 + 2.0 * (float(opening) - lo) / max(hi - lo, 1e-9), -1.0, 1.0))
 
     def in_head_frame(self, ik: ArmIK, q, frame: str) -> bool:
         """Whether ``frame`` at arm joints ``q`` would land inside the head camera's image as it stands now.
@@ -4147,6 +4224,32 @@ class R1ProSim(TiptopSim):
             excuse_start=True,
         )
 
+    def ramp_refusal(self, ik, q_from, q_to, base_pose=None, arm: str = "left", obj=None, moving: str | None = None) -> str:
+        """What ``ramp_collision`` would refuse on the straight path from ``q_from`` to ``q_to`` (over
+        ``ik.arm_joints``, every other joint where ``ik`` holds it: the fingers at the opening the hand comes in
+        with), judged before the robot stands there: base at ``base_pose`` (x, y, yaw; where it is by default), the
+        whole robot as its collision spheres against itself and the room, ``arm``'s gripper allowed onto ``obj``,
+        whose ``moving`` link is left out when it travels with the hand. "link intersects obstacle", or "".
+        ponytail: what the hands carry is not modelled; ramp_collision adds it as spheres."""
+        model = self._motion_collision_model()
+        joints, rows = dict(ik.fixed), []
+        for q in (q_from, q_to):
+            joints.update(zip(ik.arm_joints, (float(v) for v in q)))
+            rows.append([joints[name] for name in model.joint_names])
+        world_from_base = T.pose2mat(self.base_pose()).cpu().numpy()
+        if base_pose is not None:
+            c, s = math.cos(float(base_pose[2])), math.sin(float(base_pose[2]))
+            world_from_base[:3, :3] = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+            world_from_base[:2, 3] = base_pose[:2]
+        allowed = self.grasp_contacts(arm, obj) if obj is not None else {}
+        held = {id(self.objects[label]) for label in self.hands() if label in self.objects}
+        room = self._motion_obstacles(held, allowed, base=world_from_base[:3, 3])
+        if moving is not None:
+            body = self.container_body(obj, moving)
+            room = [(name, body if name == obj.name else mesh) for name, mesh in room if name != obj.name or body is not None]
+        hit = model.check(rows[0], rows[1], world_from_base, room, allowed_contacts=allowed)
+        return "" if hit is None else f"{hit[0]} intersects {hit[1]}"
+
     @staticmethod
     def grasp_contacts(arm, obj):
         """Only the grasping gripper/fingers may touch the named manipulation target."""
@@ -4887,14 +4990,17 @@ class R1ProSim(TiptopSim):
                             max_vel=STICKY_LIFT_VEL)  # fmt: skip
         return stopped is None and back is None
 
-    def planned_standoff(self, arm: str, ik, joints_of, q_standoff, name: str) -> bool:
+    def planned_standoff(self, arm: str, ik, joints_of, q_standoff, name: str, gripper: float | None = None) -> bool:
         """The planner's path to a handle's pre-solved standoff where no straight reach is clear; False without one.
 
         The goal is the standoff CONFIGURATION, not its pose: the approach and the pull were solved from it, and
-        another IK branch at the same pose would swing the arm on the straight approach that follows."""
+        another IK branch at the same pose would swing the arm on the straight approach that follows. ``gripper``:
+        the command the approach comes in with (OPEN by default)."""
         if arm != self.arm or any(j not in joints_of for j in self.planned_joints):
             return False
-        self.hold(OPEN_SETTLE_STEPS, self.OPEN)  # the planner plans with the fingers as they are
+        # the planner plans with the fingers as they are: as the approach will have them, since its preflight
+        # sweeps any finger travel over the whole path (a bar's jaw_open, reopened here, was judged fully open)
+        self.hold(OPEN_SETTLE_STEPS, self.OPEN if gripper is None else gripper)
         where, quat = ik.fk(q_standoff, f"{arm}_gripper_link")
         goal_q = [float(q_standoff[joints_of.index(j)]) for j in self.planned_joints]
         if self.planned_approach(where, quat, note=f"reach the standoff of {name}", goal_q=goal_q):

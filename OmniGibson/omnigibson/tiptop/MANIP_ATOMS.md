@@ -1065,6 +1065,41 @@ logged hand convention, the real `container_grasps` / `solve_pull` / `stance_for
   the approach is contact-checked, so a brush against it ends in the looking-stance fallback), `push_joint` widens it,
   and storing_food reaches fancyy's bar doors; the top cabinets (lkxmne, edge at 2.08 m) stay out of reach.
 
+## Second sim run (manip2d = the fixes above): the search and the ramps judge different robots
+
+The fridge failed with the identical histogram; storing_food found fancyy's stances and every one died in the ramps'
+preflight (`ramp_collision`, the whole robot as the r1pro cuRobo spheres): the reach and the approach through the torso
+(`left_arm_link5 / link6 x torso_link2 / 4`), the idle right arm and the head in the cabinet, and at door3 (the bar
+under the wall oven) `left_gripper_finger_link1 x oven_ffitak_0` from both stances. The offline harness, with the
+fingers at 0.05 as the sim holds them, reproduces all of it: the fridge's 117 x "in oven_ffitak_0" + 3 flips, fancyy's
+stance (8.90, -1.02, -91 deg, 11 of 15) and its refused reach leg, door3's refused approach at both logged stances.
+`solve_pull` checked the working arm's link polyline; the ramps check everything else too.
+
+- `solve_pull` now puts every motion of the plan through `ramp_refusal` (the ramps' own model at the candidate stance:
+  the approach with the container whole and the gripper allowed onto it, each pull step with its moving link left
+  out) and cuts the pull where it is refused. Offline it predicts the sim's refusals exactly (store_honey's first
+  slgzfc stance: `left_realsense_link x torso_link2 at the approach`, as logged).
+- A bar is approached with the jaw open to the bar plus BAR_JAW_ROOM (`jaw_open`; `arm_ik(fingers=)`, `jaw_command`):
+  at door3's two stances fully open is refused on the oven, at jaw_open they pull 7 and 15 waypoints. The fingers
+  are commanded there from the stance on (reach, `planned_standoff`, approach); let go is fully OPEN (the assist
+  releases on nothing less) and `open_container` leaves `last_gripper` OPEN after an early return.
+- `stance_for_grasp` takes the first plan pulling OPEN_TAKE_AT (half) of the way, else the furthest in its tries: the
+  truthful search's first slgzfc plan stopped at 5 of 15, the fifth pulled 15.
+- `_drive_joint` solves the pull again from where the reach left the arm when that is off the plan's standoff (the
+  planner's any-configuration branch): offline, of 12 collision-free branches at fancyy's standoff, 11 were refused
+  straight to the plan's grasp (8 on the robot's own links) and 4 re-solve to a clear approach and pull (10-15 wp).
+- Offline on the final code: fancyy door2 (9.05, -1.00, -106 deg) in 5 tries / 40 s, 9 of 15, reach, approach and
+  pull clear of the spheres; slgzfc 15 of 15 in 5 tries; jhymlr 15 of 15 at the sim's own stance in 1 try.
+- The fridge still has no stance: 92 of 120 are `left_gripper_finger_link1/2 x bottom_cabinet_fancyy_0 at the
+  approach`. The bar sits 2 cm from fancyy's frame, which stands 3.5 cm proud of the fridge's panel (the wall oven 4.6
+  cm beside, 9 cm proud), and the outer finger's spheres reach it: offline, the tips 3, 2 or 1.5 cm behind the bar's
+  front (0.3 to 1 cm of jaw room) and 1.2 cm with 1 cm of room are all refused on fancyy (60 tries each); with the
+  tips 1.2 or 1.0 cm behind the front and 5 mm of room a stance comes in 3 tries. Whether the assist holds a bar by its
+  front 1.2 cm is a sim question, so it is not built.
+- A sim run must confirm: fancyy's door2 pull and `push_joint` after it, door3 at jaw_open, the assist taking the bar
+  from a partly open jaw (the command reads as a grasp, so a finger brushing the bar on the way in could weld early),
+  slgzfc and jhymlr still opening, and the fridge's refusal arriving in ~2 min with its reason.
+
 ## Per-task readiness
 
 From `runs/skill_gap_20260924/atomic/per_task.json` against the items built. Class: 1 pick/place with existing atoms,

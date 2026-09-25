@@ -739,7 +739,7 @@ def test_the_standoff_lies_along_the_grasps_approach_and_a_lid_is_pulled_whole_o
     sim = SimpleNamespace(
         _grasp_pose_base=lambda arm, g, jaw, base_pose=None: (pull[0][:3, 3], pull[0][:3, :3]),
         _pull_poses=lambda g, start, base_pose=None: (pull, None, None), container_body=lambda obj, link: None,
-        arm_hits_scene=lambda *a, **k: [], body_hits=lambda *a, **k: False,
+        arm_hits_scene=lambda *a, **k: [], body_hits=lambda *a, **k: False, ramp_refusal=lambda *a, **k: "",
     )  # fmt: skip
     drawer = dict(kind="prismatic", lower=0.0, upper=0.4, position=0.0)
     edge = dict(joint=drawer, travel=0.3, kind="edge", lead=[-1.0, 0.0, 0.0], approach=[0.0, 0.0, 1.0], min_fraction=OPEN_MIN_FRACTION)  # fmt: skip
@@ -778,7 +778,7 @@ def test_a_pull_that_falls_open_past_its_target_is_not_pushed_back(monkeypatch):
     chosen = dict(joint=lid, travel=LID_FRACTION * 2.967, kind="edge")
     pushes = []
     sim = SimpleNamespace(
-        scene_object=lambda name: SimpleNamespace(name="toolbox"),
+        scene_object=lambda name: SimpleNamespace(name="toolbox"), OPEN=1.0,
         robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))}),
         container_grasps=lambda *a, **k: [chosen],
         _drive_joint=lambda *a, **k: {"grasp": chosen, "plan": {"reached": 15}, "waypoints": 15, "why": "", "held": True, "stance": (1.0, 2.0, 0.0)},
@@ -860,6 +860,7 @@ def test_a_handle_beside_a_flush_neighbour_is_judged_by_the_hands_own_clearance_
         _grasp_pose_base=lambda arm, g, jaw, base_pose=None: (pull[0][:3, 3], pull[0][:3, :3]),
         _pull_poses=lambda g, start, base_pose=None: (pull, None, None), container_body=lambda obj, link: None,
         arm_hits_scene=lambda *a, **k: seen.append(k.get("hand_clearance")) or [], body_hits=lambda *a, **k: False,
+        ramp_refusal=lambda *a, **k: "",
     )  # fmt: skip
     grasp = dict(joint=dict(kind="prismatic", lower=0.0, upper=0.4, position=0.0), travel=0.3, kind="bar", lead=[-1.0, 0.0, 0.0])
     plan, _ = R1ProSim.solve_pull(spy, SimpleNamespace(solve=lambda *a, **k: [0.0]), grasp, [0, 0, 1], [0.0], base_pose=(0.0, 0.0, 0.0), aabbs=[])
@@ -932,3 +933,263 @@ def test_openable_joints_reads_the_joint_frame_and_the_closed_end_off_a_live_obj
     assert not is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]), "resting at its closed end"
     laptop.metadata = {}  # no direction metadata: the lower limit is the closed end
     assert openable_joints(laptop)[0]["closed"] == 0.0
+
+
+def _bar_door_sim(grasping_mode="assisted"):
+    """fridge/petcxr's right door as in test_a_vertical_bar_on_a_door_is_read_as_a_bar_with_a_horizontal_jaw, hinged
+    on z through its far edge, with container_grasps' own helpers."""
+    import trimesh
+
+    door = trimesh.util.concatenate([trimesh.creation.box(bounds=[[0.40, -0.28, -1.0], [0.44, 0.28, 0.98]]).subdivide(),
+                                     trimesh.creation.box(bounds=[[0.47, 0.20, -0.25], [0.50, 0.235, 0.736]]).subdivide()])  # fmt: skip
+    sim, obj = _door_sim(door, grasping_mode)
+    joint = dict(name="j_door", kind="revolute", axis=[0.0, 0.0, -1.0], origin=[0.42, -0.28, 0.0], lower=0.0,
+                 upper=2.0, position=0.0, closed=0.0, link="door")  # fmt: skip
+    return sim, obj, joint
+
+
+def test_a_bar_is_approached_with_the_jaw_open_to_the_bar_and_the_ik_judges_the_hand_at_that_opening(monkeypatch):
+    """storing_food 301 (manip2, 2026-09-25): fancyy's lower door has its bar under the wall oven, and the fingers,
+    fully open 6.3 cm to each side, put the upper one in the oven on the approach from both stances tried
+    ("left_gripper_finger_link1 intersects oven_ffitak_0"). A bar grasp now carries jaw_open, half the bar's width
+    plus BAR_JAW_ROOM (finger joint metres); the IK the stance is solved with holds the fingers there, and the
+    gripper command that puts them there is linear over the finger joint's range, as the smooth controller reads it."""
+    from types import SimpleNamespace
+
+    from omnigibson.tiptop.r1pro import BAR_JAW_ROOM, R1ProSim
+
+    sim, obj, joint = _bar_door_sim()
+    grasps = R1ProSim.container_grasps(sim, obj, [joint], 0.8, np.array([0.5, 0.2, 0.3]))
+    assert grasps and {g["kind"] for g in grasps} == {"bar"}
+    assert all(g["jaw_open"] == pytest.approx(0.035 / 2 + BAR_JAW_ROOM, abs=2e-3) for g in grasps), "the bar is 3.5 cm wide"
+    built = []
+    monkeypatch.setattr("omnigibson.tiptop.r1pro.ArmIK", lambda urdf, joints, fixed, frame: built.append(fixed) or fixed)
+    names = ["left_arm_joint1", "left_gripper_finger_joint1", "left_gripper_finger_joint2", "right_gripper_finger_joint1"]
+    fingers = {"left": names[1:3], "right": names[3:]}
+    joints = {n: SimpleNamespace(lower_limit=0.0, upper_limit=0.05) for n in names[1:]}
+    arm = SimpleNamespace(robot=SimpleNamespace(get_joint_positions=lambda: np.full(4, 0.05), urdf_path="r1pro.urdf",
+                                                finger_joint_names=fingers, joints=joints, arm_joint_names={"left": names[:1]}),
+                          joint_index={n: i for i, n in enumerate(names)}, urdf_joints=set(names), OPEN=1.0,
+                          ik_joint_names=lambda arm, with_torso=False: names[:1])  # fmt: skip
+    R1ProSim.arm_ik(arm, "left", frame="left_gripper_link", with_torso=True, fingers=0.0275)
+    assert built[-1] == {names[1]: 0.0275, names[2]: 0.0275, names[3]: 0.05}, "the working hand only"
+    R1ProSim.arm_ik(arm, "left", frame="left_gripper_link")
+    assert built[-1][names[1]] == 0.05, "as the fingers stand, without an opening"
+    assert R1ProSim.jaw_command(arm, "left", 0.0275) == pytest.approx(0.1)
+    assert R1ProSim.jaw_command(arm, "left", None) == 1.0 and R1ProSim.jaw_command(arm, "left", 0.2) == 1.0
+
+
+def test_the_finger_opening_is_what_the_ramps_preflight_judges_a_hand_beside_a_neighbour_by():
+    """ramp_refusal asks the ramps' own collision model (the r1pro cuRobo spheres, the simulator's disabled pairs)
+    about a motion before the robot stands where it will run, with the joints the IK does not solve held where the
+    IK holds them: a block where the fully open finger would be refuses the hand at the stance's IK built fully open,
+    and is clear of the same pose at a bar's jaw_open. The base pose is the stance's, not where the robot is."""
+    from pathlib import Path
+    from types import MethodType, SimpleNamespace
+
+    import torch as th
+    import trimesh
+    import yaml
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    r1pro = Path(__file__).resolve().parents[2] / "datasets/omnigibson-robot-assets/models/r1pro"
+    urdf = r1pro / "urdf/r1pro.urdf"
+    names = [f"torso_joint{i}" for i in range(1, 5)] + [f"{s}_arm_joint{i}" for i in range(1, 8) for s in ("left", "right")]
+    names += [f"{s}_gripper_finger_joint{i}" for s in ("left", "right") for i in (1, 2)]
+    q = th.zeros(len(names))
+    home = dict(zip([f"torso_joint{i}" for i in range(1, 5)] + [f"left_arm_joint{i}" for i in range(1, 8)],
+                    [1.025, -1.45, -0.47, 0.0, -1.6312, 0.2636, -1.812, -1.4576, -0.0508, -0.3727, -1.3193]))  # fmt: skip
+    for i, n in enumerate(names):
+        q[i] = home.get(n, 0.05 if "finger" in n else 0.0)
+    block = SimpleNamespace(name="oven", category="oven")
+    sim = SimpleNamespace(
+        robot=SimpleNamespace(urdf_path=str(urdf), get_joint_positions=lambda: q,
+                              disabled_collision_pairs=yaml.safe_load((r1pro / "r1pro.yaml").read_text())["disabled_collision_pairs"],
+                              finger_joint_names={s: [f"{s}_gripper_finger_joint1", f"{s}_gripper_finger_joint2"] for s in ("left", "right")},
+                              trunk_joint_names=names[:4], arm_joint_names={"left": [f"left_arm_joint{i}" for i in range(1, 8)]}),
+        joint_index={n: i for i, n in enumerate(names)}, urdf_joints=set(names), objects={}, hands=lambda: {},
+        base_pose=lambda: (th.tensor([5.0, 5.0, 0.0]), th.tensor([0.0, 0.0, 0.0, 1.0])),  # far from the stance
+        grasp_contacts=R1ProSim.grasp_contacts, scene_aabbs=lambda: [(block, *block.mesh.bounds)],
+        collision_mesh_world=lambda obj: obj.mesh,
+    )  # fmt: skip
+    for name in ("_motion_collision_model", "_motion_obstacles", "arm_ik", "ik_joint_names", "ramp_refusal"):
+        setattr(sim, name, MethodType(getattr(R1ProSim, name), sim))
+    model = sim._motion_collision_model()
+    stance = (1.0, 2.0, np.pi / 2)
+    world = np.eye(4)
+    world[:3, :3] = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    world[:3, 3] = [1.0, 2.0, 0.0]
+    finger = model.links == "left_gripper_finger_link1"
+    at = model.centres([float(v) for v in q], model.links[finger], model.local_centres[finger])[0] @ world[:3, :3].T + world[:3, 3]
+    block.mesh = trimesh.creation.box([0.012, 0.012, 0.012]).apply_translation(at)  # where the open finger's base is
+    arm = [float(q[names.index(n)]) for n in sim.ik_joint_names("left", with_torso=True)]
+    assert sim.ramp_refusal(sim.arm_ik("left", "left_gripper_link", True), arm, arm, stance) == \
+        "left_gripper_finger_link1 intersects oven"  # fmt: skip
+    assert sim.ramp_refusal(sim.arm_ik("left", "left_gripper_link", True, fingers=0.0175), arm, arm, stance) == ""
+    assert sim.ramp_refusal(sim.arm_ik("left", "left_gripper_link", True), arm, arm) == "", "at (5, 5) it is far off"
+
+
+def test_solve_pull_stops_where_the_ramps_preflight_would_refuse_the_motion():
+    """fancyy (storing_food 301, manip2): the stance search took stances whose approach the ramps then refused for
+    the idle right hand in the cabinet, the head in it, the elbow through the torso -- the whole robot, which
+    solve_pull's arm polyline never saw. Every motion of the plan now goes through ramp_refusal: the approach with the
+    container whole (the hand allowed onto it), each pull step with its moving link left out; the pull is cut
+    where it is refused, like a waypoint without IK."""
+    from types import SimpleNamespace
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    pull = [pose_matrix([0.5 - 0.02 * i, 0.0, 0.9], [0.0, 0.0, 0.0, 1.0]) for i in range(16)]
+    asked = []
+
+    def refusal(ik, q_from, q_to, base_pose=None, arm="left", obj=None, moving=None):
+        asked.append((round(q_from[0], 1), round(q_to[0], 1), moving))
+        return "right_gripper_link intersects cabinet" if round(q_to[0], 1) == 1.2 else ""
+
+    solves = iter(np.arange(0.0, 1.7, 0.1))
+    sim = SimpleNamespace(
+        _grasp_pose_base=lambda arm, g, jaw, base_pose=None: (pull[0][:3, 3], pull[0][:3, :3]),
+        _pull_poses=lambda g, start, base_pose=None: (pull, None, None), container_body=lambda obj, link: None,
+        arm_hits_scene=lambda *a, **k: [], body_hits=lambda *a, **k: False, ramp_refusal=refusal,
+    )  # fmt: skip
+    grasp = dict(joint=dict(kind="prismatic", lower=0.0, upper=0.4, position=0.0, link="drawer"), travel=0.3, kind="bar",
+                 lead=[-1.0, 0.0, 0.0])  # fmt: skip
+    ik = SimpleNamespace(solve=lambda *a, **k: [float(next(solves))])
+    plan, why = R1ProSim.solve_pull(sim, ik, grasp, [0, 0, 1], [0.0], base_pose=(0.0, 0.0, 0.0), aabbs=[],
+                                    obj=SimpleNamespace(name="cabinet"))  # fmt: skip
+    assert asked[0] == (0.0, 0.1, None), "standoff to grasp: the container whole"
+    assert all(moving == "drawer" for _, _, moving in asked[1:]), "each pull step without the drawer that moves"
+    assert plan["reached"] == 10 and why == "right_gripper_link intersects cabinet at pull waypoint 11"
+
+
+def test_the_stance_search_takes_a_plan_that_pulls_half_the_way_at_once_and_a_shorter_one_only_at_the_end():
+    """store_honey's slgzfc drawer (offline, 2026-09-25): with the ramps' preflight in solve_pull the first plan
+    stopped at 5 of 15 waypoints (the idle hand into the base as the torso leans back) and the fifth pulled all 15."""
+    from types import SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    def search(reached, limit=120):
+        plans = iter(reached)
+
+        def solve_pull(*a, **k):
+            n = next(plans, None)
+            return (None, "no inverse kinematics for the grasp") if n is None else (dict(reached=n, fraction=n / 15, why=""), "")
+
+        sim = SimpleNamespace(
+            scene_aabbs=lambda: [], arm_ik=lambda *a, **k: None, ik_joint_names=lambda *a, **k: [], q_home=[],
+            planned_joints=[], _footprint_free=lambda *a, **k: (True, "free", None), solve_pull=solve_pull,
+            base_pose=lambda: (th.zeros(3), None),
+        )  # fmt: skip
+        grasp = dict(joint=dict(name="j"), lead=[-1.0, 0.0, 0.0], tips=[1.0, 0.0, 0.8], jaws=["up"])
+        return R1ProSim.stance_for_grasp(sim, SimpleNamespace(name="cabinet"), [grasp], limit=limit)
+
+    assert search([None, None, 5, None, 15])[0] == search([None, None, None, None, 15])[0], "5 of 15 passed over"
+    assert search([None, 8])[0] == search([None, 8, 15])[0], "8 of 15 is half the way: taken at once"
+    short = search([None, 3, None, 5, 4], limit=6)
+    assert short[0] == search([None, None, None, 5], limit=6)[0], "only short plans: the furthest, once the tries are spent"
+    assert search([], limit=6) == (None, None, None)
+
+
+def _drive_sim(grasp, plan, again=None, branch=None):
+    """_drive_joint's collaborators as fakes: a one-joint arm whose stance, reach, hold and pull all succeed and
+    record what they were asked. ``branch``: where the reach leaves the arm (the planner's any-configuration path);
+    ``again``: what solve_pull answers when asked from there."""
+    from types import MethodType, SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    q = th.tensor([plan["solutions"][0][0]])
+    log = []
+
+    def solve_pull(ik, g, jaw, seed, **kwargs):
+        log.append(("solve", round(float(seed[0]), 2), ik))
+        return (plan, "") if again is None or seed[0] != branch else again
+
+    def planned_standoff(arm, ik, joints_of, q_standoff, name, gripper=None):
+        log.append(("planned", gripper))
+        if branch is not None:
+            q[0] = branch
+        return True
+
+    ik = SimpleNamespace(fk=lambda q, frame: (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])), solve=lambda *a, **k: [0.9])
+    finger = SimpleNamespace(lower_limit=0.0, upper_limit=0.05)
+    sim = SimpleNamespace(
+        arm="left", other_arm="right", OPEN=1.0, CLOSE=-1.0, hands=lambda: {}, posture={}, q_home=None, planned_joints=[],
+        joint_index={"left_arm_joint1": 0}, scene_aabbs=lambda: [], container_body=lambda obj, link: None,
+        robot=SimpleNamespace(get_joint_positions=lambda: q, finger_joint_names={"left": ["f1", "f2"]}, joints={"f1": finger}),
+        arm_ik=lambda arm, frame=None, with_torso=False, fingers=None: log.append(("ik", fingers)) or ik,
+        ik_joint_names=lambda arm, with_torso=False: ["left_arm_joint1"],
+        stance_for_grasp=lambda obj, grasps, arm="left", with_torso=True: ((1.0, 2.0, 0.0), grasp, grasp["jaws"][0]),
+        place_robot=lambda *a, **k: None, hold=lambda n, g: log.append(("hold", g)), solve_pull=solve_pull,
+        reach_plan=lambda *a, **k: [], planned_standoff=planned_standoff, _targets_from=lambda joints_of, q: list(q),
+        ramp_to=lambda q_arm, posture, gripper, settle, note="", **k: log.append((note.split(" of ")[0], list(q_arm), gripper)),
+        grasp_contacts=R1ProSim.grasp_contacts, tuck_idle_arm=lambda: False,
+        close_on=lambda *a, **k: ([0.2], True), follow_pull=lambda *a: (1, ""), arm_hits_scene=lambda *a, **k: [],
+    )  # fmt: skip
+    sim.jaw_command = MethodType(R1ProSim.jaw_command, sim)
+    return sim, log
+
+
+def test_the_hand_comes_in_at_the_bars_jaw_and_lets_go_fully_open(monkeypatch):
+    """The bar's jaw_open is what the fingers are commanded to from the stance on -- the reach, the planner's
+    reach (which plans with the fingers as they are, and whose approach's preflight would otherwise sweep them
+    from fully open over the whole path) and the approach -- so the ramps judge the hand the search judged. The
+    hold is let go fully open: the assist reads any command short of OPEN as a grasp and never releases, and an
+    early return must not leave that command behind for the next motion (open_container resets it)."""
+    from types import SimpleNamespace
+
+    import torch as th
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    grasp = dict(joint=dict(name="j_door", link="door", position=0.0), kind="bar", tips=[1.0, 0.0, 1.0], jaws=[[0, 1, 0]],
+                 nudges=1, jaw_open=0.0275)  # fmt: skip
+    plan = dict(solutions=[[0.1], [0.2], [0.3]], reached=1, why="", grasp_pose=np.eye(4), approach=np.array([-1.0, 0.0, 0.0]))
+    sim, log = _drive_sim(grasp, plan)
+    run = R1ProSim._drive_joint(sim, "left", SimpleNamespace(name="fridge"), [grasp], "fridge")
+    jaw = 0.1  # -1 + 2 * 0.0275 / 0.05
+    assert run["plan"] is plan and ("ik", 0.0275) in log and ("ik", None) not in log
+    commands = [entry[-1] for entry in log if entry[0] in ("hold", "planned", "approach the handle")]
+    assert commands[:3] == [pytest.approx(jaw)] * 3, "stance hold, planner's reach, approach: all at the jaw"
+    assert ("hold", 1.0) in log and log[-1] == ("back off from fridge", [0.9], 1.0), "let go and back off fully open"
+    push = dict(grasp, jaw_open=None)
+    sim, log = _drive_sim(push, plan)
+    R1ProSim._drive_joint(sim, "left", SimpleNamespace(name="fridge"), [push], "fridge", take_hold=False)
+    assert {entry[-1] for entry in log if entry[0] in ("hold", "planned", "approach the handle", "back off from fridge")} == {-1.0}
+    left = SimpleNamespace(last_gripper=jaw, OPEN=1.0, scene_object=lambda name: SimpleNamespace(name=name),
+                           robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))}),
+                           container_grasps=lambda *a, **k: [grasp], _drive_joint=lambda *a, **k: {"why": "handle approach rejected"})  # fmt: skip
+    monkeypatch.setattr("omnigibson.tiptop.r1pro.openable_joints", lambda obj: [grasp["joint"]])
+    assert R1ProSim.open_container(left, "left", "fridge")["opened"] is False and left.last_gripper == 1.0
+
+
+def test_the_approach_is_solved_again_from_where_the_reach_left_the_arm():
+    """storing_food 301 (manip2): the straight reach was refused, the planner's "(any configuration)" path put the
+    arm at the standoff in another IK branch, and the straight approach from there to the plan's grasp swept the
+    elbow through the torso ("handle approach rejected: left_arm_link6 intersects torso_link4"). The grasp and pull
+    are solved again from the measured posture and approached from there; the plan stands when that fails, and
+    nothing is re-solved when the reach ended where the plan starts."""
+    from types import SimpleNamespace
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    grasp = dict(joint=dict(name="j_door", link="door", position=0.0), kind="bar", tips=[1.0, 0.0, 1.0], jaws=[[0, 1, 0]],
+                 nudges=1, jaw_open=0.0275)  # fmt: skip
+    plan = dict(solutions=[[0.1], [0.2], [0.3]], reached=1, why="", grasp_pose=np.eye(4), approach=np.array([-1.0, 0.0, 0.0]))
+    again = dict(plan, solutions=[[1.5], [1.6], [1.7]])
+    sim, log = _drive_sim(grasp, plan, again=(again, ""), branch=1.5)
+    run = R1ProSim._drive_joint(sim, "left", SimpleNamespace(name="fridge"), [grasp], "fridge")
+    assert [e[1] for e in log if e[0] == "solve"] == [0.1, 1.5], "the stance's plan, then from the branch"
+    assert run["plan"] is again and next(e[1] for e in log if e[0] == "approach the handle") == [1.6]
+    sim, log = _drive_sim(grasp, plan, again=(None, "no inverse kinematics for the grasp"), branch=1.5)
+    run = R1ProSim._drive_joint(sim, "left", SimpleNamespace(name="fridge"), [grasp], "fridge")
+    assert run["plan"] is plan and next(e[1] for e in log if e[0] == "approach the handle") == [0.2], "the plan stands"
+    sim, log = _drive_sim(grasp, plan)
+    R1ProSim._drive_joint(sim, "left", SimpleNamespace(name="fridge"), [grasp], "fridge")
+    assert [e[1] for e in log if e[0] == "solve"] == [0.1], "at the plan's standoff: nothing to solve again"
