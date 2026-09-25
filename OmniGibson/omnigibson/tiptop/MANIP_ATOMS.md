@@ -47,6 +47,42 @@ clouds and hulls); privileged simulator state enters only through `OracleKnowled
   place pose (compartment reach); (4) curobo imports from the main tree's editable install even under the worktree
   PYTHONPATH. The review outcome and the per-task table are at the end of this file.
 
+## Merged: assisted grasp (2026-09-25)
+
+Branch `dev/assisted-grasp` (root 29accf353 .. ab67febce, submodule a953a9a .. 05552fe; cut from the first tier-1
+commit d91c899e5 / c207733) merged into this line after the review fix pass: submodule merge a68ca53, root merge the
+commit this note arrives in. cuTAMP untouched (cutamp-24; the source branch never changed it).
+
+- What came in. (1) `r1pro.py: make_r1pro_env_config`: the gripper is the evaluator's `MultiFingerGripperController`
+  in `smooth` mode (eval/r1pro.yaml), the command in [-1, 1] the finger position, +1 open / -1 closed as before;
+  `scene.py: TiptopSim.finger_travel`. (2) `b1k/bridge/executor.py: set_gripper(creep=)`: a `Pick(` close ramps the
+  width command at `GRASP_CLOSE_STEP` (1.4 mm of finger travel per env step) so the assisted weld's 0.3 s of
+  two-finger contact passes before a corner pinch wedges a flat object out; `execute` passes `creep` for `Pick(`
+  labels; presses and opens unchanged. (3) `tiptop_run.py: part_grasps`: the corner jaw across the corner's 45 deg
+  bisector (a pad on each edge, the tip a quarter jaw in; across the diagonal the pads met the 31 cm scanner's edges
+  at 53 / 37 deg and the squeeze turned it out), and `if local.sum() < 3: continue` on the tip kind's 3 cm slices
+  (an empty slice's `min()` killed the whole request on picking_up_toys' jigsaw puzzle). (4) `run.py:
+  in_hand_by_localization`: a hold is the hand point within `HOLD_MARGIN` (5 cm) of the localized BOX, 0 inside it;
+  the centre rule (`HOLD_RADIUS`) only for a source that gives a point and no extent (the 39 x 32 x 48 cm carryall
+  held by its handle had its centre 20+ cm from the hand and every real hold read as a miss). (5) `in_hand.py:
+  in_hand_grasps(labels, positions, points, tool)`: a held hull is the object in the gripper by the tool's distance
+  to its points' box (`HOLD_MARGIN` 5 cm), `run_perception` passing the hulls' points. Tests: `test_tiptop_gripper.py`
+  (new), the executor ramp test, the knowledge hold test, the bisector and empty-slice tests in
+  `test_support_surface_fallback.py`, the large-hull test in `test_in_hand.py`, `test_hidden_held_geometry.py` on
+  the 4-arg form. None of the five had an equivalent on this branch; nothing was dropped from either side.
+- Sim evidence, from the source branch (2026-09-25, before the merge): planned picks closed welded 34 of 45 (39 of
+  77 before), and every weld stayed in the hand. The merged line itself has still not run in the simulator: the
+  Summary's first sim run (A-assist / E-tip / E-part / E-side under `--grasping-mode assisted`) is now also the check
+  that the part and side grasps weld under the smooth gripper and the creeping close.
+- Conflicts that needed judgement. `part_grasps`' corner kind: the review fix pass had removed the `jaw` parameter,
+  so the bisector code is written against the module constant `JAW`; its docstring keeps this branch's text (the
+  `side` kind, thickness read from `support_z`) with the corner sentence replaced. `test_support_surface_fallback.py`:
+  the tier-2 `side` kind gives the empty-slice test's 20 x 5 x 2 cm strip a side grasp from each 5 cm end, so that
+  test counts 14 tools and asserts the 10 top-down ones; the bisector test re-pointed at the 3-arg `part_grasps`.
+  The submodule pointer. Everything on the bridge side auto-merged.
+- Suites after the merge: bridge `OmniGibson/tests/test_tiptop_*.py` 471 passed (468 before); planner
+  `tiptop/tests/` minus `test_tiptop_h5.py` 199 passed, 5 deselected (196 before). Not linted: no ruff in either env.
+
 ## Tier 1 (2026-09-24): A-assist, E-tip, E-part, E-near, E-conj, E-pressface, E-region, auto spec
 
 Commits: c207733 / d91c899e5 (first pass) and this section's second-pass commit in both repos (the near aim uncapped,

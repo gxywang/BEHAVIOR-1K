@@ -202,6 +202,9 @@ class ExecutionSim(StubSim):
     def eef_pose_base(self, arm):
         return np.eye(4)
 
+    def finger_travel(self):
+        return 0.05  # r1pro: each finger joint runs 0 (closed) .. 0.05 m (open)
+
 
 def motion(positions):
     return {"type": "trajectory", "label": "Place(book, box)", "positions": positions, "dt": 0.1}
@@ -278,6 +281,31 @@ def test_full_body_validation_refuses_a_planned_trajectory_before_motor_commands
     assert result["completed"] is False
     assert "validation" in result["error"]
     assert sim.steps == 0
+
+
+def test_a_pick_closes_the_fingers_at_a_creep_then_holds_closed():
+    """The assisted weld needs 0.3 s of two-finger contact; a close at the joint speed cap (8 mm per step) wedged
+    flat objects out of a corner pinch in 3-5 steps. The close ramps the width command so each finger travels at
+    most GRASP_CLOSE_STEP per env step, then holds CLOSE for the usual hold steps."""
+    from omnigibson.tiptop.executor import GRASP_CLOSE_STEP
+
+    sim = ExecutionSim()
+    result = PlanExecutor(sim, gripper_hold_steps=5).execute(
+        {"q_init": [0.0], "steps": [{"type": "gripper", "label": "Pick(book, g1, q1)", "action": "close"}]}
+    )
+    assert result["completed"] is True
+    commands = np.array(sim.finger_commands[:-15])  # the 15 settling steps after the plan repeat the last command
+    assert sim.CLOSE < commands[0] < sim.OPEN and commands[-5:].tolist() == [sim.CLOSE] * 5
+    assert (np.diff(commands) <= 0).all(), "monotonic: the fingers never reopen on the way down"
+    travel = np.diff(np.concatenate([[sim.OPEN], commands])) * sim.finger_travel() / 2  # a command of 2 spans the range
+    assert np.abs(travel).max() <= GRASP_CLOSE_STEP + 1e-9
+    assert len(commands) == pytest.approx(sim.finger_travel() / GRASP_CLOSE_STEP + 5, abs=1.5)
+    assert sim.finger_commands[-1] == sim.CLOSE
+    fist = ExecutionSim()  # a press closes the empty hand in one step, as before
+    PlanExecutor(fist, gripper_hold_steps=5).execute(
+        {"q_init": [0.0], "steps": [{"type": "gripper", "label": "Push(button)", "action": "close"}]}
+    )
+    assert set(fist.finger_commands) == {sim.CLOSE}
 
 
 def test_legs_after_a_planned_grasp_or_release_keep_that_objects_finger_allowance():
