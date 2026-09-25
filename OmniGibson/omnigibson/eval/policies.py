@@ -70,7 +70,13 @@ class WebsocketPolicy:
         self.last_action = self.policy.act(obs).detach().cpu()
         return self.last_action
 
+    @property
+    def done(self) -> bool:
+        """Whether the policy server reported it has nothing left to do this episode."""
+        return bool(getattr(self.policy, "policy_done", False))
+
     def reset(self) -> None:
         if self.policy is not None:
             self.policy.reset()
+            self.policy.policy_done = False
         self.last_action = None

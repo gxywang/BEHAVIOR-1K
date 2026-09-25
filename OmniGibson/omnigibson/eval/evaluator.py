@@ -247,6 +247,11 @@ class Evaluator:
     def step(self) -> Tuple[bool, bool]:
         self.robot_action = self.policy.forward(obs=self.obs)
         obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        if self.cfg.get("stop_when_policy_done", False) and getattr(self.policy, "done", False):
+            # Development option (off by default): once the policy says it is done, the rest of the budget only
+            # holds still, so end the episode here. Metrics are aggregated on the state as it now stands.
+            truncated = True
+            self.stopped_when_policy_done = True
         obs = self._sync_lights_and_get_obs(obs)
         self.obs = self._preprocess_obs(obs)
 

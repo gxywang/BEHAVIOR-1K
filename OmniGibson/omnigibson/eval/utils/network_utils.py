@@ -57,6 +57,8 @@ class WebsocketClientPolicy:
         self._packer = Packer()
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
+        # Set from each reply's optional "policy_done": the policy has no further actions for this episode.
+        self.policy_done = False
         self._allow_reconnect = allow_reconnect
 
     def get_server_metadata(self) -> Dict:
@@ -124,6 +126,7 @@ class WebsocketClientPolicy:
                         continue
                     raise RuntimeError(f"Server response missing 'action' key: {action_dict}")
                 action = th.from_numpy(deepcopy(action_dict["action"])).to(th.float32)
+                self.policy_done = bool(action_dict.get("policy_done", False))
                 return action
 
             except websockets.exceptions.ConnectionClosedError as e:

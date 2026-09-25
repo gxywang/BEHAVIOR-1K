@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         help="Episode timeout in steps. Default (None) = 1.5x mean human-demo length.",
     )
     parser.add_argument(
+        "--stop-when-policy-done",
+        action="store_true",
+        help="Development only: end an episode once the websocket policy replies policy_done, instead of stepping "
+        "the held robot to the timeout. Off by default; official evaluation runs the full budget.",
+    )
+    parser.add_argument(
         "--env-wrapper",
         default="omnigibson.eval.wrappers.DefaultWrapper",
         help="Target path of the EnvironmentWrapper to apply.",
@@ -133,6 +139,7 @@ def main() -> None:
             "headless": args.headless,
             "partial_scene_load": True,
             "max_steps": args.max_steps,
+            "stop_when_policy_done": args.stop_when_policy_done,
             "write_video": args.write_video,
             "mode": args.mode,
             "seed": seed,
@@ -160,6 +167,7 @@ def main() -> None:
                 video_path = os.path.join(video_dir, f"{args.task_name}_{instance_id}_{rollout_id}.mp4")
                 try:
                     evaluator.reset()
+                    evaluator.stopped_when_policy_done = False
                     if args.write_video:
                         evaluator.start_recording(video_path, rate=args.video_fps)
                     terminated = truncated = False
@@ -174,6 +182,7 @@ def main() -> None:
                         metrics.update(metric.aggregate(evaluator.env))
 
                     result = {
+                        "stopped_when_policy_done": bool(getattr(evaluator, "stopped_when_policy_done", False)),
                         "task": args.task_name,
                         "instance_id": int(instance_id),
                         "rollout_id": rollout_id,
