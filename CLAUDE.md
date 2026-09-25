@@ -1,3 +1,4 @@
 # CLAUDE.md
 
 @AGENTS.md
+@AGENT_INSTRUCT.md
