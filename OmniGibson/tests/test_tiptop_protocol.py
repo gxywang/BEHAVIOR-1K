@@ -143,6 +143,15 @@ def test_saved_observation_is_the_whole_request(tmp_path):
     assert again["gt_labels"] == onboard["gt_labels"] and "gt_masks" not in again and "gt_buttons" not in again
 
 
+def test_the_side_grasp_labels_survive_the_h5_so_a_side_entry_round_replays_exactly(tmp_path):
+    from omnigibson.tiptop.protocol import request_from_observation
+
+    req = _request()
+    req["side_grasp"] = ["mug"]  # OracleKnowledge.describe, for a pick round Episode.pick marked
+    save_observation_h5(tmp_path / "obs.h5", req, [0.3, 0.0, 0.5], [1.0, 0.0, 0.0, 0.0])
+    assert request_from_observation(load_observation_h5(tmp_path / "obs.h5"))["side_grasp"] == ["mug"]
+
+
 def test_views_ride_along_validated_and_survive_the_h5(tmp_path):
     from omnigibson.tiptop.protocol import add_view, attach_knowledge, request_from_observation
 

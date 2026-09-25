@@ -23,6 +23,7 @@ from b1k.bridge.articulation import (  # noqa: F401
     grasp_orientations,
     handle_on,
     is_open,
+    joint_frame,
     joint_transform,
     leading_direction,
     opening_travel,
@@ -38,16 +39,27 @@ OPENABLE_TYPES = ("revolute", "prismatic")
 def openable_joints(obj) -> list:
     """Every joint of ``obj`` that could open, as dicts in the WORLD frame.
 
-    Each: name, kind (revolute/prismatic), axis, origin, lower, upper, position, link (the moving link's name).
-    The axis a joint reports is a letter in its own local frame, so it is composed with the parent link's pose to
-    get a world direction; the origin likewise. Joints with no range are skipped -- a fixed joint cannot open.
+    Each: name, kind (revolute/prismatic), axis, origin, lower, upper, position, closed (the limit OmniGibson's
+    Open state counts as shut: the lower one, or the upper where the object's metadata lists the joint with
+    direction -1), link (the moving link's name). The axis a joint reports is a letter in the JOINT's frame,
+    parent * (localPos0, localRot0), so ``joint_frame`` composes it with the parent link's pose; localPos0 is
+    authored at scale 1 and the scene instance's scale multiplies it. Joints with no range are skipped.
 
     Privileged, like the button poses the oracle knowledge source sends: at evaluation the same fields would have
     to come from perception. It is written as a reader so that the rest of the skill does not care which.
     """
     import omnigibson.utils.transform_utils as T
     import torch as th
+    from omnigibson.object_states.open_state import _get_relevant_joints
 
+    # ponytail: a FIXED object's joints are the scanned map's; a movable's (laptop, jar, toolbox) are oracle data
+    # read here unnamed, until an OracleKnowledge hint replaces this reader for non-fixed objects
+    try:
+        _, relevant, directions = _get_relevant_joints(obj)
+        opens_up = {id(j): d for j, d in zip(relevant, directions)}
+    except Exception:  # noqa: BLE001 - no metadata, or a name it does not have: every joint shuts at its lower limit
+        opens_up = {}
+    scale = np.asarray(getattr(obj, "scale", (1.0, 1.0, 1.0)), dtype=np.float64).reshape(3)
     out = []
     for name, joint in (getattr(obj, "joints", None) or {}).items():
         try:
@@ -68,15 +80,19 @@ def openable_joints(obj) -> list:
                 continue
             pos, quat = frame.get_position_orientation()
             rot = T.quat2mat(th.as_tensor(quat)).cpu().numpy().astype(np.float64)
+            local_pos = np.asarray(joint.local_position_0, dtype=np.float64).reshape(3) * scale
+            x, y, z, w = (float(v) for v in np.asarray(joint.local_orientation_0).reshape(4))
+            axis, origin = joint_frame(pos.cpu().numpy(), rot, local_pos, (w, x, y, z), local)
             out.append(
                 {
                     "name": name,
                     "kind": "revolute" if "revolute" in kind or "continuous" in kind else "prismatic",
-                    "axis": rot @ local,
-                    "origin": np.asarray(pos.cpu().numpy(), dtype=np.float64),
+                    "axis": axis,
+                    "origin": origin,
                     "lower": lower,
                     "upper": upper,
                     "position": position,
+                    "closed": lower if opens_up.get(id(joint), 1) == 1 else upper,
                     # the KEY in obj.links, not the link's .name: they differ, and the caller looks the link up
                     # by key. The smoke test on store_honey's cabinet failed with "has no link to take hold of"
                     # for exactly this (2026-09-13).

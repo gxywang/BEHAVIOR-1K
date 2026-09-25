@@ -93,6 +93,7 @@ class Episode:
         self.records = []  # one per round, in order
         self.blind = {}  # goal object -> the distinct stances it could not be seen from (BLIND_LIMIT gives up)
         self.stood = {}  # names -> (x, y) poses stood at for them, so a retry gets a different viewpoint
+        self.opened_at = {}  # container -> (x, y, yaw) it was opened from: its inside was reached from there
         self.floor = sim.floor_name()
         try:  # the pose the scene started the robot at: level by construction, the first place to right it at
             pos, quat = sim.robot.get_position_orientation()
@@ -108,8 +109,18 @@ class Episode:
         the joint says, and at evaluation that verdict would have to come from the hand's own travel and a fresh
         look at the container.
         """
-        from b1k.bridge.articulation import OPEN_FRACTION_SCORED
+        from b1k.bridge.articulation import OPEN_FRACTION_SCORED, is_open
+        from omnigibson.tiptop.articulation import openable_joints
 
+        if fraction == 0.0:  # a close is a push on the moving link, not a pull on its handle (r1pro.push_joint)
+            self.sim.video_caption = f"close {name}"
+            for j in openable_joints(self.sim.scene_object(name)):
+                if is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]):
+                    result = self.sim.push_joint(self.sim.arm, name, j, j["closed"])
+                    self.records.append({"close": name, **result, "step": self.sim.n_steps})
+                    if not result.get("reached"):
+                        log.info(f"{name}.{j['name']} did not shut: {result.get('why') or 'the joint stopped short'}")
+            return self.is_shut(name)
         # open_container chooses its own stance, in front of the container's leading face where the whole pull
         # solves (r1pro.stance_for_grasp); stand_for's stance is built for looking at things and stood 0.9 m off
         # the drawer fronts (2026-09-14)
@@ -160,6 +171,8 @@ class Episode:
         self.records.append({"open": name, **result, "step": self.sim.n_steps})
         if not result.get("opened"):
             log.info(f"{name} did not open: {result.get('why') or 'the joint did not move'}")
+        elif result.get("stance"):
+            self.opened_at[name] = tuple(float(v) for v in result["stance"])
         return bool(result.get("opened"))
 
     def is_floor(self, name: str) -> bool:
@@ -201,7 +214,9 @@ class Episode:
             joints = openable_joints(self.sim.scene_object(name))
         except Exception:
             return False
-        return bool(joints) and not any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
+        return bool(joints) and not any(
+            is_open(j["lower"], j["upper"], j["position"], closed=j.get("closed")) for j in joints
+        )
 
     def stance_key(self) -> tuple:
         """Where the robot is standing, coarsely: 10 cm and 15 degrees. Two rounds run from the same spot see the
@@ -248,9 +263,18 @@ class Episode:
                             f"{upright[1]:.2f}) -- every footprint test is computed in the base frame")
                 self.right(upright)
         fell = False
+        known = self.opened_at.get(names[0]) if len(names) == 1 else None
         for attempt in range(STANCE_ATTEMPTS):
             try:
-                pose = self.sim.place_robot_for(*names, avoid=avoid, refused=refused)
+                pose = None
+                if known is not None and all(np.hypot(known[0] - x, known[1] - y) > 0.05 for x, y in avoid):
+                    try:  # the stance it was opened from: the door is open and its inside was reached from there
+                        self.sim.place_robot(*known, note=f"stand where {names[0]} was opened from")
+                        pose = {"x": known[0], "y": known[1], "yaw": known[2]}
+                    except RuntimeError as why:
+                        log.info(f"the stance {names[0]} was opened from is refused now ({why}); searching")
+                if pose is None:
+                    pose = self.sim.place_robot_for(*names, avoid=avoid, refused=refused)
             except RuntimeError as e:
                 log.info(f"{e}; widening the search to {REACH_FAR} m")
                 try:
@@ -505,9 +529,13 @@ class Episode:
                 break
         return False
 
-    def pick(self, bddl: str) -> bool:
+    def pick(self, bddl: str, into: str | None = None) -> bool:
         """The object in the planned hand after up to ``--rounds`` pick rounds, each from a fresh base pose (a pick
-        that fails, no plan or the object hidden, is retried from somewhere else). False when no pose reaches it."""
+        that fails, no plan or the object hidden, is retried from somewhere else). False when no pose reaches it.
+        ``into``: where it is bound for; a roof within the hand stack over that or over where it rests (a shelf,
+        a fridge bay: ``sim.side_entry``) has the planner take it from the side, this round only
+        (``OracleKnowledge.describe`` -> ``request["side_grasp"]``)."""
+        side = any(self.sim.side_entry(bddl, c) for c in (into, self.support_of(bddl)) if c and not self.is_floor(c))
         for _ in range(self.rounds):
             try:
                 self.stand_for(bddl)
@@ -515,7 +543,9 @@ class Episode:
                 log.warning(f"{bddl}: {e}")
                 return False
             # where the item is *now*: one that was knocked to the floor needs the workspace to reach down to it
+            self.sim.side_grasp = {bddl} if side else set()
             self.plan_and_execute([atom("holding", bddl)], floor=self.reaches_floor(bddl))
+            self.sim.side_grasp = set()
             if self.holding(bddl):
                 return True
             if self.args.grasping_mode != "sticky":

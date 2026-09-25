@@ -115,6 +115,9 @@ class _Sim:
     def hands(self):
         return dict(self.held_objects)
 
+    def label_of(self, bddl):
+        return bddl.replace(".n.01_", "_")
+
     def workspace(self, floor=False):
         return [[0.35, -0.8, -0.05 if floor else 0.25], [1.3, 0.8, 1.6]]
 
@@ -248,7 +251,7 @@ class _Episode(Episode):
 
     def __init__(self, outcomes, arms=("left",), on_table=None, positions=None, unreachable=(), rounds=2):
         self.rounds = rounds  # no Episode.__init__: there is no simulator behind this one
-        self.sim = SimpleNamespace()
+        self.sim = SimpleNamespace(side_entry=lambda item, container: False)
         self.args = SimpleNamespace(grasping_mode="sticky")  # the press fallback is tried (and fails: no sim behind it)
         self.outcomes = list(outcomes)
         self.arms = set(arms)
@@ -1107,3 +1110,18 @@ def test_an_inside_goal_ships_the_container_interior_only_when_the_flag_is_on():
     req = _request()
     source.describe(goal, req, {})
     assert "place_surfaces" not in req
+
+
+def test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_from_the_side():
+    """Episode.pick marks the round when a roof sits within the hand stack over where the item rests or goes
+    (R1ProSim.side_entry); the planner gives that label's side grasps confidence 1.0 (tiptop_run side_grasp)."""
+    goal = [{"predicate": "holding", "args": ["book.n.01_1"]}]
+    sim = _Sim(_masks(book_1=20))
+    source = make_knowledge("oracle", sim, goal)
+    req = _request()
+    source.describe(goal, req, {})
+    assert "side_grasp" not in req, "an unmarked round leaves the request as it is"
+    sim.side_grasp = {"book.n.01_1"}
+    req = _request()
+    source.describe(goal, req, {})
+    assert req["side_grasp"] == ["book_1"]

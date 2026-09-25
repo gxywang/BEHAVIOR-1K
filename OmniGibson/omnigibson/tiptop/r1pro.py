@@ -323,6 +323,8 @@ PLACE_HEIGHT_MAX = 1.5  # m: a board above this is out of the arm's reach from a
 HEADROOM = 0.03  # m the item needs under the next board
 BOARD_REACH = 1.0  # m from the base to the nearest point of a board for it to be placed on from here
 STANDS_ON_TOL = 0.05  # m: a body whose top is within this of a task object's underside is that object's support
+HAND_STACK = 0.21  # m above the fingertips the wrist's link7 sphere tops out (enclosed/hand_stack.out): a top-down
+# hand needs this much clear above what it takes; a shelf or a cavity roof nearer than that means a side grasp
 # What the base can drive over is decided by the base's own underside (see _footprint_free), not by a guess at
 # how thin a thing is: the 8 cm rule that used to live here exempted the toys a task has to pick up.
 # place_robot: the overview camera in the base's frame, (eye dx, eye dy, eye z, target dx, target z); "shoulder" looks
@@ -359,6 +361,12 @@ OPEN_FOLLOW_TOL = 0.02  # m the hand may get ahead of a drawer by before the pul
 OPEN_FOLLOW_TOL_RAD = 0.05  # the same for a door, in radians of the hinge
 OPEN_MIN_FRACTION = 0.20  # of the joint's range: the shortest pull worth making when the arm cannot follow it all
 OPEN_STANCE_TRIES = 120  # (stance, grasp) pairs solved for before a container is given up on
+DOOR_TRAVEL_MAX = math.pi / 2  # rad a side-hinged door is pulled at most: the arc beyond is outside any fixed stance
+LID_FRACTION = 0.85  # of the range a lid (horizontal hinge) is opened at least: past every balance angle measured
+# (car 78%, toolbox / bins / jar under 50%, close/lid_geometry.out); short of it the lid falls shut
+JOINT_TOL = 0.05  # of the range: OmniGibson's own open threshold, and how close a push must bring the joint
+EDGE_INSET = 0.015  # m below a panel's top edge the fingertips pinch it (the "edge" grip)
+EDGE_THICKNESS = 0.01  # ponytail: a panel is assumed 2 cm thick; the jaw is centred 1 cm behind its face
 # A reach ramp that reports a joint behind its target at its LAST step is not a collision on the way: the baseline
 # stopped 'left_arm_joint1 0.12 rad behind at step 121 of 122' and this code 'left_arm_joint2 0.13 rad behind at
 # step 153 of 154' (2026-09-14), a shoulder settling short of a stretched configuration. What matters is where the
@@ -479,6 +487,17 @@ def boards(vertices, faces) -> list[tuple]:
         ]
         result.append((zt, lo, hi, min(over, default=float("inf"))))
     return result
+
+
+def roof_over(mesh, centre_xy, half_xy, z_lo: float, z_hi: float) -> bool:
+    """Whether ``mesh`` has geometry over the rectangle between heights ``z_lo`` and ``z_hi``: rays up from a 3 x 3
+    grid over the rectangle's inner half, any hit within the band."""
+    if mesh is None or not len(mesh.faces) or z_hi <= z_lo:
+        return False
+    c, h = np.asarray(centre_xy, dtype=np.float64), np.asarray(half_xy, dtype=np.float64)
+    origins = np.array([[c[0] + sx * h[0] / 2, c[1] + sy * h[1] / 2, z_lo + 1e-3] for sx in (-1, 0, 1) for sy in (-1, 0, 1)])
+    hits, _, _ = mesh.ray.intersects_location(origins, np.tile([0.0, 0.0, 1.0], (len(origins), 1)))
+    return bool(len(hits)) and bool((np.asarray(hits, dtype=np.float64)[:, 2] <= z_hi).any())
 
 
 def make_r1pro_env_config(
@@ -924,6 +943,71 @@ class R1ProSim(TiptopSim):
         Privileged, like ``button_hints`` and ``openable_joints``. The geometry source is the predicate's own
         definition rather than a task guess: OmniGibson's ``Inside`` is unsatisfiable without a fillable meta link.
         """
+        rect = self.inside_rect(item, container)
+        if rect is None:
+            return None
+        centre, half, floor, ceiling = rect
+        log.info(
+            f"inside({item}, {container}): placing at ({centre[0]:.2f}, {centre[1]:.2f}), floor z={floor:.3f} world, "
+            f"{2 * half[0]:.2f} x {2 * half[1]:.2f} m, under a ceiling of {ceiling:.3f}"
+        )
+        return self.region_box(centre, half, floor, ceiling - floor)
+
+    def side_entry(self, item: str, container: str) -> bool:
+        """Whether ``item`` goes into or comes out of ``container`` sideways: a FIXED container (its mesh is the
+        scanned map's) with geometry over its compartment rectangle within ``HAND_STACK`` above the item's top
+        (``item_height``: the captures' points), a shelf or a cavity roof a top-down hand would hit. A pulled-out
+        drawer's exposed part and an open-top box have none."""
+        obj = self.scene_object(container)
+        if obj is None or not obj.fixed_base:
+            return False
+        rect = self.inside_rect(item, container)
+        if rect is None:
+            return False
+        centre, half, floor, _ = rect
+        top = floor + self.item_height(item)
+        # HEADROOM over the stack: petcxr's right bays leave a 10 cm item 21.3 cm, 4 mm more than the stack, which no
+        # planner margin lets through (side_entry_check.out)
+        roofed = roof_over(self.collision_mesh_world(obj), centre, half, top, top + HAND_STACK + HEADROOM)
+        log.info(f"{container} has {'a' if roofed else 'no'} roof within {HAND_STACK + HEADROOM:.2f} m over {item} (top z={top:.3f})")
+        return roofed
+
+    def bay(self, link, lo, hi, near=None, n: int = 16, levels: int = 8) -> tuple:
+        """The compartment of the fillable ``link`` nearest ``near`` (xy; the AABB centre when None): the accepted point
+        of an n x n x levels grid over the AABB (lo, hi) nearest ``near`` (the lowest of equals), the run of accepted
+        points through it along each axis, and its floor, probed 1 cm at a time straight down from it -- petcxr's two
+        columns start 26 cm apart, so the volume's own bottom is the OTHER column's floor, behind the shut door.
+        (centre xy, half xy, floor z); the AABB's own when nothing is accepted."""
+        xs, ys, zs = (np.linspace(lo[a], hi[a], m + 2)[1:-1] for a, m in ((0, n), (1, n), (2, levels)))
+        accepted = lambda pts: np.asarray(link.check_points_in_volume(th.tensor(pts, dtype=th.float32)))
+        ok = accepted([[x, y, z] for x in xs for y in ys for z in zs]).reshape(n, n, levels)
+        centre, half = (lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2]) / 2.0
+        if not ok.any():
+            return centre, half, float(lo[2])
+        aim = centre if near is None else np.asarray(near, dtype=np.float64)[:2]
+        i, k, l = min(zip(*np.nonzero(ok)),
+                      key=lambda p: (round(float(np.hypot(xs[p[0]] - aim[0], ys[p[1]] - aim[1])), 2), p[2]))  # fmt: skip
+
+        def run(line, at):
+            a = b = at
+            while a > 0 and line[a - 1]:
+                a -= 1
+            while b < len(line) - 1 and line[b + 1]:
+                b += 1
+            return a, b
+
+        i0, i1 = run(ok[:, k, l], i)
+        k0, k1 = run(ok[i, :, l], k)
+        column = np.linspace(zs[l], lo[2], int((zs[l] - lo[2]) / 0.01) + 2)
+        down = accepted([[xs[i], ys[k], z] for z in column])
+        floor = float(column[int(np.argmin(down)) - 1]) if not down.all() else float(lo[2])
+        cell = np.array([xs[1] - xs[0], ys[1] - ys[0]])
+        return (np.array([xs[i0] + xs[i1], ys[k0] + ys[k1]]) / 2.0,
+                (np.array([xs[i1] - xs[i0], ys[k1] - ys[k0]]) + cell) / 2.0, floor)  # fmt: skip
+
+    def inside_rect(self, item: str, container: str) -> tuple | None:
+        """The compartment of ``container`` that ``item`` goes into: (centre xy, half xy, floor z, ceiling z), world
+        frame, a rectangle the fillable volume itself accepts; None, with the reason logged, when there is none."""
         from omnigibson.tiptop.articulation import openable_joints
 
         from b1k.bridge.articulation import is_open
@@ -940,15 +1024,17 @@ class R1ProSim(TiptopSim):
             log.info(f"inside({item}, {container}): no fillable meta link, so there is no interior to place on")
             return None
         joints = openable_joints(obj)
-        opened = [j for j in joints if is_open(j["lower"], j["upper"], j["position"])]
+        opened = [j for j in joints if is_open(j["lower"], j["upper"], j["position"], closed=j.get("closed"))]
         if joints and not opened:
             log.info(f"inside({item}, {container}): every joint of {container} is shut; no region")
             return None
+        near = None
         if opened:  # the compartment belonging to the joint that is furthest open
-            j = max(opened, key=lambda j: abs(float(j["position"])))
+            j = max(opened, key=lambda j: abs(float(j["position"]) - float(j.get("closed", 0.0))))
             moving = obj.links[j["link"]]
             mid = sum(v.cpu().numpy().astype(np.float64) for v in moving.aabb) / 2.0
             link = min(fills, key=lambda l: float(np.abs(l.visual_aabb_center.cpu().numpy() - mid).sum()))
+            near = mid[:2]
         else:  # open-topped: no joint to open, the largest fillable volume is the one
             j, link = None, max(fills, key=lambda l: float(np.prod(l.visual_aabb_extent.cpu().numpy())))
         lo, hi = (v.cpu().numpy().astype(np.float64) for v in link.visual_aabb)
@@ -976,10 +1062,13 @@ class R1ProSim(TiptopSim):
                 log.info(f"inside({item}, {container}): no shelf of {container} in reach has room for it; no region")
                 return None
             lo, hi = np.array([*board[1], board[0]]), np.array([*board[2], board[3]])
+        # fridge petcxr's one fillable volume is two columns with the AABB's centre between them, so every centred
+        # rectangle was refused (spec 6.2); gjeoer / rkgjer span two door bays. The rectangle is centred on the
+        # accepted point nearest the opened door, sized to the run of accepted points about it, on that bay's floor.
+        centre, half, lo[2] = self.bay(link, lo, hi, near=near)
         # where the SCORER will look for the item's AABB centre once it rests on the floor, clamped into the
         # volume so a tall object is still aimed at the floor rather than refused back onto the lid
         z_rest = min(lo[2] + (ihi[2] - ilo[2]) / 2.0, (lo[2] + hi[2]) / 2.0)
-        centre, half = (lo[:2] + hi[:2]) / 2.0, (hi[:2] - lo[:2]) / 2.0
         for _ in range(8):  # shrink until the fillable volume itself accepts all four corners: the scorer's gate
             corners = th.tensor(
                 [[centre[0] + sx * half[0], centre[1] + sy * half[1], z_rest] for sx in (-1, 1) for sy in (-1, 1)],
@@ -994,12 +1083,7 @@ class R1ProSim(TiptopSim):
         if 2 * float(half.min()) <= INSIDE_MIN_SIDE:
             log.info(f"inside({item}, {container}): the emerged interior is {2 * half} m, too small to place on")
             return None
-        log.info(
-            f"inside({item}, {container}): placing on {link.name}, floor z={lo[2]:.3f} world, "
-            f"{2 * half[0]:.2f} x {2 * half[1]:.2f} m; the item should rest at z={z_rest:.3f} under a "
-            f"ceiling of {hi[2]:.3f}"
-        )
-        return self.region_box(centre, half, float(lo[2]), float(hi[2] - lo[2]))
+        return centre, half, float(lo[2]), float(hi[2])
 
     def region_box(self, centre_xy, half_xy, z_top: float, dz: float) -> dict:
         """Cuboid kwargs in the base frame for a placement surface at world ``z_top``: the box is sunk so its TOP
@@ -1599,8 +1683,15 @@ class R1ProSim(TiptopSim):
         a flat panel the pressed-face grasp of ``close_on`` is offered at a column of heights (the old behaviour).
         """
         out = []
+        # under the assisted weld a pressed face has no second finger and no ray between the pads (robot.py ~3150):
+        # only what a jaw closes around (a bar) or pinches (a panel's top edge) can take hold
+        pressable = getattr(self.robot, "grasping_mode", "sticky") == "sticky"
         for j in joints:
-            travel = opening_travel(j["kind"], j["lower"], j["upper"], j["position"], fraction)
+            vertical = j["kind"] == "revolute" and abs(float(j["axis"][2])) >= 0.7
+            want = fraction if vertical or j["kind"] != "revolute" else max(fraction, LID_FRACTION)
+            travel = opening_travel(j["kind"], j["lower"], j["upper"], j["position"], want, closed=j.get("closed"))
+            if vertical:  # what a door's arc leaves beyond this is push_joint's to finish
+                travel = float(np.clip(travel, -DOOR_TRAVEL_MAX, DOOR_TRAVEL_MAX))
             link = obj.links.get(j["link"])
             if link is None or abs(travel) < 1e-4:
                 continue
@@ -1649,7 +1740,7 @@ class R1ProSim(TiptopSim):
                      for z in np.linspace(middle - band, middle + band, GRASP_COLUMN_SAMPLES)}
                 )  # fmt: skip
             uprights = [np.array([0.0, 0.0, 1.0]), h["side"]]
-            for z in heights:
+            for z in heights if pressable else ():
                 point = np.array([face_c[0], face_c[1], z], dtype=np.float64)
                 on_surface = self.surface_point(link, point, into)
                 out.append(
@@ -1657,6 +1748,12 @@ class R1ProSim(TiptopSim):
                          press=GRASP_PRESS, lead=lead, rank=(1, abs(float(on_surface[2] - hand_world[2]))),
                          handle=h, nudges=GRASP_NUDGES)
                 )  # fmt: skip
+            # the panel's top edge, pinched from above across its thickness: what a flat panel offers a jaw
+            top = face_c + h["up"] * (h["face_extent"][1] / 2.0 - EDGE_INSET) - lead * EDGE_THICKNESS
+            out.append(
+                dict(joint=j, travel=travel, kind="edge", tips=top, into=-h["up"], jaws=[lead, -lead], press=0.0,
+                     lead=lead, rank=(2, abs(float(top[2] - hand_world[2]))), handle=h, nudges=1)
+            )  # fmt: skip
         out.sort(key=lambda g: g["rank"])
         return out
 
@@ -1760,7 +1857,9 @@ class R1ProSim(TiptopSim):
         return dict(solutions=solutions, poses=poses[: len(solutions)], reached=reached, why=why, lead=lead_b,
                     grasp_pose=grasp_pose, fraction=fraction_done), why  # fmt: skip
 
-    def stance_for_grasp(self, obj, grasps: list, arm: str = "left", limit: int = OPEN_STANCE_TRIES) -> tuple:
+    def stance_for_grasp(
+        self, obj, grasps: list, arm: str = "left", limit: int = OPEN_STANCE_TRIES, with_torso: bool = True
+    ) -> tuple:
         """A base pose in front of the container's leading face from which the whole opening motion solves and
         the arm is clear of the scene, and the grasp it was found for: ((x, y, yaw), grasp, jaw_world) or
         (None, None, None).
@@ -1772,8 +1871,8 @@ class R1ProSim(TiptopSim):
         0.9 m from a drawer front, at furniture backs and against walls.
         """
         aabbs = self.scene_aabbs()
-        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
-        joints_of = self.ik_joint_names(arm, with_torso=True)
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=with_torso)
+        joints_of = self.ik_joint_names(arm, with_torso=with_torso)
         seed = [float(self.q_home[self.planned_joints.index(j)]) if j in self.planned_joints else 0.0 for j in joints_of]
         tried, footprints = 0, {}
         refused = {}
@@ -1945,20 +2044,107 @@ class R1ProSim(TiptopSim):
         hand_world = self.robot.eef_links[arm].get_position_orientation()[0].cpu().numpy().astype(np.float64)
         grasps = self.container_grasps(obj, joints, fraction, hand_world, height=height)
         if not grasps:
-            already = any(is_open(j["lower"], j["upper"], j["position"]) for j in joints)
+            already = any(is_open(j["lower"], j["upper"], j["position"], closed=j.get("closed")) for j in joints)
             return {"opened": already, "why": "already open" if already else f"no joint of {name} can be taken hold of"}
-        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=True)
-        joints_of = self.ik_joint_names(arm, with_torso=True)
-        chosen, jaw_world, plan = None, None, None
+        run = self._drive_joint(arm, obj, grasps, name, stand=stand)
+        if "plan" not in run:
+            return {"opened": False, **run}
+        chosen, plan, done, blocked = run["grasp"], run["plan"], run["waypoints"], run["why"]
+        j = chosen["joint"]
+        now = next((k for k in openable_joints(obj) if k["name"] == j["name"]), j)
+        opened = is_open(now["lower"], now["upper"], now["position"], closed=now.get("closed"))
+        log.info(
+            f"{name}.{j['name']} ({j['kind']}): asked for {chosen['travel']:+.3f}, pulled {done} of {plan['reached']} "
+            f"solved waypoints ({OPEN_PATH_STEPS - 1} in the full path), joint now {now['position']:.3f} of "
+            f"[{now['lower']:.2f}, {now['upper']:.2f}] -- {'OPEN' if opened else 'still closed'}"
+            + (f"; {blocked}" if blocked else "")
+        )
+        out = {"opened": opened, "why": blocked, "joint": j["name"], "position": now["position"], "grip": chosen["kind"],
+               "waypoints": done, "solved": plan["reached"], "held": run["held"], "stance": run["stance"]}  # fmt: skip
+        # a door's arc runs out of any fixed stance (solve_pull keeps a pull reaching OPEN_MIN_FRACTION): what the
+        # pull left is pushed, on the door's inner face
+        target = float(j["position"] + chosen["travel"])
+        if done and j["kind"] == "revolute" and abs(float(now["position"]) - target) > JOINT_TOL * abs(j["upper"] - j["lower"]):
+            pushed = self.push_joint(arm, name, now, target)
+            position = float(pushed.get("position", now["position"]))
+            out.update(pushed=pushed, position=position,
+                       opened=is_open(now["lower"], now["upper"], position, closed=now.get("closed")))  # fmt: skip
+        return out
+
+    def push_grasps(self, obj, j: dict, target: float, hand_world) -> list:
+        """Where the closed hand pushes ``obj``'s moving link toward joint value ``target``: a column of points on
+        the face that TRAILS the link's motion (``handle_on`` read along the motion reversed: a drawer's front as it
+        closes, a door's outer face, its inner face when it is pushed wider), the hand coming in along the motion
+        and its standoff back along it. Best first: nearest the hand's own height."""
+        travel = float(target) - float(j["position"])
+        link = obj.links.get(j["link"])
+        if link is None or abs(travel) < 1e-4:
+            return []
+        mesh = self.link_trimesh_world(link)
+        if mesh is None or not len(mesh.vertices):
+            return []
+        verts = np.asarray(mesh.vertices, dtype=np.float64)
+        motion = leading_direction(j["kind"], j["axis"], j["origin"], verts, travel)
+        h = handle_on(verts, -motion)
+        face_c = np.asarray(h["face_centre"], dtype=np.float64)
+        band = max(0.0, h["face_extent"][1] / 2.0 - GRASP_COLUMN_INSET)
+        out = []
+        for s in np.linspace(-band, band, GRASP_COLUMN_SAMPLES):
+            point = self.surface_point(link, face_c + h["up"] * float(s), motion)
+            out.append(
+                dict(joint=j, travel=travel, kind="push", tips=point, into=motion, jaws=[np.array([0.0, 0.0, 1.0]), h["side"]],
+                     press=0.0, lead=-motion, rank=(0, abs(float(point[2] - hand_world[2]))), handle=h, nudges=0)
+            )  # fmt: skip
+        out.sort(key=lambda g: g["rank"])
+        return out
+
+    def push_joint(self, arm: str, name: str, joint: dict, target: float) -> dict:
+        """Push ``name``'s moving link to joint value ``target`` with the closed hand: a close is a push (5 of
+        13,362 demo closes grasp, and the simulator has no latch), and so is widening a door past where the pull
+        reached. The hand comes in along the link's motion onto the face that trails it (``push_grasps``) and
+        follows ``follow_joint`` waypoints there, contact allowed only with the moving link (``solve_pull``'s body
+        check); the joint counts as there within ``JOINT_TOL`` of its range."""
+        obj = self.scene_object(name)
+        span = abs(float(joint["upper"] - joint["lower"]))
+        hand_world = self.robot.eef_links[arm].get_position_orientation()[0].cpu().numpy().astype(np.float64)
+        grasps = self.push_grasps(obj, joint, target, hand_world)
+        if not grasps:
+            there = abs(float(joint["position"]) - float(target)) <= JOINT_TOL * span
+            return {"reached": there, "why": "" if there else f"nothing of {name}.{joint['name']} to push on"}
+        run = self._drive_joint(arm, obj, grasps, name, take_hold=False)
+        if "plan" not in run:
+            return {"reached": False, **run}
+        now = next((k for k in openable_joints(obj) if k["name"] == joint["name"]), joint)
+        reached = abs(float(now["position"]) - float(target)) <= JOINT_TOL * span
+        log.info(
+            f"{name}.{joint['name']}: pushed {run['waypoints']} of {run['plan']['reached']} waypoints toward "
+            f"{float(target):+.3f}, joint now {now['position']:.3f} -- {'THERE' if reached else 'short'}"
+            + (f"; {run['why']}" if run["why"] else "")
+        )
+        return {"reached": reached, "why": run["why"], "joint": joint["name"], "position": now["position"],
+                "target": float(target), "waypoints": run["waypoints"], "solved": run["plan"]["reached"],
+                "stance": run["stance"]}  # fmt: skip
+
+    def _drive_joint(self, arm: str, obj, grasps: list, name: str, stand: bool = True, take_hold: bool = True) -> dict:
+        """Take the first of ``grasps`` whose whole motion solves and carry it along its joint: the stance
+        (``stand``), the reach to the standoff, the approach, the hold (``take_hold``: close on the handle; else
+        the hand comes closed and pushes), the pull (``follow_pull``) and the retreat. The torso is held while
+        the other hand holds something: a carried item rides its lean. A dict with "why" alone when it stops
+        short; else grasp, plan, waypoints, why, held, stance."""
+        torso = self.other_arm not in self.hands().values()
+        gripper = self.OPEN if take_hold else self.CLOSE
+        ik = self.arm_ik(arm, frame=f"{arm}_gripper_link", with_torso=torso)
+        joints_of = self.ik_joint_names(arm, with_torso=torso)
+        chosen, jaw_world, plan, pose = None, None, None, None
         if stand:
-            pose, chosen, jaw_world = self.stance_for_grasp(obj, grasps, arm=arm)
+            pose, chosen, jaw_world = self.stance_for_grasp(obj, grasps, arm=arm, with_torso=torso)
             if pose is None:
-                return {"opened": False, "why": f"no stance in front of {name} lets the arm reach its handle and pull"}
+                return {"why": f"no stance in front of {name} lets the arm reach its handle and pull"}
             try:
                 self.place_robot(*pose, note=f"stand to open {name}", unfold=False)
             except RuntimeError as exc:  # BasePlacementCollision or an unvalidated destination
-                return {"opened": False, "why": f"opening stance rejected ({exc})"}
-            self.hold(OPEN_SETTLE_STEPS, self.OPEN)
+                return {"why": f"opening stance rejected ({exc})"}
+            self.hold(OPEN_SETTLE_STEPS, gripper)
         # solve from where the robot actually stands (a teleport settles a little off the pose asked for), seeded
         # from the ready posture as the stance search was, not from the travel fold the arms are in now
         q = self.robot.get_joint_positions()
@@ -1977,7 +2163,7 @@ class R1ProSim(TiptopSim):
                 break
             log.info(f"{name}.{g['joint']['name']}: {why}; trying the next grasp")
         if plan is None:
-            return {"opened": False, "why": f"no grasp on {name} solves from here"}
+            return {"why": f"no grasp on {name} solves from here"}
         j = chosen["joint"]
         log.info(
             f"taking hold of {name}.{j['name']} by its {chosen['kind']} at {np.round(chosen['tips'], 3).tolist()} "
@@ -1989,9 +2175,9 @@ class R1ProSim(TiptopSim):
             arm, ik, joints_of, plan["solutions"][0], exclude=(obj.name,), aabbs=aabbs, body=self.container_body(obj, j["link"])
         )
         if not legs and not self.planned_standoff(arm, ik, joints_of, plan["solutions"][0], name):
-            return {"opened": False, "why": f"no collision-free approach to {name}"}
+            return {"why": f"no collision-free approach to {name}"}
         for k, leg in enumerate(legs):
-            stopped = self.ramp_to(self._targets_from(joints_of, leg), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
+            stopped = self.ramp_to(self._targets_from(joints_of, leg), self.posture, gripper, OPEN_SETTLE_STEPS,
                                    note=f"reach the standoff of {name} (leg {k + 1} of {len(legs)})", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
             if stopped is not None and " intersects " in stopped[0]:
                 # refused before it moved: the straight leg sweeps the cabinet (store_honey, 2026-09-22)
@@ -2002,12 +2188,12 @@ class R1ProSim(TiptopSim):
                 measured = [float(q_now[self.joint_index[jn]]) for jn in joints_of]
                 off = float(np.linalg.norm(ik.fk(measured, f"{arm}_gripper_link")[0] - ik.fk(leg, f"{arm}_gripper_link")[0]))
                 if off > OPEN_REACH_SLACK or k + 1 < len(legs):
-                    self.hold(OPEN_SETTLE_STEPS, self.OPEN)
-                    return {"opened": False, "joint": j["name"], "position": j["position"],
+                    self.hold(OPEN_SETTLE_STEPS, gripper)
+                    return {"joint": j["name"], "position": j["position"],
                             "why": f"{stopped[0]} stopped following on the way to the standoff (leg {k + 1} of {len(legs)}, "
                                    f"hand {off * 100:.1f} cm short)"}  # fmt: skip
                 log.info(f"{stopped[0]} settled {stopped[2]:.2f} rad short at the end of the reach; the hand is {off * 100:.1f} cm off the standoff, going on")
-        approach = lambda: self.ramp_to(self._targets_from(joints_of, plan["solutions"][1]), self.posture, self.OPEN,
+        approach = lambda: self.ramp_to(self._targets_from(joints_of, plan["solutions"][1]), self.posture, gripper,
                                         OPEN_SETTLE_STEPS, note=f"approach the handle of {name}", max_vel=OPEN_MAX_JOINT_VEL,
                                         allowed_contacts=self.grasp_contacts(arm, obj))  # fmt: skip
         stopped = approach()
@@ -2017,15 +2203,17 @@ class R1ProSim(TiptopSim):
                 and self.tuck_idle_arm()):  # fmt: skip
             stopped = approach()
         if stopped is not None:
-            return {"opened": False, "why": f"handle approach rejected: {stopped[0]}"}
-        seed, grabbed = self.close_on(arm, ik, obj, j["link"], plan["grasp_pose"], -plan["lead"], plan["solutions"][1],
-                                      joints_of, nudges=chosen["nudges"])  # fmt: skip
-        if not grabbed:
-            log.info(f"nothing to pull on: the assist never took hold of {name}.{j['name']}")
-        # 4. the pull
+            return {"why": f"handle approach rejected: {stopped[0]}"}
+        grabbed = False
+        if take_hold:
+            seed, grabbed = self.close_on(arm, ik, obj, j["link"], plan["grasp_pose"], -plan["lead"], plan["solutions"][1],
+                                          joints_of, nudges=chosen["nudges"])  # fmt: skip
+            if not grabbed:
+                log.info(f"nothing to pull on: the assist never took hold of {name}.{j['name']}")
+        # 4. the pull (or the push: the same waypoints with the hand closed)
         done, blocked = self.follow_pull(arm, joints_of, plan, obj, chosen)
         # 5. let go and back off along the pull, checked like everything else
-        self.hold(OPEN_SETTLE_STEPS, self.OPEN)
+        self.hold(OPEN_SETTLE_STEPS, gripper)
         back = None
         try:
             pos_now, quat_now = ik.fk(plan["solutions"][1 + done], f"{arm}_gripper_link")
@@ -2036,19 +2224,9 @@ class R1ProSim(TiptopSim):
         except Exception as why_r:  # noqa: BLE001 - the retreat is a courtesy
             log.info(f"no retreat solved ({type(why_r).__name__}: {why_r})")
         if back is not None:
-            self.ramp_to(self._targets_from(joints_of, back), self.posture, self.OPEN, OPEN_SETTLE_STEPS,
+            self.ramp_to(self._targets_from(joints_of, back), self.posture, gripper, OPEN_SETTLE_STEPS,
                          note=f"back off from {name}", max_vel=OPEN_MAX_JOINT_VEL)  # fmt: skip
-        after = openable_joints(obj)
-        now = next((k for k in after if k["name"] == j["name"]), j)
-        opened = is_open(now["lower"], now["upper"], now["position"])
-        log.info(
-            f"{name}.{j['name']} ({j['kind']}): asked for {chosen['travel']:+.3f}, pulled {done} of {plan['reached']} "
-            f"solved waypoints ({OPEN_PATH_STEPS - 1} in the full path), joint now {now['position']:.3f} of "
-            f"[{now['lower']:.2f}, {now['upper']:.2f}] -- {'OPEN' if opened else 'still closed'}"
-            + (f"; {blocked}" if blocked else "")
-        )
-        return {"opened": opened, "why": blocked, "joint": j["name"], "position": now["position"], "grip": chosen["kind"],
-                "waypoints": done, "solved": plan["reached"], "held": bool(grabbed)}  # fmt: skip
+        return {"grasp": chosen, "plan": plan, "waypoints": done, "why": blocked, "held": bool(grabbed), "stance": pose}
 
     def place_robot_near(self, support: str, side: str = "auto", standoff: float = 0.30, ignore_names=()) -> dict:
         """Put the robot next to a piece of furniture, facing it ("navigation done" stand-in).

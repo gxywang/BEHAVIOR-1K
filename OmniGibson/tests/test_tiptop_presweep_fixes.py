@@ -132,7 +132,7 @@ def test_an_opening_stance_the_destination_check_refuses_is_reported_not_raised(
     from omnigibson.tiptop.r1pro import BasePlacementCollision
     import inspect
 
-    source = inspect.getsource(R1ProSim.open_container)
+    source = inspect.getsource(R1ProSim._drive_joint)  # the stance is taken here, for open_container and push_joint
     assert "except RuntimeError" in source and issubclass(BasePlacementCollision, RuntimeError)
 
 
@@ -640,7 +640,8 @@ def test_the_idle_arm_is_tucked_when_it_rides_the_torso_into_the_handle_approach
     plan = dict(solutions=[[0.1], [0.2], [0.3]], reached=1, why="", grasp_pose=np.eye(4), lead=np.array([-1.0, 0.0, 0.0]))
     ik = SimpleNamespace(fk=lambda q, frame: (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])), solve=lambda *a, **k: None)
     sim = SimpleNamespace(
-        arm="left", other_arm="right", OPEN=1.0, posture={"right_arm_joint1": 0.0}, q_home=None, planned_joints=[],
+        arm="left", other_arm="right", OPEN=1.0, CLOSE=-1.0, hands=lambda: {}, posture={"right_arm_joint1": 0.0},
+        q_home=None, planned_joints=[],
         scene_object=lambda name: SimpleNamespace(name="cab"), joint_index={"left_arm_joint1": 0},
         robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))},
                               get_joint_positions=lambda: th.zeros(1)),
@@ -653,6 +654,7 @@ def test_the_idle_arm_is_tucked_when_it_rides_the_torso_into_the_handle_approach
         close_on=lambda *a, **kwargs: ([0.2], True), follow_pull=lambda *a: state.append(dict(joint, position=0.25)) or (1, ""),
         hold=lambda n, g: None, arm_hits_scene=lambda *a, **kwargs: False,
     )
+    sim._drive_joint = MethodType(R1ProSim._drive_joint, sim)
     result = R1ProSim.open_container(sim, "left", "cab", stand=False)
     if "right_" in refusal:
         assert result["opened"] and tucks == [1] and ramps.count("approach the handle of cab") == 2
@@ -871,9 +873,101 @@ def test_the_widened_retry_is_told_what_the_first_search_refused():
     sim = SimpleNamespace(place_robot_for=place_robot_for, hold=lambda n, g: None, last_gripper=None, n_steps=0,
                           settled_level=lambda x, y: (True, ""), robot=None)
     ep = SimpleNamespace(sim=sim, stood={}, records=[], args=SimpleNamespace(settle_steps=1), last_level=None,
-                         fallen=lambda: False)
+                         fallen=lambda: False, opened_at={})
     ep.stand_for = MethodType(Episode.stand_for, ep)
     assert ep.stand_for("plywood.n.01_1")["x"] == -7.03
     assert calls == [(0.9, [], []), (REACH_FAR, [], [(-6.23, -3.12, np.pi / 2, "paver_sekqqq_0")])]
     ep.stand_for("plywood.n.01_1")  # the next search avoids the stance taken and starts with nothing refused
     assert calls[2] == (0.9, [(-7.03, -2.32)], [])
+
+
+def test_side_entry_is_a_roof_within_the_hand_stack_over_the_item_and_an_open_top_or_a_movable_has_none():
+    """spec S13: the wrist tops out 20.9 cm above the fingertips (enclosed/hand_stack.out), so a board 18 cm above a
+    10 cm item stops a top-down hand (35 of 40 bookcase place rounds had the hand straight down). A movable
+    container's mesh is not ours to read: it is never asked."""
+    case = _shelves([0.44, 0.72])  # the next board's underside 0.70: 16 cm over a 10 cm item on the 0.44 board
+    fixed = SimpleNamespace(fixed_base=True)
+    sim = SimpleNamespace(scene_object=lambda name: fixed, collision_mesh_world=lambda obj: case, item_height=lambda name: 0.10,
+                          inside_rect=lambda item, container: (np.array([0.9, 0.0]), np.array([0.2, 0.4]), 0.44, 0.70))  # fmt: skip
+    sim.side_entry = MethodType(R1ProSim.side_entry, sim)
+    assert sim.side_entry("book_1", "bookcase_1") is True
+    sim.item_height = lambda name: 0.01  # 25 cm clear over a flat sheet: the hand and its margin fit
+    assert sim.side_entry("book_1", "bookcase_1") is False
+    sim.item_height = lambda name: 0.04  # 22 cm: the stack fits by a centimetre, which no planner margin allows
+    assert sim.side_entry("book_1", "bookcase_1") is True
+    walls = [trimesh.creation.box([0.02, 0.8, 0.3]).apply_translation([x, 0.0, 0.59]) for x in (0.69, 1.11)]
+    walls += [trimesh.creation.box([0.44, 0.02, 0.3]).apply_translation([0.9, y, 0.59]) for y in (-0.41, 0.41)]
+    sim.collision_mesh_world = lambda obj: trimesh.util.concatenate(walls + [_shelves([0.44])])  # an open-top bin
+    sim.item_height = lambda name: 0.10
+    assert sim.side_entry("book_1", "bin_1") is False
+    sim.scene_object = lambda name: SimpleNamespace(fixed_base=False)
+    sim.collision_mesh_world = lambda obj: pytest.fail("a movable's mesh must not be read")
+    assert sim.side_entry("book_1", "box_1") is False
+
+
+def test_a_two_column_fillable_gives_a_rectangle_in_the_bay_nearest_the_opened_door():
+    """fridge petcxr's one fillable volume is two columns with the AABB's centre between them, so every centred
+    rectangle was refused and the fridge got no region (spec 6.2). Its columns start 26 cm apart (side_entry_check.out),
+    so the bay's floor is its own, probed down from the bay, not the volume's bottom: that is the other column's."""
+    def accepts(points):
+        x, z = points.numpy()[:, 0], points.numpy()[:, 2]
+        return th.tensor(((np.abs(x - 0.2) < 0.2) & (z >= 0.0)) | ((np.abs(x - 1.0) < 0.2) & (z >= 0.26)))
+
+    link = SimpleNamespace(check_points_in_volume=accepts)
+    lo, hi = np.array([0.0, -0.3, 0.0]), np.array([1.2, 0.3, 0.5])
+    centre, half, floor = R1ProSim.bay(None, link, lo, hi, near=[1.1, 0.0])
+    assert centre[0] == pytest.approx(1.0, abs=0.05) and half[0] == pytest.approx(0.2, abs=0.05)
+    assert centre[1] == pytest.approx(0.0, abs=1e-6) and half[1] == pytest.approx(0.3, abs=0.05)
+    assert floor == pytest.approx(0.26, abs=0.011), "the right column's own floor, not the volume's bottom"
+    centre, half, floor = R1ProSim.bay(None, link, lo, hi, near=[0.1, 0.0])
+    assert centre[0] == pytest.approx(0.2, abs=0.05) and floor == pytest.approx(0.0, abs=0.011)
+    assert R1ProSim.bay(None, SimpleNamespace(check_points_in_volume=lambda p: th.zeros(len(p), dtype=th.bool)),
+                        lo, hi)[0][0] == pytest.approx(0.6)  # nothing accepted: the AABB's own, the caller shrinks it
+
+
+def test_the_stance_a_container_was_opened_from_is_stood_at_again_before_any_search():
+    from omnigibson.tiptop.bench import Episode
+
+    calls = []
+    sim = SimpleNamespace(
+        place_robot=lambda x, y, yaw, note="": calls.append(("place", x, y, yaw)),
+        place_robot_for=lambda *names, **kw: calls.append(("search", names)) or {"x": 9.0, "y": 9.0, "yaw": 0.0},
+        hold=lambda n, g: None, last_gripper=None, n_steps=0, settled_level=lambda x, y: (True, ""), robot=None,
+    )  # fmt: skip
+    ep = SimpleNamespace(sim=sim, stood={}, records=[], args=SimpleNamespace(settle_steps=1), last_level=None,
+                         fallen=lambda: False, opened_at={"fridge.n.01_1": (1.0, 2.0, 0.5)})  # fmt: skip
+    ep.stand_for = MethodType(Episode.stand_for, ep)
+    assert ep.stand_for("fridge.n.01_1") == {"x": 1.0, "y": 2.0, "yaw": 0.5} and calls == [("place", 1.0, 2.0, 0.5)]
+    ep.stand_for("fridge.n.01_1")  # a second call for the same object stands somewhere else, as ever
+    assert calls[-1] == ("search", ("fridge.n.01_1",))
+    ep.stand_for("fridge.n.01_1", "jar.n.01_1")  # a pair is the pair's own search
+    assert calls[-1] == ("search", ("fridge.n.01_1", "jar.n.01_1"))
+
+
+def test_closing_pushes_every_open_joint_to_its_closed_end_and_a_roofed_pick_is_marked_for_the_side_grasp(monkeypatch):
+    from omnigibson.tiptop import articulation
+    from omnigibson.tiptop.bench import Episode
+
+    joints = [dict(name="j_door", lower=0.0, upper=1.6, position=1.2, closed=0.0),
+              dict(name="j_lid", lower=-1.0, upper=0.0, position=-0.02, closed=0.0),  # hung the other way: shut
+              dict(name="j_drawer", lower=0.0, upper=0.4, position=0.3, closed=0.0)]  # fmt: skip
+    monkeypatch.setattr(articulation, "openable_joints", lambda obj: joints)
+    pushes = []
+    sim = SimpleNamespace(arm="left", n_steps=0, scene_object=lambda name: "fridge",
+                          push_joint=lambda arm, name, j, target: pushes.append((j["name"], target)) or {"reached": True, "why": ""})  # fmt: skip
+    ep = SimpleNamespace(sim=sim, records=[], spec=None, is_shut=lambda name: True)
+    ep.open_up = MethodType(Episode.open_up, ep)
+    assert ep.open_up("fridge.n.01_1", fraction=0.0) is True
+    assert pushes == [("j_door", 0.0), ("j_drawer", 0.0)] and [r["close"] for r in ep.records] == ["fridge.n.01_1"] * 2
+
+    marks = []
+    ep, _ = _pick_ep(attached_first=None, target=SimpleNamespace(name="book_1"), grasping_mode="assisted")
+    ep.sim.side_entry = lambda item, container: container == "bookcase.n.01_1"
+    ep.support_of, ep.is_floor = lambda b: "bookcase.n.01_1", lambda name: False
+    ep.plan_and_execute = lambda atoms, floor=False: marks.append(set(ep.sim.side_grasp))
+    ep.pick("book.n.02_1", into="box.n.01_1")  # out of a shelf
+    assert marks == [{"book.n.02_1"}] and ep.sim.side_grasp == set(), "marked for that round only"
+    ep.pick("book.n.02_1", into="bookcase.n.01_1")  # into one
+    ep.support_of = lambda b: "table.n.02_1"
+    ep.pick("book.n.02_1")
+    assert marks[1:] == [{"book.n.02_1"}, set()]

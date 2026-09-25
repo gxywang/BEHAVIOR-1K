@@ -52,7 +52,7 @@ class TransferEpisode:
     def goal_already_holds(self, predicate, item, target):
         return (predicate, item, target) in self.completed
 
-    def pick(self, item):
+    def pick(self, item, into=None):
         self.calls.append(("pick", item))
         assert self.hand is None, "another pickup must not displace an existing grasp"
         self.hand = item

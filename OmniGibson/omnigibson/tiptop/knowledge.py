@@ -63,6 +63,9 @@ class OracleKnowledge(KnowledgeSource):
         regions = self.sim.inside_regions(atoms) if getattr(self.sim, "send_inside", False) else {}
         if regions:
             request["place_surfaces"] = regions
+        side = getattr(self.sim, "side_grasp", None)  # Episode.pick marked this round: a roof within the hand stack
+        if side:
+            request["side_grasp"] = sorted(self.sim.label_of(name) for name in side)
         counts = {
             name: {label: int(m.sum()) for label, m in zip(labels, view_masks)} for name, view_masks in masks.items()
         }

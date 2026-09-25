@@ -67,8 +67,9 @@ class FakeEpisode:
         return arm in self.arms
 
     # rounds
-    def pick(self, bddl):
+    def pick(self, bddl, into=None):
         self.calls.append(("pick", bddl))
+        self.into = into  # the container the transfer is fetching it for (Episode.pick's side-entry mark)
         if bddl in self.pick_ok:
             self.hand = bddl
             return True
@@ -157,6 +158,50 @@ class FakeEpisode:
             return 0.0
         lo, hi, c = self.boxes[support]["lo"], self.boxes[support]["hi"], self.boxes[item]["center"]
         return float(min(c[0] - lo[0], hi[0] - c[0], c[1] - lo[1], hi[1] - c[1]))
+
+
+class Kitchen(FakeEpisode):
+    """A FakeEpisode that answers from facts the way a :init states them, (predicate, item, container) triples,
+    rather than from boxes: boxes cannot tell an item INSIDE a cabinet from one on its top. A placement rewrites
+    the item's facts, every distance is unknown, and a container starts shut when ``shut`` names it."""
+
+    def __init__(self, facts, **kw):
+        super().__init__({}, **kw)
+        self.facts = set(facts)
+
+    def goal_already_holds(self, predicate, item, container):
+        return (predicate, item, container) in self.facts
+
+    def support_of(self, item):
+        return next((f[2] for f in self.facts if f[0] in ("ontop", "inside") and f[1] == item), self.floor)
+
+    def switched_on(self, name):
+        return ("toggled_on", name) in self.facts
+
+    def edge_gap(self, item, support):
+        return 0.0
+
+    def distance(self, a, b):
+        raise NotImplementedError  # Runner.gap reads it as infinitely far: transfers go in goal order
+
+    def open_up(self, name, fraction=None):
+        self.calls.append(("open_up", name, fraction))
+        if self.opens_ok:
+            (self.shut.add if fraction == 0.0 else self.shut.discard)(name)
+        return self.opens_ok
+
+    def achieve(self, atoms, arm="left", floor=None):
+        self.calls.append(("achieve", tuple(a["predicate"] for a in atoms), tuple(atoms[0]["args"]), arm))
+        for a in atoms:
+            if len(a["args"]) == 2:
+                self.facts = {f for f in self.facts if a["args"][0] not in f[1:]} | {(a["predicate"], *a["args"])}
+        self.hand = None
+        return True
+
+    def put_down(self, bddl, support, floor=None):
+        if super().put_down(bddl, support, floor=floor):
+            self.facts = {f for f in self.facts if bddl not in f[1:]} | {("ontop", bddl, support)}
+        return self.put_down_ok
 
 
 def basket_world():
@@ -924,6 +969,58 @@ def test_only_an_inside_placement_waits_for_the_container_to_open():
     kinds = [c[0] for c in ep.calls]
     assert "open_up" not in kinds, "an ontop placement must not try to open its target"
     assert "pick" in kinds, "and must not be refused because that target would not open"
+
+
+def test_a_shut_source_container_holding_the_item_is_opened_before_the_pick_and_closed_at_the_end():
+    """freeze_fruit: the tupperware starts inside a shut cabinet and is wanted inside the fridge, which the goal
+    wants shut again (spec S27, S28). The runner opened only placement targets, so the pick reached into a closed
+    cabinet, and nothing it opened was ever shut again."""
+    from b1k.bridge.articulation import OPEN_FRACTION_REACH
+
+    tub, cabinet, fridge = "tupperware.n.01_1", "cabinet.n.01_1", "electric_refrigerator.n.01_1"
+    goal = [atom("inside", tub, fridge), atom("not", "open", fridge)]
+    ep = Kitchen({("inside", tub, cabinet)}, pick_ok={tub}, shut={cabinet, fridge})
+    strategy_for("freeze_fruit", goal).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    opens = [(c[1], c[2]) for c in ep.calls if c[0] == "open_up"]
+    assert opens[:2] == [(fridge, OPEN_FRACTION_REACH), (cabinet, OPEN_FRACTION_REACH)], opens
+    assert kinds.index("pick") > kinds.index("open_up"), "both opened before the hand is full"
+    assert ep.into == fridge, "the pick is told where the item is going"
+    assert sorted(opens[2:]) == [(cabinet, 0.0), (fridge, 0.0)], f"both shut at the end: {opens}"
+    closes = [i for i, c in enumerate(ep.calls) if c[0] == "open_up" and c[2] == 0.0]
+    assert min(closes) > max(i for i, k in enumerate(kinds) if k == "achieve"), "and shut only after the placement"
+
+
+def test_an_item_on_a_shut_articulated_counter_opens_nothing():
+    """The bar countertop is an articulated asset, so is_shut() is True of it; a bottle standing ON it is not
+    inside it and needs nothing opened to be taken off (setup_a_bar)."""
+    bottle, counter = "bottle.n.01_1", "countertop.n.01_1"
+    ep = Kitchen({("ontop", bottle, counter)}, pick_ok={bottle}, shut={counter})
+    strategy_for("setup_a_bar_for_a_cocktail_party", [atom("ontop", bottle, "table.n.02_1")]).run(ep)
+    assert not [c for c in ep.calls if c[0] == "open_up"]
+    assert ("pick", "bottle.n.01_1") in ep.calls
+
+
+def test_a_container_the_goal_wants_shut_is_shut_after_the_transfers():
+    """store_produce with the fridge standing open: the goal's not-open atom was worked BEFORE the transfers, so
+    the fridge was shut, opened again to fill it, and left open."""
+    mango, fridge = "mango.n.02_1", "electric_refrigerator.n.01_1"
+    goal = [atom("inside", mango, fridge), atom("not", "open", fridge)]
+    ep = Kitchen({("inside", mango, "wicker_basket.n.01_1")}, pick_ok={mango})  # nothing shut: the fridge is open
+    strategy_for("store_produce", goal).run(ep)
+    kinds = [c[0] for c in ep.calls]
+    assert [c for c in ep.calls if c[0] == "open_up"] == [("open_up", fridge, 0.0)]
+    assert kinds.index("achieve") < kinds.index("open_up"), "shut after the placement, not before"
+
+
+def test_a_container_the_goal_wants_open_is_not_shut_at_the_end():
+    mango, fridge = "mango.n.02_1", "electric_refrigerator.n.01_1"
+    goal = [atom("inside", mango, fridge), atom("open", fridge)]
+    ep = Kitchen({("inside", mango, "wicker_basket.n.01_1")}, pick_ok={mango}, shut={fridge})
+    strategy_for("store_produce", goal).run(ep)
+    opens = [c for c in ep.calls if c[0] == "open_up"]
+    assert opens and all(c[2] != 0.0 for c in opens), opens
+    assert ("achieve", ("inside",), (mango, fridge), "left") in ep.calls
 
 
 def test_a_one_handed_press_stands_for_the_thing_it_presses():

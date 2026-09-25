@@ -109,6 +109,61 @@ def test_is_open_matches_omnigibsons_five_percent_rule_at_both_ends():
     assert not is_open(0.0, 0.4, position=0.39), "a joint resting at its far limit is closed too"
 
 
+def test_a_lid_resting_at_its_open_limit_reads_open_and_closes_toward_its_closed_end():
+    """A laptop or a car trunk rests at its OPEN limit; OmniGibson's Open state counts from the closed end (the lower
+    limit, or the upper one where the metadata lists the joint with direction -1). Without it both ends read shut."""
+    assert not is_open(0.0, 2.4, position=2.4)  # the symmetric rule, still the default
+    assert is_open(0.0, 2.4, position=2.4, closed=0.0)  # the laptop at its open limit
+    assert not is_open(0.0, 2.4, position=2.4, closed=2.4)  # a door hung the other way, resting shut
+    assert opening_travel("revolute", 0.0, 2.4, position=2.4, fraction=0.0, closed=0.0) == pytest.approx(-2.4)
+    assert opening_travel("revolute", 0.0, 2.4, position=0.1, fraction=0.5, closed=0.0) == pytest.approx(1.1)
+    assert opening_travel("revolute", -1.6, 0.0, position=-0.2, fraction=0.0, closed=0.0) == pytest.approx(0.2)
+
+
+def test_joint_frame_turns_the_axis_letter_by_the_joints_own_rotation_and_puts_the_hinge_at_its_own_origin():
+    """USD puts the joint frame at parent * (localPos0, localRot0) and the axis letter is in THAT frame. Read as
+    R_parent @ letter through the parent's origin, 38 of 39 challenge hinges led the hand off by more than 30 deg
+    (skill_gap joint_reader_check.out)."""
+    from omnigibson.tiptop.articulation import joint_frame
+
+    quarter = (np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4))  # localRot0: a quarter turn about z, wxyz
+    axis, origin = joint_frame([1.0, 2.0, 0.0], np.eye(3), [0.3, 0.0, 0.5], quarter, [1.0, 0.0, 0.0])
+    assert np.allclose(axis, [0.0, 1.0, 0.0], atol=1e-9), "the X letter, turned 90 deg by localRot0"
+    assert np.allclose(origin, [1.3, 2.0, 0.5])
+    parent = rotation_about([0.0, 0.0, 1.0], np.pi / 2)  # and the parent link's own pose composes on top
+    axis, origin = joint_frame([0.0, 0.0, 0.0], parent, [0.3, 0.0, 0.5], quarter, [1.0, 0.0, 0.0])
+    assert np.allclose(axis, [-1.0, 0.0, 0.0], atol=1e-9) and np.allclose(origin, [0.0, 0.3, 0.5], atol=1e-9)
+
+
+def test_a_door_open_80_deg_is_pushed_on_the_face_that_trails_its_motion_whichever_way_it_goes():
+    """push_joint (F-close): the closed hand comes in along the link's motion onto the face that trails it, a door's
+    outer face to shut it and its inner face to push it wider. Nothing is taken hold of."""
+    from types import MethodType, SimpleNamespace
+
+    import trimesh
+
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    # a 2 cm panel hinged on a vertical axis through the origin, along +y when shut, swung 80 deg toward -x
+    panel = trimesh.creation.box([0.02, 0.5, 1.0])
+    panel.apply_translation([0.0, 0.25, 0.5])
+    panel.apply_transform(trimesh.transformations.rotation_matrix(np.radians(80), [0.0, 0.0, 1.0]))
+    j = dict(name="j_door", kind="revolute", axis=np.array([0.0, 0.0, 1.0]), origin=np.zeros(3), lower=0.0,
+             upper=1.6, position=np.radians(80), closed=0.0, link="door")  # fmt: skip
+    obj = SimpleNamespace(links={"door": SimpleNamespace(name="door")})
+    sim = SimpleNamespace(link_trimesh_world=lambda link: panel)
+    sim.surface_point = MethodType(R1ProSim.surface_point, sim)
+    hand = np.array([0.0, 0.0, 0.9])
+    for target in (0.0, 1.5):  # shut it; push it wider
+        grasps = R1ProSim.push_grasps(sim, obj, j, target, hand)
+        assert grasps and all(g["kind"] == "push" and g["press"] == 0.0 and g["nudges"] == 0 for g in grasps)
+        motion = np.array([np.cos(np.radians(80)), np.sin(np.radians(80)), 0.0]) * (1.0 if target < j["position"] else -1.0)
+        for g in grasps:
+            assert np.allclose(g["into"], motion, atol=1e-6) and np.allclose(g["lead"], -motion, atol=1e-6)
+            assert (g["tips"] - panel.centroid) @ motion == pytest.approx(-0.01, abs=1e-3), "on the trailing face"
+        assert grasps[0]["tips"][2] == pytest.approx(0.9, abs=0.15), "nearest the hand's own height first"
+
+
 # --------------------------------------------------------------- the handle heuristic
 class _Link:
     """A link with just the box the handle heuristic reads."""

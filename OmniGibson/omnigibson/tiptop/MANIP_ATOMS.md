@@ -188,3 +188,184 @@ and `cutamp-20-near-aim-half-of-allowed.patch`. Suites after integration: bridge
   thin-sheet probe with `--grasping-mode assisted`, judged by `read_run.py` against sweep4), planned part grasps on
   tile / eraser / paintbrush / magazine / jigsaw_puzzle rounds, and one episode each of hiding_Easter_eggs,
   putting_shoes_on_rack and putting_up_Christmas_decorations_inside for E-region.
+
+## Tier 2 (2026-09-24): F-reader, F-revopen, F-close, E-side, E-region petcxr, W-seq
+
+The kitchen group (DESIGN.md section 4). cuTAMP: `install/patches/cutamp-21-side-grasp-lift-first-clear-centimetre.patch`.
+Suites after integration: bridge 422 passed (409 after tier 1); planner 182 passed, 5 deselected (180 after tier 1).
+Integration wired two test fakes the packages could not reach: `test_tiptop_transfer_recovery.py` `TransferEpisode.pick`
+takes `into=None` (7 tests), and `test_movable_surface_cover.py::test_the_lift_rises_until_the_carried_object_clears_the_rim`
+mocks `ee_pose` / `tool_from_ee` for the new `_lift_height` (its expectations are unchanged: a top-down approach).
+Nothing in this tier ran in the simulator; every "unproven" line below is the same fact.
+
+### F-reader: the joint frame is the joint's own, and "closed" is directional (bridge + policy)
+
+- `b1k/bridge/articulation.py: joint_frame(parent_pos, parent_rot, local_pos0, local_rot0_wxyz, letter)` -> (axis,
+  origin) = R_parent @ (R_local0 @ letter), parent_pos + R_parent @ localPos0. `OmniGibson/omnigibson/tiptop/articulation.py:
+  openable_joints` uses it with `joint.local_position_0` (times the instance scale) and `local_orientation_0` (xyzw
+  converted), and adds `"closed"`: the lower limit, or the upper one where `open_state._get_relevant_joints` lists the
+  joint with direction -1. `is_open(..., closed=)` and `opening_travel(..., closed=)` measure from that end;
+  `bench.is_shut`, `r1pro.inside_rect`, `container_grasps`, `open_container`, `push_joint` pass it.
+- Reads: the joint frames of fixed objects (map) and the asset's openable_joint_ids direction metadata. A NON-fixed
+  object's joints (laptop, jar, toolbox) are oracle data read here unnamed: a `# ponytail:` note in `openable_joints`
+  marks it until an OracleKnowledge hint replaces the reader for movables.
+- Tests: `test_tiptop_articulation.py::test_joint_frame_turns_the_axis_letter_by_the_joints_own_rotation_and_puts_the_hinge_at_its_own_origin`,
+  `::test_a_lid_resting_at_its_open_limit_reads_open_and_closes_toward_its_closed_end`.
+- Replay (`T2-articulation/joint_reader_check_after.out`, offline USD, 39 revolute joints of 27 challenge assets): lead
+  error 0.0 deg on 39 of 39 (skill_gap's reader: 38 of 39 over 30 deg), handle miss at 0.5 rad 0.0 cm on 39 of 39 (was
+  9-89 cm), hinge offset 0.000 m. The two assets whose +travel closes (laptop_nvulcs, trash_can_ifzxzj) are what
+  `"closed"` now reads. store_honey's slgzfc prismatic axes are unchanged.
+- Unproven in simulation: any hinge pull with the corrected frame (only drawer pulls were ever recorded, and their
+  prismatic axes did not change).
+
+### F-revopen: doors to 90 deg, lids past balance, grips that weld under assisted (bridge)
+
+- `r1pro.py: container_grasps`: a vertical hinge's travel is clipped to `DOOR_TRAVEL_MAX = pi/2`; a horizontal hinge
+  (lid) asks for at least `LID_FRACTION = 0.85` of its range; under assisted grasping the pressed-face column is dropped
+  (no second finger, no ray between the pads) and a new `edge` grip pinches the panel's top edge from above
+  (`EDGE_INSET` 1.5 cm below the edge, `EDGE_THICKNESS`: the panel is assumed 2 cm thick, ponytail-marked). The stance /
+  reach / approach / hold / pull / retreat of `open_container` is factored into `_drive_joint`, which `push_joint`
+  shares; it solves `with_torso=False` while the other hand holds. A revolute pull that stops more than `JOINT_TOL`
+  (5 % of range) short of its target continues with `push_joint` on the door's inner face.
+- Reads: the robot's grasping mode and `hands()`; the container's mesh as before (fixed: the map).
+- Tests: none of its own. The caps and the edge grip run only through the updated `open_container` fakes in
+  `test_tiptop_presweep_fixes.py` (`test_the_idle_arm_is_tucked_...`, `test_an_opening_stance_the_destination_check_refuses_is_reported_not_raised`,
+  which now inspects `_drive_joint`, where the except moved).
+- Replay: none; no recorded round opens a hinge.
+- Unproven in simulation: whether the edge grip welds under assisted (the finger-to-finger ray must cross a 2 cm panel
+  pinched 1.5 cm below its edge; `EDGE_THICKNESS` is assumed), the 90 deg door pull, the lid at 0.85, the push
+  continuation.
+
+### F-close: a close is a push on the moving link (bridge)
+
+- `r1pro.py: push_grasps` (a column of points on the face that TRAILS the link's motion: `handle_on` read along the
+  motion reversed, the hand coming in along the motion, closed, no nudges) and `push_joint(arm, name, joint, target)` ->
+  {reached, why, position, ...} via `_drive_joint(take_hold=False)`; the arm must clear the container's body
+  (`solve_pull`'s body check). `bench.py: Episode.open_up(name, 0.0)` routes to it: every joint of the container that
+  `is_open` from its closed end is pushed to its `"closed"` value, records get `{"close": name, ...}`, and it returns
+  `is_shut(name)`.
+- Reads: the moving link's mesh (fixed: the map); the joint read-back after the push (privileged, as it always was).
+- Tests: `test_tiptop_articulation.py::test_a_door_open_80_deg_is_pushed_on_the_face_that_trails_its_motion_whichever_way_it_goes`,
+  `test_tiptop_presweep_fixes.py::test_closing_pushes_every_open_joint_to_its_closed_end_and_a_roofed_pick_is_marked_for_the_side_grasp`
+  (a lid 2 % from its upper closed end is left alone).
+- Replay: none; no recorded round closes anything.
+- Unproven in simulation: a live push close. `push_joint` plans against the container's body but executes with the
+  whole container as allowed contact (`grasp_contacts`), not the moving link alone.
+
+### E-side: a grasp from the side where a roof stops a top-down hand (planner + cuTAMP + bridge)
+
+- Planner: `tiptop/tiptop_run.py: part_grasps` gains the `side` kind: 8 yaws about the vertical, approach horizontal
+  at mid-height, the jaw across the width seen from that yaw, tips half the depth in (at most 4 cm), tool columns
+  [up, cross(n, up), n]; each candidate and its 180 deg twin pass `weld_ok`, confidence PART_GRASP_CONFIDENCE. Two gates
+  the design did not name: a yaw whose seen width is >= jaw - 1 cm is skipped (the far face is behind the tips on a
+  partial cloud, so `weld_ok` cannot refuse it), and only objects at least 2 * FINGER_HALF_WIDTH (2 cm) tall get the
+  kind (the finger's width is centred on the tips). `process_scene_geometry(side_grasp=set)`: those labels' side grasps
+  (the one kind with a horizontal approach) get confidence 1.0; `run_perception` passes the request's `side_grasp`;
+  `perception_wrapper.extract_gt_detections` reads the key.
+- cuTAMP (cutamp-21): `motion_solver._lift_height` reads the approach axis from the kinematic state it already
+  computes (`ee_pose` @ inverse(`world.tool_from_ee`), column z); |z . up| < 0.7 (within ~45 deg of horizontal; the
+  45 deg edge kind at 0.7071 keeps LIFT_HEIGHT) steps 1 cm up to 5 cm, else the old 5 cm steps to 30 cm. The Place is
+  untouched (approach and retreat along the gripper axis).
+- Bridge: `r1pro.py: HAND_STACK = 0.21`, `roof_over(mesh, centre, half, z_lo, z_hi)` (3 x 3 rays up over the
+  rectangle's inner half) and `R1ProSim.side_entry(item, container)`: the container must be `fixed_base` (a movable's
+  mesh is never read), the rectangle is `inside_rect`'s, the band is [floor + `item_height`, + HAND_STACK + HEADROOM].
+  `bench.py: Episode.pick(bddl, into=None)` sets `sim.side_grasp = {bddl}` around each pick round when
+  `side_entry(bddl, into)` or `side_entry(bddl, support_of(bddl))` (floors skipped), cleared after;
+  `knowledge.py: OracleKnowledge.describe` writes `request["side_grasp"]` = the sorted labels; `protocol.py:
+  KNOWLEDGE_JSON_KEYS` and `request_from_observation`'s copy list carry it. Stance: `bench.py` records
+  `opened_at[name]` = the (x, y, yaw) `open_container` stood at; `stand_for(name)` teleports back there first (when the
+  pose is not in the names' avoid list) and searches only otherwise or when `place_robot` refuses it.
+- Reads: planner, the label's depth cloud and hull, cuRobo kinematics and obstacle costs; bridge, a fixed container's
+  collision mesh (map), the item's height from the captures' own box (points). The privileged decision (a roof within
+  the hand stack) never enters the planner: it arrives as the request key `side_grasp`, filled only through
+  `OracleKnowledge.describe` from `Episode.pick`'s per-round mark.
+- Tests: `tiptop/tests/test_support_surface_fallback.py::test_a_standing_book_gets_side_grasps_and_side_grasp_makes_them_certain`
+  (a 22 x 3 x 30 cm book on edge: 4 side grasps from its two ends, then 1.0 with the label marked, M2T2's 0.6 and an
+  unmarked book's 0.2 untouched), `tiptop/tests/test_lift_off_support.py::test_a_side_grasped_lift_stops_at_the_first_clear_centimetre`
+  (5 mm in the desk: LIFT_HEIGHT top-down, 0.01 sideways; 3.5 cm in: 0.04; 15 cm in: the 0.05 cap);
+  `test_tiptop_presweep_fixes.py::test_side_entry_is_a_roof_within_the_hand_stack_over_the_item_and_an_open_top_or_a_movable_has_none`,
+  `::test_the_stance_a_container_was_opened_from_is_stood_at_again_before_any_search`, the side-mark half of
+  `::test_closing_pushes_every_open_joint_...`; `test_tiptop_knowledge.py::test_a_pick_round_marked_for_a_side_entry_names_the_label_the_planner_takes_from_the_side`;
+  `test_tiptop_protocol.py::test_the_side_grasp_labels_survive_the_h5_so_a_side_entry_round_replays_exactly`.
+- Replay, planner (`T2-planner/side_grasps_eval_{before,after}.out`, CPU, every book of the 9 recorded pick rounds of
+  sweep4 re_shelving_library_books i0, the pool = recorded grasps.pt + part grasps through ParticleInitializer's
+  top-N-of-2N rule): before, 0 side grasps anywhere. After: the pick targets lie FLAT (15-26 cm each way, 2.6-4 cm
+  tall) in 9 of 11 goal rows and get 0 side grasps, since every yaw's width is over the jaw: the jaw is the ceiling,
+  not the code, and the S13 bookcase failure (hand straight down on a flat book) needs something else. Small or partial
+  clouds get them: r12 book_2 (7.4 x 3.8 x 2.4 cm, no M2T2) 16 side grasps -> 1024/1024 particles; r26 book_3 12 ->
+  1024/1024 (0 part grasps before). The only rows with both M2T2 and side grasps (r01 book_2, 180 / 336 M2T2, 2 side):
+  at 0.2 they keep 0 of 1024 slots, at 1.0 they keep 21 and 15 (2 distinct poses), i.e. 1.0 makes every draw of them
+  survive, about 2N x side/pool particles, not "the kept half" as DESIGN.md put it.
+- Replay, bridge (`T2-articulation/side_entry_check.out`, decrypted USDs, joint at 80 % of range, a 10 cm item): fridge
+  petcxr True (shelf underside 21.1 cm above the item), bookcase otwukr True, bottom_cabinet slgzfc at store_honey's
+  scale (the pulled-out drawer) False, microwave hjjxmi (17.8 cm cavity) True. Before HEADROOM the right column's 4 mm
+  surplus over the bare stack read False: petcxr's right bays are 31.3 cm tall and leave a 10 cm item 21.3 cm, which no
+  planner margin lets through. DESIGN.md correction: the band is HAND_STACK + HEADROOM, not HAND_STACK.
+- Unproven in simulation: whether a side grasp welds under assisted, whether the palm clears the shelf at mid-height,
+  the 1 cm lift under a shelf, whether ~20 particles on 2 poses are enough beside M2T2's, the stance reuse, a
+  side-marked pick round end to end. M2T2's own horizontal grasps are not raised to 1.0 for the marked labels (one line
+  in `process_scene_geometry` if a live run wants them).
+
+### E-region petcxr: the bay behind the opened door, on its own floor (bridge)
+
+- `r1pro.py: inside_rect` (centre, half, floor, ceiling) is split out of `inside_region` (the box);
+  `R1ProSim.bay(link, lo, hi, near=None, n=16, levels=8)` -> (centre, half, floor): an n x n x levels grid over the
+  fillable AABB, the accepted point nearest the opened link's AABB centre (the lowest of equals), the run of accepted
+  points about it along x and y, and the bay's OWN floor probed 1 cm at a time straight down from it. The floor was not
+  in the contract: petcxr's two columns start 26 cm apart (left from z = -0.243, right-door column from z = 0.019), so
+  the volume's bottom at the item's rest height is the OTHER column, behind the shut door; the single-height bay landed
+  there. `"opened"` is read on the directional joint (F-reader).
+- Reads: the fillable meta-link volumes and the moving link's AABB of fixed objects (map). `inside_rect`'s pre-existing
+  read of the item's AABB is unchanged.
+- Test: `test_tiptop_presweep_fixes.py::test_a_two_column_fillable_gives_a_rectangle_in_the_bay_nearest_the_opened_door`
+  (columns with floors 26 cm apart: the right column's rectangle and its own floor).
+- Replay (`side_entry_check.out`): before the bay-floor fix the region sat in the left column at z = -0.243 (behind the
+  shut door); after, the right column at z = 0.363. DESIGN.md correction: `bay()` returns the floor too.
+- Unproven in simulation: a place into petcxr.
+
+### W-seq: open the source, close what the goal wants shut, after the transfers (policy)
+
+- `b1k/bridge/strategies.py: Runner.transfer`: after the target open (now added to `self.opened`), and only with the
+  hand empty, `support` (the `ep.support_of(item)` `transfer_one` already passes) is opened with OPEN_FRACTION_REACH when
+  it is not a floor, `ep.is_shut(support)` and `Runner.holds(ep, "inside", item, support)`; a failed open returns False
+  like the target case; then `ep.pick(item, into=container)`. `Runner.run`: the opens loop opens only what the goal wants
+  open, before the transfers; a loop after the transfers (before the presses, so a microwave is shut before its press)
+  shuts every wanted-shut name and every `self.opened` container the goal does not want open, when `not ep.is_shut(name)`,
+  via `open_up(name, 0.0)`. `self.opened` is cleared in `run` (the Runner is reused across instances).
+- Reads: `ep.support_of` (localized boxes), `ep.is_shut` (joints, the existing privileged read), `ep.goal_already_holds`
+  (the existing oracle verdict), `ep.is_floor`. Nothing new on the wire.
+- Tests (`test_tiptop_strategies.py`, on a `Kitchen(FakeEpisode)` that answers from (predicate, item, container) facts
+  the way a :init states them, since boxes cannot tell an item inside a cabinet from one on its top):
+  `::test_a_shut_source_container_holding_the_item_is_opened_before_the_pick_and_closed_at_the_end` (freeze_fruit),
+  `::test_an_item_on_a_shut_articulated_counter_opens_nothing` (setup_a_bar),
+  `::test_a_container_the_goal_wants_shut_is_shut_after_the_transfers` (store_produce; fails on the committed runner,
+  which closed first and left it open), `::test_a_container_the_goal_wants_open_is_not_shut_at_the_end`.
+- Replay (`T2-policy/dryrun.py` -> `dryrun.txt`, every task's problem0.bddl grounded offline, `Runner.run` on a Kitchen
+  from its :init; `before_after.out` against the committed runner): 0 of 100 raise; 23 tasks run no rounds (tier-3
+  predicates: not-covered/stained 12, cooked 5, attached 4, real 3, contains+real 3, covered 2, on_fire, frozen,
+  filled); 28 end with a close. freeze_fruit before: open(fridge) -> picks/places, the tupperware's cabinet never
+  opened, nothing shut; after: open(fridge) -> open(cabinet) -> pick -> inside x6 -> close(fridge) -> close(cabinet).
+  storing_food, store_produce and clearing_food_from_table_into_fridge likewise end with a close. Tiers 3 and 4 rerun
+  `dryrun.py` and diff `dryrun.txt`.
+- Unproven in simulation: the whole chain, and one known gap on the live path: `Episode.support_of` (bench.py) uses
+  `judgement.highest_support` -> `placed_over(from_bottom=False)`, which accepts only an item whose bottom is within
+  -2..+15 cm of the candidate's TOP. An item on a shelf inside a shut cabinet or fridge (freeze_fruit's tupperware in
+  cabinet gjeoer) has its bottom far below the cabinet top, so `support_of` answers the floor and the source open never
+  fires live; the dry run passes because the Kitchen answers from :init. Not wired at integration: a behaviour change
+  with no owner in this tier (see below).
+
+### Open after tier 2
+
+- `Episode.support_of` for an item inside a container (above). Two candidate fixes: fall back to the highest candidate
+  whose box contains the item (`placed_over(from_bottom=True)`) when no "on" support is found, which mis-answers an item
+  on the floor under a table's footprint; or tier 3's `Runner.scope` letting `transfer` test `holds("inside", item, c)`
+  over the scope's shut containers, which needs no geometry. Until one lands, W-seq's source open is dead live.
+- `EDGE_THICKNESS` is an assumption (2 cm panel); `push_joint` allows contact with the whole container; no
+  OracleKnowledge hint yet for a non-fixed object's joints (the ponytail notes name all three).
+- curobo imports from the MAIN tree's editable install (`BEHAVIOR-1K/tiptop/curobo/src`) even under the worktree
+  PYTHONPATH; nothing in this tier touches curobo, so the suites are unaffected, but a future curobo change in the
+  worktree would not be what the tests run.
+- `runs/manip_atoms_20260924/T2-articulation-partial/` is superseded by `T2-articulation/{root,tiptop}.diff`.
+- Live checks when a sim slot is free: one fridge task (freeze_fruit or storing_food, petcxr / dszchb) for the open ->
+  side pick -> stance reuse -> push close chain under `--grasping-mode assisted`; store_honey for the unchanged drawer
+  path; a standing-book or cup pick with `side_grasp` set; one place into a bookcase bay with a side-grasped item.
