@@ -995,6 +995,9 @@ def test_the_oracle_world_holds_what_the_skills_said_while_the_fingers_say_held(
     jar = ObjRef("jar.n.01_1", "jar")
     w.apply(WorldUpdate("held", jar, "left"))
     assert w.held("left").value == (jar,) and w.holding(jar).value == ("left",)
+    held["left"] = None  # the fingers still move, or a trial's first step before the sensor's window is full
+    assert w.held("left").value == (jar,), "an unknown reading leaves the record standing (the toolbox demo place: " \
+        "5/5 NOT_HOLDING at step 0 while the setup had just verified the hold)"
     held["left"] = False
     assert w.held("left").value == () and w.held("left").source == "proprio"
     held["left"] = True

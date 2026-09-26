@@ -40,11 +40,11 @@ class OracleWorld:
     # -- the hands ----------------------------------------------------------------------------------------------------
     def held(self, arm) -> Belief:
         sensed = self.grasp.held(arm, self.obs).value
-        if sensed is None:
-            return self._b(None, "proprio")
-        if not sensed:
+        if sensed is False:
             self.hands[arm].clear()
             return self._b((), "proprio")
+        # held, or unknown (the fingers still move, or the sensor's window is not full yet at a trial's first step):
+        # what the skills and the setup recorded stands, as an unknown reading never opens the latch's closed hand
         return self._b(tuple(sorted(self.hands[arm], key=lambda o: o.id)) or None, "belief")
 
     def holding(self, o) -> Belief:
