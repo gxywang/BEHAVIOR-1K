@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from b1k.connector.skills import PressArgs, SkillCall, Status
 from b1k.connector.types import ObjRef
@@ -78,8 +79,12 @@ def test_the_press_cases_load_the_switches_off_the_stove_on_and_the_radio_from_t
     assert all(c["instance"] == 301 and c["setup"]["torso"] == [1.025, -1.45, -0.47, 0.0] for c in switches)
     stove = cases["press_cook_bacon_stove_knob"]["call"]
     assert isinstance(stove.args, PressArgs) and stove.args.want_on is True and stove.arm == "left"
-    held, ab = cases["press_turning_on_radio_held"], cases["press_turning_on_radio_fingertip"]
-    for c in (held, ab):  # the demo situation: the right hand holds the radio, the bench picks the free left hand
-        assert c["mode"] == "train" and c["setup"]["held"] == {"right": "radio_89"} and c["call"].arm is None
-        assert Path(c["demo"]["snapshot"]).is_file() and c["call"].args.want_on is True, "the state is checked here"
-    assert held["call"].variant is None and ab["call"].variant == "press.fingertip"
+    held = cases["press_turning_on_radio_held"]  # the demo situation: the right hand holds the radio, the bench picks the free left hand
+    assert held["mode"] == "train" and held["setup"]["held"] == {"right": "radio_89"} and held["call"].arm is None
+    assert Path(held["demo"]["snapshot"]).is_file() and held["call"].args.want_on is True, "the state is checked here"
+    assert held["call"].variant is None
+    raw = {c["id"]: c for c in yaml.safe_load((ROOT / "tiptop/b1k/skills/bench/press.yaml").read_text())}
+    ab = raw["press_turning_on_radio_fingertip"]
+    assert "press_turning_on_radio_fingertip" not in cases and "not implemented" in ab["skip"], \
+        "the server refuses hand != closed: the case could only return UNSUPPORTED in 0 steps, so it is off the bench"
+    assert ab["call"]["variant"] == "press.fingertip"

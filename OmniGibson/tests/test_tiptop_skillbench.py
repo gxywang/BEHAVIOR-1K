@@ -20,6 +20,7 @@ from b1k.connector.skills import (
     OpenArgs,
     PickArgs,
     PlaceArgs,
+    PressArgs,
     Rel,
     Relation,
     ReleaseArgs,
@@ -378,9 +379,42 @@ def test_a_legacy_failure_takes_its_code_from_the_rounds_own_error_text():
     ("no joint of cabinet.n.01_1 can be taken hold of", "open", (Status.INFEASIBLE, Code.NO_FEATURE, "check")),
     (None, "pick_up", (Status.FAILED, Code.GRASP_MISSED, "execute")),
     ("the joint did not move", "open", (Status.FAILED, Code.STALLED, "execute")),
+    ("TiptopPlanningError: the start posture is in self-collision (the human's idle right arm; cuRobo self-collision "
+     "cost 4.01)", "place", (Status.INFEASIBLE, Code.NO_MOTION, "motion")),  # the server's S1 precheck: no place ran
 ])  # fmt: skip
 def test_the_one_classifier_maps_todays_error_text_to_codes(why, skill, expected):
     assert classify(why, skill) == expected
+
+
+def test_a_legacy_crash_before_any_sim_step_is_a_backend_fault_not_a_wrong_placement():
+    """brisket_legacy: Episode.achieve raised ValueError (the burner is not a task object) before the sim stepped, and
+    the row read placed_wrong / execute for a place that never happened."""
+    env = Env()
+    rt, ep, _ = legacy_rt(env, truth={"ontop": False})
+
+    def boom(atoms, arm="left"):
+        raise ValueError("burner.n.01_1 is not a task object")
+
+    ep.achieve = boom
+    r = DirectConnector(rt, env.step, Host(env), env.raw()).run(SkillCall("place", PlaceArgs(apple, (Relation(Rel.ON, table),)), arm="left"))
+    assert (r.status, r.code, r.phase, r.steps) == (Status.FAILED, Code.BACKEND_ERROR, None, 0), r
+    assert "not a task object" in r.detail
+
+
+def test_a_legacy_press_on_a_device_already_in_the_wanted_state_succeeds_in_zero_steps():
+    """SPEC 6.5 on the legacy lane too: the dispatch pressed toggled_on unconditionally and flipped the device."""
+    env = Env()
+    rt, ep, _ = legacy_rt(env, truth={"toggled_on": True})
+    rt.registry.routing["press"] = {"default": "legacy"}
+    r = DirectConnector(rt, env.step, Host(env), env.raw()).run(
+        SkillCall("press", PressArgs(ObjRef("radio.n.01_1", "radio"), want_on=True), arm="left"))
+    assert (r.status, r.steps, r.detail) == (Status.SUCCEEDED, 0, "already in the wanted state"), r
+    assert ep.sim.n_steps == 0 and not hasattr(ep, "atoms"), "achieve was never called"
+    rt2, ep2, _ = legacy_rt(Env(), truth={"toggled_on": False})
+    rt2.registry.routing["press"] = {"default": "legacy"}
+    r2 = DirectConnector(rt2, Env().step, Host(Env()), Env().raw()).run(
+        SkillCall("press", PressArgs(ObjRef("radio.n.01_1", "radio"), want_on=True), arm="left"))
+    assert ep2.atoms == [{"predicate": "toggled_on", "args": ["radio.n.01_1"]}] and ep2.sim.n_steps == 30
 
 
 # ------------------------------------------------------------------------------------------------ single_round
@@ -514,6 +548,11 @@ def test_a_legacy_trial_is_one_call_with_no_observe_and_holds_the_step_invariant
         "an open's joint value and its source reach the row (SPEC 6.6: theta and its source)"
     s = skillbench.summarize(case, [row, dict(row, status="failed", code="grasp_missed", u0=False)])
     assert (s["n"], s["succeeded"], s["rate"], s["expect_met"], s["u0_all"]) == (2, 1, 0.5, 1, False)
+    assert (s["shadow_judged"], s["agree"]) == (0, 0), "no shadow checker judged: nothing agreed (None is no agreement)"
+    shadow = [dict(row, verdicts={"scorer": True, "perception": None}), dict(row, verdicts={"scorer": True, "perception": True}),
+              dict(row, verdicts={"scorer": True, "perception": False})]
+    s = skillbench.summarize(case, shadow)
+    assert (s["shadow_judged"], s["agree"]) == (2, 1), "two judged, one agrees; the None row counts in neither"
 
 
 def test_a_native_trial_observes_once_and_every_env_step_is_charged_to_it():
@@ -792,6 +831,9 @@ def test_the_bench_cases_load_as_skill_calls_and_a_setup_the_bench_cannot_do_is_
     bad.write_text(yaml.safe_dump([{**first, "setup": {"held": {"left": "apple_2"}}}]))
     with pytest.raises(ValueError, match="needs demo.snapshot"):
         skillbench.load_cases(bad)
+    bad.write_text(yaml.safe_dump([{**{k: v for k, v in first.items() if k != "mode"}, "demo": {"snapshot": "s.json"}}]))
+    with pytest.raises(ValueError, match="names the mode"):
+        skillbench.load_cases(bad), "a mode-less snapshot case fell back to --mode (public_test) over a train snapshot"
 
 
 def test_the_demo_cases_load_with_their_snapshot_mode_and_hands():
@@ -994,17 +1036,60 @@ def test_the_mesh_room_is_todays_physical_meshes_posed_in_the_map_frame():
 def test_the_pseudo_stack_counts_every_oracle_read_and_judges_with_the_scorer(monkeypatch):
     from omnigibson.tiptop.oracle import pseudo_services
 
-    cab = SimpleNamespace(aabb=(th.tensor([0.0, 0.0, 0.0]), th.tensor([1.0, 0.5, 0.9])), fixed_base=True)
-    sim = SimpleNamespace(n_steps=9, max_steps=None, scene_object=lambda n: cab, robot=None,
+    from b1k.connector.world import FurniturePiece, VoxelGrid
+    from omnigibson.tiptop.oracle import mapbuild
+
+    cab = SimpleNamespace(aabb=(th.tensor([0.0, 0.0, 0.0]), th.tensor([1.0, 0.5, 0.9])), fixed_base=True,
+                          category="cabinet", name="cab_1")
+    wall = SimpleNamespace(aabb=(th.tensor([0.0, 0.0, 0.0]), th.tensor([1.0, 0.5, 2.9])), fixed_base=True,
+                           category="floors", name="floor_1")  # no map piece: NOT_FURNITURE
+    sim = SimpleNamespace(n_steps=9, max_steps=None, scene_object=lambda n: cab if "cabinet" in n else wall, robot=None,
                           task_scope=lambda: {}, env=SimpleNamespace(scene=SimpleNamespace(objects=[])))  # fmt: skip
+    occupied = np.zeros((50, 25, 45), dtype=bool)
+    occupied[:, :, :40] = True  # the cabinet's body: top at 0.80; its AABB top is 0.90 (a rail, say)
+    occupied[:2, :, :] = True
+    mapbuild._MAPS[id(sim)] = mapbuild.PseudoMap(sim)  # the per-sim cache is keyed by id(): a collected fake's id can recur
+    mapbuild._MAPS[id(sim)].pieces["cab_1"] = FurniturePiece(ObjRef("cabinet.n.01_1", "cabinet", True), tuple(map(tuple, np.eye(4))),
+                                                             {"body": VoxelGrid(0.02, (0.0, 0.0, 0.0), occupied)}, ())
     routing = {"goal_checker": "scorer", "goal_checkers_shadow": []}
     svc, segmenter = pseudo_services(SimpleNamespace(sim=sim), "planner", routing)
     assert isinstance(svc.goals, GoalPanel) and svc.goals.primary == "scorer" and svc.planner == "planner"
     top = svc.geometry.top_support(ObjRef("cabinet.n.01_1", "cabinet", True))
-    assert top.value.z == pytest.approx(0.9) and top.source == "oracle"
-    assert svc.provenance.take() == {"geometry.top_support": 1}, "counted in pseudo"
+    assert top.value.z == pytest.approx(0.8) and top.source == "map", \
+        "the map's modal top (SPEC 6.2), never the AABB's maximum: bed_1's headboard put the pillow 6.5 cm high"
+    top = svc.geometry.top_support(ObjRef("floors.n.01_1", "floors", True))
+    assert top.value.z == pytest.approx(2.9) and top.source == "oracle", "no piece in the map: the AABB, tagged oracle"
+    assert svc.provenance.take() == {"geometry.top_support": 1}, "the oracle read is counted in pseudo; the map read is not privileged"
     assert isinstance(svc.provenance, ProvenancePolicy) and segmenter.sim is sim
     sim.nearby_obstacles, sim.obstacles, sim.room_collision_scene = lambda collision_map: None, {}, dict
     mesh, _ = pseudo_services(SimpleNamespace(sim=sim), "planner", routing, collision="mesh")
     assert mesh.collision.room((0.0, 0.0, 0.0), 3.0) == Provided([], "oracle", 9)
     assert mesh.provenance.take() == {"collision.room": 1}, "the mesh room is oracle and counted"
+
+
+def test_the_oracle_base_pose_carries_the_bases_height_over_the_floor():
+    """Pose2.z (W2-S2 6a21afb25): the room moved into the base frame sits where the cloud has it, 5 mm down for a
+    standing R1Pro; nothing pinned the z the OracleWorld reads."""
+    from omnigibson.tiptop.oracle.world import OracleWorld
+
+    robot = SimpleNamespace(get_position_orientation=lambda: (th.tensor([1.0, 2.0, 0.005]), th.tensor([0.0, 0.0, 0.0, 1.0])))
+    world = OracleWorld(SimpleNamespace(sim=SimpleNamespace(robot=robot)), grasp=None)
+    pose = world.base_pose().value
+    assert (pose.x, pose.y, pose.yaw) == (1.0, 2.0, 0.0) and pose.z == pytest.approx(0.005)
+
+
+def test_a_demo_restore_loads_the_instance_in_the_cases_mode(monkeypatch):
+    """demo_cases.restore(..., mode): a manip run's stance snapshot is of a public_test instance (bb0680248); the
+    only tests of that change replaced restore with a lambda, so the argument never reached load_task_instance."""
+    import omnigibson.eval.evaluator as evaluator
+    from omnigibson.tiptop.host import demo_cases
+
+    loaded, resets = [], []
+    monkeypatch.setattr(evaluator, "load_task_instance", lambda env, robot, inst, mode: loaded.append((inst, mode)))
+    monkeypatch.setattr("omnigibson.utils.python_utils.recursively_convert_to_torch", lambda x: x)
+    env = SimpleNamespace(reset=lambda: resets.append(1), robots=[SimpleNamespace(name="r1")],
+                          scene=SimpleNamespace(object_registry=lambda k, name: SimpleNamespace(
+                              load_state=lambda st, serialized: None)))  # fmt: skip
+    demo_cases.restore(env, {}, 301, "public_test")
+    demo_cases.restore(env, {}, 188)
+    assert loaded == [(301, "public_test"), (188, "train")] and len(resets) == 4

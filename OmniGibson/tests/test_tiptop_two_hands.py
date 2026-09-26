@@ -2,6 +2,7 @@
 as one bench trial, its U0 in the concurrent form, and the bridge half of S1: adopting the other arm's planner locks
 the idle arm where it stands instead of refusing a posture off the nominal."""
 
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ import pytest
 import torch as th
 
 from b1k.connector.observe import Percept, PerceptInfo, StepObs
-from b1k.connector.skills import HoldArgs, Precheck, PressArgs, SkillCall, SkillResult, Status
+from b1k.connector.skills import Code, HoldArgs, Precheck, PressArgs, SkillCall, SkillResult, Status
 from b1k.connector.types import Fact, ObjRef
 from b1k.runtime.compose import ACTION_SLICES, CLOSED, OPEN
 from b1k.skills.scripted import ScriptedBackend
@@ -147,16 +148,18 @@ def test_the_setup_puts_the_holding_arm_at_its_ready_posture_where_a_pick_leaves
     monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: None)
     q, events = th.arange(4.0), []
     robot = SimpleNamespace(get_joint_positions=lambda: q, keep_still=lambda: events.append("still"),
-                            set_joint_positions=lambda v, drive: events.append(("set", v.tolist(), drive)))
+                            set_joint_positions=lambda v, indices=None, drive=False: events.append(
+                                ("set", v.tolist(), None if indices is None else indices.tolist(), drive)))
     sim = SimpleNamespace(OPEN=1.0, arm="left", robot=robot, planned_joints=["t1", "a1"], q_home=[9.0, 8.0],
-                          joint_index={"t1": 0, "a1": 2, "r1": 3}, stance_ready=None, place_robot=lambda *a, note: None,
+                          arm_idx=th.tensor([0, 2]), stance_ready=None, place_robot=lambda *a, note: None,
                           look_at=lambda *n: None, hold=lambda n, g: events.append(("hold", n)))  # fmt: skip
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
     case = {"id": "c", "setup": {"robot_pose": [1.0, 2.0, 0.0], "ready": "left"},
             "call": SkillCall("press", PressArgs(radio), arm="right")}
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
-    assert events == [("set", [9.0, 1.0, 8.0, 3.0], False), "still", ("hold", 3)], \
-        "the planned joints at q_home outright, nothing else moved, then the settle"
+    assert events == [("set", [9.0, 8.0], [0, 2], False), "still", ("hold", 3)], \
+        "the planned joints at q_home outright by index (no get_joint_positions: a privileged read outside oracle/), " \
+        "nothing else moved, then the settle"
     assert sim.stance_ready == [9.0, 8.0], "the capture's ready posture is where the arm now stands"
     case["setup"]["ready"] = "right"
     with pytest.raises(ValueError, match="not on the bench"):
@@ -169,14 +172,17 @@ def test_a_new_instance_resets_the_lock_a_legacy_round_of_the_last_one_adopted(m
     monkeypatch.setattr("omnigibson.eval.evaluator.load_task_instance", lambda env, robot, inst, mode: None)
     emb = {"arm": "left", "joint_names": ["torso_joint1", "left_arm_joint1"], "q_home": [1.0, -1.6],
            "locked_joints": {"right_arm_joint1": 0.0, "right_gripper_finger_joint1": 0.05}}
-    sim = SimpleNamespace(env=SimpleNamespace(reset=lambda: None), robot=None, arm="right",
+    sim = SimpleNamespace(env=SimpleNamespace(reset=lambda: None), robot=None, arm="right", OPEN=1.0,
                           posture={"left_arm_joint1": -0.8, "torso_joint1": 1.0}, locked_nominal={}, q_home=[0.0] * 7,
+                          held_objects={"jar_of_honey_72": "right"}, last_gripper=CLOSED,  # the last case's held hand
                           reset_embodiment=lambda e: setattr(sim, "arm", e["arm"]))  # fmt: skip
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
     physics, fields = skillbench.load_instance(og, sim, 226, "train", emb)
     assert (sim.arm, sim.posture) == ("left", {"right_arm_joint1": 0.0, "right_gripper_finger_joint1": 0.05})
     assert sim.locked_nominal == {"right_arm_joint1": 0.0} and sim.q_home == [1.0, -1.6]
     assert fields["posture"] == sim.posture, "the base snapshot every case of the instance restores carries it"
+    assert (fields["held_objects"], fields["last_gripper"]) == ({}, 1.0), \
+        "a demo case's hand record (adopt_demo_posture) is not the next instance's: its base starts with empty, open hands"
 
 
 def test_the_finger_settled_knob_sets_the_sensors_test_for_the_process(monkeypatch):
@@ -187,6 +193,42 @@ def test_the_finger_settled_knob_sets_the_sensors_test_for_the_process(monkeypat
     assert ProprioGraspSensor.SETTLED == 0.01
     skillbench.finger_settled(skillbench.parse_args(["--out-dir", "o", "--case", "x.yaml", "--finger-settled", "0.02"]))
     assert ProprioGraspSensor.SETTLED == 0.02
+
+
+def test_the_lease_runs_beside_the_call_by_the_routed_backend_not_the_call_field():
+    """routing.yaml `press: {default: legacy}` with no --backend: the call's backend is None, and the lease used to
+    start beside a legacy round that holds the other hand itself and steps the sim under the live lease."""
+    from b1k.skills.registry import SkillRegistry
+    from b1k.skills.specs import SPECS
+
+    lease = SkillCall("hold", HoldArgs(radio, pose="here"), arm="left")
+    case = {"lease": lease}
+    press = SkillCall("press", PressArgs(radio), arm="right")
+    class Legacy(Press):  # the legacy backend's shape: it captures inside its own sim-clock run
+        name, captures_in_own_run = "legacy", True
+
+    backends = {"legacy": Legacy(), "tiptop": Press()}
+    legacy = SkillRegistry(SPECS, backends, {"press": {"default": "legacy"}})
+    tiptop = SkillRegistry(SPECS, backends, {"press": {"default": "tiptop"}})
+    assert skillbench.lease_for(case, press, 3, legacy) is None, "the legacy round holds the other hand itself"
+    assert skillbench.lease_for(case, press, 3, tiptop) == dataclasses.replace(lease, seed=3)
+    assert skillbench.lease_for(case, dataclasses.replace(press, backend="legacy"), 3, tiptop) is None
+    assert skillbench.lease_for({}, press, 3, tiptop) is None
+
+
+def test_a_refused_lease_ends_the_trial_with_its_refusal_and_never_runs_the_press():
+    """hold_press_ready.e164: the lease was refused NOT_HOLDING (the sensor read None) and press(right) still ran;
+    a toggle would then have scored as a two-handed success with the left hand held by the latch alone."""
+    ran = []
+    refusal = SimpleNamespace(skill="hold", status=Status.PRECONDITION_UNMET, code=Code.NOT_HOLDING)
+    conn = SimpleNamespace(start=lambda call: SimpleNamespace(call_id="h1"), rt=SimpleNamespace(results={"h1": refusal}),
+                           check=lambda call: SimpleNamespace(code=None), run=lambda call: ran.append(call) or call,
+                           abort=lambda h: refusal)  # fmt: skip
+    lease = SkillCall("hold", HoldArgs(radio, pose="here"), arm="left")
+    r = skillbench.one_call(conn, SkillCall("press", PressArgs(radio), arm="right"), lease=lease)
+    assert r is refusal and ran == [], "the row carries the lease's refusal; the press did not run alone"
+    conn.rt.results = {}  # the lease runs: the call goes ahead beside it
+    assert skillbench.one_call(conn, SkillCall("press", PressArgs(radio), arm="right"), lease=lease).skill == "press"
 
 
 def test_the_two_hands_cases_load_with_their_lease():

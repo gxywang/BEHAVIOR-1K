@@ -105,6 +105,8 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[Sk
     setup. With a ``lease`` it is hold_and_press (b1k.connector.api): the lease started first, the observe from where
     the head is (a lease holds the trunk read-only), the call beside it, the lease aborted after."""
     h = conn.start(lease) if lease is not None else None
+    if h is not None and h.call_id in conn.rt.results:  # refused before it ran (not_holding, resource_busy): the
+        return conn.rt.results[h.call_id]  # trial is not two-handed, and its row says so, instead of a lone press
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
         req = ObserveRequest(targets(call), views=views, aim=lease is None)
         call = dataclasses.replace(call, percept=conn.observe(req).id)
@@ -134,6 +136,9 @@ def load_cases(path, ids=None) -> list:
         if setup.get("held") and not demo.get("snapshot"):
             raise ValueError(f"{case['id']}: setup.held needs demo.snapshot (the object is in the hand there)")
         if demo.get("snapshot"):
+            if not case.get("mode"):
+                raise ValueError(f"{case['id']}: a demo.snapshot case names the mode of the instance it was taken on "
+                                 "(train for a human demo, public_test for a manip run's stance)")
             demo["snapshot"] = str(Path(path).resolve().parent / demo["snapshot"])
         case["call"] = from_dict(case["call"], SkillCall)
         if case.get("lease"):
@@ -150,14 +155,19 @@ def make_backends(ep, host, svc) -> dict:
     onto on(), which its result then says."""
     has_cavity = lambda target, item: bool(getattr(ep.sim, "send_inside", False)) and \
         svc.geometry.cavity(target, item).value is not None
-    found = builders.discover()
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
-            "tiptop": TiptopBackend({s: m.build for s, m in found.items()},
-                                    checks={s: m.check for s, m in found.items() if hasattr(m, "check")},
-                                    stops={s: m.stop_state for s, m in found.items() if hasattr(m, "stop_state")},
-                                    updates={s: m.world_updates for s, m in found.items()
-                                             if hasattr(m, "world_updates")}),
+            "tiptop": TiptopBackend.from_modules(builders.discover()),  # its hooks (check, stop_state, ...) by its list
             "scripted": ScriptedBackend()}  # fmt: skip
+
+
+def lease_for(case: dict, call: SkillCall, seed: int, registry: SkillRegistry) -> Optional[SkillCall]:
+    """The case's lease beside the call, unless the backend routing.yaml resolves for the call captures in its own run
+    (a legacy round holds the other hand itself, and steps the sim under a live lease): by the route, not by
+    call.backend, so `press: {default: legacy}` in routing.yaml drops the lease as --backend legacy does."""
+    lease = case.get("lease")
+    if lease is None or getattr(registry.backend_for(call), "captures_in_own_run", False):
+        return None
+    return dataclasses.replace(lease, seed=seed)
 
 
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall,
@@ -224,7 +234,11 @@ def summarize(case: dict, rows: list) -> dict:
         "expect_met": sum(all(r.get(k) == v for k, v in expect.items()) for r in rows),
         "codes": json.dumps(Counter(r["code"] for r in rows)),
         "steps_p50": float(np.percentile(steps, 50)), "steps_p95": float(np.percentile(steps, 95)),
-        "agree": sum(all(v is None or v == r["verdicts"][r["primary"]] for v in r["verdicts"].values()) for r in rows),
+        # the shadow checkers against the primary, over the trials where a shadow judged (None is no agreement: the
+        # perception shadow judges nothing until a host puts head frames in StepObs.sensors)
+        "shadow_judged": sum(any(v is not None for n, v in r["verdicts"].items() if n != r["primary"]) for r in rows),
+        "agree": sum(any(v is not None for n, v in r["verdicts"].items() if n != r["primary"])
+                     and all(v is None or v == r["verdicts"][r["primary"]] for v in r["verdicts"].values()) for r in rows),
         "u0_all": all(r["u0"] for r in rows), "requires_sim_clock": sum(r["requires_sim_clock"] for r in rows),
         "wall_s_mean": round(float(np.mean([r["wall_s"] for r in rows])), 1),
         "lease_kept": sum((r.get("lease") or {}).get("status") == "aborted" for r in rows),  # held to the end
@@ -331,10 +345,9 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         #                 set outright as apply_posture does, the object welded to the hand following at the settle
         if s["ready"] != sim.arm:
             raise ValueError(f"{case['id']}: ready: {s['ready']} is not on the bench (the {sim.arm} arm is planned)")
-        q = sim.robot.get_joint_positions().clone()
-        for j, v in zip(sim.planned_joints, sim.q_home):
-            q[sim.joint_index[j]] = v
-        sim.robot.set_joint_positions(q, drive=False)
+        import torch as th
+
+        sim.robot.set_joint_positions(th.tensor(sim.q_home), indices=sim.arm_idx, drive=False)  # no sim read here
         sim.robot.keep_still()
         sim.stance_ready = [float(v) for v in sim.q_home]
     for name, joints in (s.get("joint_states") or {}).items():  # set outright; the settle below propagates it
@@ -388,6 +401,8 @@ def load_instance(og, sim, instance: int, mode: str, embodiment: dict) -> tuple:
     sim.posture = {j: float(v) for j, v in embodiment["locked_joints"].items()}
     sim.locked_nominal = {j: v for j, v in sim.posture.items() if "finger" not in j}
     sim.q_home = [float(v) for v in embodiment["q_home"]]
+    sim.held_objects, sim.last_gripper = {}, sim.OPEN  # the last case's held hand (adopt_demo_posture) is not this
+    #                                                    instance's: every case of it starts with empty, open hands
     return snapshot(og, sim)
 
 
@@ -523,13 +538,11 @@ def main(argv=None) -> None:
                 observer = CaptureObserver(sim, host, segmenter, args.task)
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
                                            arm=pick_arm(case["call"], held))
-                lease = case.get("lease")  # a legacy round holds the other hand itself: no lease beside it
-                lease = (dataclasses.replace(lease, seed=seed) if lease is not None and call.backend != "legacy"
-                         else None)
+                backends = make_backends(ep, host, svc)
+                lease = lease_for(case, call, seed, SkillRegistry(SPECS, backends, routing))
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
-                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host, svc), routing, observer, call,
-                                                     lease)
+                    r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease)
                 held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
                                 observer.steps, held_by))

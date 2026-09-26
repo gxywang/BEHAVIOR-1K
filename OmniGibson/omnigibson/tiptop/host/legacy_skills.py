@@ -20,6 +20,7 @@ LEGACY_CODES = (
     ("no collision-free base destination", Status.INFEASIBLE, Code.NO_STANCE_HERE, "check"),
     ("can be taken hold of", Status.INFEASIBLE, Code.NO_FEATURE, "check"),
     ("no grasp on", Status.INFEASIBLE, Code.NO_MOTION, "check"),
+    ("self-collision", Status.INFEASIBLE, Code.NO_MOTION, "motion"),  # the server's S1 precheck: nothing planned
 )
 NO_SOLUTION = {"pick_up": Code.NO_GRASP}  # else NO_PLACEMENT
 FAILED_AS = {"pick_up": Code.GRASP_MISSED, "open": Code.STALLED, "close": Code.STALLED,
@@ -102,6 +103,10 @@ class LegacyBackend:
                                f"the legacy wire would place {bent} on top", (), {}, svc.goals.primary,
                                evidence={"degraded_to": "on", "relations": bent})
         n0, r0, err, legacy_ok = self.ep.sim.n_steps, len(self.ep.records), None, False
+        goal = effects(call)
+        if call.skill == "press" and goal and svc.goals.judge(goal, self.observe_now(), who=call.call_id)[0].value is True:
+            return SkillResult(call.call_id, call.skill, self.name, Status.SUCCEEDED, None, "", "already in the wanted "
+                               "state", goal, {}, svc.goals.primary, requires_sim_clock=True)  # SPEC 6.5: 0 steps
         try:
             legacy_ok = bool(self.dispatch[call.skill](call))
         except skillrun.PASSTHROUGH:
@@ -109,7 +114,6 @@ class LegacyBackend:
         except Exception as e:  # noqa: BLE001 - a legacy crash is a result
             err = e
         records = json.loads(json.dumps(self.ep.records[r0:], default=_plain))
-        goal = effects(call)
         verdict, verdicts = svc.goals.judge(goal, self.observe_now(), who=call.call_id)  # the frames after the run
         ok = legacy_ok and err is None if verdict.value is None else bool(verdict.value)
         if ok:
@@ -118,6 +122,8 @@ class LegacyBackend:
             why = err if err is not None else next((r.get("error") or r.get("why") for r in reversed(records)
                                                     if r.get("error") or r.get("why")), None)
             status, code, phase = self.classify(why, call.skill)
+            if phase == "execute" and self.ep.sim.n_steps == n0:  # no known text and the sim never stepped: nothing
+                status, code, phase = Status.FAILED, Code.BACKEND_ERROR, None  # executed, so no execution code
         else:  # the legacy code says it worked; the GoalChecker says the requested relation does not hold
             status, code, phase = Status.FAILED, FAILED_AS.get(call.skill, Code.PLACED_WRONG), "verify"
         ev = {"legacy_ok": legacy_ok, "single_round": self.single, "records": records}
