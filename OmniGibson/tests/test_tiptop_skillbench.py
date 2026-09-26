@@ -915,9 +915,12 @@ def test_the_bench_cases_load_as_skill_calls_and_a_setup_the_bench_cannot_do_is_
     bench = ROOT / "tiptop/b1k/skills/bench"
     cases = {c["id"]: c for f in ("pick_up.yaml", "open.yaml", "close.yaml") for c in skillbench.load_cases(bench / f)}
     assert {"pick_up_freeze_fruit_apple", "pick_up_store_honey_jar", "open_store_honey_drawer",
-            "open_store_batteries_drawer", "close_store_honey_drawer"} <= set(cases)
+            "open_store_batteries_drawer", "close_store_honey_drawer", "open_storing_food_fancyy_door2",
+            "close_storing_food_fancyy_door2"} <= set(cases)
     shut = cases["close_store_honey_drawer"]
     assert isinstance(shut["call"].args, CloseArgs) and shut["setup"]["joint_states"] == {"cabinet.n.01_1": {"j_link_4": 0.31}}
+    door = cases["close_storing_food_fancyy_door2"]  # a door: the same case form, the joint in radians
+    assert door["call"].args.joint == "j_door2" and door["setup"]["joint_states"] == {"cabinet.n.01_3": {"j_door2": 0.7}}
     assert cases["open_store_batteries_drawer"]["call"].args.joint == "j_link_5"
     apple_case = cases["pick_up_freeze_fruit_apple"]
     assert (apple_case["task"], apple_case["instance"], apple_case["seeds"]) == ("freeze_fruit", 301, [0, 1, 2, 3, 4])
