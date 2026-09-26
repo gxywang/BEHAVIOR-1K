@@ -40,7 +40,7 @@ import yaml
 import b1k.runtime.skillrun as skillrun
 from b1k.bridge.protocol import bddl_category
 from b1k.bridge.strategies import STRATEGIES
-from b1k.connector.codec import from_dict
+from b1k.connector.codec import from_dict, to_dict
 from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
@@ -70,8 +70,9 @@ from omnigibson.tiptop.run import (
 
 log = logging.getLogger("omnigibson.tiptop")
 
-SETUP_KEYS = ("robot_pose", "torso", "held")  # held {arm: sim object name} needs demo.snapshot (the object is in
-#                                                 the hand there); object_poses and joint_states join when needed
+SETUP_KEYS = ("robot_pose", "torso", "held", "joint_states")  # held {arm: sim object name} needs demo.snapshot (the
+#                                                 object is in the hand there); joint_states {object: {joint: value}}
+#                                                 (a drawer to close starts open); object_poses joins when needed
 # R1ProSim's command state, which the physics state does not carry: what its own steps (a legacy run, the restore's
 # hold) command the joints nobody plans (posture), which arm plans, where the captures look, both gripper commands
 # (a demo's held hand stays closed) and the hand record (what a legacy round knows the hands hold)
@@ -101,10 +102,10 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",)):
 
 
 def load_cases(path, ids=None) -> list:
-    """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?}, call: to_dict(SkillCall), n,
-    seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode (train), demo {snapshot:
-    a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene needs it; the ones named
-    in ``ids`` when given. A case with ``skip: <reason>`` is left out, its reason logged."""
+    """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?, joint_states?}, call:
+    to_dict(SkillCall), n, seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode
+    (train), demo {snapshot: a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene
+    needs it; the ones named in ``ids`` when given. A case with ``skip: <reason>`` is left out, its reason logged."""
     with open(path) as f:
         cases = [c for c in yaml.safe_load(f) if ids is None or c["id"] in ids]
     for case in cases:
@@ -137,7 +138,9 @@ def make_backends(ep, host, svc) -> dict:
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
             "tiptop": TiptopBackend({s: m.build for s, m in found.items()},
                                     checks={s: m.check for s, m in found.items() if hasattr(m, "check")},
-                                    stops={s: m.stop_state for s, m in found.items() if hasattr(m, "stop_state")}),
+                                    stops={s: m.stop_state for s, m in found.items() if hasattr(m, "stop_state")},
+                                    updates={s: m.world_updates for s, m in found.items()
+                                             if hasattr(m, "world_updates")}),
             "scripted": ScriptedBackend()}  # fmt: skip
 
 
@@ -185,6 +188,7 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2),
         "oracle_reads": dict(r.oracle_reads), "planner_oracle_reads": dict(rt.planner_oracle_reads),
         "requires_sim_clock": r.requires_sim_clock, "evidence": dict(r.evidence),
+        "world_updates": [to_dict(u) for u in r.world_updates],  # an open's joint value and its source (SPEC §6.6)
     }  # fmt: skip
 
 
@@ -298,6 +302,9 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         apply_embodiment_posture(sim, args, embodiment)
         if "robot_pose" in s:
             sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
+    for name, joints in (s.get("joint_states") or {}).items():  # set outright; the settle below propagates it
+        for joint, value in joints.items():
+            sim.scene_object(name).joints[joint].set_pos(float(value))
     if targets(case["call"]):  # a release names nothing: the head stays where the setup left it
         sim.look_at(*(o.id for o in targets(case["call"])))
     sim.hold(args.settle_steps, sim.last_gripper if demo.get("snapshot") else sim.OPEN)

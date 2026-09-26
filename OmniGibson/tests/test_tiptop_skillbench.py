@@ -15,6 +15,7 @@ from b1k.connector.goals import GoalPanel
 from b1k.connector.observe import ObserveRequest, StepObs
 from b1k.connector.skills import (
     Binding,
+    CloseArgs,
     Code,
     OpenArgs,
     PickArgs,
@@ -337,6 +338,8 @@ def test_the_bench_finds_its_backends_by_file_so_a_new_skill_never_edits_it():
     tiptop, scripted = backends["tiptop"], backends["scripted"]
     assert {"pick_up", "open", "close"} <= set(tiptop.builders), "builders/pick.py and builders/articulate.py"
     assert set(tiptop.checks) >= {"pick_up", "open"}, "a builder's check goes with it"
+    assert set(tiptop.stops) >= {"open", "close"} and set(tiptop.updates) >= {"open", "close"}, \
+        "and its stall stop and world updates (articulate.stop_state, articulate.world_updates)"
     assert tiptop.supports(SkillCall("open", OpenArgs(basket))) and not tiptop.supports(SkillCall("wait", None))
     assert scripted.supports(SkillCall("wait", None)) and scripted.name == "scripted"
     assert skillbench.SPECS is __import__("b1k.skills.specs", fromlist=["SPECS"]).SPECS, "one SPECS, in b1k"
@@ -504,6 +507,11 @@ def test_a_legacy_trial_is_one_call_with_no_observe_and_holds_the_step_invariant
     bound = dataclasses.replace(r, binding=(Binding("robot_to_world", 3, 256),))
     assert skillbench.row(case, 0, 3, bound, rt, 40, 2.0, 0.5)["binding"] == [
         {"constraint": "robot_to_world", "satisfied": 3, "of": 256}]
+    opened = dataclasses.replace(r, world_updates=(WorldUpdate("joint", basket, joint="j_link_4", value=0.31,
+                                                               source="oracle"),))
+    (u,) = skillbench.row(case, 0, 3, opened, rt, 40, 2.0, 0.5)["world_updates"]
+    assert (u["kind"], u["joint"], u["value"], u["source"]) == ("joint", "j_link_4", 0.31, "oracle"), \
+        "an open's joint value and its source reach the row (SPEC 6.6: theta and its source)"
     s = skillbench.summarize(case, [row, dict(row, status="failed", code="grasp_missed", u0=False)])
     assert (s["n"], s["succeeded"], s["rate"], s["expect_met"], s["u0_all"]) == (2, 1, 0.5, 1, False)
 
@@ -598,6 +606,13 @@ def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
     case["call"] = SkillCall("release", ReleaseArgs())
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
     assert events == ["torso", "place", "hold"], "a call that names no object frames nothing (look_at() would raise)"
+    events.clear()
+    sim.scene_object = lambda name: SimpleNamespace(joints={"j_link_4": SimpleNamespace(
+        set_pos=lambda v: events.append(("joint", name, v)))})
+    case["setup"]["joint_states"] = {"cabinet.n.01_1": {"j_link_4": 0.31}}
+    skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+    assert events == ["torso", "place", ("joint", "cabinet.n.01_1", 0.31), "hold"], \
+        "a drawer to close starts open: the joint set after the teleport, the settle propagates it"
 
 
 class DemoSim:
@@ -752,8 +767,12 @@ def test_the_latch_gap_is_how_far_the_next_action_would_snap_an_arm():
 
 def test_the_bench_cases_load_as_skill_calls_and_a_setup_the_bench_cannot_do_is_refused(tmp_path):
     bench = ROOT / "tiptop/b1k/skills/bench"
-    cases = {c["id"]: c for f in ("pick_up.yaml", "open.yaml") for c in skillbench.load_cases(bench / f)}
-    assert {"pick_up_freeze_fruit_apple", "pick_up_store_honey_jar", "open_store_honey_drawer"} <= set(cases)
+    cases = {c["id"]: c for f in ("pick_up.yaml", "open.yaml", "close.yaml") for c in skillbench.load_cases(bench / f)}
+    assert {"pick_up_freeze_fruit_apple", "pick_up_store_honey_jar", "open_store_honey_drawer",
+            "open_store_batteries_drawer", "close_store_honey_drawer"} <= set(cases)
+    shut = cases["close_store_honey_drawer"]
+    assert isinstance(shut["call"].args, CloseArgs) and shut["setup"]["joint_states"] == {"cabinet.n.01_1": {"j_link_4": 0.31}}
+    assert cases["open_store_batteries_drawer"]["call"].args.joint == "j_link_5"
     apple_case = cases["pick_up_freeze_fruit_apple"]
     assert (apple_case["task"], apple_case["instance"], apple_case["seeds"]) == ("freeze_fruit", 301, [0, 1, 2, 3, 4])
     assert apple_case["call"] == SkillCall("pick_up", PickArgs(ObjRef("apple.n.01_2", "apple")), arm="left")
