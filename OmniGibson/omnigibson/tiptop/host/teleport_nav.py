@@ -85,9 +85,10 @@ class TeleportNavigator:
         from omnigibson.tiptop.r1pro import BasePlacementCollision
 
         n0 = self.sim.n_steps
-        try:  # an empty hand must unfold at least halfway there, as place_robot_for asks (UNFOLD_MIN)
-            self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw, note=f"go_to {stance.key}",
-                                 min_unfold=0.0 if self.sim.hands() else 0.5)
+        try:  # the arm unfolds as far as it can: UNFOLD_MIN refused every stance the IK service reached from at the
+            #   store_honey jar (25%, the countertop) and the wall switch (0%, a cabinet), where the press succeeded
+            #   with no minimum; place_robot_for itself falls back to the furthest unfold when no stance makes it
+            self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw, note=f"go_to {stance.key}")
         except BasePlacementCollision as e:
             self.steps += self.sim.n_steps - n0
             return NavResult(False, stance, 0, 0, str(e)), obs

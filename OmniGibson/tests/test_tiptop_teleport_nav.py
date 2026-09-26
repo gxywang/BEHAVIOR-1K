@@ -40,7 +40,6 @@ def sim(blocked=lambda x, y: False, refuse=False, search=None):
             raise BasePlacementCollision("base destination rejected: base_link intersects counter", obstacle="counter")
         s.placed.append((x, y, yaw, note, min_unfold))
 
-    s.hands = lambda: {}
     s.xy_radius = lambda name: 0.07
     s.best_base_pose = lambda points, **kw: (s.searched.append((points, kw)), (search, {}))[1]
 
@@ -94,12 +93,9 @@ def test_go_to_teleports_on_the_sim_clock_and_charges_the_move_to_mean_in_shadow
         next(gen)  # ends before its first yield: 0 Runtime steps
     result, obs = done.value.value
     assert result == NavResult(True, stance, 0, MOVE_TO_STEPS) and obs == "obs"
-    assert s.placed == [(1.5, 2.0, 0.3, "go_to ring:0.60:0", 0.5)] and nav.steps == 40, \
-        "the teleport's own sim steps; an empty hand must unfold at least halfway there"
-    s.hands = lambda: {"jar_1": "left"}
-    with pytest.raises(StopIteration):
-        next(nav.go_to(stance, "obs"))
-    assert s.placed[-1][4] == 0.0, "carrying, the unfold is not asked for (place_robot_for's rule)"
+    assert s.placed == [(1.5, 2.0, 0.3, "go_to ring:0.60:0", 0.0)] and nav.steps == 40, \
+        "the teleport's own sim steps; the arm unfolds as far as it can there (no minimum: UNFOLD_MIN refused every " \
+        "stance the IK service reached from, at a jar on a counter and a wall switch over a cabinet)"
     refused = TeleportNavigator(sim(refuse=True))
     with pytest.raises(StopIteration) as done:
         next(refused.go_to(stance, "obs"))
