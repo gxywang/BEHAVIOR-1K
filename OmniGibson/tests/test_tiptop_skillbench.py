@@ -601,6 +601,10 @@ class DemoSim:
     the task scope (BDDL name -> object) and the fingers the fake robot reports."""
 
     OPEN = 1.0
+    overview_view = "shoulder"
+
+    def aim_overview(self, eye, target):
+        self.events.append(("overview", tuple(round(v, 3) for v in eye), tuple(round(v, 3) for v in target)))
 
     def __init__(self, finger_sum=0.02):
         self.arm, self.other_arm, self.n_steps = "left", "right", 0
@@ -640,7 +644,8 @@ class DemoSim:
 
 
 def demo_case(held={"left": "log_176"}):
-    return {"id": "d", "instance": 188, "setup": {"held": dict(held)}, "demo": {"snapshot": "snap.json"},
+    return {"id": "d", "instance": 188, "setup": {"robot_pose": [1.0, 2.0, 0.0], "held": dict(held)},
+            "demo": {"snapshot": "snap.json"},
             "call": SkillCall("place", PlaceArgs(ObjRef("log.n.01_2", "log"), (Relation(Rel.ON, basket),)))}
 
 
@@ -669,7 +674,9 @@ def test_a_demo_case_setup_restores_the_snapshot_adopts_the_human_posture_and_ve
     assert sim.posture["left_gripper_finger_joint1"] == 0.05, "only the idle arm's joints change"
     assert sim.stance_ready == [0.3] * 11, "the planned arm's ready posture is where it stands"
     assert (sim.last_gripper, sim.other_gripper) == (CLOSED, 1.0) and sim.held_objects == {"log_2": "left"}
-    assert sim.events == [("look", ("log.n.01_2", basket.id)), ("hold", 3, CLOSED)], "the settle keeps the hand closed"
+    assert sim.events == [("overview", (-0.5, 3.1, 1.7), (1.7, 2.0, 0.55)), ("look", ("log.n.01_2", basket.id)),
+                          ("hold", 3, CLOSED)], \
+        "the overview camera aimed over the shoulder as place_robot aims it (the restore put the base down, no teleport); the settle keeps the hand closed"
     assert state[1]["last_gripper"] == CLOSED and state[1]["held_objects"] == {"log_2": "left"}
     assert skillbench.pick_arm(case["call"], held) == "left", "the hand that holds the object places it"
     assert skillbench.pick_arm(SkillCall("pick_up", PickArgs(apple)), held) == "right", "a free hand picks"

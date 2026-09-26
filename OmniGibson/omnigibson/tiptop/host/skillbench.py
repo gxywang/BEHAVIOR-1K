@@ -57,6 +57,7 @@ from omnigibson.tiptop.host import demo_cases
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, _plain
+from omnigibson.tiptop.r1pro import OVERVIEW_OFFSETS
 from omnigibson.tiptop.run import (
     add_common,
     add_planner_args,
@@ -260,6 +261,13 @@ def adopt_demo_posture(sim, host, held: dict) -> None:
     sim.held_objects = {labels[ref.id]: arm for arm, ref in held.items() if ref.id in labels}
 
 
+def aim_overview(sim, x: float, y: float, yaw: float) -> None:
+    """The overview camera as place_robot aims it (r1pro.py), for a base the restore put down instead of a teleport."""
+    dx, dy, z, tx, tz = OVERVIEW_OFFSETS[sim.overview_view]
+    c, s = math.cos(yaw), math.sin(yaw)
+    sim.aim_overview((x + dx * c - dy * s, y + dx * s + dy * c, z), (x + tx * c, y + tx * s, tz))
+
+
 def commanded_obs(sim, host):
     """The StepObs the proprio GraspSensor reads: the observation now, with what R1ProSim last commanded."""
     a23 = np.concatenate([sim.commanded_targets()[g] for g in ACTION_SLICES]).astype(np.float32)
@@ -279,6 +287,7 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
             demo_cases.restore(sim.env, json.load(f), int(case["instance"]))
         held = held_refs(sim, s.get("held") or {}, case["call"])
         adopt_demo_posture(sim, host or BenchHost(sim), held)
+        aim_overview(sim, *s["robot_pose"])  # the video's third-person view; no place_robot here to aim it
     else:
         args.torso = s.get("torso")
         apply_embodiment_posture(sim, args, embodiment)
