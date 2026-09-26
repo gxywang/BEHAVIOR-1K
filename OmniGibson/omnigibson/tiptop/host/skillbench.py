@@ -251,6 +251,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--selftest", type=int, default=None, metavar="N",
                    help="SPEC §9's sim self-test instead of the trials: N seeded runs of one scripted trajectory "
                    "from each case's restored state; the proprio and object spread is the sim's noise floor")
+    p.add_argument("--finger-settled", type=float, default=None,
+                   help="the proprio GraspSensor's settled test (rad/s) for this process, over its own 0.01")
     return p.parse_args(argv)
 
 
@@ -381,7 +383,22 @@ def load_instance(og, sim, instance: int, mode: str, embodiment: dict) -> tuple:
     load_task_instance(sim.env, sim.robot, instance, mode=mode)
     sim.env.reset()
     sim.reset_embodiment(embodiment)
+    # the lock as apply_posture leaves it: a legacy round of the previous instance may have adopted the other arm
+    # (its posture then names the left arm, and the restore's hold raised KeyError 'right_arm_joint1')
+    sim.posture = {j: float(v) for j, v in embodiment["locked_joints"].items()}
+    sim.locked_nominal = {j: v for j, v in sim.posture.items() if "finger" not in j}
+    sim.q_home = [float(v) for v in embodiment["q_home"]]
     return snapshot(og, sim)
+
+
+def finger_settled(args) -> None:
+    """--finger-settled: the proprio GraspSensor's settled test for this process (its own is 0.01 rad/s). A welded
+    finger under a held object reports a velocity that never decays while its position never changes (the radio in
+    the left hand at its ready posture: |qvel| 0.010-0.018 over 720 steps, 2026-09-26), so the sensor answers None
+    and refuses the hold; a report-only knob until the sensor settles by position (the pick track's item)."""
+    if args.finger_settled is not None:
+        ProprioGraspSensor.SETTLED = args.finger_settled
+        log.warning(f"the proprio GraspSensor's settled test is {args.finger_settled} rad/s in this process")
 
 
 def spread(rows: list) -> dict:
@@ -453,6 +470,7 @@ def main(argv=None) -> None:
         log.info("gm.USE_GPU_DYNAMICS on: a case asks for it")
     skillrun.PASSTHROUGH = (EpisodeOver,)  # the harness's own exception: no skill may swallow it
     providers, routing = importlib.import_module(args.providers), load_routing()
+    finger_settled(args)
     if args.setup_only:
         client = metadata = press_client = press_meta = None
         embodiment = load_embodiment_meta()

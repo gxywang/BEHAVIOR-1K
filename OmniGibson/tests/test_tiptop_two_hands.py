@@ -163,6 +163,32 @@ def test_the_setup_puts_the_holding_arm_at_its_ready_posture_where_a_pick_leaves
         skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
 
 
+def test_a_new_instance_resets_the_lock_a_legacy_round_of_the_last_one_adopted(monkeypatch):
+    """After a legacy round adopted the right arm, posture names the left arm and the torso; the next instance's
+    base restore then held the right arm from a posture without its joints (KeyError 'right_arm_joint1')."""
+    monkeypatch.setattr("omnigibson.eval.evaluator.load_task_instance", lambda env, robot, inst, mode: None)
+    emb = {"arm": "left", "joint_names": ["torso_joint1", "left_arm_joint1"], "q_home": [1.0, -1.6],
+           "locked_joints": {"right_arm_joint1": 0.0, "right_gripper_finger_joint1": 0.05}}
+    sim = SimpleNamespace(env=SimpleNamespace(reset=lambda: None), robot=None, arm="right",
+                          posture={"left_arm_joint1": -0.8, "torso_joint1": 1.0}, locked_nominal={}, q_home=[0.0] * 7,
+                          reset_embodiment=lambda e: setattr(sim, "arm", e["arm"]))  # fmt: skip
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
+    physics, fields = skillbench.load_instance(og, sim, 226, "train", emb)
+    assert (sim.arm, sim.posture) == ("left", {"right_arm_joint1": 0.0, "right_gripper_finger_joint1": 0.05})
+    assert sim.locked_nominal == {"right_arm_joint1": 0.0} and sim.q_home == [1.0, -1.6]
+    assert fields["posture"] == sim.posture, "the base snapshot every case of the instance restores carries it"
+
+
+def test_the_finger_settled_knob_sets_the_sensors_test_for_the_process(monkeypatch):
+    from b1k.perception.grasp_sensor import ProprioGraspSensor
+
+    monkeypatch.setattr(ProprioGraspSensor, "SETTLED", 0.01)
+    skillbench.finger_settled(SimpleNamespace(finger_settled=None))
+    assert ProprioGraspSensor.SETTLED == 0.01
+    skillbench.finger_settled(skillbench.parse_args(["--out-dir", "o", "--case", "x.yaml", "--finger-settled", "0.02"]))
+    assert ProprioGraspSensor.SETTLED == 0.02
+
+
 def test_the_two_hands_cases_load_with_their_lease():
     cases = skillbench.load_cases(ROOT / "tiptop/b1k/skills/bench/two_hands.yaml")
     assert cases and all(c["task"] == "turning_on_radio" and c["setup"]["held"] == {"left": "radio_89"} for c in cases)
