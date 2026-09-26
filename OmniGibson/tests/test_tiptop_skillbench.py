@@ -155,13 +155,37 @@ def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_per
     assert all(isinstance(v, CameraView) for v in percept.views.values()), "the Percept's view type"
     assert percept.masks.value == {apple.id: sim.masks["head"]["apple_1"], basket.id: sim.masks["head"]["basket_1"]}
     assert percept.masks.source == "oracle", "the primary view's masks, keyed by ObjRef.id"
+    assert percept.view_masks.value == {"head": percept.masks.value,
+                                        "left_wrist": {apple.id: sim.masks["left_wrist"]["apple_1"],
+                                                       basket.id: sim.masks["left_wrist"]["basket_1"]}}, \
+        "every view's masks too, keyed the same way, so a builder can send the wrist views"
+    assert percept.view_masks.source == "oracle" and percept.view_masks.value["left_wrist"][basket.id][0, 0]
     assert (percept.q["trunk"] == np.arange(61)[PROPRIO_SLICES["trunk_qpos"]]).all() and obs.wall_s > 0.0
-    with pytest.raises(NotImplementedError):
-        next(obs.observe(ObserveRequest((apple,), aim=False), None))
     with pytest.raises(NotImplementedError, match="captures"):  # R1ProSim captures what it was built with
         next(obs.observe(ObserveRequest((apple,), views=("head",)), None))
     with pytest.raises(NotImplementedError, match="captures"):
         next(obs.observe(ObserveRequest((apple,), views=obs.views, look_at=(1.0, 0.0, 0.8)), None))
+
+
+def test_observe_without_aim_captures_from_where_the_head_is_and_moves_nothing(monkeypatch):
+    from omnigibson.tiptop.host import capture_observer
+
+    host = SimpleNamespace(observe_now=lambda: StepObs(40, np.arange(61, dtype=np.float32), {}))
+    sim = capture_sim()
+    request, extras = sim.capture("t")  # what the aimed capture renders (the fake counts 61 steps: aimed only)
+    sim.n_steps, rendered = 0, []
+    sim.capture = lambda task: pytest.fail("observe(aim=False) went through R1ProSim.capture: it aims and swings")
+    monkeypatch.setattr(capture_observer, "TiptopSim",
+                        SimpleNamespace(capture=lambda s, task: rendered.append((s, task)) or (request, extras)))
+    obs = CaptureObserver(sim, host, sim.segmenter, "t")
+    gen = obs.observe(ObserveRequest((apple, basket), views=obs.views, aim=False), None)
+    with pytest.raises(StopIteration) as done:
+        next(gen)
+    percept, after = done.value.value
+    assert rendered == [(sim, "t")], "TiptopSim.capture: the views as the cameras stand"
+    assert sim.looked == [] and obs.steps == 0 and sim.n_steps == 0, "no look, no swing, no head turn: 0 sim steps"
+    assert list(percept.views) == ["head", "left_wrist"] and percept.info.visible == {apple.id: 1.0, basket.id: 0.0}
+    assert set(percept.view_masks.value) == {"head", "left_wrist"} and after.step == 40
 
 
 # ------------------------------------------------------------------------------------ the legacy backend (group 5)
@@ -305,6 +329,16 @@ def test_the_benchs_tiptop_pick_refuses_what_its_planner_cannot_plan_before_plan
     tiptop = skillbench.make_backends(FakeEpisode(Host(Env())), Host(Env()), SimpleNamespace())["tiptop"]
     call = SkillCall("pick_up", PickArgs(apple), arm="left", freeze_trunk=True)
     assert tiptop.check(call, None).code is Code.UNSUPPORTED, "r1pro_left moves the torso"
+
+
+def test_the_bench_finds_its_backends_by_file_so_a_new_skill_never_edits_it():
+    backends = skillbench.make_backends(FakeEpisode(Host(Env())), Host(Env()), SimpleNamespace())
+    tiptop, scripted = backends["tiptop"], backends["scripted"]
+    assert {"pick_up", "open", "close"} <= set(tiptop.builders), "builders/pick.py and builders/articulate.py"
+    assert set(tiptop.checks) >= {"pick_up", "open"}, "a builder's check goes with it"
+    assert tiptop.supports(SkillCall("open", OpenArgs(basket))) and not tiptop.supports(SkillCall("wait", None))
+    assert scripted.supports(SkillCall("wait", None)) and scripted.name == "scripted"
+    assert skillbench.SPECS is __import__("b1k.skills.specs", fromlist=["SPECS"]).SPECS, "one SPECS, in b1k"
 
 
 def test_the_bench_flags_an_in_the_legacy_wire_bends_onto_on():
@@ -549,22 +583,139 @@ def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
         "place_robot clears the look target: the capture would aim at the default point, not at the objects"
 
 
+class DemoSim:
+    """R1ProSim as a demo setup sees it: the planned left arm, an idle right arm with a nominal posture, both grippers,
+    the task scope (BDDL name -> object) and the fingers the fake robot reports."""
+
+    OPEN = 1.0
+
+    def __init__(self, finger_sum=0.02):
+        self.arm, self.other_arm, self.n_steps = "left", "right", 0
+        self.robot = SimpleNamespace(arm_joint_names={a: [f"{a}_arm_joint{k}" for k in range(1, 8)]
+                                                      for a in ("left", "right")})  # fmt: skip
+        self.posture = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)} | {"left_gripper_finger_joint1": 0.05}
+        self.locked_nominal = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)}
+        self.stance_ready, self.last_gripper, self.other_gripper, self.held_objects = None, 1.0, 1.0, {}
+        self.env, self.events, self.finger_sum = "env", [], finger_sum
+        self.scope = {"log.n.01_2": SimpleNamespace(name="log_176"), "block.n.01_1": SimpleNamespace(name="block_9")}
+
+    def task_scope(self):
+        return self.scope
+
+    def tracked_label(self, bddl):
+        return bddl.replace(".n.01_", "_")
+
+    def q_arm(self):
+        return np.full(11, 0.3)
+
+    def look_at(self, *names):
+        self.events.append(("look", names))
+
+    def hold(self, n, gripper):
+        self.events.append(("hold", n, gripper))
+        self.last_gripper = gripper
+
+    def commanded_targets(self):
+        return {"base": np.zeros(3), "trunk": np.zeros(4), "arm_left": np.zeros(7), "arm_right": np.zeros(7),
+                "gripper_left": np.array([self.last_gripper]), "gripper_right": np.array([self.other_gripper])}
+
+    def proprio(self):
+        p = np.zeros(61, dtype=np.float32)
+        p[PROPRIO_SLICES["arm_right_qpos"]] = np.arange(7) * 0.1 + 0.5  # the human's right arm, as restored
+        p[PROPRIO_SLICES["gripper_left_qpos"]] = self.finger_sum / 2  # the left fingers, settled on the log or on air
+        return p
+
+
+def demo_case(held={"left": "log_176"}):
+    return {"id": "d", "instance": 188, "setup": {"held": dict(held)}, "demo": {"snapshot": "snap.json"},
+            "call": SkillCall("place", PlaceArgs(ObjRef("log.n.01_2", "log"), (Relation(Rel.ON, basket),)))}
+
+
+@pytest.fixture
+def demo_env(monkeypatch, tmp_path):
+    restored = []
+    monkeypatch.setattr(skillbench.demo_cases, "restore", lambda env, snap, inst: restored.append((env, snap, inst)))
+    monkeypatch.setattr(skillbench.demo_cases, "held", lambda robot: {"left": "log_176", "right": None})
+    (tmp_path / "snap.json").write_text('{"log_176": {"pos": [1, 2, 3]}}')
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
+    return og, restored, tmp_path
+
+
+def test_a_demo_case_setup_restores_the_snapshot_adopts_the_human_posture_and_verifies_the_hold(demo_env):
+    og, restored, tmp_path = demo_env
+    sim = DemoSim()
+    host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(0, sim.proprio(), {}))
+    case = demo_case()
+    case["demo"]["snapshot"] = str(tmp_path / "snap.json")
+    state, held = skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {}, host)
+    assert restored == [("env", {"log_176": {"pos": [1, 2, 3]}}, 188)], "demo_cases.restore: instance + snapshot"
+    assert held == {"left": case["call"].args.obj}, "setup.held names the sim object; the hand holds the call's ObjRef"
+    assert sim.posture["right_arm_joint3"] == pytest.approx(0.7), \
+        "the idle arm is locked where the human left it: no hold or capture drives it to the nominal posture"
+    assert sim.locked_nominal["right_arm_joint7"] == pytest.approx(1.1), "and restore_locked_arm has nothing to undo"
+    assert sim.posture["left_gripper_finger_joint1"] == 0.05, "only the idle arm's joints change"
+    assert sim.stance_ready == [0.3] * 11, "the planned arm's ready posture is where it stands"
+    assert (sim.last_gripper, sim.other_gripper) == (CLOSED, 1.0) and sim.held_objects == {"log_2": "left"}
+    assert sim.events == [("look", ("log.n.01_2", basket.id)), ("hold", 3, CLOSED)], "the settle keeps the hand closed"
+    assert state[1]["last_gripper"] == CLOSED and state[1]["held_objects"] == {"log_2": "left"}
+    assert skillbench.pick_arm(case["call"], held) == "left", "the hand that holds the object places it"
+    assert skillbench.pick_arm(SkillCall("pick_up", PickArgs(apple)), held) == "right", "a free hand picks"
+    assert skillbench.pick_arm(SkillCall("pick_up", PickArgs(apple), arm="left"), held) == "left", "the call's arm wins"
+    assert skillbench.pick_arm(SkillCall("pick_up", PickArgs(apple)), {}) == "left"
+
+
+def test_a_demo_case_whose_hand_does_not_hold_after_the_restore_fails_its_setup_with_the_reason(demo_env):
+    og, restored, tmp_path = demo_env
+    sim = DemoSim(finger_sum=0.0)  # the fingers closed on air: the grasp did not come back
+    host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(0, sim.proprio(), {}))
+    case = demo_case()
+    case["demo"]["snapshot"] = str(tmp_path / "snap.json")
+    with pytest.raises(skillbench.CaseSetupError, match=r"\['left'\] hand does not hold \['log.n.01_2'\].*proprio"):
+        skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {}, host)
+    assert len(restored) == 1, "it did restore first; the proprio GraspSensor refused what it found"
+    refs = skillbench.held_refs(sim, {"right": "wicker_basket_92"}, case["call"])
+    assert refs == {"right": ObjRef("wicker_basket_92", "wicker_basket", False)}, "an object outside the task scope"
+    block = skillbench.held_refs(sim, {"right": "block_9"}, case["call"])["right"]
+    assert block == ObjRef("block.n.01_1", "block", False), "a task object the call does not name: its BDDL name"
+
+
+def test_the_self_test_spread_is_the_widest_range_over_the_trials():
+    p = np.zeros(61)
+    rows = [{"proprio": p.tolist(), "objects": {"log_176": [0.0, 0.0, 0.0], "apple_1": [1.0, 0.0, 0.0]}},
+            {"proprio": (p + np.eye(61)[PROPRIO_SLICES["arm_left_qpos"].start + 2] * 0.002).tolist(),
+             "objects": {"log_176": [0.0, 0.0, 0.0], "apple_1": [1.0, 0.003, 0.004]}}]  # fmt: skip
+    s = skillbench.spread(rows)
+    assert s["proprio"]["arm_left"] == pytest.approx(0.002) and s["proprio"]["trunk"] == 0.0
+    assert set(s["proprio"]) == {"trunk", "arm_left", "arm_right", "gripper_left", "gripper_right"}
+    assert s["objects_m"] == {"log_176": 0.0, "apple_1": pytest.approx(0.005)}
+    args = skillbench.parse_args(["--out-dir", "o", "--case", "c.yaml", "--setup-only", "--selftest", "5"])
+    assert args.setup_only and args.selftest == 5
+
+
 def test_every_trial_restores_the_command_state_the_physics_state_does_not_carry():
     events = []
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics",
                                              load_state=lambda st, serialized: events.append(("load", st))))
     sim = SimpleNamespace(OPEN=1.0, posture={"right_arm_joint4": 0.0}, look_target=np.array([0.6, 0.1, 0.8]),
-                          stance_ready=None, seen_boxes={"x": 1})  # fmt: skip
-    sim.hold = lambda n, g: events.append(("hold", dict(sim.posture)))
-    sim.begin_episode = lambda name: events.append(("begin", name))
+                          stance_ready=None, seen_boxes={"x": 1}, last_gripper=1.0, other_gripper=CLOSED,
+                          held_objects={"log_2": "right"})  # fmt: skip
+    sim.hold = lambda n, g: events.append(("hold", dict(sim.posture), g))
+    sim.begin_episode = lambda name: events.append(("begin", name)) or setattr(sim, "held_objects", {})
     state = skillbench.snapshot(og, sim)
     sim.posture["right_arm_joint4"] = -1.9  # trial 0 tucked the idle arm (tuck_idle_arm), or a ramp stopped
     sim.look_target, sim.stance_ready = None, [0.1] * 11
+    sim.last_gripper, sim.other_gripper, sim.held_objects = CLOSED, 1.0, {}  # trial 0 picked with the left, dropped
     skillbench.restore(og, sim, state, "t1")
     assert sim.posture == {"right_arm_joint4": 0.0} and np.allclose(sim.look_target, [0.6, 0.1, 0.8])
     assert sim.stance_ready is None and sim.seen_boxes == {}
-    assert events == [("load", "physics"), ("hold", {"right_arm_joint4": 0.0}), ("begin", "t1")], \
-        "the restore's own step commands the restored posture, not the last trial's"
+    assert events == [("load", "physics"), ("hold", {"right_arm_joint4": 0.0}, 1.0), ("begin", "t1")], \
+        "the restore's own step commands the restored posture and gripper, not the last trial's"
+    assert (sim.last_gripper, sim.other_gripper) == (1.0, CLOSED), "a demo's held right hand stays closed"
+    assert sim.held_objects == {"log_2": "right"}, "begin_episode cleared the hand record; the setup's hands refill it"
+    bare = SimpleNamespace(OPEN=1.0, seen_boxes={}, hold=lambda n, g: events.append(("bare", g)),
+                           begin_episode=lambda name: None)  # a sim that never had a gripper command
+    skillbench.restore(og, bare, skillbench.snapshot(og, bare), "t2")
+    assert events[-1] == ("bare", 1.0), "no command recorded: open"
 
 
 def test_the_latch_gap_is_how_far_the_next_action_would_snap_an_arm():
@@ -588,9 +739,30 @@ def test_the_bench_cases_load_as_skill_calls_and_a_setup_the_bench_cannot_do_is_
     assert [c["id"] for c in only] == ["pick_up_store_honey_jar"]
     bad = tmp_path / "bad.yaml"
     first = yaml.safe_load((bench / "pick_up.yaml").read_text())[0]
-    bad.write_text(yaml.safe_dump([{**first, "setup": {"held": "apple.n.01_2"}}]))
+    bad.write_text(yaml.safe_dump([{**first, "setup": {"object_poses": {}}}]))
     with pytest.raises(ValueError, match="not on the bench yet"):
         skillbench.load_cases(bad)
+    bad.write_text(yaml.safe_dump([{**first, "setup": {"held": {"left": "apple_2"}}}]))
+    with pytest.raises(ValueError, match="needs demo.snapshot"):
+        skillbench.load_cases(bad)
+
+
+def test_the_demo_cases_load_with_their_snapshot_mode_and_hands():
+    bench = ROOT / "tiptop/b1k/skills/bench"
+    groups = ("pick_up", "place_on", "place_in", "open_drawer", "open_door", "press")
+    cases = [c for g in groups for c in skillbench.load_cases(bench / f"demo_{g}.yaml")]
+    assert len(cases) == 45 and len({c["id"] for c in cases}) == 45
+    assert all(c["mode"] == "train" and Path(c["demo"]["snapshot"]).is_file() for c in cases), \
+        "every demo case restores a snapshot the bench ships (a path relative to the case file, resolved)"
+    held = [c for c in cases if (c["setup"].get("held"))]
+    assert len(held) == 22 and all(set(c["setup"]["held"]) <= {"left", "right"} for c in held)
+    log = next(c for c in cases if c["id"] == "place_on.chopping_wood.e8933.f625")
+    assert log["setup"]["held"] == {"left": "log_176"} and isinstance(log["call"].args, PlaceArgs)
+    assert log["call"].args.obj.id == "log.n.01_2" and log["call"].arm is None
+    assert log["demo"]["arms"]["left"][0] == pytest.approx(-0.6772) and len(log["demo"]["fingers"]["right"]) == 2
+    pizza = next(c for c in cases if c["task"] == "make_pizza")
+    assert pizza.get("gpu_dynamics") is True, "its transition rules spawn a particle system"
+    assert not any(c.get("gpu_dynamics") for c in cases if c["task"] != "make_pizza")
 
 
 def test_the_one_call_planner_observes_only_when_the_skill_asks_for_a_percept():

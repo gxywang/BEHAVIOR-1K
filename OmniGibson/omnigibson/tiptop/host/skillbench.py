@@ -1,7 +1,8 @@
 """The Tier 1 skill bench (SPEC §9): one skill call from a fixed start state, through the production path.
 
-One process loads one (task, instance) and, per case, runs the setup (harness-only: the torso and a teleport to the
-case's stance, never charged to the skill), dumps the state, and restores it before every trial. A trial is the
+One process loads one task and, per case, its (instance, mode) when that changes, then runs the setup (harness-only,
+never charged to the skill: the torso and a teleport to the case's stance, or a human demo's snapshot restored with
+its arm posture and the object in its hand), dumps the state, and restores it before every trial. A trial is the
 one-call TaskPlanner (an observe when the skill asks for a Percept, then the call) over DirectConnector, with the
 production Runtime, registry, latch, GoalPanel and the providers of --providers. Seeds go to numpy, torch and the
 call. Every trial writes one JSON row (<out>/<case>.jsonl) and asserts the step invariant (U0):
@@ -13,8 +14,9 @@ has one line per case.
       --case tiptop/b1k/skills/bench/pick_up.yaml --ids pick_up_freeze_fruit_apple --grasping-mode assisted \\
       --views head left_wrist right_wrist --no-state-stream
 
---backend legacy runs the baseline; --backend tiptop --collision mesh runs the native skill against today's meshes
-(the planner server takes no map voxels until tiptop/skills/voxels.py lands).
+--backend legacy runs the baseline; --backend tiptop runs the native skill (--collision mesh: against today's meshes
+instead of the map's voxels). --setup-only loads, restores and checks every case's setup without a planner or a trial
+(setup.jsonl); --selftest N runs SPEC §9's sim self-test on each case's restored state instead of its trials.
 """
 
 import argparse
@@ -25,6 +27,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import math
 import random
 import sys
 import time
@@ -35,27 +38,22 @@ import numpy as np
 import yaml
 
 import b1k.runtime.skillrun as skillrun
+from b1k.bridge.protocol import bddl_category
 from b1k.bridge.strategies import STRATEGIES
 from b1k.connector.codec import from_dict
 from b1k.connector.observe import ObserveRequest
-from b1k.connector.skills import (
-    CloseArgs,
-    Code,
-    OpenArgs,
-    PickArgs,
-    PlaceArgs,
-    ReleaseArgs,
-    SkillCall,
-    SkillSpec,
-    SkillSpecInfo,
-)
-from b1k.runtime.compose import ACTION_SLICES, PROPRIO_Q
+from b1k.connector.skills import Code, SkillCall, WorldUpdate
+from b1k.connector.types import ObjRef
+from b1k.perception.grasp_sensor import ProprioGraspSensor
+from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q
 from b1k.runtime.core import Runtime
 from b1k.runtime.direct import DirectConnector
 from b1k.skills.registry import SkillRegistry, load_routing
-from b1k.skills.specs import arm_resources, hand_empty, holding_obj
+from b1k.skills.scripted import ScriptedBackend
+from b1k.skills.specs import SPECS
+from b1k.skills.tiptop import builders
 from b1k.skills.tiptop.backend import TiptopBackend
-from b1k.skills.tiptop.builders import pick as pick_request
+from omnigibson.tiptop.host import demo_cases
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, _plain
@@ -71,27 +69,19 @@ from omnigibson.tiptop.run import (
 
 log = logging.getLogger("omnigibson.tiptop")
 
-SETUP_KEYS = ("robot_pose", "torso")  # object_poses, joint_states and held join when a case needs them
+SETUP_KEYS = ("robot_pose", "torso", "held")  # held {arm: sim object name} needs demo.snapshot (the object is in
+#                                                 the hand there); object_poses and joint_states join when needed
 # R1ProSim's command state, which the physics state does not carry: what its own steps (a legacy run, the restore's
-# hold) command the joints nobody plans (posture), which arm plans, and where the captures look
+# hold) command the joints nobody plans (posture), which arm plans, where the captures look, both gripper commands
+# (a demo's held hand stays closed) and the hand record (what a legacy round knows the hands hold)
 SIM_FIELDS = ("posture", "locked_nominal", "arm", "other_arm", "planned_joints", "arm_idx", "gripper_idx", "q_home",
-              "stance_ready", "look_target", "look_names", "look_arm", "mirror_arm_idx", "mirror_gripper_idx")
+              "stance_ready", "look_target", "look_names", "look_arm", "mirror_arm_idx", "mirror_gripper_idx",
+              "last_gripper", "other_gripper", "held_objects")
+SELFTEST_STEPS, SELFTEST_RAD = 90, 0.1  # the self-test's scripted trajectory: every planned-arm joint, a sine bump
 
 
-def _spec(name: str, args_type: type, budget: int, check=None, needs_percept: bool = False) -> SkillSpec:
-    info = SkillSpecInfo(name, "1", (), args_type.__name__, (), (), budget, (), "legacy", needs_percept=needs_percept)
-    return SkillSpec(info, args_type, arm_resources, check)
-
-
-# The week-1 skills' backend-agnostic half. Budgets (report-only until a gate): pick and place from our executed
-# rounds (SPEC §1), open/close from store_honey's executed open (475 env steps), release from its bench case.
-SPECS = {
-    "pick_up": _spec("pick_up", PickArgs, 950, hand_empty, needs_percept=True),
-    "place": _spec("place", PlaceArgs, 1100, holding_obj, needs_percept=True),
-    "open": _spec("open", OpenArgs, 600, hand_empty),
-    "close": _spec("close", CloseArgs, 600, hand_empty),
-    "release": _spec("release", ReleaseArgs, 60),
-}
+class CaseSetupError(RuntimeError):
+    """The harness could not bring the sim to the case's start state (its reason is the message)."""
 
 
 def targets(call: SkillCall) -> tuple:
@@ -110,28 +100,39 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",)):
 
 
 def load_cases(path, ids=None) -> list:
-    """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso}, call: to_dict(SkillCall), n, seeds,
-    expect, baseline}; the ones named in ``ids`` when given."""
+    """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?}, call: to_dict(SkillCall), n,
+    seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode (train), demo {snapshot:
+    a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene needs it; the ones named
+    in ``ids`` when given."""
     with open(path) as f:
         cases = [c for c in yaml.safe_load(f) if ids is None or c["id"] in ids]
     for case in cases:
-        unknown = set(case.get("setup") or {}) - set(SETUP_KEYS)
+        setup, demo = case.get("setup") or {}, case.get("demo") or {}
+        unknown = set(setup) - set(SETUP_KEYS)
         if unknown:
             raise ValueError(f"{case['id']}: setup {sorted(unknown)} is not on the bench yet (it takes {SETUP_KEYS})")
+        if setup.get("held") and not demo.get("snapshot"):
+            raise ValueError(f"{case['id']}: setup.held needs demo.snapshot (the object is in the hand there)")
+        if demo.get("snapshot"):
+            demo["snapshot"] = str(Path(path).resolve().parent / demo["snapshot"])
         case["call"] = from_dict(case["call"], SkillCall)
         case.setdefault("seeds", list(range(case.get("n", 5))))
     return cases
 
 
 def make_backends(ep, host, svc) -> dict:
-    """legacy (the baseline, one round) and tiptop (a RequestBuilder per native skill); a call picks one by its
-    backend, then routing.yaml. The legacy wire sends a compartment floor for an in() only under --inside-region
-    and only where the geometry has a cavity; anything else it bends onto on(), which its result then says."""
+    """legacy (the baseline, one round), tiptop (a RequestBuilder per native skill) and scripted, the last two found
+    by file (b1k/skills/tiptop/builders/<skill>.py, b1k/skills/scripted/<skill>.py): a new skill is a new module
+    there, not an edit here. A call picks one by its backend, then routing.yaml. The legacy wire sends a compartment
+    floor for an in() only under --inside-region and only where the geometry has a cavity; anything else it bends
+    onto on(), which its result then says."""
     has_cavity = lambda target, item: bool(getattr(ep.sim, "send_inside", False)) and \
         svc.geometry.cavity(target, item).value is not None
+    found = builders.discover()
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
-            "tiptop": TiptopBackend({"pick_up": pick_request.build},
-                                    checks={"pick_up": pick_request.check})}  # fmt: skip
+            "tiptop": TiptopBackend({s: m.build for s, m in found.items()},
+                                    checks={s: m.check for s, m in found.items() if hasattr(m, "check")}),
+            "scripted": ScriptedBackend()}  # fmt: skip
 
 
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall) -> tuple:
@@ -210,22 +211,90 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--collision", choices=("map", "mesh"), default="map",
                    help="the room a native skill plans against: the map's voxels, or today's physical meshes (the "
                    "A/B; the planner server takes only meshes until tiptop/skills/voxels.py lands)")
+    p.add_argument("--setup-only", action="store_true",
+                   help="no planner, no trial: load, restore and check every case's setup (setup.jsonl)")
+    p.add_argument("--selftest", type=int, default=None, metavar="N",
+                   help="SPEC §9's sim self-test instead of the trials: N seeded runs of one scripted trajectory "
+                   "from each case's restored state; the proprio and object spread is the sim's noise floor")
     return p.parse_args(argv)
 
 
-def setup(og, sim, args, case: dict, embodiment: dict) -> tuple:
-    """Harness-only, never charged to the skill: the torso, the teleport to the case's stance, the look at the call's
-    objects (a round stood for them looked there before it captured), a settle. Returns the state every trial
-    restores."""
-    s = case.get("setup") or {}
-    args.torso = s.get("torso")
-    apply_embodiment_posture(sim, args, embodiment)
-    if "robot_pose" in s:
-        sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
+def held_refs(sim, held: dict, call: SkillCall) -> dict:
+    """{arm: ObjRef} of a case's setup.held (sim object names, as the demo recorded them): the call's own ObjRef where
+    it names the object, else one built from the BDDL name the task scope gives it (a task object), else the name."""
+    named = {o.id: o for o in targets(call)}
+    by_name = {obj.name: bddl for bddl, obj in sim.task_scope().items()}
+    out = {}
+    for arm, name in held.items():
+        bddl = by_name.get(name)
+        out[arm] = (named.get(bddl) or ObjRef(bddl, bddl_category(bddl), False) if bddl
+                    else ObjRef(name, name.rsplit("_", 1)[0], False))  # not a task object: a scene object by name
+    return out
+
+
+def pick_arm(call: SkillCall, held: dict) -> str:
+    """The call's arm when the case leaves it to the bench: the hand holding args.obj (place, hold, release), else a
+    free hand, left first."""
+    if call.arm:
+        return call.arm
+    obj = getattr(call.args, "obj", None)
+    holding = [arm for arm, ref in held.items() if obj is not None and ref.id == obj.id]
+    return holding[0] if holding else next((a for a in ("left", "right") if a not in held), "left")
+
+
+def adopt_demo_posture(sim, host, held: dict) -> None:
+    """After a demo restore, R1ProSim's command state is the human's: the idle arm is locked where it stands (its
+    planner takes the measured lock, S1) so no hold or capture drives it to the nominal posture, the planned arm's
+    ready posture is where it stands (the capture returns there), a holding hand stays commanded closed, and the
+    hand record names what it holds, so a legacy round knows and the capture leaves that arm alone."""
+    p = host.proprio()
+    idle = dict(zip(sim.robot.arm_joint_names[sim.other_arm], p[PROPRIO_Q[f"arm_{sim.other_arm}"]].tolist()))
+    sim.posture.update({j: v for j, v in idle.items() if j in sim.posture})
+    sim.locked_nominal.update({j: v for j, v in idle.items() if j in sim.locked_nominal})
+    sim.stance_ready = [float(v) for v in sim.q_arm()]
+    sim.last_gripper = CLOSED if sim.arm in held else OPEN
+    sim.other_gripper = CLOSED if sim.other_arm in held else OPEN
+    labels = {ref.id: sim.tracked_label(ref.id) for ref in held.values() if ref.id in sim.task_scope()}
+    sim.held_objects = {labels[ref.id]: arm for arm, ref in held.items() if ref.id in labels}
+
+
+def commanded_obs(sim, host):
+    """The StepObs the proprio GraspSensor reads: the observation now, with what R1ProSim last commanded."""
+    a23 = np.concatenate([sim.commanded_targets()[g] for g in ACTION_SLICES]).astype(np.float32)
+    return dataclasses.replace(host.observe_now(), commanded=a23)
+
+
+def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
+    """Harness-only, never charged to the skill. A stance case: the torso, the teleport to the case's stance. A demo
+    case: the human's snapshot restored (demo_cases.restore: the instance, then every saved object and the robot
+    with its grasp constraints), the human's arm posture adopted as the command state, the held hand closed and its
+    hold verified by the proprio GraspSensor (CaseSetupError with the reason when it does not hold). Then the look at
+    the call's objects (a round stood for them looked there before it captured) and a settle. Returns the state
+    every trial restores and {arm: ObjRef} of what the hands hold."""
+    s, demo, held = case.get("setup") or {}, case.get("demo") or {}, {}
+    if demo.get("snapshot"):
+        with open(demo["snapshot"]) as f:
+            demo_cases.restore(sim.env, json.load(f), int(case["instance"]))
+        held = held_refs(sim, s.get("held") or {}, case["call"])
+        adopt_demo_posture(sim, host or BenchHost(sim), held)
+    else:
+        args.torso = s.get("torso")
+        apply_embodiment_posture(sim, args, embodiment)
+        if "robot_pose" in s:
+            sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
     sim.look_at(*(o.id for o in targets(case["call"])))
-    sim.hold(args.settle_steps, sim.OPEN)
-    log.info(f"{case['id']}: setup {s} done")
-    return snapshot(og, sim)
+    sim.hold(args.settle_steps, sim.last_gripper if demo.get("snapshot") else sim.OPEN)
+    if held:
+        obs, sensor = commanded_obs(sim, host or BenchHost(sim)), ProprioGraspSensor()
+        verdicts = {arm: sensor.held(arm, obs).value for arm in held}
+        truth, what = demo_cases.held(sim.robot), {a: r.id for a, r in held.items()}  # the sim's record, logged beside
+        log.info(f"{case['id']}: held {what}: proprio {verdicts}, sim {truth}")
+        missing = [arm for arm, v in verdicts.items() if v is not True]
+        if missing:
+            raise CaseSetupError(f"{case['id']}: the {missing} hand does not hold {[held[a].id for a in missing]} "
+                                 f"after the restore: proprio {verdicts}, sim {truth}")
+    log.info(f"{case['id']}: setup {s} done" + (f" from {demo['snapshot']}" if demo.get("snapshot") else ""))
+    return snapshot(og, sim), held
 
 
 def snapshot(og, sim) -> tuple:
@@ -238,19 +307,72 @@ def restore(og, sim, state: tuple, name: str) -> None:
     og.sim.load_state(physics, serialized=False)
     for k, v in fields.items():
         setattr(sim, k, copy.deepcopy(v))
-    sim.seen_boxes, sim.last_gripper, sim.other_gripper = {}, sim.OPEN, sim.OPEN
-    sim.hold(1, sim.OPEN)  # a physics step propagates the loaded state (Simulator.load_state)
-    sim.begin_episode(name=name)  # counts from zero; clears the hand record
+    sim.seen_boxes = {}
+    gripper = fields.get("last_gripper")
+    sim.hold(1, sim.OPEN if gripper is None else gripper)  # a physics step propagates the loaded state; the grippers
+    #                                                         as the setup left them (a demo's held hand stays closed)
+    sim.begin_episode(name=name)  # counts from zero; clears the hand record, which the setup's hands then refill
+    sim.held_objects = dict(fields.get("held_objects") or {})
+
+
+def load_instance(og, sim, instance: int, mode: str, embodiment: dict) -> tuple:
+    """One (instance, mode) of the loaded task, as the evaluator loads it, the embodiment planned afresh; the base
+    state every case of it starts from."""
+    from omnigibson.eval.evaluator import load_task_instance
+
+    sim.env.reset()
+    load_task_instance(sim.env, sim.robot, instance, mode=mode)
+    sim.env.reset()
+    sim.reset_embodiment(embodiment)
+    return snapshot(og, sim)
+
+
+def spread(rows: list) -> dict:
+    """The self-test's noise floor over its trials: per proprio group the widest range of any joint (rad or m), per
+    object the largest distance between two trials' positions (m)."""
+    p = np.asarray([r["proprio"] for r in rows], dtype=np.float64)
+    groups = {**PROPRIO_Q, **{f"gripper_{a}": s for a, s in FINGER_Q.items()}}
+    out = {"proprio": {g: float((p[:, s].max(0) - p[:, s].min(0)).max()) for g, s in groups.items()}}
+    objs = {}
+    for name in rows[0]["objects"]:
+        xyz = np.asarray([r["objects"][name] for r in rows if name in r["objects"]], dtype=np.float64)
+        objs[name] = float(max(np.linalg.norm(a - b) for a in xyz for b in xyz))
+    out["objects_m"] = objs
+    return out
+
+
+def selftest(og, sim, host, state: tuple, case: dict, seeds: list, out: Path) -> dict:
+    """SPEC §9's sim self-test (F18): the same scripted trajectory (a sine bump of SELFTEST_RAD on every planned-arm
+    joint over SELFTEST_STEPS env steps, from what the restore left commanded) from the same restored state, once
+    per seed. The spread of the final proprio and of the task objects' positions is the sim's noise floor: what no
+    per-skill gate can claim below."""
+    import torch
+
+    rows, arm = [], ACTION_SLICES[f"arm_{sim.arm}"]
+    for i, seed in enumerate(seeds):
+        restore(og, sim, state, f"{case['id']}_selftest{i}")
+        random.seed(seed), np.random.seed(seed), torch.manual_seed(seed)
+        a = np.concatenate([sim.commanded_targets()[g] for g in ACTION_SLICES]).astype(np.float32)
+        start, raw = a[arm].copy(), host.raw()
+        for k in range(1, SELFTEST_STEPS + 1):
+            a[arm] = start + SELFTEST_RAD * math.sin(math.pi * k / SELFTEST_STEPS)
+            raw = host.env_step(a)
+        rows.append({"case": case["id"], "trial": i, "seed": seed, "proprio": raw["proprio"].tolist(),
+                     "objects": demo_cases.object_positions(sim.env)})  # fmt: skip
+    _append(out / "selftest.jsonl", rows)
+    result = {"case": case["id"], "n": len(rows), "steps": SELFTEST_STEPS, "rad": SELFTEST_RAD, **spread(rows)}
+    log.info(f"SELFTEST {result}")
+    return result
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
     setup_logging()
     cases = [case for path in args.case for case in load_cases(path, args.ids)]
-    runs = {(c["task"], int(c["instance"])) for c in cases}
-    if len(runs) != 1:
-        raise SystemExit(f"one (task, instance) per process; the cases name {sorted(runs)}")
-    ((task, instance),) = runs
+    tasks = {c["task"] for c in cases}
+    if len(tasks) != 1:
+        raise SystemExit(f"one task per process (its instances and modes reload in it); the cases name {sorted(tasks)}")
+    (task,) = tasks
     spec = STRATEGIES.get(task)
     args.activity, args.embodiment = task, "r1pro"
     args.task = spec.instruction if spec is not None else task.replace("_", " ")
@@ -259,40 +381,72 @@ def main(argv=None) -> None:
 
     import omnigibson as og
     import torch
-    from omnigibson.eval.evaluator import load_task_instance
+    from omnigibson.eval.evaluator import DISABLED_TRANSITION_RULES
+    from omnigibson.macros import gm
     from omnigibson.tiptop.bench import Episode
     from omnigibson.tiptop.knowledge import make_knowledge
+    from omnigibson.tiptop.r1pro import load_embodiment_meta
     from omnigibson.tiptop.scene import EpisodeOver
     from b1k.bridge.strategies import strategy_for, task_goal_atoms, task_goal_options
 
+    for rule in DISABLED_TRANSITION_RULES:  # as the evaluator runs: no recipe rule (their garbage is a particle system)
+        rule.ENABLED = False
+    if any(c.get("gpu_dynamics") for c in cases):  # a scene whose transition rules spawn a micro particle system
+        gm.USE_GPU_DYNAMICS = True
+        log.info("gm.USE_GPU_DYNAMICS on: a case asks for it")
     skillrun.PASSTHROUGH = (EpisodeOver,)  # the harness's own exception: no skill may swallow it
     providers, routing = importlib.import_module(args.providers), load_routing()
-    client, metadata, press_client, press_meta = connect_planners(args)
-    check_imports(metadata, press_meta)  # the step-zero gate line: every module from this checkout, or stop here
+    if args.setup_only:
+        client = metadata = press_client = press_meta = None
+        embodiment = load_embodiment_meta()
+    else:
+        client, metadata, press_client, press_meta = connect_planners(args)
+        check_imports(metadata, press_meta)  # the step-zero gate line: every module from this checkout, or stop here
+        embodiment = metadata["embodiment"]
     planners = {"left": (client, metadata), **({"right": (press_client, press_meta)} if press_client else {})}
-    exit_code, summaries = 0, []
+    exit_code, summaries, loaded, strategy = 0, [], None, None
     try:
-        sim = build_r1pro_sim(args, metadata["embodiment"])
-        sim.env.reset()
-        load_task_instance(sim.env, sim.robot, instance, mode=args.mode)
-        sim.env.reset()
-        sim.reset_embodiment(metadata["embodiment"])
-        strategy = strategy_for(task, task_goal_atoms(sim), options=task_goal_options(sim),
-                                scope=sorted(sim.task_scope()))  # fmt: skip
-        knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
-        host, base = BenchHost(sim), snapshot(og, sim)
+        sim = build_r1pro_sim(args, embodiment)
+        host = BenchHost(sim)
         for case in cases:
+            key = (int(case["instance"]), case.get("mode") or args.mode)
+            if key != loaded:
+                base, loaded = load_instance(og, sim, *key, embodiment), key
+                log.info(f"loaded {task} instance {key[0]} ({key[1]})")
+            if strategy is None:
+                strategy = strategy_for(task, task_goal_atoms(sim), options=task_goal_options(sim),
+                                        scope=sorted(sim.task_scope()))  # fmt: skip
+                knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
             restore(og, sim, base, case["id"])  # every case starts from the instance as loaded
-            state, rows = setup(og, sim, args, case, metadata["embodiment"]), []
+            t0 = time.monotonic()
+            try:
+                (state, held), rows = setup(og, sim, args, case, embodiment, host), []
+            except CaseSetupError as e:
+                log.error(f"SETUP FAILED {e}")
+                _append(out / "setup.jsonl", [{"case": case["id"], "task": task, "instance": key[0], "mode": key[1],
+                                               "ok": False, "reason": str(e),
+                                               "wall_s": round(time.monotonic() - t0, 1)}])  # fmt: skip
+                continue
+            _append(out / "setup.jsonl", [{"case": case["id"], "task": task, "instance": key[0], "mode": key[1],
+                                           "ok": True, "held": {a: r.id for a, r in held.items()},
+                                           "wall_s": round(time.monotonic() - t0, 1)}])  # fmt: skip
+            if args.setup_only:
+                continue
             (out / case["id"]).mkdir(parents=True, exist_ok=True)
+            if args.selftest:
+                summaries.append(selftest(og, sim, host, state, case, list(range(args.selftest)), out))
+                continue
             for i, seed in enumerate(case["seeds"][: args.trials]):
                 name = f"{case['id']}_t{i}"
                 restore(og, sim, state, name)
                 random.seed(seed), np.random.seed(seed), torch.manual_seed(seed)
                 ep = Episode(sim, args, planners, knowledge, out / case["id"] / f"t{i}", spec=strategy.spec)
                 svc, segmenter = providers.pseudo_services(ep, client, routing, collision=args.collision)
+                for arm, ref in held.items():  # what the setup put in the hands, as a pick's result would say it
+                    svc.world.apply(WorldUpdate("held", ref, arm))
                 observer = CaptureObserver(sim, host, segmenter, args.task)
-                call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend)
+                call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
+                                           arm=pick_arm(case["call"], held))
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
                     r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host, svc), routing, observer, call)
@@ -309,7 +463,10 @@ def main(argv=None) -> None:
         log.exception("skill bench failed")
         exit_code = 1
     finally:
-        if summaries:
+        if summaries and args.selftest:
+            with open(out / "selftest.json", "w") as f:
+                json.dump(summaries, f, indent=1)
+        elif summaries:
             with open(out / "summary.csv", "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(summaries[0]))
                 w.writeheader()

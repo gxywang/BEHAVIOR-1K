@@ -353,6 +353,12 @@ def held(robot) -> dict:
     return {arm: (o.name if (o := robot._ag_obj_in_hand[arm]) is not None else None) for arm in ("left", "right")}
 
 
+def object_positions(env) -> dict:
+    """{name: [x, y, z]} of every task object with a pose (systems have none): the bench self-test's object spread."""
+    return {o.name: [round(float(v), 5) for v in o.get_position_orientation()[0]]
+            for o in env.task.object_scope.values() if hasattr(o, "get_position_orientation")}
+
+
 def materialize(case: dict, env, method: str | None = None, settle: int = 10) -> dict:
     """Bring ``env`` (``make_env(case["task"])``) to the human's situation at the case's start frame and return the
     setup: robot pose + joints, what each hand holds, the fidelity numbers, and the snapshot (object states).
