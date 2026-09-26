@@ -104,9 +104,13 @@ def load_cases(path, ids=None) -> list:
     """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?}, call: to_dict(SkillCall), n,
     seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode (train), demo {snapshot:
     a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene needs it; the ones named
-    in ``ids`` when given."""
+    in ``ids`` when given. A case with ``skip: <reason>`` is left out, its reason logged."""
     with open(path) as f:
         cases = [c for c in yaml.safe_load(f) if ids is None or c["id"] in ids]
+    for case in cases:
+        if case.get("skip"):
+            log.warning(f"{case['id']}: skipped: {case['skip']}")
+    cases = [c for c in cases if not c.get("skip")]
     for case in cases:
         setup, demo = case.get("setup") or {}, case.get("demo") or {}
         unknown = set(setup) - set(SETUP_KEYS)

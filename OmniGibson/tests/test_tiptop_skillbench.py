@@ -775,18 +775,19 @@ def test_the_demo_cases_load_with_their_snapshot_mode_and_hands():
     bench = ROOT / "tiptop/b1k/skills/bench"
     groups = ("pick_up", "place_on", "place_in", "open_drawer", "open_door", "press")
     cases = [c for g in groups for c in skillbench.load_cases(bench / f"demo_{g}.yaml")]
-    assert len(cases) == 45 and len({c["id"] for c in cases}) == 45
+    assert len(cases) == 44 and len({c["id"] for c in cases}) == 44, "45 on the bench, make_pizza skipped"
     assert all(c["mode"] == "train" and Path(c["demo"]["snapshot"]).is_file() for c in cases), \
         "every demo case restores a snapshot the bench ships (a path relative to the case file, resolved)"
     held = [c for c in cases if (c["setup"].get("held"))]
-    assert len(held) == 22 and all(set(c["setup"]["held"]) <= {"left", "right"} for c in held)
+    assert len(held) == 21 and all(set(c["setup"]["held"]) <= {"left", "right"} for c in held)
     log = next(c for c in cases if c["id"] == "place_on.chopping_wood.e8933.f625")
     assert log["setup"]["held"] == {"left": "log_176"} and isinstance(log["call"].args, PlaceArgs)
     assert log["call"].args.obj.id == "log.n.01_2" and log["call"].arm is None
     assert log["demo"]["arms"]["left"][0] == pytest.approx(-0.6772) and len(log["demo"]["fingers"]["right"]) == 2
-    pizza = next(c for c in cases if c["task"] == "make_pizza")
-    assert pizza.get("gpu_dynamics") is True, "its transition rules spawn a particle system"
-    assert not any(c.get("gpu_dynamics") for c in cases if c["task"] != "make_pizza")
+    pizza = next(c for c in yaml.safe_load((bench / "demo_place_on.yaml").read_text()) if c["task"] == "make_pizza")
+    assert pizza.get("gpu_dynamics") is True and "PhysX" in pizza["skip"], \
+        "its transition rules spawn a particle system, and GPU dynamics crash PhysX on this box: skipped with the reason"
+    assert not any(c["task"] == "make_pizza" or c.get("gpu_dynamics") for c in cases), "a skip: case is left out"
 
 
 def test_the_one_call_planner_observes_only_when_the_skill_asks_for_a_percept():
