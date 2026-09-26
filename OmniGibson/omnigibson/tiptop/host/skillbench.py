@@ -52,7 +52,7 @@ from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
 from b1k.perception.grasp_sensor import ProprioGraspSensor
-from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q, Latch
+from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q
 from b1k.runtime.core import Runtime
 from b1k.runtime.direct import DirectConnector
 from b1k.skills.registry import SkillRegistry, load_routing
@@ -182,9 +182,8 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     """One trial: the production Runtime and registry over these providers and backends, DirectConnector on the
     host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
     calls = []
+    # the Runtime seeds its latch from the host: what the setup left commanded (a demo's held hand stays closed)
     rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer)
-    rt.latch = Latch(host.observe_now().proprio)  # Latch opens both hands at its first observation; the trial starts
-    rt.latch.reseed(host.commanded_targets())  # from what the setup left commanded (a demo's held hand stays closed)
     host.env_wall_s, host.frames_wall_s, t0 = 0.0, 0.0, time.monotonic()
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
                  lease)
@@ -390,8 +389,12 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         sim.look_at(*(o.id for o in targets(case["call"])))
     sim.hold(args.settle_steps, sim.last_gripper if demo.get("snapshot") else sim.OPEN)
     if held:
-        obs, sensor = commanded_obs(sim, host or BenchHost(sim)), ProprioGraspSensor()
-        verdicts = {arm: sensor.held(arm, obs).value for arm in held}
+        host, sensor = host or BenchHost(sim), ProprioGraspSensor()
+        for _ in range(sensor.WINDOW):  # a welded finger's phantom velocity: the sensor settles by position over a window
+            verdicts = {arm: sensor.held(arm, commanded_obs(sim, host)).value for arm in held}
+            if None not in verdicts.values():
+                break
+            sim.hold(1, sim.last_gripper)
         truth, what = demo_cases.held(sim.robot), {a: r.id for a, r in held.items()}  # the sim's record, logged beside
         log.info(f"{case['id']}: held {what}: proprio {verdicts}, sim {truth}")
         missing = [arm for arm, v in verdicts.items() if v is not True]
