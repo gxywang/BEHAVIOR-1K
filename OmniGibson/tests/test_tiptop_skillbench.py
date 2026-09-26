@@ -301,6 +301,12 @@ def test_a_legacy_open_takes_the_calls_joint_and_fraction():
     assert ep.opened == ("cabinet.n.01_1", 0.5, "j_link_2", True)
 
 
+def test_the_benchs_tiptop_pick_refuses_what_its_planner_cannot_plan_before_planning():
+    tiptop = skillbench.make_backends(FakeEpisode(Host(Env())), Host(Env()), SimpleNamespace())["tiptop"]
+    call = SkillCall("pick_up", PickArgs(apple), arm="left", freeze_trunk=True)
+    assert tiptop.check(call, None).code is Code.UNSUPPORTED, "r1pro_left moves the torso"
+
+
 def test_the_bench_flags_an_in_the_legacy_wire_bends_onto_on():
     geometry = SimpleNamespace(cavity=lambda t, item: Provided("floor" if t == basket else None, "oracle", 0))
     ep = SimpleNamespace(sim=SimpleNamespace(send_inside=False))

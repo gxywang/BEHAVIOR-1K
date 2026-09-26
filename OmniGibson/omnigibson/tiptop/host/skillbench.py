@@ -130,7 +130,8 @@ def make_backends(ep, host, svc) -> dict:
     has_cavity = lambda target, item: bool(getattr(ep.sim, "send_inside", False)) and \
         svc.geometry.cavity(target, item).value is not None
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
-            "tiptop": TiptopBackend({"pick_up": pick_request.build})}  # fmt: skip
+            "tiptop": TiptopBackend({"pick_up": pick_request.build},
+                                    checks={"pick_up": pick_request.check})}  # fmt: skip
 
 
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall) -> tuple:

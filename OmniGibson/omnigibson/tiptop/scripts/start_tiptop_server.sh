@@ -19,6 +19,9 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" OMP_NUM_THREADS="${OMP_NUM_THREAD
 if [ -n "${TIPTOP_GPU:-}" ]; then export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$TIPTOP_GPU"; fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${TIPTOP_DIR:-$HERE/../../../../tiptop}"
+# skill/1 speaks b1k.connector's codec, which lives in this checkout, not in the pixi env's install: without it on the
+# path the server plans but serves no skill (tiptop_websocket_server.served_skills)
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 # A CUDA fault (an illegal memory access inside cuRobo, seen a few times on the shared box) poisons the process: every
 # later plan fails at once. The server then exits with code 3 and is relaunched here; clients wait for /health.
 set +e
