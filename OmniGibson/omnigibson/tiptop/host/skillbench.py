@@ -45,7 +45,7 @@ from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
 from b1k.perception.grasp_sensor import ProprioGraspSensor
-from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q
+from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q, Latch
 from b1k.runtime.core import Runtime
 from b1k.runtime.direct import DirectConnector
 from b1k.skills.registry import SkillRegistry, load_routing
@@ -140,6 +140,8 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
     calls = []
     rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer)
+    rt.latch = Latch(host.observe_now().proprio)  # Latch opens both hands at its first observation; the trial starts
+    rt.latch.reseed(host.commanded_targets())  # from what the setup left commanded (a demo's held hand stays closed)
     host.env_wall_s, t0 = 0.0, time.monotonic()
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)))
     return r, rt, calls, time.monotonic() - t0

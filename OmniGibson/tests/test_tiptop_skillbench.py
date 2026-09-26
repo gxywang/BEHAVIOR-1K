@@ -24,6 +24,7 @@ from b1k.connector.skills import (
     ReleaseArgs,
     SkillCall,
     Status,
+    WaitArgs,
     WorldUpdate,
 )
 from b1k.connector.types import Belief, Fact, ObjRef, Pose2, Provided
@@ -551,6 +552,18 @@ def test_a_native_pick_on_the_bench_plans_from_the_capture_and_plays_the_plan():
     assert req.skill == "pick" and req.seed == 3 and req.observation["view_name"] == "head"
     assert req.observation["gt_labels"] == ["apple_1"] and np.array_equal(req.observation["gt_masks"][0], np.eye(4))
     assert rt.charged == {"observe": 0, "skill": r.steps} and r.steps > 0 and skillbench.u0(rt)
+
+
+def test_a_trial_starts_from_what_the_setup_left_commanded_so_a_held_hand_stays_closed_through_a_dwell():
+    host, acts = Host(Env()), []  # Host.commanded_targets: gripper_left CLOSED, as a demo restore leaves it
+    host.env_step = lambda a: (acts.append(a.copy()), host.env.step(a))[1]
+    svc = make_rt().svc
+    r, rt, _, _ = skillbench.run_trial(host, svc, skillbench.make_backends(FakeEpisode(host), host, svc),
+                                       {"wait": {"default": "scripted"}}, SimClockObserver(),
+                                       SkillCall("wait", WaitArgs(2)))  # fmt: skip
+    assert r.status is Status.SUCCEEDED and len(acts) == 2 and skillbench.u0(rt)
+    assert all(a[ACTION_SLICES["gripper_left"]] == CLOSED for a in acts), \
+        "Latch opens both hands at its first observation; the trial starts from what the setup left commanded"
 
 
 def test_the_step_invariant_fails_on_an_idle_step_or_an_uncharged_one():
