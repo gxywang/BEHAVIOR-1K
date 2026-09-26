@@ -738,19 +738,28 @@ def test_the_mesh_room_is_todays_physical_meshes_posed_in_the_map_frame():
     from omnigibson.tiptop.oracle.meshroom import MeshRoom
 
     pose = (th.tensor([1.0, 3.0, 0.5]), th.tensor([0.0, 0.0, 0.0, 1.0]))
-    shelf = SimpleNamespace(get_position_orientation=lambda: pose)
+
+    def body(category, fixed, lo, hi):
+        return SimpleNamespace(get_position_orientation=lambda: pose, category=category, fixed_base=fixed,
+                               aabb=(th.tensor(lo), th.tensor(hi)), name=f"{category}_0")
+
+    shelf = body("shelf", True, [0.8, 2.8, 0.0], [1.2, 3.2, 1.0])
+    others = {"apple_1": body("apple", False, [0.9, 2.9, 0.9], [1.0, 3.0, 1.0]),  # a task movable: a perceived hull
+              "lawn_0": body("lawn", True, [-9.0, -9.0, 0.0], [9.0, 9.0, 0.01]),  # the ground, not furniture
+              "far_0": body("shelf", True, [9.0, 9.0, 0.0], [9.5, 9.5, 1.0])}  # past the radius
     mesh = {"vertices": np.zeros((3, 3), np.float32), "faces": np.zeros((1, 3), np.int32), "kind": "obstacle",
             "pose": np.eye(4, dtype=np.float32), "fixed_base": True}  # fmt: skip
     asked = []
-    sim = SimpleNamespace(n_steps=4, obstacles={}, room_collision_scene=lambda: {"shelf_0": mesh})
+    sim = SimpleNamespace(n_steps=4, obstacles={}, room_collision_scene=lambda: {n: mesh for n in sim.obstacles},
+                          robot=None, task_scope=lambda: {})  # fmt: skip
 
     def nearby_obstacles(collision_map=False):
         asked.append(collision_map)
-        sim.obstacles = {"shelf_0": shelf}  # as R1ProSim: registered here, read by room_collision_scene
+        sim.obstacles = {"shelf_0": shelf, **others}  # as R1ProSim: registered here, read by room_collision_scene
 
     sim.nearby_obstacles = nearby_obstacles
     got = MeshRoom(sim).room((0.0, 0.0, 0.0), 3.0)
-    (entry,) = got.value
+    (entry,) = got.value  # the map room's bodies only: the A/B changes the room's form, nothing else
     assert (got.source, got.step, asked) == ("oracle", 4, [True])
     assert entry["name"] == "shelf_0" and entry["vertices"] is mesh["vertices"] and entry["kind"] == "obstacle"
     assert np.allclose(entry["pose"][:3, 3], [1.0, 3.0, 0.5]), "the map (world) frame, not the base frame"
