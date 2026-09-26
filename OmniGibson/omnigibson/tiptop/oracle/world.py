@@ -108,4 +108,4 @@ class OracleWorld:
         import omnigibson.utils.transform_utils as T
 
         pos, quat = self.sim.robot.get_position_orientation()
-        return self._b(Pose2(float(pos[0]), float(pos[1]), float(T.quat2euler(quat)[2])))
+        return self._b(Pose2(float(pos[0]), float(pos[1]), float(T.quat2euler(quat)[2]), float(pos[2])))
