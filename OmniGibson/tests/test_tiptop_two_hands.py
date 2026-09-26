@@ -143,9 +143,31 @@ def test_without_a_lease_the_one_call_planner_aims_as_before():
     assert rt.charged == {"observe": 0, "skill": 3} and skillbench.u0(rt)
 
 
+def test_the_setup_puts_the_holding_arm_at_its_ready_posture_where_a_pick_leaves_it(monkeypatch):
+    monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: None)
+    q, events = th.arange(4.0), []
+    robot = SimpleNamespace(get_joint_positions=lambda: q, keep_still=lambda: events.append("still"),
+                            set_joint_positions=lambda v, drive: events.append(("set", v.tolist(), drive)))
+    sim = SimpleNamespace(OPEN=1.0, arm="left", robot=robot, planned_joints=["t1", "a1"], q_home=[9.0, 8.0],
+                          joint_index={"t1": 0, "a1": 2, "r1": 3}, stance_ready=None, place_robot=lambda *a, note: None,
+                          look_at=lambda *n: None, hold=lambda n, g: events.append(("hold", n)))  # fmt: skip
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
+    case = {"id": "c", "setup": {"robot_pose": [1.0, 2.0, 0.0], "ready": "left"},
+            "call": SkillCall("press", PressArgs(radio), arm="right")}
+    skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+    assert events == [("set", [9.0, 1.0, 8.0, 3.0], False), "still", ("hold", 3)], \
+        "the planned joints at q_home outright, nothing else moved, then the settle"
+    assert sim.stance_ready == [9.0, 8.0], "the capture's ready posture is where the arm now stands"
+    case["setup"]["ready"] = "right"
+    with pytest.raises(ValueError, match="not on the bench"):
+        skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+
+
 def test_the_two_hands_cases_load_with_their_lease():
     cases = skillbench.load_cases(ROOT / "tiptop/b1k/skills/bench/two_hands.yaml")
     assert cases and all(c["task"] == "turning_on_radio" and c["setup"]["held"] == {"left": "radio_89"} for c in cases)
+    assert {c["id"].split(".")[0] for c in cases} == {"hold_press", "hold_press_ready"}
+    assert all((c["setup"].get("ready") == "left") == c["id"].startswith("hold_press_ready") for c in cases)
     for c in cases:
         assert c["call"].skill == "press" and c["call"].arm == "right" and c["call"].args.want_on is True
         assert c["lease"] == SkillCall("hold", HoldArgs(c["call"].args.target, pose="here"), arm="left"), \

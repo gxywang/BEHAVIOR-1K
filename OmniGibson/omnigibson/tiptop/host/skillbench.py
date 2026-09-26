@@ -76,9 +76,10 @@ from omnigibson.tiptop.run import (
 
 log = logging.getLogger("omnigibson.tiptop")
 
-SETUP_KEYS = ("robot_pose", "torso", "held", "joint_states")  # held {arm: sim object name} needs demo.snapshot (the
-#                                                 object is in the hand there); joint_states {object: {joint: value}}
-#                                                 (a drawer to close starts open); object_poses joins when needed
+SETUP_KEYS = ("robot_pose", "torso", "held", "joint_states", "ready")  # held {arm: sim object name} needs
+#                                     demo.snapshot (the object is in the hand there); joint_states {object: {joint:
+#                                     value}} (a drawer to close starts open); ready: the planned arm at its planner's
+#                                     ready posture, where a pick leaves it; object_poses joins when needed
 # R1ProSim's command state, which the physics state does not carry: what its own steps (a legacy run, the restore's
 # hold) command the joints nobody plans (posture), which arm plans, where the captures look, both gripper commands
 # (a demo's held hand stays closed) and the hand record (what a legacy round knows the hands hold)
@@ -324,6 +325,16 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         apply_embodiment_posture(sim, args, embodiment)
         if "robot_pose" in s:
             sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
+    if s.get("ready"):  # the holding arm where a pick leaves it (SPEC §5.6: hold "here"): its planner's ready posture
+        #                 set outright as apply_posture does, the object welded to the hand following at the settle
+        if s["ready"] != sim.arm:
+            raise ValueError(f"{case['id']}: ready: {s['ready']} is not on the bench (the {sim.arm} arm is planned)")
+        q = sim.robot.get_joint_positions().clone()
+        for j, v in zip(sim.planned_joints, sim.q_home):
+            q[sim.joint_index[j]] = v
+        sim.robot.set_joint_positions(q, drive=False)
+        sim.robot.keep_still()
+        sim.stance_ready = [float(v) for v in sim.q_home]
     for name, joints in (s.get("joint_states") or {}).items():  # set outright; the settle below propagates it
         for joint, value in joints.items():
             sim.scene_object(name).joints[joint].set_pos(float(value))
