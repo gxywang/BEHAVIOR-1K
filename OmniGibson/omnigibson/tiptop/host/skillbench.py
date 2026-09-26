@@ -132,7 +132,8 @@ def make_backends(ep, host, svc) -> dict:
     found = builders.discover()
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
             "tiptop": TiptopBackend({s: m.build for s, m in found.items()},
-                                    checks={s: m.check for s, m in found.items() if hasattr(m, "check")}),
+                                    checks={s: m.check for s, m in found.items() if hasattr(m, "check")},
+                                    stops={s: m.stop_state for s, m in found.items() if hasattr(m, "stop_state")}),
             "scripted": ScriptedBackend()}  # fmt: skip
 
 

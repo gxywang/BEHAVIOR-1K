@@ -9,6 +9,7 @@ from b1k.perception.grasp_sensor import ProprioGraspSensor
 from b1k.perception.verifier import PerceptionVerifier
 from b1k.runtime.skillrun import Services
 from omnigibson.tiptop.oracle.articulation import OracleArticulation
+from omnigibson.tiptop.oracle.buttons import OracleButtons
 from omnigibson.tiptop.oracle.geometry import OracleGeometry
 from omnigibson.tiptop.oracle.goals import EpisodeScorer
 from omnigibson.tiptop.oracle.joints import OracleJoints
@@ -34,7 +35,7 @@ def pseudo_services(ep, planner, routing: dict, collision: str = "map") -> tuple
         joints=guarded(joints, policy, "joints"),
         collision=guarded(room, policy, "collision"),
         grasp=grasp,
-        buttons=None,  # oracle/buttons.py lands with press (week 2)
+        buttons=guarded(OracleButtons(sim), policy, "buttons"),
         goals=goal_panel(routing, "pseudo", scorer=EpisodeScorer(sim), perception=PerceptionVerifier()),
         planner=planner,
         percepts={},
