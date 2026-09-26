@@ -663,7 +663,7 @@ class DemoSim:
 
 
 def demo_case(held={"left": "log_176"}):
-    return {"id": "d", "instance": 188, "setup": {"robot_pose": [1.0, 2.0, 0.0], "held": dict(held)},
+    return {"id": "d", "instance": 188, "mode": "train", "setup": {"robot_pose": [1.0, 2.0, 0.0], "held": dict(held)},
             "demo": {"snapshot": "snap.json"},
             "call": SkillCall("place", PlaceArgs(ObjRef("log.n.01_2", "log"), (Relation(Rel.ON, basket),)))}
 
@@ -671,7 +671,8 @@ def demo_case(held={"left": "log_176"}):
 @pytest.fixture
 def demo_env(monkeypatch, tmp_path):
     restored = []
-    monkeypatch.setattr(skillbench.demo_cases, "restore", lambda env, snap, inst: restored.append((env, snap, inst)))
+    monkeypatch.setattr(skillbench.demo_cases, "restore",
+                        lambda env, snap, inst, mode: restored.append((env, snap, inst, mode)))
     monkeypatch.setattr(skillbench.demo_cases, "held", lambda robot: {"left": "log_176", "right": None})
     (tmp_path / "snap.json").write_text('{"log_176": {"pos": [1, 2, 3]}}')
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
@@ -684,8 +685,9 @@ def test_a_demo_case_setup_restores_the_snapshot_adopts_the_human_posture_and_ve
     host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(0, sim.proprio(), {}))
     case = demo_case()
     case["demo"]["snapshot"] = str(tmp_path / "snap.json")
-    state, held = skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {}, host)
-    assert restored == [("env", {"log_176": {"pos": [1, 2, 3]}}, 188)], "demo_cases.restore: instance + snapshot"
+    state, held = skillbench.setup(og, sim, SimpleNamespace(settle_steps=3, mode="public_test"), case, {}, host)
+    assert restored == [("env", {"log_176": {"pos": [1, 2, 3]}}, 188, "train")], \
+        "demo_cases.restore: instance + snapshot, of the case's mode (a demo's is a training instance)"
     assert held == {"left": case["call"].args.obj}, "setup.held names the sim object; the hand holds the call's ObjRef"
     assert sim.posture["right_arm_joint3"] == pytest.approx(0.7), \
         "the idle arm is locked where the human left it: no hold or capture drives it to the nominal posture"
@@ -709,9 +711,11 @@ def test_a_demo_case_whose_hand_does_not_hold_after_the_restore_fails_its_setup_
     host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(0, sim.proprio(), {}))
     case = demo_case()
     case["demo"]["snapshot"] = str(tmp_path / "snap.json")
+    case["instance"], case["mode"] = 301, "public_test"  # a manip run's stance: its snapshot is of a public_test instance
     with pytest.raises(skillbench.CaseSetupError, match=r"\['left'\] hand does not hold \['log.n.01_2'\].*proprio"):
-        skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {}, host)
-    assert len(restored) == 1, "it did restore first; the proprio GraspSensor refused what it found"
+        skillbench.setup(og, sim, SimpleNamespace(settle_steps=3, mode="train"), case, {}, host)
+    assert restored == [("env", {"log_176": {"pos": [1, 2, 3]}}, 301, "public_test")], \
+        "it did restore first, the case's own mode over the bench's; the proprio GraspSensor refused what it found"
     refs = skillbench.held_refs(sim, {"right": "wicker_basket_92"}, case["call"])
     assert refs == {"right": ObjRef("wicker_basket_92", "wicker_basket", False)}, "an object outside the task scope"
     block = skillbench.held_refs(sim, {"right": "block_9"}, case["call"])["right"]

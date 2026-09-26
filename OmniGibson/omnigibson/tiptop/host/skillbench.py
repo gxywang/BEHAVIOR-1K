@@ -318,7 +318,7 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
     s, demo, held = case.get("setup") or {}, case.get("demo") or {}, {}
     if demo.get("snapshot"):
         with open(demo["snapshot"]) as f:
-            demo_cases.restore(sim.env, json.load(f), int(case["instance"]))
+            demo_cases.restore(sim.env, json.load(f), int(case["instance"]), case.get("mode") or args.mode)
         held = held_refs(sim, s.get("held") or {}, case["call"])
         adopt_demo_posture(sim, host or BenchHost(sim), held)
         aim_overview(sim, *s["robot_pose"])  # the video's third-person view; no place_robot here to aim it

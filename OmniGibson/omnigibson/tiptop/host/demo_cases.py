@@ -432,14 +432,15 @@ def hold_action(action: np.ndarray, frame: int):
     return hold
 
 
-def restore(env, snapshot: dict, instance: int) -> None:
-    """The bench side: the instance first, then every saved object and the robot on top of it."""
+def restore(env, snapshot: dict, instance: int, mode: str = "train") -> None:
+    """The bench side: the instance (of ``mode``: a demo's is a training one, a manip run's stance a public_test one)
+    first, then every saved object and the robot on top of it."""
     from omnigibson.eval.evaluator import load_task_instance
     from omnigibson.utils.python_utils import recursively_convert_to_torch
 
     robot = env.robots[0]
     env.reset()
-    load_task_instance(env, robot, instance, mode="train")
+    load_task_instance(env, robot, instance, mode=mode)
     env.reset()
     for name, state in recursively_convert_to_torch(json.loads(json.dumps(snapshot))).items():
         if name == robot.name:
