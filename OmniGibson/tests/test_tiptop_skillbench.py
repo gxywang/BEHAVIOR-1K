@@ -749,14 +749,14 @@ class DemoSim:
     def scene_object(self, name):
         return SimpleNamespace(prim_path=f"/World/{name}", aabb_center=th.tensor([1.5, 2.0, 0.9]))
 
-    def __init__(self, finger_sum=0.02):
+    def __init__(self, finger_sum=0.02, phantom_qvel=0.0):
         self.arm, self.other_arm, self.n_steps = "left", "right", 0
         self.robot = SimpleNamespace(arm_joint_names={a: [f"{a}_arm_joint{k}" for k in range(1, 8)]
                                                       for a in ("left", "right")}, prim_path="/World/robot0")  # fmt: skip
         self.posture = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)} | {"left_gripper_finger_joint1": 0.05}
         self.locked_nominal = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)}
         self.stance_ready, self.last_gripper, self.other_gripper, self.held_objects = None, 1.0, 1.0, {}
-        self.env, self.events, self.finger_sum = "env", [], finger_sum
+        self.env, self.events, self.finger_sum, self.phantom_qvel = "env", [], finger_sum, phantom_qvel
         self.scope = {"log.n.01_2": SimpleNamespace(name="log_176"), "block.n.01_1": SimpleNamespace(name="block_9")}
 
     def task_scope(self):
@@ -773,7 +773,7 @@ class DemoSim:
 
     def hold(self, n, gripper):
         self.events.append(("hold", n, gripper))
-        self.last_gripper = gripper
+        self.last_gripper, self.n_steps = gripper, self.n_steps + n
 
     def commanded_targets(self):
         return {"base": np.zeros(3), "trunk": np.zeros(4), "arm_left": np.zeros(7), "arm_right": np.zeros(7),
@@ -783,6 +783,7 @@ class DemoSim:
         p = np.zeros(61, dtype=np.float32)
         p[PROPRIO_SLICES["arm_right_qpos"]] = np.arange(7) * 0.1 + 0.5  # the human's right arm, as restored
         p[PROPRIO_SLICES["gripper_left_qpos"]] = self.finger_sum / 2  # the left fingers, settled on the log or on air
+        p[PROPRIO_SLICES["gripper_left_qvel"]] = self.phantom_qvel  # what PhysX says they do meanwhile
         return p
 
 
@@ -846,6 +847,21 @@ def test_a_demo_case_whose_hand_does_not_hold_after_the_restore_fails_its_setup_
     assert refs == {"right": ObjRef("wicker_basket_92", "wicker_basket", False)}, "an object outside the task scope"
     block = skillbench.held_refs(sim, {"right": "block_9"}, case["call"])["right"]
     assert block == ObjRef("block.n.01_1", "block", False), "a task object the call does not name: its BDDL name"
+
+
+def test_a_hold_whose_welded_finger_reports_a_phantom_velocity_verifies_over_a_window(demo_env):
+    """make_microwave_popcorn (W2-P probe): the fingers unchanged at [0.0497, 0.0] m while PhysX reports 5 cm/s, so
+    the sensor's one-shot velocity test never resolved and 15 held setups were refused. The setup reads the sensor
+    over its window, one physics step apart, and the sensor settles by position."""
+    og, restored, tmp_path = demo_env
+    sim = DemoSim(finger_sum=0.0497, phantom_qvel=0.05)
+    host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(sim.n_steps, sim.proprio(), {}))
+    case = demo_case()
+    case["demo"]["snapshot"] = str(tmp_path / "snap.json")
+    state, held = skillbench.setup(og, sim, SimpleNamespace(settle_steps=3, mode="public_test"), case, {}, host)
+    assert held == {"left": case["call"].args.obj}
+    assert sim.events[-3:] == [("hold", 3, CLOSED), ("hold", 1, CLOSED), ("hold", 1, CLOSED)], \
+        "the settle, then one step per further reading until the window was full"
 
 
 def test_the_self_test_spread_is_the_widest_range_over_the_trials():
