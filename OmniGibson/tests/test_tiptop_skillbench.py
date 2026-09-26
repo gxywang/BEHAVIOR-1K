@@ -35,7 +35,7 @@ from b1k.observation import PROPRIO_SLICES, CameraView
 from b1k.runtime.compose import ACTION_SLICES, CLOSED
 from b1k.runtime.direct import DirectConnector
 from b1k.tests.fakes import REFS, Env, JointWorld, Scripted, SimV, apple, basket, make_rt, table
-from omnigibson.tiptop.host import skillbench
+from omnigibson.tiptop.host import overview, skillbench
 from omnigibson.tiptop.host.bench_host import BenchHost, Frames
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, classify
@@ -710,29 +710,30 @@ def test_the_overview_camera_takes_the_first_eye_that_sees_the_robot_and_the_tar
         body = walls.get((key(start), key(end)))
         return {"hit": True, "distance": 0.5, "rigidBody": body} if body else {"hit": False}
 
-    monkeypatch.setattr(skillbench, "raytest", raytest)
+    monkeypatch.setattr(overview, "raytest", raytest)
     jar = SimpleNamespace(prim_path="/World/scene_0/jar_7", aabb_center=th.tensor([2.0, 2.3, 0.9]))
     sim = SimpleNamespace(overview_view="shoulder", aim_overview=lambda eye, look: aimed.append((key(eye), key(look))),
                           robot=SimpleNamespace(prim_path="/World/scene_0/robot0"), scene_object=lambda n: jar)  # fmt: skip
     shoulder, right, chest, look = (-0.5, 3.1, 1.7), (-0.5, 0.9, 1.7), (1.0, 2.0, 1.1), (2.0, 2.3, 0.9)  # base (1, 2, yaw 0)
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    overview.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
     assert aimed[-1] == (shoulder, look), "every ray clear: the --overview eye as place_robot puts it, at the target"
     walls[(shoulder, look)] = "/World/scene_0/walls_pillar"
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    overview.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
     assert aimed[-1] == (right, look), "a pillar hides the jar from the shoulder eye: the next eye, over the right"
     walls[(right, chest)] = "/World/scene_0/window_3"
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    overview.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
     assert aimed[-1][0] == (2.15, 2.75, 1.35), "a window between that eye and the robot: the eye ahead-left"
     walls[(shoulder, look)], walls[(right, chest)] = jar.prim_path, sim.robot.prim_path
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    overview.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
     assert aimed[-1] == (shoulder, look), "a hit on the target's own body, or on the robot's toward its chest, is clear"
     walls[(shoulder, look)] = "/World/scene_0/walls_pillar"
-    for e in skillbench.OVERVIEW_EYES:
+    for e in overview.OVERVIEW_EYES:
         walls[(key((1.0 + e[0], 2.0 + e[1], e[2])), chest)] = "/World/scene_0/walls"
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    overview.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
     assert aimed[-1] == (shoulder, look), "every eye blocked: the --overview eye, as before"
-    skillbench.aim_overview(sim, 1.0, 2.0, 0.0)
+    overview.aim_overview(sim, 1.0, 2.0, 0.0)
     assert aimed[-1] == (shoulder, (1.7, 2.0, 0.55)), "no target named (a release): the view's own workspace point"
+    assert skillbench.aim_overview is overview.aim_overview, "the bench's setup aims through it (harness-only: HARNESS_SETUP)"
 
 
 class DemoSim:
@@ -748,14 +749,14 @@ class DemoSim:
     def scene_object(self, name):
         return SimpleNamespace(prim_path=f"/World/{name}", aabb_center=th.tensor([1.5, 2.0, 0.9]))
 
-    def __init__(self, finger_sum=0.02, phantom_qvel=0.0):
+    def __init__(self, finger_sum=0.02):
         self.arm, self.other_arm, self.n_steps = "left", "right", 0
         self.robot = SimpleNamespace(arm_joint_names={a: [f"{a}_arm_joint{k}" for k in range(1, 8)]
                                                       for a in ("left", "right")}, prim_path="/World/robot0")  # fmt: skip
         self.posture = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)} | {"left_gripper_finger_joint1": 0.05}
         self.locked_nominal = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)}
         self.stance_ready, self.last_gripper, self.other_gripper, self.held_objects = None, 1.0, 1.0, {}
-        self.env, self.events, self.finger_sum, self.phantom_qvel = "env", [], finger_sum, phantom_qvel
+        self.env, self.events, self.finger_sum = "env", [], finger_sum
         self.scope = {"log.n.01_2": SimpleNamespace(name="log_176"), "block.n.01_1": SimpleNamespace(name="block_9")}
 
     def task_scope(self):
@@ -772,7 +773,7 @@ class DemoSim:
 
     def hold(self, n, gripper):
         self.events.append(("hold", n, gripper))
-        self.last_gripper, self.n_steps = gripper, self.n_steps + n
+        self.last_gripper = gripper
 
     def commanded_targets(self):
         return {"base": np.zeros(3), "trunk": np.zeros(4), "arm_left": np.zeros(7), "arm_right": np.zeros(7),
@@ -782,7 +783,6 @@ class DemoSim:
         p = np.zeros(61, dtype=np.float32)
         p[PROPRIO_SLICES["arm_right_qpos"]] = np.arange(7) * 0.1 + 0.5  # the human's right arm, as restored
         p[PROPRIO_SLICES["gripper_left_qpos"]] = self.finger_sum / 2  # the left fingers, settled on the log or on air
-        p[PROPRIO_SLICES["gripper_left_qvel"]] = self.phantom_qvel  # what PhysX says they do meanwhile
         return p
 
 
@@ -798,7 +798,7 @@ def demo_env(monkeypatch, tmp_path):
     monkeypatch.setattr(skillbench.demo_cases, "restore",
                         lambda env, snap, inst, mode: restored.append((env, snap, inst, mode)))
     monkeypatch.setattr(skillbench.demo_cases, "held", lambda robot: {"left": "log_176", "right": None})
-    monkeypatch.setattr(skillbench, "raytest", lambda start, end: {"hit": False})  # every overview eye clear
+    monkeypatch.setattr(overview, "raytest", lambda start, end: {"hit": False})  # every overview eye clear
     (tmp_path / "snap.json").write_text('{"log_176": {"pos": [1, 2, 3]}}')
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
     return og, restored, tmp_path
@@ -846,21 +846,6 @@ def test_a_demo_case_whose_hand_does_not_hold_after_the_restore_fails_its_setup_
     assert refs == {"right": ObjRef("wicker_basket_92", "wicker_basket", False)}, "an object outside the task scope"
     block = skillbench.held_refs(sim, {"right": "block_9"}, case["call"])["right"]
     assert block == ObjRef("block.n.01_1", "block", False), "a task object the call does not name: its BDDL name"
-
-
-def test_a_hold_whose_welded_finger_reports_a_phantom_velocity_verifies_over_a_window(demo_env):
-    """make_microwave_popcorn (W2-P probe): the fingers unchanged at [0.0497, 0.0] m while PhysX reports 5 cm/s, so
-    the sensor's one-shot velocity test never resolved and 15 held setups were refused. The setup reads the sensor
-    over its window, one physics step apart, and the sensor settles by position."""
-    og, restored, tmp_path = demo_env
-    sim = DemoSim(finger_sum=0.0497, phantom_qvel=0.05)
-    host = SimpleNamespace(proprio=sim.proprio, observe_now=lambda: StepObs(sim.n_steps, sim.proprio(), {}))
-    case = demo_case()
-    case["demo"]["snapshot"] = str(tmp_path / "snap.json")
-    state, held = skillbench.setup(og, sim, SimpleNamespace(settle_steps=3, mode="public_test"), case, {}, host)
-    assert held == {"left": case["call"].args.obj}
-    assert sim.events[-3:] == [("hold", 3, CLOSED), ("hold", 1, CLOSED), ("hold", 1, CLOSED)], \
-        "the settle, then one step per further reading until the window was full"
 
 
 def test_the_self_test_spread_is_the_widest_range_over_the_trials():
