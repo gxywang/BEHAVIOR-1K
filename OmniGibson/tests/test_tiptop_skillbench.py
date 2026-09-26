@@ -594,6 +594,10 @@ def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
     assert events == ["torso", "place", ("look", (apple.id, basket.id)), "hold"], \
         "place_robot clears the look target: the capture would aim at the default point, not at the objects"
+    events.clear()
+    case["call"] = SkillCall("release", ReleaseArgs())
+    skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+    assert events == ["torso", "place", "hold"], "a call that names no object frames nothing (look_at() would raise)"
 
 
 class DemoSim:

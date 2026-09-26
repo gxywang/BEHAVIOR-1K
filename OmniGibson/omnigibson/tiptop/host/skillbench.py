@@ -293,7 +293,8 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         apply_embodiment_posture(sim, args, embodiment)
         if "robot_pose" in s:
             sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
-    sim.look_at(*(o.id for o in targets(case["call"])))
+    if targets(case["call"]):  # a release names nothing: the head stays where the setup left it
+        sim.look_at(*(o.id for o in targets(case["call"])))
     sim.hold(args.settle_steps, sim.last_gripper if demo.get("snapshot") else sim.OPEN)
     if held:
         obs, sensor = commanded_obs(sim, host or BenchHost(sim)), ProprioGraspSensor()
