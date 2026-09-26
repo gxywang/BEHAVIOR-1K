@@ -119,8 +119,8 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[Sk
 def load_cases(path, ids=None) -> list:
     """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?, joint_states?}, call:
     to_dict(SkillCall), n, seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode
-    (train), demo {snapshot: a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene
-    needs it, and ``lease`` (to_dict(SkillCall): the hold the call runs beside); the ones named in ``ids`` when
+    (train), demo {snapshot: a path relative to the case file, arms, fingers, ...}, and ``lease`` (to_dict(SkillCall):
+    the hold the call runs beside); the ones named in ``ids`` when
     given. A case with ``skip: <reason>`` is left out, its reason logged."""
     with open(path) as f:
         cases = [c for c in yaml.safe_load(f) if ids is None or c["id"] in ids]
@@ -471,18 +471,15 @@ def main(argv=None) -> None:
     import omnigibson as og
     import torch
     from omnigibson.eval.evaluator import DISABLED_TRANSITION_RULES
-    from omnigibson.macros import gm
     from omnigibson.tiptop.bench import Episode
     from omnigibson.tiptop.knowledge import make_knowledge
     from omnigibson.tiptop.r1pro import load_embodiment_meta
     from omnigibson.tiptop.scene import EpisodeOver
     from b1k.bridge.strategies import strategy_for, task_goal_atoms, task_goal_options
 
-    for rule in DISABLED_TRANSITION_RULES:  # as the evaluator runs: no recipe rule (their garbage is a particle system)
-        rule.ENABLED = False
-    if any(c.get("gpu_dynamics") for c in cases):  # a scene whose transition rules spawn a micro particle system
-        gm.USE_GPU_DYNAMICS = True
-        log.info("gm.USE_GPU_DYNAMICS on: a case asks for it")
+    for rule in DISABLED_TRANSITION_RULES:  # as the evaluator runs: no recipe rule (their garbage is a particle system),
+        rule.ENABLED = False  # and GPU dynamics off as the evaluator has them (make_pizza loads and restores so; on,
+    #                           PhysX GPU crashed at the first physics step, W2-P setup sweep)
     skillrun.PASSTHROUGH = (EpisodeOver,)  # the harness's own exception: no skill may swallow it
     providers, routing = importlib.import_module(args.providers), load_routing()
     finger_settled(args)
