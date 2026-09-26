@@ -86,8 +86,8 @@ def test_go_to_teleports_on_the_sim_clock_and_charges_the_move_to_mean_in_shadow
 class Conn:
     """A connector out of reach: check says NO_STANCE_HERE until go_to, then PERCEPT_REQUIRED, then the run."""
 
-    def __init__(self):
-        self.events, self.here = [], False
+    def __init__(self, proposals=3):
+        self.events, self.here, self.proposals = [], False, proposals
         self.rt = SimpleNamespace(results={})
 
     def check(self, call):
@@ -96,11 +96,11 @@ class Conn:
         return Precheck(False, Code.PERCEPT_REQUIRED) if call.percept is None else Precheck(True)
 
     def propose_stances(self, req, k=8):
-        return [Stance(f"s{i}", Pose2(float(i), 0.0, 0.0), 1.0, "t", "oracle") for i in range(3)]
+        return [Stance(f"s{i}", Pose2(float(i), 0.0, 0.0), 1.0, "t", "oracle") for i in range(self.proposals)]
 
     def check_stances(self, call, stances):
         self.events.append("check_stances")
-        return [0.0, 1.0, 1.0]
+        return [0.0, 1.0, 1.0][: len(stances)]
 
     def go_to(self, stance):
         self.events.append(("go_to", stance.key))
@@ -124,3 +124,7 @@ def test_the_one_call_planner_reaches_by_check_stances_before_it_observes_only_f
     c = Conn()
     assert skillbench.one_call(c, SkillCall("pick_up", PickArgs(jar), arm="left")) == "result"
     assert c.events == [("run", None)], "no reach: the case's stance is the setup's, and check says NO_STANCE_HERE"
+    c = Conn(proposals=0)
+    assert skillbench.one_call(c, SkillCall("pick_up", PickArgs(jar), arm="left"), reach=True) == "result"
+    assert c.events == ["check_stances", ("run", None)], \
+        "nowhere to stand: the trial is not an exception; the run answers NO_STANCE_HERE from where it is"

@@ -47,7 +47,7 @@ from b1k.bridge.client import ArmPlanners
 from b1k.bridge.protocol import bddl_category
 from b1k.bridge.strategies import STRATEGIES
 from b1k.connector.codec import from_dict, to_dict
-from b1k.connector.api import reach as api_reach
+from b1k.connector.api import Unreachable, reach as api_reach
 from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
@@ -113,7 +113,10 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[Sk
     if h is not None and h.call_id in conn.rt.results:  # refused before it ran (not_holding, resource_busy): the
         return conn.rt.results[h.call_id]  # trial is not two-handed, and its row says so, instead of a lone press
     if reach:
-        api_reach(conn, call)
+        try:
+            api_reach(conn, call)
+        except Unreachable:  # no candidate, or none the service reaches from: the run answers NO_STANCE_HERE from here
+            pass
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
         req = ObserveRequest(targets(call), views=views, aim=lease is None)
         call = dataclasses.replace(call, percept=conn.observe(req).id)

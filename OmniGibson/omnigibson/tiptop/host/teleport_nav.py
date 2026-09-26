@@ -18,7 +18,9 @@ from b1k.connector.skills import NavResult, Stance
 from b1k.connector.types import Belief, Pose2
 
 MOVE_TO_STEPS = 559  # the human move-to mean (SPEC D20)
-STANDOFFS = (0.6, 0.45, 0.75)  # m from the reach points' centroid, the preferred first
+STANDOFFS = (0.6, 0.75, 0.9, 1.05, 0.45)  # m from the reach points' centroid, the preferred first; an object 0.3 m into
+#                                            a counter needs the base a further 0.5 m off its edge (the arm's resting
+#                                            posture is tested too), so the rings reach past the arm's 0.9 m
 ANGLES = np.arange(0.0, 2 * np.pi, np.pi / 6)  # around the centroid
 YAW_OFFSETS = (0.0, np.pi / 6, -np.pi / 6)  # facing the centroid, and the object to the left or right of straight ahead
 
