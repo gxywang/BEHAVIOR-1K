@@ -146,6 +146,7 @@ def test_without_a_lease_the_one_call_planner_aims_as_before():
 
 def test_the_setup_puts_the_holding_arm_at_its_ready_posture_where_a_pick_leaves_it(monkeypatch):
     monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: None)
+    monkeypatch.setattr(skillbench, "aim_overview", lambda sim, *pose, target=None: None)  # the video camera: not this test
     q, events = th.arange(4.0), []
     robot = SimpleNamespace(get_joint_positions=lambda: q, keep_still=lambda: events.append("still"),
                             set_joint_positions=lambda v, indices=None, drive=False: events.append(
