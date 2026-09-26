@@ -8,7 +8,11 @@ production Runtime, registry, latch, GoalPanel and the providers of --providers.
 call. Every trial writes one JSON row (<out>/<case>.jsonl) and asserts the step invariant (U0):
 rt.step - rt.idle_steps == sum(rt.charged), with idle_steps == 0, and, for a trial that did not step the sim itself
 (legacy), sim.n_steps == rt.step + the steps the planner's captures took: nothing else stepped the sim. summary.csv
-has one line per case.
+has one line per case. A case with a ``lease`` (a persistent call: hold(left, "here")) is the two-handed shape
+(SPEC §5.6): the lease starts before the observe, which then captures from where the head is (aim=False), the call
+runs beside it (press(right) through the r1pro_right planner of --press-port), and the lease is aborted after; the
+lease is charged every step too, so U0 reads rt.step == sum(rt.charged) - lease.steps. A legacy call runs alone: its
+round holds the other hand itself.
 
   OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.host.skillbench --out-dir runs/skillbench/pick --port 8970 \\
       --case tiptop/b1k/skills/bench/pick_up.yaml --ids pick_up_freeze_fruit_apple --grasping-mode assisted \\
@@ -33,11 +37,13 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import yaml
 
 import b1k.runtime.skillrun as skillrun
+from b1k.bridge.client import ArmPlanners
 from b1k.bridge.protocol import bddl_category
 from b1k.bridge.strategies import STRATEGIES
 from b1k.connector.codec import from_dict, to_dict
@@ -92,20 +98,27 @@ def targets(call: SkillCall) -> tuple:
     return named + tuple(r.target for r in getattr(a, "relations", ()))
 
 
-def one_call(conn, call: SkillCall, views: tuple = ("head",)):
+def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[SkillCall] = None):
     """The bench's TaskPlanner: the one call, after an observe of ``views`` when the skill asks for a Percept (a
     legacy backend captures in its own run and does not). It never calls go_to: the case's stance is the harness's
-    setup."""
+    setup. With a ``lease`` it is hold_and_press (b1k.connector.api): the lease started first, the observe from where
+    the head is (a lease holds the trunk read-only), the call beside it, the lease aborted after."""
+    h = conn.start(lease) if lease is not None else None
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
-        call = dataclasses.replace(call, percept=conn.observe(ObserveRequest(targets(call), views=views)).id)
-    return conn.run(call)
+        req = ObserveRequest(targets(call), views=views, aim=lease is None)
+        call = dataclasses.replace(call, percept=conn.observe(req).id)
+    r = conn.run(call)
+    if h is not None:
+        conn.abort(h)
+    return r
 
 
 def load_cases(path, ids=None) -> list:
     """A <skill>.yaml: a list of {id, task, instance, setup: {robot_pose, torso, held?, joint_states?}, call:
     to_dict(SkillCall), n, seeds, expect, baseline}, plus, for a case from the human demos (demo_cases.py), mode
     (train), demo {snapshot: a path relative to the case file, arms, fingers, ...} and gpu_dynamics when its scene
-    needs it; the ones named in ``ids`` when given. A case with ``skip: <reason>`` is left out, its reason logged."""
+    needs it, and ``lease`` (to_dict(SkillCall): the hold the call runs beside); the ones named in ``ids`` when
+    given. A case with ``skip: <reason>`` is left out, its reason logged."""
     with open(path) as f:
         cases = [c for c in yaml.safe_load(f) if ids is None or c["id"] in ids]
     for case in cases:
@@ -122,6 +135,8 @@ def load_cases(path, ids=None) -> list:
         if demo.get("snapshot"):
             demo["snapshot"] = str(Path(path).resolve().parent / demo["snapshot"])
         case["call"] = from_dict(case["call"], SkillCall)
+        if case.get("lease"):
+            case["lease"] = from_dict(case["lease"], SkillCall)
         case.setdefault("seeds", list(range(case.get("n", 5))))
     return cases
 
@@ -144,7 +159,8 @@ def make_backends(ep, host, svc) -> dict:
             "scripted": ScriptedBackend()}  # fmt: skip
 
 
-def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall) -> tuple:
+def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall,
+              lease: Optional[SkillCall] = None) -> tuple:
     """One trial: the production Runtime and registry over these providers and backends, DirectConnector on the
     host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
     calls = []
@@ -152,15 +168,17 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     rt.latch = Latch(host.observe_now().proprio)  # Latch opens both hands at its first observation; the trial starts
     rt.latch.reseed(host.commanded_targets())  # from what the setup left commanded (a demo's held hand stays closed)
     host.env_wall_s, t0 = 0.0, time.monotonic()
-    r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)))
+    r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
+                 lease)
     return r, rt, calls, time.monotonic() - t0
 
 
-def u0(rt, sim_steps=None, observe_steps: int = 0) -> bool:
+def u0(rt, sim_steps=None, observe_steps: int = 0, lease_steps: int = 0) -> bool:
     """The hard invariant on the one-call planner: every env step carried a live run's action, and (``sim_steps``:
     the sim's own count, for a trial that did not step the sim itself) the sim advanced only by those steps and the
-    planner's captures, so nothing stepped it while anything planned."""
-    runtime = rt.step - rt.idle_steps == sum(rt.charged.values()) and rt.idle_steps == 0
+    planner's captures, so nothing stepped it while anything planned. A lease beside the call is charged on every
+    step of the trial too (``lease_steps``): the steps it shared are counted once."""
+    runtime = rt.step - rt.idle_steps == sum(rt.charged.values()) - lease_steps and rt.idle_steps == 0
     return runtime and (sim_steps is None or sim_steps == rt.step + observe_steps)
 
 
@@ -172,16 +190,19 @@ def latch_gap(rt) -> float:
 
 
 def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float,
-        observe_wall_s: float = 0.0, observe_steps: int = 0) -> dict:
+        observe_wall_s: float = 0.0, observe_steps: int = 0, lease: Optional[dict] = None) -> dict:
     """planning_wall_s is what is neither an env step nor the planner's capture: planning, resampling and
-    verification (for a legacy run, which captures and steps inside itself, all of it)."""
+    verification (for a legacy run, which captures and steps inside itself, all of it). ``lease``: the skill_calls
+    row of the lease the call ran beside (aborted = still holding when the call ended; hold_lost = it let go)."""
     return {
         "case": case["id"], "trial": trial, "seed": seed, "skill": r.skill, "backend": r.backend,
         "status": r.status.value, "code": None if r.code is None else r.code.value, "phase": r.phase,
         "detail": r.detail, "binding": [dataclasses.asdict(b) for b in r.binding], "primary": r.primary,
         "verdicts": dict(r.verdicts), "steps": r.steps,
         "rt_step": rt.step, "idle_steps": rt.idle_steps, "charged": dict(rt.charged),
-        "u0": u0(rt, None if r.requires_sim_clock else sim_steps, observe_steps),  # legacy steps the sim itself
+        "u0": u0(rt, None if r.requires_sim_clock else sim_steps, observe_steps,  # legacy steps the sim itself
+                 lease["steps"] if lease else 0),
+        "lease": None if lease is None else {k: lease[k] for k in ("skill", "backend", "status", "code", "steps")},
         "sim_steps": sim_steps, "observe_steps": observe_steps, "latch_gap_rad": round(latch_gap(rt), 4),
         "wall_s": round(wall_s, 2),
         "env_wall_s": round(env_wall_s, 2), "observe_wall_s": round(observe_wall_s, 2),
@@ -205,6 +226,7 @@ def summarize(case: dict, rows: list) -> dict:
         "agree": sum(all(v is None or v == r["verdicts"][r["primary"]] for v in r["verdicts"].values()) for r in rows),
         "u0_all": all(r["u0"] for r in rows), "requires_sim_clock": sum(r["requires_sim_clock"] for r in rows),
         "wall_s_mean": round(float(np.mean([r["wall_s"] for r in rows])), 1),
+        "lease_kept": sum((r.get("lease") or {}).get("status") == "aborted" for r in rows),  # held to the end
     }  # fmt: skip
 
 
@@ -428,6 +450,7 @@ def main(argv=None) -> None:
         check_imports(metadata, press_meta)  # the step-zero gate line: every module from this checkout, or stop here
         embodiment = metadata["embodiment"]
     planners = {"left": (client, metadata), **({"right": (press_client, press_meta)} if press_client else {})}
+    planner = ArmPlanners(client, press_client) if press_client else client  # a right-arm skill plans on the second
     exit_code, summaries, loaded, strategy = 0, [], None, None
     try:
         sim = build_r1pro_sim(args, embodiment)
@@ -465,22 +488,29 @@ def main(argv=None) -> None:
                 restore(og, sim, state, name)
                 random.seed(seed), np.random.seed(seed), torch.manual_seed(seed)
                 ep = Episode(sim, args, planners, knowledge, out / case["id"] / f"t{i}", spec=strategy.spec)
-                svc, segmenter = providers.pseudo_services(ep, client, routing, collision=args.collision)
+                svc, segmenter = providers.pseudo_services(ep, planner, routing, collision=args.collision)
                 for arm, ref in held.items():  # what the setup put in the hands, as a pick's result would say it
                     svc.world.apply(WorldUpdate("held", ref, arm))
                 observer = CaptureObserver(sim, host, segmenter, args.task)
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
                                            arm=pick_arm(case["call"], held))
+                lease = case.get("lease")  # a legacy round holds the other hand itself: no lease beside it
+                lease = (dataclasses.replace(lease, seed=seed) if lease is not None and call.backend != "legacy"
+                         else None)
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
-                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host, svc), routing, observer, call)
+                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host, svc), routing, observer, call,
+                                                     lease)
+                held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
-                                observer.steps))
+                                observer.steps, held_by))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])
                 log.info(f"TRIAL {name}: {r.status.value} {r.code} steps {r.steps} rt {rt.step} "
-                         f"charged {rt.charged} idle {rt.idle_steps} latch gap {rows[-1]['latch_gap_rad']} rad")
+                         f"charged {rt.charged} idle {rt.idle_steps} latch gap {rows[-1]['latch_gap_rad']} rad"
+                         + (f" lease {held_by['status']} {held_by['code']} {held_by['steps']} steps"
+                            if held_by else ""))
                 assert rows[-1]["u0"], f"{name} broke the step invariant (U0): {rows[-1]}"
             summaries.append(summarize(case, rows))
     except Exception:

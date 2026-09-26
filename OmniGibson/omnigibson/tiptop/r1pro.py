@@ -3257,15 +3257,16 @@ class R1ProSim(TiptopSim):
         self.mirror_arm_idx = self.mirror_gripper_idx = None
         self.stance_ready = None
 
-    def adopt_embodiment(self, embodiment: dict, tol: float = 0.05) -> None:
+    def adopt_embodiment(self, embodiment: dict) -> None:
         """Plan another arm from here on without moving anything: e.g. ``r1pro_right`` after the left hand picked
-        something up. The joints the new embodiment locks (torso, the other arm) must already be where it expects
-        them within ``tol`` (a loaded wrist settles up to ~0.035 rad short of its target under a held object; the
-        new planner only uses these values for the other arm's own collision spheres); fingers are the gripper
-        state and are not checked. The arm that planned so far keeps its last gripper command (a held object stays
-        held) and its joints are held at their current values; the adopted arm resumes the command it was left
-        with (until 2026-09-09 it inherited the other arm's, so a left hand holding the radio was commanded open
-        by the next left plan and dropped it).
+        something up. The joints the new embodiment locks (torso, the other arm) are locked where they stand: every
+        request sends their measured values and the server locks them as sent (S1), so a posture off the
+        embodiment's nominal is adopted, not refused (until 2026-09-26 more than 0.05 rad off raised, and the
+        right-arm press was refused after every off-nominal pick), and ``restore_locked_arm`` has nothing to drive
+        the idle arm back to; fingers are the gripper state. The arm that planned so far keeps its last gripper
+        command (a held object stays held) and its joints are held at their current values; the adopted arm resumes
+        the command it was left with (until 2026-09-09 it inherited the other arm's, so a left hand holding the
+        radio was commanded open by the next left plan and dropped it).
         A capture still poses the free arm for its wrist camera (the held arm never moves), and the Rerun mirror
         keeps reporting the first embodiment's joints."""
         arm = embodiment["arm"]
@@ -3278,11 +3279,6 @@ class R1ProSim(TiptopSim):
         q = self.robot.get_joint_positions()
         errs = {j: abs(float(q[self.joint_index[j]]) - v) for j, v in locked.items() if "finger" not in j}
         worst = max(errs, key=errs.get)
-        if errs[worst] > tol:
-            raise RuntimeError(
-                f"{embodiment['robot_type']} locks {worst} at {locked[worst]:.3f} rad but the simulator has it at "
-                f"{float(q[self.joint_index[worst]]):.3f} (off by {errs[worst]:.3f} > {tol})"
-            )
         if self.mirror_arm_idx is None:
             self.mirror_arm_idx, self.mirror_gripper_idx = self.arm_idx, self.gripper_idx
         self.other_arm, self.other_gripper, self.last_gripper = self.arm, self.last_gripper, self.other_gripper
@@ -3291,13 +3287,13 @@ class R1ProSim(TiptopSim):
         self.arm_idx = th.tensor([self.joint_index[j] for j in self.planned_joints])
         self.gripper_idx = self.robot.gripper_control_idx[arm]
         self.posture = {j: float(q[self.joint_index[j]]) for j in locked if "finger" not in j}  # hold, do not move
-        self.locked_nominal = {j: v for j, v in locked.items() if "finger" not in j}
+        self.locked_nominal = dict(self.posture)  # the lock is the measured posture (S1): nothing to restore to
         self.q_home = [float(v) for v in embodiment["q_home"]]
         self.stance_ready = None  # the other arm's joints: this stance's partway posture no longer applies
         log.info(
             f"planning the {arm} arm from here on ({embodiment['robot_type']}: {len(self.planned_joints)} joints); "
             f"the {self.other_arm} arm holds its posture with gripper command {self.other_gripper:+.0f}; "
-            f"worst locked-joint error {errs[worst]:.4f} rad on {worst}"
+            f"locked where it stands, {errs[worst]:.4f} rad off the embodiment's nominal on {worst}"
         )
 
     def mirror_q(self) -> np.ndarray:
