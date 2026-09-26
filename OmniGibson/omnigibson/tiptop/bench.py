@@ -104,7 +104,8 @@ class Episode:
             self.last_level = None
 
     # ---------------------------------------------------------------- moving
-    def open_up(self, name: str, fraction: float | None = None, single_round: bool = False) -> bool:
+    def open_up(self, name: str, fraction: float | None = None, single_round: bool = False,
+                joint: str | None = None) -> bool:
         """Stand at ``name`` and open it, by ``fraction`` of its joint's range (the scored atom's worth by default).
 
         Reading the joint back afterwards is privileged, the way the oracle's masks are: the motion reports what
@@ -112,7 +113,8 @@ class Episode:
         look at the container.
 
         ``single_round`` (the skill bench's legacy baseline): one pull or push from where the robot stands, no
-        stance of its own and no fallback stance, so it compares with a skill that never moves the base.
+        stance of its own and no fallback stance, so it compares with a skill that never moves the base. The call's
+        own ``joint`` and ``fraction`` then win over the task's hint (the Runner's generic fractions do not).
         """
         from b1k.bridge.articulation import OPEN_FRACTION_SCORED, is_open
         from omnigibson.tiptop.articulation import openable_joints
@@ -120,7 +122,8 @@ class Episode:
         if fraction == 0.0:  # a close is a push on the moving link, not a pull on its handle (r1pro.push_joint)
             self.sim.video_caption = f"close {name}"
             for j in openable_joints(self.sim.scene_object(name)):
-                if is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]):
+                if (joint is None or j["name"] == joint) and is_open(j["lower"], j["upper"], j["position"],
+                                                                       closed=j["closed"]):
                     one = {"stand": False} if single_round else {}  # no stance of its own
                     result = self.sim.push_joint(self.sim.arm, name, j, j["closed"], **one)
                     self.records.append({"close": name, **result, "step": self.sim.n_steps})
@@ -132,6 +135,8 @@ class Episode:
         # the drawer fronts (2026-09-14)
         self.sim.video_caption = f"open {name}"
         hint = dict((getattr(self.spec, "opens", None) or {}).get(name) or {})
+        if single_round:
+            hint.update({k: v for k, v in (("joint", joint), ("fraction", fraction)) if v is not None})
         if hint:
             log.info(f"{name}: opening with the values this task names for it: {hint}")
         result = self.sim.open_container(

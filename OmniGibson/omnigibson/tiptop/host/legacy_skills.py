@@ -5,7 +5,7 @@ import json
 from typing import Callable, ClassVar
 
 import b1k.runtime.skillrun as skillrun
-from b1k.connector.skills import Code, PlaceArgs, Precheck, Rel, SkillResult, Status, effects
+from b1k.connector.skills import Code, PlaceArgs, Precheck, Rel, SkillResult, Status, WorldUpdate, effects
 
 # Legacy error text -> (status, code, phase); the first match wins. The texts are the manip2 corpus' round errors
 # and open/close "why"s (2026-09-25), most frequent first.
@@ -22,7 +22,8 @@ LEGACY_CODES = (
     ("no grasp on", Status.INFEASIBLE, Code.NO_MOTION, "check"),
 )
 NO_SOLUTION = {"pick_up": Code.NO_GRASP}  # else NO_PLACEMENT
-FAILED_AS = {"pick_up": Code.GRASP_MISSED, "open": Code.STALLED, "close": Code.STALLED}  # else PLACED_WRONG
+FAILED_AS = {"pick_up": Code.GRASP_MISSED, "open": Code.STALLED, "close": Code.STALLED,
+             "release": Code.BLOCKED}  # else PLACED_WRONG. release: the hand did not let go
 
 
 def classify(why, skill: str) -> tuple:
@@ -52,7 +53,10 @@ class LegacyBackend:
     Status comes from the primary GoalChecker on the REQUESTED relations, judged on the observation AFTER the legacy
     code stepped the sim (observe_now); what the legacy code returned goes to evidence["legacy_ok"], its round
     records to evidence["records"], and a relation the legacy wire bends onto on() is named in
-    evidence["degraded_to"]. A relation in strict_relations returns UNSUPPORTED instead of running.
+    evidence["degraded_to"]: every under and touching, and an in whose target ``has_cavity(target, item)`` says
+    the legacy wire sends no compartment floor for. A relation in strict_relations returns UNSUPPORTED instead of
+    running. A success names what the hand now holds or let go (WorldUpdate held / released), as a native pick's
+    does, so the WorldView the next precheck reads agrees with it.
 
     single_round (the skill bench): Episode.pick / open_up run ONE round from the case's stance, with no stand_for
     and no hidden push, so the baseline compares with a native call that never moves the base. The pseudo
@@ -63,7 +67,7 @@ class LegacyBackend:
     captures_in_own_run: ClassVar[bool] = True  # exempt from PERCEPT_REQUIRED: it captures inside its own run
 
     def __init__(self, episode, observe_now: Callable, classify: Callable = classify,
-                 has_cavity: Callable = lambda o: True, strict_relations: frozenset = frozenset(),
+                 has_cavity: Callable = lambda target, item: True, strict_relations: frozenset = frozenset(),
                  single_round: bool = False):
         self.ep, self.classify, self.observe_now, self.has_cavity = episode, classify, observe_now, has_cavity
         self.strict, self.single = frozenset(strict_relations), single_round
@@ -71,9 +75,9 @@ class LegacyBackend:
         self.dispatch = {
             "pick_up": lambda c: self.ep.pick(c.args.obj.id, into=None, **one),
             "place": lambda c: self.ep.achieve([_atom(c.args.obj, r) for r in c.args.relations], arm=c.arm or "left"),
-            "open": lambda c: self.ep.open_up(c.args.target.id, c.args.min_fraction, **one),
-            "close": lambda c: self.ep.open_up(c.args.target.id, 0.0, **one),
-            "release": lambda c: self.ep.release(),
+            "open": lambda c: self.ep.open_up(c.args.target.id, c.args.min_fraction, joint=c.args.joint, **one),
+            "close": lambda c: self.ep.open_up(c.args.target.id, 0.0, joint=c.args.joint, **one),
+            "release": lambda c: self.ep.release() or True,  # returns None: it raises when it cannot open the hand
         }
 
     def supports(self, call) -> bool:
@@ -86,7 +90,7 @@ class LegacyBackend:
         if not isinstance(call.args, PlaceArgs):
             return []
         return [r.rel for r in call.args.relations
-                if r.rel in self.BENT or (r.rel is Rel.IN and not self.has_cavity(r.target))]
+                if r.rel in self.BENT or (r.rel is Rel.IN and not self.has_cavity(r.target, call.args.obj))]
 
     def run(self, call, svc, obs):
         bent_rels = self._bent(call)
@@ -117,8 +121,11 @@ class LegacyBackend:
         ev = {"legacy_ok": legacy_ok, "single_round": self.single, "records": records}
         if bent:
             ev.update(degraded_to="on", relations=bent)
+        arm, obj = call.arm or "left", getattr(call.args, "obj", None)
+        kind = {"pick_up": "held", "place": "released", "release": "released"}.get(call.skill) if ok else None
         return SkillResult(call.call_id, call.skill, self.name, status, code, phase, str(err or ""),
                            goal if ok else (), verdicts, svc.goals.primary,
+                           world_updates=(WorldUpdate(kind, obj, arm),) if kind else (),
                            steps=self.ep.sim.n_steps - n0, requires_sim_clock=True, evidence=ev)
         yield {}  # unreachable: makes run() a generator that ends before its first yield
 

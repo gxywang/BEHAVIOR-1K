@@ -21,6 +21,7 @@ from b1k.connector.skills import (
     PlaceArgs,
     Rel,
     Relation,
+    ReleaseArgs,
     SkillCall,
     Status,
     WorldUpdate,
@@ -49,8 +50,13 @@ def test_step_action_places_each_runtime_group_on_the_robots_controller_and_read
     for g in order:
         idx[g], k = th.arange(k, k + sizes[g]), k + sizes[g]
     sent = []
-    sim = SimpleNamespace(robot=SimpleNamespace(name="r1", controller_action_idx=idx, action_dim=23), arm="left",
-                          other_arm="right", last_action=None, step_env=lambda a: sent.append(a) or "obs")  # fmt: skip
+    names = {"trunk": [f"torso_joint{k}" for k in range(1, 5)],
+             "left": [f"left_arm_joint{k}" for k in range(1, 8)], "right": [f"right_arm_joint{k}" for k in range(1, 8)]}
+    robot = SimpleNamespace(name="r1", controller_action_idx=idx, action_dim=23, trunk_joint_names=names["trunk"],
+                            arm_joint_names={"left": names["left"], "right": names["right"]})
+    sim = SimpleNamespace(robot=robot, arm="left", other_arm="right", last_action=None, other_gripper=1.0,
+                          posture={j: 0.0 for j in names["right"]}, planned_joints=names["trunk"] + names["left"],
+                          step_env=lambda a: sent.append(a) or "obs")  # fmt: skip
     assert R1ProSim.commanded_targets(sim) == {}  # nothing stepped yet
     a23 = np.arange(23, dtype=np.float32) / 10.0
     a23[ACTION_SLICES["gripper_left"]], a23[ACTION_SLICES["gripper_right"]] = CLOSED, 1.0
@@ -61,6 +67,10 @@ def test_step_action_places_each_runtime_group_on_the_robots_controller_and_read
         assert np.allclose(back[g], a23[s]), g
     assert sent[0]["r1"][idx["arm_left"]].tolist() == pytest.approx(a23[ACTION_SLICES["arm_left"]].tolist())
     assert (sim.last_gripper, sim.other_gripper) == (CLOSED, 1.0), "R1ProSim's own steps keep the hands after it"
+    own = R1ProSim.action(sim, np.zeros(11), CLOSED)["r1"]  # R1ProSim's own next step (a legacy run, a restore)
+    assert own[idx["arm_right"]].tolist() == pytest.approx(a23[ACTION_SLICES["arm_right"]].tolist()), \
+        "the idle arm stays where the Runtime put it: no snap back to the pre-run posture"
+    assert set(sim.posture) == set(names["right"]), "only the locked joints are latched"
 
 
 def test_every_env_step_is_kept_as_the_last_action():
@@ -115,21 +125,32 @@ def capture_sim(n: int = 2) -> SimpleNamespace:
     extras = {"views": {"left_wrist": {}}}
     masks = {"head": {"apple_1": np.eye(n, dtype=bool), "basket_1": np.zeros((n, n), bool)},
              "left_wrist": {"apple_1": np.zeros((n, n), bool), "basket_1": np.zeros((n, n), bool)}}  # fmt: skip
-    return SimpleNamespace(capture=lambda task: (request, extras), tracked_label=lambda n: n.replace(".n.01_", "_"),
-                           segmenter=SimpleNamespace(masks=lambda labels, rq, ex: Provided(masks, "oracle", 40)),
-                           masks=masks)  # fmt: skip
+    sim = SimpleNamespace(tracked_label=lambda n: n.replace(".n.01_", "_"), masks=masks, n_steps=0, looked=[],
+                          segmenter=SimpleNamespace(masks=lambda labels, rq, ex: Provided(masks, "oracle", 40)),
+                          primary_view="head", extra_views=("left_wrist",))  # fmt: skip
+
+    def capture(task):
+        sim.n_steps += 61  # R1ProSim.capture steps the sim itself
+        return request, extras
+
+    sim.capture, sim.look_at = capture, lambda *names: sim.looked.append(names)
+    return sim
 
 
 def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_percept():
     host = SimpleNamespace(observe_now=lambda: StepObs(40, np.arange(61, dtype=np.float32), {}))
     sim = capture_sim()
+    sim.masks["left_wrist"]["basket_1"][0, 0] = True  # the basket: only the wrist view sees it
     obs = CaptureObserver(sim, host, sim.segmenter, "t")
-    assert obs.requires_sim_clock
-    gen = obs.observe(ObserveRequest((apple, basket)), None)
+    assert obs.requires_sim_clock and obs.views == ("head", "left_wrist")
+    gen = obs.observe(ObserveRequest((apple, basket), views=obs.views), None)
     with pytest.raises(StopIteration) as done:
         next(gen)  # ends before its first yield: 0 Runtime steps
     percept, after = done.value.value
-    assert after.step == 40 and percept.info.visible == {apple.id: 1.0, basket.id: 0.0}
+    assert after.step == 40 and percept.info.visible == {apple.id: 1.0, basket.id: 0.0}, \
+        "visible is read off the masks the Percept carries (the head's): the wrist-only basket is not"
+    assert sim.looked == [(apple.id, basket.id)], "the capture framed the targets"
+    assert obs.steps == 61, "the capture's own sim steps, for the bench's U0 check"
     assert percept.info.source == "oracle" and list(percept.views) == ["head", "left_wrist"]
     assert all(isinstance(v, CameraView) for v in percept.views.values()), "the Percept's view type"
     assert percept.masks.value == {apple.id: sim.masks["head"]["apple_1"], basket.id: sim.masks["head"]["basket_1"]}
@@ -137,6 +158,10 @@ def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_per
     assert (percept.q["trunk"] == np.arange(61)[PROPRIO_SLICES["trunk_qpos"]]).all() and obs.wall_s > 0.0
     with pytest.raises(NotImplementedError):
         next(obs.observe(ObserveRequest((apple,), aim=False), None))
+    with pytest.raises(NotImplementedError, match="captures"):  # R1ProSim captures what it was built with
+        next(obs.observe(ObserveRequest((apple,), views=("head",)), None))
+    with pytest.raises(NotImplementedError, match="captures"):
+        next(obs.observe(ObserveRequest((apple,), views=obs.views, look_at=(1.0, 0.0, 0.8)), None))
 
 
 # ------------------------------------------------------------------------------------ the legacy backend (group 5)
@@ -160,6 +185,13 @@ class FakeEpisode:
         self.sim.n_steps += 30
         self.atoms = atoms
         return True
+
+    def open_up(self, name, fraction=None, single_round=False, joint=None):
+        self.opened = (name, fraction, joint, single_round)
+        return True
+
+    def release(self):  # Episode.release returns nothing
+        self.sim.n_steps += 45
 
 
 class Host:
@@ -188,7 +220,7 @@ class Host:
 def legacy_rt(env, strict=frozenset(), truth=None, host=True, single_round=True, **ep):
     h = Host(env)
     episode = FakeEpisode(h, **ep)
-    lb = LegacyBackend(episode, h.observe_now, has_cavity=lambda o: False, strict_relations=strict,
+    lb = LegacyBackend(episode, h.observe_now, has_cavity=lambda target, item: False, strict_relations=strict,
                        single_round=single_round)  # fmt: skip
     routing = {"pick_up": {"default": "legacy"}, "place": {"default": "legacy"}, "wait": {"default": "scripted"}}
     v = SimV(truth)
@@ -224,6 +256,59 @@ def test_a_legacy_call_costs_no_runtime_step_reseeds_the_latch_and_is_judged_aft
     rt4, _, _ = legacy_rt(env4, host=False)
     with pytest.raises(RuntimeError, match="HostHooks"):
         DirectConnector(rt4, env4.step, Host(env4), env4.raw()).run(SkillCall("pick_up", PickArgs(apple)))
+
+
+def test_a_legacy_success_names_what_the_hand_holds_so_the_next_precheck_agrees():
+    from b1k.skills.specs import hand_empty, holding_obj
+    from omnigibson.tiptop.oracle.world import OracleWorld
+
+    env = Env()
+    rt, ep, _ = legacy_rt(env)
+    grasp = SimpleNamespace(held=lambda arm, obs: Provided(arm == "left", "proprio", 0))  # the left fingers closed
+    world = OracleWorld(SimpleNamespace(sim=None), grasp)
+    rt.svc = dataclasses.replace(rt.svc, world=world)
+    conn = DirectConnector(rt, env.step, Host(env), env.raw())
+    pick = conn.run(SkillCall("pick_up", PickArgs(apple), arm="left"))
+    assert pick.world_updates == (WorldUpdate("held", apple, "left"),)
+    place = SkillCall("place", PlaceArgs(apple, (Relation(Rel.ON, table),)), arm="left")
+    assert holding_obj(place, rt.svc).ok, "a place after a legacy pick finds the apple in the hand"
+    assert conn.run(place).world_updates == (WorldUpdate("released", apple, "left"),)
+    assert world.hands["left"] == set()
+
+
+def test_a_legacy_release_that_opened_the_hand_succeeds_when_nothing_judges_it():
+    env = Env()
+    rt, ep, _ = legacy_rt(env, truth={"hand_empty": None})  # goal_checker none, or a checker that cannot judge
+    r = LegacyBackend(ep, Host(env).observe_now)
+    gen = r.run(SkillCall("release", ReleaseArgs(), arm="left"), rt.svc, None)
+    with pytest.raises(StopIteration) as done:
+        next(gen)
+    result = done.value.value
+    assert (result.status, result.evidence["legacy_ok"], result.steps) == (Status.SUCCEEDED, True, 45), result
+    assert result.world_updates == (WorldUpdate("released", None, "left"),)
+    from omnigibson.tiptop.host.legacy_skills import FAILED_AS
+
+    assert FAILED_AS["release"] is Code.BLOCKED, "a release that did not let go is not a wrong placement"
+
+
+def test_a_legacy_open_takes_the_calls_joint_and_fraction():
+    env = Env()
+    rt, ep, _ = legacy_rt(env)
+    call = SkillCall("open", OpenArgs(ObjRef("cabinet.n.01_1", "cabinet", True), joint="j_link_2", min_fraction=0.5))
+    gen = LegacyBackend(ep, Host(env).observe_now, single_round=True).run(call, rt.svc, None)
+    with pytest.raises(StopIteration):
+        next(gen)
+    assert ep.opened == ("cabinet.n.01_1", 0.5, "j_link_2", True)
+
+
+def test_the_bench_flags_an_in_the_legacy_wire_bends_onto_on():
+    geometry = SimpleNamespace(cavity=lambda t, item: Provided("floor" if t == basket else None, "oracle", 0))
+    ep = SimpleNamespace(sim=SimpleNamespace(send_inside=False))
+    legacy = skillbench.make_backends(ep, Host(Env()), SimpleNamespace(geometry=geometry))["legacy"]
+    into = lambda t: SkillCall("place", PlaceArgs(apple, (Relation(Rel.IN, t),)))
+    assert legacy._bent(into(basket)) == [Rel.IN], "without --inside-region every in() lands on the hull top"
+    ep.sim.send_inside = True
+    assert legacy._bent(into(basket)) == [] and legacy._bent(into(table)) == [Rel.IN]
 
 
 def test_a_legacy_failure_takes_its_code_from_the_rounds_own_error_text():
@@ -291,6 +376,31 @@ def test_a_single_round_open_pulls_from_where_it_stands_with_no_fallback_stance(
     assert Episode.open_up(ep, "cabinet.n.01_1", single_round=True) is False
     assert [kw["stand"] for kw in opened] == [False] and ep.records[-1]["single_round"] is True
     assert Episode.open_up(ep, "cabinet.n.01_1", 0.0, single_round=True) is True and pushed == [False]
+    ep.spec = SimpleNamespace(opens={"cabinet.n.01_1": {"joint": "j_link_4", "fraction": 0.8, "height": 0.5}})
+    Episode.open_up(ep, "cabinet.n.01_1", 0.5, single_round=True, joint="j_link_2")
+    assert {k: opened[-1][k] for k in ("joint", "fraction", "height")} == {"joint": "j_link_2", "fraction": 0.5,
+                                                                          "height": 0.5}, "the call wins over the hint"
+    assert Episode.open_up(ep, "cabinet.n.01_1", 0.0, single_round=True, joint="j_link_2") is True
+    assert pushed == [False], "a close of another joint pushes nothing"
+
+
+def test_a_door_pulled_short_is_pushed_on_from_the_same_stance_in_a_single_round(monkeypatch):
+    from omnigibson.tiptop import r1pro
+
+    door = {"name": "j0", "kind": "revolute", "lower": 0.0, "upper": 1.5, "position": 0.0, "closed": 0.0,
+            "link": "door"}  # fmt: skip
+    reads = iter([[door], [dict(door, position=0.3)]])  # before the pull, and after it: short of 1.2
+    monkeypatch.setattr(r1pro, "openable_joints", lambda obj: next(reads))
+    pushed = []
+    hand = SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0])))
+    run = {"grasp": {"joint": door, "travel": 1.2, "kind": "bar"}, "plan": {"reached": 5}, "waypoints": 5, "why": "",
+           "held": True, "stance": None}  # fmt: skip
+    sim = SimpleNamespace(scene_object=lambda n: object(), OPEN=1.0, robot=SimpleNamespace(eef_links={"left": hand}),
+                          container_grasps=lambda *a, **k: ["g"], _drive_joint=lambda *a, stand: run,
+                          push_joint=lambda arm, name, j, target, stand=True: pushed.append(stand) or {"position": 1.2})
+    out = r1pro.R1ProSim.open_container(sim, "left", "fridge.n.01_1", fraction=0.8, stand=False)
+    assert pushed == [False], "the push after a short pull chose a stance of its own: a base teleport in the skill"
+    assert out["opened"] is True
 
 
 # ---------------------------------------------------------------------------------------- the trial and U0
@@ -394,7 +504,7 @@ def test_a_native_pick_on_the_bench_plans_from_the_capture_and_plays_the_plan():
     svc = dataclasses.replace(base.svc, world=World(REFS))
     observer = CaptureObserver(sim, host, sim.segmenter, "t")
     call = SkillCall("pick_up", PickArgs(apple), arm="left", seed=3, backend="tiptop")
-    r, rt, _, _ = skillbench.run_trial(host, svc, skillbench.make_backends(FakeEpisode(host), host),
+    r, rt, _, _ = skillbench.run_trial(host, svc, skillbench.make_backends(FakeEpisode(host), host, svc),
                                        {"pick_up": {"default": "legacy"}}, observer, call)  # fmt: skip
     assert (r.status, r.backend, r.phase) == (Status.SUCCEEDED, "tiptop", "lift"), r
     (req,) = planner.asked
@@ -406,8 +516,49 @@ def test_a_native_pick_on_the_bench_plans_from_the_capture_and_plays_the_plan():
 def test_the_step_invariant_fails_on_an_idle_step_or_an_uncharged_one():
     rt = SimpleNamespace(step=3, idle_steps=0, charged={"skill": 3})
     assert skillbench.u0(rt)
+    assert skillbench.u0(rt, sim_steps=64, observe_steps=61), "the sim: the run's 3 steps and the capture's 61"
+    assert not skillbench.u0(rt, sim_steps=65, observe_steps=61), "a step nothing charged: something planned on it"
     assert not skillbench.u0(SimpleNamespace(step=3, idle_steps=1, charged={"skill": 2}))
     assert not skillbench.u0(SimpleNamespace(step=3, idle_steps=0, charged={"skill": 2}))
+
+
+def test_a_native_row_fails_u0_on_a_sim_step_nobody_charged():
+    r, rt, _, _ = trial("tiptop")
+    case = {"id": "c", "call": SkillCall("pick_up", PickArgs(apple))}
+    assert skillbench.row(case, 0, 3, r, rt, rt.step + 61, 2.0, 0.5, 1.0, 61)["u0"]
+    assert not skillbench.row(case, 0, 3, r, rt, rt.step + 62, 2.0, 0.5, 1.0, 61)["u0"]
+
+
+def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
+    events = []
+    monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: events.append("torso"))
+    sim = SimpleNamespace(OPEN=1.0, place_robot=lambda *pose, note: events.append("place"),
+                          look_at=lambda *names: events.append(("look", names)),
+                          hold=lambda n, g: events.append("hold"))  # fmt: skip
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
+    case = {"id": "c", "setup": {"robot_pose": [1.0, 2.0, 0.0]},
+            "call": SkillCall("place", PlaceArgs(apple, (Relation(Rel.IN, basket),)))}
+    skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+    assert events == ["torso", "place", ("look", (apple.id, basket.id)), "hold"], \
+        "place_robot clears the look target: the capture would aim at the default point, not at the objects"
+
+
+def test_every_trial_restores_the_command_state_the_physics_state_does_not_carry():
+    events = []
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics",
+                                             load_state=lambda st, serialized: events.append(("load", st))))
+    sim = SimpleNamespace(OPEN=1.0, posture={"right_arm_joint4": 0.0}, look_target=np.array([0.6, 0.1, 0.8]),
+                          stance_ready=None, seen_boxes={"x": 1})  # fmt: skip
+    sim.hold = lambda n, g: events.append(("hold", dict(sim.posture)))
+    sim.begin_episode = lambda name: events.append(("begin", name))
+    state = skillbench.snapshot(og, sim)
+    sim.posture["right_arm_joint4"] = -1.9  # trial 0 tucked the idle arm (tuck_idle_arm), or a ramp stopped
+    sim.look_target, sim.stance_ready = None, [0.1] * 11
+    skillbench.restore(og, sim, state, "t1")
+    assert sim.posture == {"right_arm_joint4": 0.0} and np.allclose(sim.look_target, [0.6, 0.1, 0.8])
+    assert sim.stance_ready is None and sim.seen_boxes == {}
+    assert events == [("load", "physics"), ("hold", {"right_arm_joint4": 0.0}), ("begin", "t1")], \
+        "the restore's own step commands the restored posture, not the last trial's"
 
 
 def test_the_latch_gap_is_how_far_the_next_action_would_snap_an_arm():

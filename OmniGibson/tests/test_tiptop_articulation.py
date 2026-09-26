@@ -782,7 +782,7 @@ def test_a_pull_that_falls_open_past_its_target_is_not_pushed_back(monkeypatch):
         robot=SimpleNamespace(eef_links={"left": SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), None))}),
         container_grasps=lambda *a, **k: [chosen],
         _drive_joint=lambda *a, **k: {"grasp": chosen, "plan": {"reached": 15}, "waypoints": 15, "why": "", "held": True, "stance": (1.0, 2.0, 0.0)},
-        push_joint=lambda arm, name, j, target: pushes.append(round(target, 3)) or {"reached": True, "position": target, "why": ""},
+        push_joint=lambda arm, name, j, target, stand=True: pushes.append(round(target, 3)) or {"reached": True, "position": target, "why": ""},
     )  # fmt: skip
     state.append(dict(lid, position=2.967))  # fell open to the limit after the release
     assert R1ProSim.open_container(sim, "left", "toolbox")["opened"] and pushes == []

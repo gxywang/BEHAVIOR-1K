@@ -2502,7 +2502,7 @@ class R1ProSim(TiptopSim):
         target = float(j["position"] + chosen["travel"])
         left = (target - float(now["position"])) * math.copysign(1.0, chosen["travel"])
         if done and j["kind"] == "revolute" and left > JOINT_TOL * abs(j["upper"] - j["lower"]):
-            pushed = self.push_joint(arm, name, now, target)
+            pushed = self.push_joint(arm, name, now, target, stand=stand)  # stand=False: no stance of its own
             position = float(pushed.get("position", now["position"]))
             out.update(pushed=pushed, position=position,
                        opened=is_open(now["lower"], now["upper"], position, closed=now.get("closed")))  # fmt: skip
@@ -5309,8 +5309,9 @@ class R1ProSim(TiptopSim):
 
     def step_action(self, a23):
         """One env step with a whole 23-D action in the Runtime's layout (b1k.runtime.compose.ACTION_SLICES), the
-        skill bench's DirectConnector's step. Both gripper commands are kept, so R1ProSim's own steps after it
-        (a legacy run) hold the hands where the Runtime left them."""
+        skill bench's DirectConnector's step. Both gripper commands and every locked joint's command (``posture``:
+        the idle arm, the torso of r1pro_right) are kept, so R1ProSim's own steps after it (a legacy run, a
+        restore's hold) hold the hands and the idle arm where the Runtime left them instead of snapping them back."""
         from b1k.runtime.compose import ACTION_SLICES
 
         idx, a23 = self.robot.controller_action_idx, np.asarray(a23, dtype=np.float32).reshape(-1)
@@ -5319,6 +5320,11 @@ class R1ProSim(TiptopSim):
             a[idx[group]] = th.as_tensor(a23[s])
         self.last_gripper = float(a23[ACTION_SLICES[f"gripper_{self.arm}"]][0])
         self.other_gripper = float(a23[ACTION_SLICES[f"gripper_{self.other_arm}"]][0])
+        for group, names in (("trunk", self.robot.trunk_joint_names), ("arm_left", self.robot.arm_joint_names["left"]),
+                             ("arm_right", self.robot.arm_joint_names["right"])):
+            for joint, value in zip(names, a23[ACTION_SLICES[group]]):
+                if joint in self.posture:
+                    self.posture[joint] = float(value)
         return self.step_env({self.robot.name: a})
 
     def commanded_targets(self) -> dict:

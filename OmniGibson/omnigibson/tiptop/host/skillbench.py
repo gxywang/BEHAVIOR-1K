@@ -5,7 +5,9 @@ case's stance, never charged to the skill), dumps the state, and restores it bef
 one-call TaskPlanner (an observe when the skill asks for a Percept, then the call) over DirectConnector, with the
 production Runtime, registry, latch, GoalPanel and the providers of --providers. Seeds go to numpy, torch and the
 call. Every trial writes one JSON row (<out>/<case>.jsonl) and asserts the step invariant (U0):
-rt.step - rt.idle_steps == sum(rt.charged), with idle_steps == 0. summary.csv has one line per case.
+rt.step - rt.idle_steps == sum(rt.charged), with idle_steps == 0, and, for a trial that did not step the sim itself
+(legacy), sim.n_steps == rt.step + the steps the planner's captures took: nothing else stepped the sim. summary.csv
+has one line per case.
 
   OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.host.skillbench --out-dir runs/skillbench/pick --port 8970 \\
       --case tiptop/b1k/skills/bench/pick_up.yaml --ids pick_up_freeze_fruit_apple --grasping-mode assisted \\
@@ -17,6 +19,7 @@ rt.step - rt.idle_steps == sum(rt.charged), with idle_steps == 0. summary.csv ha
 
 import argparse
 import contextlib
+import copy
 import csv
 import dataclasses
 import importlib
@@ -69,6 +72,10 @@ from omnigibson.tiptop.run import (
 log = logging.getLogger("omnigibson.tiptop")
 
 SETUP_KEYS = ("robot_pose", "torso")  # object_poses, joint_states and held join when a case needs them
+# R1ProSim's command state, which the physics state does not carry: what its own steps (a legacy run, the restore's
+# hold) command the joints nobody plans (posture), which arm plans, and where the captures look
+SIM_FIELDS = ("posture", "locked_nominal", "arm", "other_arm", "planned_joints", "arm_idx", "gripper_idx", "q_home",
+              "stance_ready", "look_target", "look_names", "look_arm", "mirror_arm_idx", "mirror_gripper_idx")
 
 
 def _spec(name: str, args_type: type, budget: int, check=None, needs_percept: bool = False) -> SkillSpec:
@@ -93,11 +100,12 @@ def targets(call: SkillCall) -> tuple:
     return named + tuple(r.target for r in getattr(a, "relations", ()))
 
 
-def one_call(conn, call: SkillCall):
-    """The bench's TaskPlanner: the one call, after an observe when the skill asks for a Percept (a legacy backend
-    captures in its own run and does not). It never calls go_to: the case's stance is the harness's setup."""
+def one_call(conn, call: SkillCall, views: tuple = ("head",)):
+    """The bench's TaskPlanner: the one call, after an observe of ``views`` when the skill asks for a Percept (a
+    legacy backend captures in its own run and does not). It never calls go_to: the case's stance is the harness's
+    setup."""
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
-        call = dataclasses.replace(call, percept=conn.observe(ObserveRequest(targets(call))).id)
+        call = dataclasses.replace(call, percept=conn.observe(ObserveRequest(targets(call), views=views)).id)
     return conn.run(call)
 
 
@@ -115,10 +123,13 @@ def load_cases(path, ids=None) -> list:
     return cases
 
 
-def make_backends(ep, host) -> dict:
+def make_backends(ep, host, svc) -> dict:
     """legacy (the baseline, one round) and tiptop (a RequestBuilder per native skill); a call picks one by its
-    backend, then routing.yaml."""
-    return {"legacy": LegacyBackend(ep, host.observe_now, single_round=True),
+    backend, then routing.yaml. The legacy wire sends a compartment floor for an in() only under --inside-region
+    and only where the geometry has a cavity; anything else it bends onto on(), which its result then says."""
+    has_cavity = lambda target, item: bool(getattr(ep.sim, "send_inside", False)) and \
+        svc.geometry.cavity(target, item).value is not None
+    return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
             "tiptop": TiptopBackend({"pick_up": pick_request.build})}  # fmt: skip
 
 
@@ -128,13 +139,16 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     calls = []
     rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer)
     host.env_wall_s, t0 = 0.0, time.monotonic()
-    r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call)
+    r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)))
     return r, rt, calls, time.monotonic() - t0
 
 
-def u0(rt) -> bool:
-    """The hard invariant on the one-call planner: every env step carried a live run's action."""
-    return rt.step - rt.idle_steps == sum(rt.charged.values()) and rt.idle_steps == 0
+def u0(rt, sim_steps=None, observe_steps: int = 0) -> bool:
+    """The hard invariant on the one-call planner: every env step carried a live run's action, and (``sim_steps``:
+    the sim's own count, for a trial that did not step the sim itself) the sim advanced only by those steps and the
+    planner's captures, so nothing stepped it while anything planned."""
+    runtime = rt.step - rt.idle_steps == sum(rt.charged.values()) and rt.idle_steps == 0
+    return runtime and (sim_steps is None or sim_steps == rt.step + observe_steps)
 
 
 def latch_gap(rt) -> float:
@@ -145,7 +159,7 @@ def latch_gap(rt) -> float:
 
 
 def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float,
-        observe_wall_s: float = 0.0) -> dict:
+        observe_wall_s: float = 0.0, observe_steps: int = 0) -> dict:
     """planning_wall_s is what is neither an env step nor the planner's capture: planning, resampling and
     verification (for a legacy run, which captures and steps inside itself, all of it)."""
     return {
@@ -153,8 +167,10 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "status": r.status.value, "code": None if r.code is None else r.code.value, "phase": r.phase,
         "detail": r.detail, "binding": [dataclasses.asdict(b) for b in r.binding], "primary": r.primary,
         "verdicts": dict(r.verdicts), "steps": r.steps,
-        "rt_step": rt.step, "idle_steps": rt.idle_steps, "charged": dict(rt.charged), "u0": u0(rt),
-        "sim_steps": sim_steps, "latch_gap_rad": round(latch_gap(rt), 4), "wall_s": round(wall_s, 2),
+        "rt_step": rt.step, "idle_steps": rt.idle_steps, "charged": dict(rt.charged),
+        "u0": u0(rt, None if r.requires_sim_clock else sim_steps, observe_steps),  # legacy steps the sim itself
+        "sim_steps": sim_steps, "observe_steps": observe_steps, "latch_gap_rad": round(latch_gap(rt), 4),
+        "wall_s": round(wall_s, 2),
         "env_wall_s": round(env_wall_s, 2), "observe_wall_s": round(observe_wall_s, 2),
         "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2),
         "oracle_reads": dict(r.oracle_reads), "planner_oracle_reads": dict(rt.planner_oracle_reads),
@@ -196,21 +212,31 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def setup(og, sim, args, case: dict, embodiment: dict) -> dict:
-    """Harness-only, never charged to the skill: the torso, the teleport to the case's stance, a settle. Returns the
-    state every trial restores."""
+def setup(og, sim, args, case: dict, embodiment: dict) -> tuple:
+    """Harness-only, never charged to the skill: the torso, the teleport to the case's stance, the look at the call's
+    objects (a round stood for them looked there before it captured), a settle. Returns the state every trial
+    restores."""
     s = case.get("setup") or {}
     args.torso = s.get("torso")
     apply_embodiment_posture(sim, args, embodiment)
     if "robot_pose" in s:
         sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
+    sim.look_at(*(o.id for o in targets(case["call"])))
     sim.hold(args.settle_steps, sim.OPEN)
     log.info(f"{case['id']}: setup {s} done")
-    return og.sim.dump_state(serialized=False)
+    return snapshot(og, sim)
 
 
-def restore(og, sim, state: dict, name: str) -> None:
-    og.sim.load_state(state, serialized=False)
+def snapshot(og, sim) -> tuple:
+    """The physics state and R1ProSim's own command state (SIM_FIELDS): load_state restores only the first."""
+    return og.sim.dump_state(serialized=False), {k: copy.deepcopy(getattr(sim, k, None)) for k in SIM_FIELDS}
+
+
+def restore(og, sim, state: tuple, name: str) -> None:
+    physics, fields = state
+    og.sim.load_state(physics, serialized=False)
+    for k, v in fields.items():
+        setattr(sim, k, copy.deepcopy(v))
     sim.seen_boxes, sim.last_gripper, sim.other_gripper = {}, sim.OPEN, sim.OPEN
     sim.hold(1, sim.OPEN)  # a physics step propagates the loaded state (Simulator.load_state)
     sim.begin_episode(name=name)  # counts from zero; clears the hand record
@@ -253,7 +279,7 @@ def main(argv=None) -> None:
         strategy = strategy_for(task, task_goal_atoms(sim), options=task_goal_options(sim),
                                 scope=sorted(sim.task_scope()))  # fmt: skip
         knowledge = make_knowledge(args.knowledge, sim, strategy.goal, spec=strategy.spec)
-        host, base = BenchHost(sim), og.sim.dump_state(serialized=False)
+        host, base = BenchHost(sim), snapshot(og, sim)
         for case in cases:
             restore(og, sim, base, case["id"])  # every case starts from the instance as loaded
             state, rows = setup(og, sim, args, case, metadata["embodiment"]), []
@@ -268,8 +294,9 @@ def main(argv=None) -> None:
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend)
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
-                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host), routing, observer, call)
-                rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s))
+                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host, svc), routing, observer, call)
+                rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
+                                observer.steps))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])
