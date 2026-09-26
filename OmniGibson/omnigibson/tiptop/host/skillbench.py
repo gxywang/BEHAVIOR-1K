@@ -10,6 +10,9 @@ rt.step - rt.idle_steps == sum(rt.charged), with idle_steps == 0. summary.csv ha
   OMNIGIBSON_HEADLESS=1 python -m omnigibson.tiptop.host.skillbench --out-dir runs/skillbench/pick --port 8970 \\
       --case tiptop/b1k/skills/bench/pick_up.yaml --ids pick_up_freeze_fruit_apple --grasping-mode assisted \\
       --views head left_wrist right_wrist --no-state-stream
+
+--backend legacy runs the baseline; --backend tiptop --collision mesh runs the native skill against today's meshes
+(the planner server takes no map voxels until tiptop/skills/voxels.py lands).
 """
 
 import argparse
@@ -48,6 +51,8 @@ from b1k.runtime.core import Runtime
 from b1k.runtime.direct import DirectConnector
 from b1k.skills.registry import SkillRegistry, load_routing
 from b1k.skills.specs import arm_resources, hand_empty, holding_obj
+from b1k.skills.tiptop.backend import TiptopBackend
+from b1k.skills.tiptop.builders import pick as pick_request
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, _plain
@@ -110,6 +115,13 @@ def load_cases(path, ids=None) -> list:
     return cases
 
 
+def make_backends(ep, host) -> dict:
+    """legacy (the baseline, one round) and tiptop (a RequestBuilder per native skill); a call picks one by its
+    backend, then routing.yaml."""
+    return {"legacy": LegacyBackend(ep, host.observe_now, single_round=True),
+            "tiptop": TiptopBackend({"pick_up": pick_request.build})}  # fmt: skip
+
+
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall) -> tuple:
     """One trial: the production Runtime and registry over these providers and backends, DirectConnector on the
     host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
@@ -132,14 +144,19 @@ def latch_gap(rt) -> float:
     return max(float(np.abs(rt.latch.target[ACTION_SLICES[g]] - q[s]).max()) for g, s in PROPRIO_Q.items())
 
 
-def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float) -> dict:
+def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float,
+        observe_wall_s: float = 0.0) -> dict:
+    """planning_wall_s is what is neither an env step nor the planner's capture: planning, resampling and
+    verification (for a legacy run, which captures and steps inside itself, all of it)."""
     return {
         "case": case["id"], "trial": trial, "seed": seed, "skill": r.skill, "backend": r.backend,
         "status": r.status.value, "code": None if r.code is None else r.code.value, "phase": r.phase,
-        "detail": r.detail, "primary": r.primary, "verdicts": dict(r.verdicts), "steps": r.steps,
+        "detail": r.detail, "binding": [dataclasses.asdict(b) for b in r.binding], "primary": r.primary,
+        "verdicts": dict(r.verdicts), "steps": r.steps,
         "rt_step": rt.step, "idle_steps": rt.idle_steps, "charged": dict(rt.charged), "u0": u0(rt),
         "sim_steps": sim_steps, "latch_gap_rad": round(latch_gap(rt), 4), "wall_s": round(wall_s, 2),
-        "env_wall_s": round(env_wall_s, 2), "planning_wall_s": round(wall_s - env_wall_s, 2),
+        "env_wall_s": round(env_wall_s, 2), "observe_wall_s": round(observe_wall_s, 2),
+        "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2),
         "oracle_reads": dict(r.oracle_reads), "planner_oracle_reads": dict(rt.planner_oracle_reads),
         "requires_sim_clock": r.requires_sim_clock, "evidence": dict(r.evidence),
     }  # fmt: skip
@@ -172,7 +189,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--mode", choices=("train", "public_test", "hidden_test"), default="public_test")
     p.add_argument("--rounds", type=int, default=1, help="Episode's rounds (a single_round legacy call runs one)")
     p.add_argument("--providers", default="omnigibson.tiptop.oracle",
-                   help="the package whose pseudo_services(episode, planner, routing) builds the Services")
+                   help="the package whose pseudo_services(episode, planner, routing, collision) builds the Services")
+    p.add_argument("--collision", choices=("map", "mesh"), default="map",
+                   help="the room a native skill plans against: the map's voxels, or today's physical meshes (the "
+                   "A/B; the planner server takes only meshes until tiptop/skills/voxels.py lands)")
     return p.parse_args(argv)
 
 
@@ -243,14 +263,13 @@ def main(argv=None) -> None:
                 restore(og, sim, state, name)
                 random.seed(seed), np.random.seed(seed), torch.manual_seed(seed)
                 ep = Episode(sim, args, planners, knowledge, out / case["id"] / f"t{i}", spec=strategy.spec)
-                svc, segmenter = providers.pseudo_services(ep, client, routing)
-                backends = {"legacy": LegacyBackend(ep, host.observe_now, single_round=True)}
+                svc, segmenter = providers.pseudo_services(ep, client, routing, collision=args.collision)
+                observer = CaptureObserver(sim, host, segmenter, args.task)
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend)
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
-                    r, rt, calls, wall_s = run_trial(host, svc, backends, routing,
-                                                     CaptureObserver(sim, host, segmenter, args.task), call)
-                rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s))
+                    r, rt, calls, wall_s = run_trial(host, svc, make_backends(ep, host), routing, observer, call)
+                rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])

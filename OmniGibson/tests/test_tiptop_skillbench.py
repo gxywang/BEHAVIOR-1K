@@ -2,6 +2,7 @@
 bench host, the CaptureObserver, the legacy backend (smoke group 5's legacy half), single_round, the bench's trial
 and its step invariant (U0), and the oracle providers over fakes of the scene."""
 
+import dataclasses
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -13,6 +14,7 @@ import yaml
 from b1k.connector.goals import GoalPanel
 from b1k.connector.observe import ObserveRequest, StepObs
 from b1k.connector.skills import (
+    Binding,
     Code,
     OpenArgs,
     PickArgs,
@@ -23,12 +25,12 @@ from b1k.connector.skills import (
     Status,
     WorldUpdate,
 )
-from b1k.connector.types import Fact, ObjRef, Provided
+from b1k.connector.types import Belief, Fact, ObjRef, Pose2, Provided
 from b1k.connector.world import ProvenancePolicy, link_pose
-from b1k.observation import PROPRIO_SLICES
+from b1k.observation import PROPRIO_SLICES, CameraView
 from b1k.runtime.compose import ACTION_SLICES, CLOSED
 from b1k.runtime.direct import DirectConnector
-from b1k.tests.fakes import Env, Scripted, SimV, apple, basket, make_rt, table
+from b1k.tests.fakes import REFS, Env, JointWorld, Scripted, SimV, apple, basket, make_rt, table
 from omnigibson.tiptop.host import skillbench
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
@@ -100,23 +102,39 @@ def test_the_bench_host_hands_the_runtime_the_eval_proprio_layout_and_what_r1pro
     assert host.parse(raw, 3).step == 3 and host.commanded_targets()["arm_left"].sum() == 7
 
 
+def view(name: str, n: int = 2) -> dict:  # one view as R1ProSim.capture's request carries it
+    return {"name": name, "rgb": np.zeros((n, n, 3), np.uint8), "depth": np.ones((n, n), np.float32),
+            "intrinsics": np.eye(3), "world_from_cam": np.eye(4)}  # fmt: skip
+
+
+def capture_sim(n: int = 2) -> SimpleNamespace:
+    """R1ProSim's capture (the primary view's request, a wrist view in it) and the oracle segmenter's masks: the apple
+    in the head view only."""
+    request = {**view("head", n), "view_name": "head", "views": [view("left_wrist", n)]}
+    request.pop("name")
+    extras = {"views": {"left_wrist": {}}}
+    masks = {"head": {"apple_1": np.eye(n, dtype=bool), "basket_1": np.zeros((n, n), bool)},
+             "left_wrist": {"apple_1": np.zeros((n, n), bool), "basket_1": np.zeros((n, n), bool)}}  # fmt: skip
+    return SimpleNamespace(capture=lambda task: (request, extras), tracked_label=lambda n: n.replace(".n.01_", "_"),
+                           segmenter=SimpleNamespace(masks=lambda labels, rq, ex: Provided(masks, "oracle", 40)),
+                           masks=masks)  # fmt: skip
+
+
 def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_percept():
     host = SimpleNamespace(observe_now=lambda: StepObs(40, np.arange(61, dtype=np.float32), {}))
-    request = {"view_name": "head", "rgb": "img", "views": [{"name": "left_wrist", "rgb": "wimg"}]}
-    extras = {"views": {"left_wrist": {}}}
-    sim = SimpleNamespace(capture=lambda task: (request, extras), tracked_label=lambda n: n.replace(".n.01_", "_"))
-    masks = {"head": {"apple_1": np.ones((2, 2), bool), "basket_1": np.zeros((2, 2), bool)},
-             "left_wrist": {"apple_1": np.zeros((2, 2), bool), "basket_1": np.zeros((2, 2), bool)}}  # fmt: skip
-    segmenter = SimpleNamespace(masks=lambda labels, rq, ex: Provided(masks, "oracle", 40))
-    obs = CaptureObserver(sim, host, segmenter, "t")
+    sim = capture_sim()
+    obs = CaptureObserver(sim, host, sim.segmenter, "t")
     assert obs.requires_sim_clock
     gen = obs.observe(ObserveRequest((apple, basket)), None)
     with pytest.raises(StopIteration) as done:
         next(gen)  # ends before its first yield: 0 Runtime steps
     percept, after = done.value.value
     assert after.step == 40 and percept.info.visible == {apple.id: 1.0, basket.id: 0.0}
-    assert percept.info.source == "oracle" and set(percept.views) == {"head", "left_wrist"}
-    assert (percept.q["trunk"] == np.arange(61)[PROPRIO_SLICES["trunk_qpos"]]).all()
+    assert percept.info.source == "oracle" and list(percept.views) == ["head", "left_wrist"]
+    assert all(isinstance(v, CameraView) for v in percept.views.values()), "the Percept's view type"
+    assert percept.masks.value == {apple.id: sim.masks["head"]["apple_1"], basket.id: sim.masks["head"]["basket_1"]}
+    assert percept.masks.source == "oracle", "the primary view's masks, keyed by ObjRef.id"
+    assert (percept.q["trunk"] == np.arange(61)[PROPRIO_SLICES["trunk_qpos"]]).all() and obs.wall_s > 0.0
     with pytest.raises(NotImplementedError):
         next(obs.observe(ObserveRequest((apple,), aim=False), None))
 
@@ -331,6 +349,10 @@ def test_a_legacy_trial_is_one_call_with_no_observe_and_holds_the_step_invariant
     case = {"id": "c", "call": SkillCall("pick_up", PickArgs(apple)), "expect": {"status": "succeeded"}}
     row = skillbench.row(case, 0, 3, r, rt, 40, 2.0, 0.5)
     assert row["u0"] and row["steps"] == 40 and row["planning_wall_s"] == 1.5 and row["verdicts"] == {"scorer": True}
+    assert skillbench.row(case, 0, 3, r, rt, 40, 2.0, 0.5, 1.2)["planning_wall_s"] == 0.3, "the capture is not planning"
+    bound = dataclasses.replace(r, binding=(Binding("robot_to_world", 3, 256),))
+    assert skillbench.row(case, 0, 3, bound, rt, 40, 2.0, 0.5)["binding"] == [
+        {"constraint": "robot_to_world", "satisfied": 3, "of": 256}]
     s = skillbench.summarize(case, [row, dict(row, status="failed", code="grasp_missed", u0=False)])
     assert (s["n"], s["succeeded"], s["rate"], s["expect_met"], s["u0_all"]) == (2, 1, 0.5, 1, False)
 
@@ -340,6 +362,45 @@ def test_a_native_trial_observes_once_and_every_env_step_is_charged_to_it():
     r, rt, _, _ = trial("tiptop", observer)
     assert r.status is Status.SUCCEEDED and observer.n == 1
     assert rt.charged == {"observe": 0, "skill": 3} and rt.step == 3 and rt.idle_steps == 0 and skillbench.u0(rt)
+
+
+class World(JointWorld):  # what the pick builder reads besides the hands: where the base stands, what the apple is on
+    def base_pose(self):
+        return Belief(Pose2(0.0, 0.0, 0.0), "oracle", 0)
+
+    def support_of(self, o):
+        return Belief(table, "oracle", 0)
+
+
+class Planner:  # the planner server: records the request, answers a two-waypoint approach, the grasp and a lift
+    def __init__(self):
+        self.asked = []
+
+    def skill(self, req):
+        from tiptop.skills.wire import WIRE, PlanStep, SkillResponse, StopRule
+
+        self.asked.append(req)
+        names = tuple(f"torso_joint{k}" for k in range(1, 5)) + tuple(f"left_arm_joint{k}" for k in range(1, 8))
+        plan = (PlanStep("trajectory", "approach", positions=((0.1,) * 11, (0.2,) * 11), dt=1 / 30),
+                PlanStep("gripper", "grasp", gripper="creep", stop=StopRule("width", 0.006, "grasp_missed")),
+                PlanStep("trajectory", "lift", positions=((0.3,) * 11,), dt=1 / 30))  # fmt: skip
+        return SkillResponse(WIRE, True, None, "lift", "", (), names, plan, (("holding", "apple_1"),), {})
+
+
+def test_a_native_pick_on_the_bench_plans_from_the_capture_and_plays_the_plan():
+    env, planner, sim = Env(), Planner(), capture_sim(4)
+    host = Host(env)
+    base = make_rt(planner=planner)
+    svc = dataclasses.replace(base.svc, world=World(REFS))
+    observer = CaptureObserver(sim, host, sim.segmenter, "t")
+    call = SkillCall("pick_up", PickArgs(apple), arm="left", seed=3, backend="tiptop")
+    r, rt, _, _ = skillbench.run_trial(host, svc, skillbench.make_backends(FakeEpisode(host), host),
+                                       {"pick_up": {"default": "legacy"}}, observer, call)  # fmt: skip
+    assert (r.status, r.backend, r.phase) == (Status.SUCCEEDED, "tiptop", "lift"), r
+    (req,) = planner.asked
+    assert req.skill == "pick" and req.seed == 3 and req.observation["view_name"] == "head"
+    assert req.observation["gt_labels"] == ["apple_1"] and np.array_equal(req.observation["gt_masks"][0], np.eye(4))
+    assert rt.charged == {"observe": 0, "skill": r.steps} and r.steps > 0 and skillbench.u0(rt)
 
 
 def test_the_step_invariant_fails_on_an_idle_step_or_an_uncharged_one():
@@ -515,6 +576,35 @@ def test_the_pseudo_map_serves_fixed_furniture_once_per_scene_tagged_map(monkeyp
     assert mapbuild.pseudo_map(sim) is mapbuild.pseudo_map(sim)
 
 
+def test_the_mesh_room_is_todays_physical_meshes_posed_in_the_map_frame():
+    from b1k.skills.tiptop.builders import pick
+    from omnigibson.tiptop.oracle.meshroom import MeshRoom
+
+    pose = (th.tensor([1.0, 3.0, 0.5]), th.tensor([0.0, 0.0, 0.0, 1.0]))
+    shelf = SimpleNamespace(get_position_orientation=lambda: pose)
+    mesh = {"vertices": np.zeros((3, 3), np.float32), "faces": np.zeros((1, 3), np.int32), "kind": "obstacle",
+            "pose": np.eye(4, dtype=np.float32), "fixed_base": True}  # fmt: skip
+    asked = []
+    sim = SimpleNamespace(n_steps=4, obstacles={}, room_collision_scene=lambda: {"shelf_0": mesh})
+
+    def nearby_obstacles(collision_map=False):
+        asked.append(collision_map)
+        sim.obstacles = {"shelf_0": shelf}  # as R1ProSim: registered here, read by room_collision_scene
+
+    sim.nearby_obstacles = nearby_obstacles
+    got = MeshRoom(sim).room((0.0, 0.0, 0.0), 3.0)
+    (entry,) = got.value
+    assert (got.source, got.step, asked) == ("oracle", 4, [True])
+    assert entry["name"] == "shelf_0" and entry["vertices"] is mesh["vertices"] and entry["kind"] == "obstacle"
+    assert np.allclose(entry["pose"][:3, 3], [1.0, 3.0, 0.5]), "the map (world) frame, not the base frame"
+    world = World(REFS)
+    world.base_pose = lambda: Belief(Pose2(1.0, 2.0, np.pi / 2), "oracle", 0)
+    rt = make_rt()
+    rt.svc = dataclasses.replace(rt.svc, world=world, collision=MeshRoom(sim))
+    (moved,) = pick.room(rt.svc)
+    assert np.allclose(moved["pose"][:3, 3], [1.0, 0.0, 0.5]), "the pick builder moves it into the base frame"
+
+
 def test_the_pseudo_stack_counts_every_oracle_read_and_judges_with_the_scorer(monkeypatch):
     from omnigibson.tiptop.oracle import pseudo_services
 
@@ -528,3 +618,7 @@ def test_the_pseudo_stack_counts_every_oracle_read_and_judges_with_the_scorer(mo
     assert top.value.z == pytest.approx(0.9) and top.source == "oracle"
     assert svc.provenance.take() == {"geometry.top_support": 1}, "counted in pseudo"
     assert isinstance(svc.provenance, ProvenancePolicy) and segmenter.sim is sim
+    sim.nearby_obstacles, sim.obstacles, sim.room_collision_scene = lambda collision_map: None, {}, dict
+    mesh, _ = pseudo_services(SimpleNamespace(sim=sim), "planner", routing, collision="mesh")
+    assert mesh.collision.room((0.0, 0.0, 0.0), 3.0) == Provided([], "oracle", 9)
+    assert mesh.provenance.take() == {"collision.room": 1}, "the mesh room is oracle and counted"

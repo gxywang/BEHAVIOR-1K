@@ -12,23 +12,26 @@ from omnigibson.tiptop.oracle.geometry import OracleGeometry
 from omnigibson.tiptop.oracle.goals import EpisodeScorer
 from omnigibson.tiptop.oracle.joints import OracleJoints
 from omnigibson.tiptop.oracle.mapbuild import pseudo_map
+from omnigibson.tiptop.oracle.meshroom import MeshRoom
 from omnigibson.tiptop.oracle.segmenter import OracleSegmenter
 from omnigibson.tiptop.oracle.world import OracleWorld
 
 
-def pseudo_services(ep, planner, routing: dict) -> tuple:
+def pseudo_services(ep, planner, routing: dict, collision: str = "map") -> tuple:
     """(Services, segmenter) for one Episode: the oracle WorldView, the pseudo map (one per scene) and the room from
-    it, the oracle geometry, articulation and joint values, the proprio GraspSensor, and the GoalPanel from
-    routing.yaml's goal_checker line with the scorer behind it. The segmenter is the bench Observer's."""
+    it (collision="mesh": today's physical meshes instead, the A/B), the oracle geometry, articulation and joint
+    values, the proprio GraspSensor, and the GoalPanel from routing.yaml's goal_checker line with the scorer behind
+    it. The segmenter is the bench Observer's."""
     sim, policy = ep.sim, ProvenancePolicy("pseudo")
     grasp, joints, map_ = ProprioGraspSensor(), OracleJoints(sim), pseudo_map(sim)
+    room = MeshRoom(sim) if collision == "mesh" else MapCollisionWorld(map_, joints, lambda: sim.n_steps)
     svc = Services(
         world=guarded(OracleWorld(ep, grasp), policy, "world"),
         map=guarded(map_, policy, "map"),
         geometry=guarded(OracleGeometry(sim), policy, "geometry"),
         articulation=guarded(OracleArticulation(sim), policy, "articulation"),
         joints=guarded(joints, policy, "joints"),
-        collision=guarded(MapCollisionWorld(map_, joints, lambda: sim.n_steps), policy, "collision"),
+        collision=guarded(room, policy, "collision"),
         grasp=grasp,
         buttons=None,  # oracle/buttons.py lands with press (week 2)
         goals=goal_panel(routing, "pseudo", scorer=EpisodeScorer(sim)),
