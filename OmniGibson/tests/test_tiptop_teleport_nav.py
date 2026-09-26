@@ -15,12 +15,14 @@ from omnigibson.tiptop.host import skillbench
 from omnigibson.tiptop.host.teleport_nav import MOVE_TO_STEPS, STANDOFFS, TeleportNavigator
 
 jar = ObjRef("jar.n.01_1", "jar")
+JAR = SimpleNamespace(aabb=(th.tensor([1.95, 1.95, 0.85]), th.tensor([2.05, 2.05, 0.95])), aabb_center=th.tensor([2.0, 2.0, 0.9]))
 
 
-def sim(blocked=lambda x, y: False, refuse=False):
-    """A scene whose footprint test refuses ``blocked`` spots, a robot at the origin, and a teleport that steps the
-    sim 40 times (its fold and unfold ramps)."""
-    s = SimpleNamespace(n_steps=0, placed=[], objects={jar.id: "jar_obj"})
+def sim(blocked=lambda x, y: False, refuse=False, search=None):
+    """A scene whose footprint test refuses ``blocked`` spots, a robot at the origin, a legacy stance search that
+    finds ``search`` ((score, x, y, yaw, ...) or None), and a teleport that steps the sim 40 times (its fold and
+    unfold ramps)."""
+    s = SimpleNamespace(n_steps=0, placed=[], objects={jar.id: JAR}, searched=[])
     s.robot = SimpleNamespace(get_position_orientation=lambda: (th.zeros(3), th.tensor([0.0, 0.0, 0.0, 1.0])))
     s.scene_aabbs = lambda: ["boxes"]
     s.scene_object = lambda name: s.objects[name]
@@ -39,6 +41,8 @@ def sim(blocked=lambda x, y: False, refuse=False):
         s.placed.append((x, y, yaw, note, min_unfold))
 
     s.hands = lambda: {}
+    s.xy_radius = lambda name: 0.07
+    s.best_base_pose = lambda points, **kw: (s.searched.append((points, kw)), (search, {}))[1]
 
     s._footprint_free, s.place_robot = footprint_free, place_robot
     return s
@@ -58,13 +62,26 @@ def test_propose_rings_the_reach_point_where_the_footprint_is_free_nearest_first
     for st in out:
         facing = math.atan2(2.0 - st.pose.y, 2.0 - st.pose.x)
         assert min(abs((st.pose.yaw - facing - off + math.pi) % (2 * math.pi) - math.pi) for off in (0, math.pi / 6, -math.pi / 6)) < 1e-9
-    assert all(a[3] == ["boxes"] and a[4] == ("jar_obj",) and a[5] is False for a in s.asked), \
+    assert all(a[3] == ["boxes"] and a[4] == (JAR,) and a[5] is False for a in s.asked), \
         "one scene reading for the whole search; the arm may rest in what it reaches for; the arms are not tested " \
         "at their working posture (the teleport folds them and checks the landing itself)"
     few = TeleportNavigator(sim(blocked=lambda x, y: y > 1.9)).propose(req, k=8)
     assert len(few) == 8 and len({round(math.hypot(st.pose.x - 2.0, st.pose.y - 2.0), 2) for st in few}) > 1, \
         "the next standoffs fill in when the preferred ring has too few free spots"
     assert TeleportNavigator(sim(blocked=lambda x, y: True)).propose(req) == []
+
+
+def test_propose_leads_with_the_legacy_stance_search_which_frames_the_target_and_the_rings_fill_in():
+    s = sim(search=(0.8, 1.25, 2.1, -3.0, [0.75], [0.1], 0.3))
+    out = TeleportNavigator(s).propose(StanceRequest((jar,), ((2.0, 2.0, 0.9),)), k=8)
+    assert len(out) == 8 and out[0].key == "search:0" and out[0].pose == Pose2(1.25, 2.1, -3.0, 0.0)
+    assert all(st.key.startswith("ring:") for st in out[1:]), "the rings after it, to k"
+    ((points, kw),) = s.searched
+    assert np.allclose(points, [[2.0, 2.0]]) and kw["reaching"] == [JAR] and kw["support_z"] == [pytest.approx(0.85)], \
+        "asked as place_robot_for asks it: the targets' box centres, their bottoms as the support the camera must see"
+    assert kw["half_widths"] == [0.07] and np.allclose(kw["boxes"][0][1], [2.05, 2.05, 0.95])
+    assert TeleportNavigator(sim()).propose(StanceRequest((jar,), ((2.0, 2.0, 0.9),)), k=8)[0].key.startswith("ring:"), \
+        "no stance from the search: the rings alone"
 
 
 def test_go_to_teleports_on_the_sim_clock_and_charges_the_move_to_mean_in_shadow_steps():
