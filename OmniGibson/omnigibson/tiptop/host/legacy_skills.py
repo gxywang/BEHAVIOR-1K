@@ -77,6 +77,8 @@ class LegacyBackend:
             "place": lambda c: self.ep.achieve([_atom(c.args.obj, r) for r in c.args.relations], arm=c.arm or "left"),
             "open": lambda c: self.ep.open_up(c.args.target.id, c.args.min_fraction, joint=c.args.joint, **one),
             "close": lambda c: self.ep.open_up(c.args.target.id, 0.0, joint=c.args.joint, **one),
+            "press": lambda c: self.ep.achieve([{"predicate": "toggled_on", "args": [c.args.target.id]}],
+                                               arm=c.arm or "left"),
             "release": lambda c: self.ep.release() or True,  # returns None: it raises when it cannot open the hand
         }
 
