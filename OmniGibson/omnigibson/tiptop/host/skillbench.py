@@ -47,6 +47,7 @@ from b1k.bridge.client import ArmPlanners
 from b1k.bridge.protocol import bddl_category
 from b1k.bridge.strategies import STRATEGIES
 from b1k.connector.codec import from_dict, to_dict
+from b1k.connector.api import reach as api_reach
 from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
@@ -63,6 +64,7 @@ from omnigibson.tiptop.host import demo_cases
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, _plain
+from omnigibson.tiptop.host.teleport_nav import TeleportNavigator
 from omnigibson.tiptop.host.overview import aim_overview
 from omnigibson.tiptop.run import (
     add_common,
@@ -99,14 +101,19 @@ def targets(call: SkillCall) -> tuple:
     return named + tuple(r.target for r in getattr(a, "relations", ()))
 
 
-def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[SkillCall] = None):
+def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[SkillCall] = None,
+             reach: bool = False):
     """The bench's TaskPlanner: the one call, after an observe of ``views`` when the skill asks for a Percept (a
-    legacy backend captures in its own run and does not). It never calls go_to: the case's stance is the harness's
-    setup. With a ``lease`` it is hold_and_press (b1k.connector.api): the lease started first, the observe from where
-    the head is (a lease holds the trunk read-only), the call beside it, the lease aborted after."""
+    legacy backend captures in its own run and does not). It calls go_to only for a ``reach`` case (check_stances.yaml):
+    b1k.connector.api.reach, the stance the IK service scores best, from a setup stance out of reach; otherwise the
+    case's stance is the harness's setup. With a ``lease`` it is hold_and_press (b1k.connector.api): the lease started
+    first, the observe from where the head is (a lease holds the trunk read-only), the call beside it, the lease
+    aborted after."""
     h = conn.start(lease) if lease is not None else None
     if h is not None and h.call_id in conn.rt.results:  # refused before it ran (not_holding, resource_busy): the
         return conn.rt.results[h.call_id]  # trial is not two-handed, and its row says so, instead of a lone press
+    if reach:
+        api_reach(conn, call)
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
         req = ObserveRequest(targets(call), views=views, aim=lease is None)
         call = dataclasses.replace(call, percept=conn.observe(req).id)
@@ -171,16 +178,16 @@ def lease_for(case: dict, call: SkillCall, seed: int, registry: SkillRegistry) -
 
 
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall,
-              lease: Optional[SkillCall] = None) -> tuple:
+              lease: Optional[SkillCall] = None, nav=None, reach: bool = False) -> tuple:
     """One trial: the production Runtime and registry over these providers and backends, DirectConnector on the
     host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
     calls = []
-    rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer)
+    rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer, navigator=nav)
     rt.latch = Latch(host.observe_now().proprio)  # Latch opens both hands at its first observation; the trial starts
     rt.latch.reseed(host.commanded_targets())  # from what the setup left commanded (a demo's held hand stays closed)
     host.env_wall_s, host.frames_wall_s, t0 = 0.0, 0.0, time.monotonic()
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
-                 lease)
+                 lease, reach)
     return r, rt, calls, time.monotonic() - t0
 
 
@@ -531,16 +538,18 @@ def main(argv=None) -> None:
                 for arm, ref in held.items():  # what the setup put in the hands, as a pick's result would say it
                     svc.world.apply(WorldUpdate("held", ref, arm))
                 observer = CaptureObserver(sim, host, segmenter, args.task)
+                nav = TeleportNavigator(sim)  # a reach case's go_to; its teleports' sim steps join the U0 check
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
                                            arm=pick_arm(case["call"], held))
                 backends = make_backends(ep, host, svc)
                 lease = lease_for(case, call, seed, SkillRegistry(SPECS, backends, routing))
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
-                    r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease)
+                    r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease, nav,
+                                                     bool(case.get("reach")))
                 held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
-                                observer.steps, held_by, host.frames_wall_s))
+                                observer.steps + nav.steps, held_by, host.frames_wall_s))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])
