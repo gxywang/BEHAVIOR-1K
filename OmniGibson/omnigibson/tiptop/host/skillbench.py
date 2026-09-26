@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch as th
 import yaml
 
 import b1k.runtime.skillrun as skillrun
@@ -73,6 +74,7 @@ from omnigibson.tiptop.run import (
     connect_planners,
     setup_logging,
 )
+from omnigibson.utils.sampling_utils import raytest
 
 log = logging.getLogger("omnigibson.tiptop")
 
@@ -87,6 +89,11 @@ SIM_FIELDS = ("posture", "locked_nominal", "arm", "other_arm", "planned_joints",
               "stance_ready", "look_target", "look_names", "look_arm", "mirror_arm_idx", "mirror_gripper_idx",
               "last_gripper", "other_gripper", "held_objects")
 SELFTEST_STEPS, SELFTEST_RAD = 90, 0.1  # the self-test's scripted trajectory: every planned-arm joint, a sine bump
+# The video's overview camera: candidate eyes in the base frame (dx, dy, z), tried after the --overview view's own: over
+# the right shoulder, ahead-left and ahead-right looking back, behind and higher, overhead (aim_overview)
+OVERVIEW_EYES = ((-1.5, -1.1, 1.7), (1.15, 0.75, 1.35), (1.15, -0.75, 1.35), (-2.4, 0.0, 2.2), (0.0, 0.8, 2.6))
+SIGHT_MARGIN = 0.3  # m: a raycast hit this close to the point looked at is that point's own body
+CHEST_Z = 1.1  # m: where the eye must see the robot (its chest, over the base)
 
 
 class CaseSetupError(RuntimeError):
@@ -178,7 +185,7 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer)
     rt.latch = Latch(host.observe_now().proprio)  # Latch opens both hands at its first observation; the trial starts
     rt.latch.reseed(host.commanded_targets())  # from what the setup left commanded (a demo's held hand stays closed)
-    host.env_wall_s, t0 = 0.0, time.monotonic()
+    host.env_wall_s, host.frames_wall_s, t0 = 0.0, 0.0, time.monotonic()
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
                  lease)
     return r, rt, calls, time.monotonic() - t0
@@ -201,9 +208,11 @@ def latch_gap(rt) -> float:
 
 
 def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float,
-        observe_wall_s: float = 0.0, observe_steps: int = 0, lease: Optional[dict] = None) -> dict:
+        observe_wall_s: float = 0.0, observe_steps: int = 0, lease: Optional[dict] = None,
+        frames_wall_s: float = 0.0) -> dict:
     """planning_wall_s is what is neither an env step nor the planner's capture: planning, resampling and
-    verification (for a legacy run, which captures and steps inside itself, all of it). ``lease``: the skill_calls
+    verification (for a legacy run, which captures and steps inside itself, all of it); ``frames_wall_s``, the part
+    of it spent rendering the end-of-run frames the GoalPanel read, is shown beside it. ``lease``: the skill_calls
     row of the lease the call ran beside (aborted = still holding when the call ended; hold_lost = it let go)."""
     return {
         "case": case["id"], "trial": trial, "seed": seed, "skill": r.skill, "backend": r.backend,
@@ -217,7 +226,7 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "sim_steps": sim_steps, "observe_steps": observe_steps, "latch_gap_rad": round(latch_gap(rt), 4),
         "wall_s": round(wall_s, 2),
         "env_wall_s": round(env_wall_s, 2), "observe_wall_s": round(observe_wall_s, 2),
-        "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2),
+        "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2), "frames_wall_s": round(frames_wall_s, 2),
         "oracle_reads": dict(r.oracle_reads), "planner_oracle_reads": dict(rt.planner_oracle_reads),
         "requires_sim_clock": r.requires_sim_clock, "evidence": dict(r.evidence),
         "world_updates": [to_dict(u) for u in r.world_updates],  # an open's joint value and its source (SPEC §6.6)
@@ -235,7 +244,7 @@ def summarize(case: dict, rows: list) -> dict:
         "codes": json.dumps(Counter(r["code"] for r in rows)),
         "steps_p50": float(np.percentile(steps, 50)), "steps_p95": float(np.percentile(steps, 95)),
         # the shadow checkers against the primary, over the trials where a shadow judged (None is no agreement: the
-        # perception shadow judges nothing until a host puts head frames in StepObs.sensors)
+        # perception shadow judges the end-of-run Frames the host puts in StepObs.sensors, None where they cannot say)
         "shadow_judged": sum(any(v is not None for n, v in r["verdicts"].items() if n != r["primary"]) for r in rows),
         "agree": sum(any(v is not None for n, v in r["verdicts"].items() if n != r["primary"])
                      and all(v is None or v == r["verdicts"][r["primary"]] for v in r["verdicts"].values()) for r in rows),
@@ -309,11 +318,33 @@ def adopt_demo_posture(sim, host, held: dict) -> None:
     sim.held_objects = {labels[ref.id]: arm for arm, ref in held.items() if ref.id in labels}
 
 
-def aim_overview(sim, x: float, y: float, yaw: float) -> None:
-    """The overview camera as place_robot aims it (r1pro.py), for a base the restore put down instead of a teleport."""
+def clear_sight(eye, point, allow=()) -> bool:
+    """Nothing between ``eye`` and ``point`` (world) but a body ``allow`` names (prim path prefixes) or the point's own
+    surroundings (a hit within SIGHT_MARGIN of it: the target's own body, the fingers around it)."""
+    hit = raytest(th.tensor(eye, dtype=th.float32), th.tensor(point, dtype=th.float32))
+    return (not hit["hit"] or hit["distance"] >= float(np.linalg.norm(np.subtract(point, eye))) - SIGHT_MARGIN
+            or any(str(hit["rigidBody"]).startswith(p) for p in allow))
+
+
+def aim_overview(sim, x: float, y: float, yaw: float, target: Optional[str] = None) -> None:
+    """The overview camera (the video's third-person view) for a base at (x, y, yaw): the first eye, the --overview
+    view's own (OVERVIEW_OFFSETS, as place_robot aims it) then OVERVIEW_EYES, that sees the robot's chest and
+    ``target`` (the call's target object; else the view's own workspace point) with nothing in the way, by a raycast
+    (harness-only): the shoulder eye sat behind a pillar at the store_honey stance and looked at a window at the
+    drawer stances (VIDEO_FINDINGS 9, 13). Every eye blocked: the view's own, as before."""
     dx, dy, z, tx, tz = OVERVIEW_OFFSETS[sim.overview_view]
     c, s = math.cos(yaw), math.sin(yaw)
-    sim.aim_overview((x + dx * c - dy * s, y + dx * s + dy * c, z), (x + tx * c, y + tx * s, tz))
+    world = lambda ox, oy, oz: (x + ox * c - oy * s, y + ox * s + oy * c, oz)
+    chest, robot = world(0.0, 0.0, CHEST_Z), (sim.robot.prim_path,)
+    if target is not None:
+        obj = sim.scene_object(target)
+        look, own = tuple(float(v) for v in obj.aabb_center), (obj.prim_path,)
+    else:
+        look, own = world(tx, 0.0, tz), ()
+    eyes = [world(dx, dy, z)] + [world(*e) for e in OVERVIEW_EYES]
+    eye = next((e for e in eyes if clear_sight(e, chest, robot) and clear_sight(e, look, own)), eyes[0])
+    log.info(f"overview camera: eye {eyes.index(eye)} at {np.round(eye, 2).tolist()} looking at {np.round(look, 2).tolist()}")
+    sim.aim_overview(eye, look)
 
 
 def commanded_obs(sim, host):
@@ -335,12 +366,14 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
             demo_cases.restore(sim.env, json.load(f), int(case["instance"]), case.get("mode") or args.mode)
         held = held_refs(sim, s.get("held") or {}, case["call"])
         adopt_demo_posture(sim, host or BenchHost(sim), held)
-        aim_overview(sim, *s["robot_pose"])  # the video's third-person view; no place_robot here to aim it
     else:
         args.torso = s.get("torso")
         apply_embodiment_posture(sim, args, embodiment)
         if "robot_pose" in s:
             sim.place_robot(*s["robot_pose"], note=f"skill bench setup of {case['id']}")
+    if "robot_pose" in s:  # the video's third-person view, with a line of sight to the robot and the call's target
+        named = targets(case["call"])
+        aim_overview(sim, *s["robot_pose"], target=named[0].id if named else None)
     if s.get("ready"):  # the holding arm where a pick leaves it (SPEC §5.6: hold "here"): its planner's ready posture
         #                 set outright as apply_posture does, the object welded to the hand following at the settle
         if s["ready"] != sim.arm:
@@ -530,6 +563,7 @@ def main(argv=None) -> None:
                 random.seed(seed), np.random.seed(seed), torch.manual_seed(seed)
                 ep = Episode(sim, args, planners, knowledge, out / case["id"] / f"t{i}", spec=strategy.spec)
                 svc, segmenter = providers.pseudo_services(ep, planner, routing, collision=args.collision)
+                host.segmenter = segmenter  # the GoalPanel's end-of-run frames carry this trial's masks
                 for arm, ref in held.items():  # what the setup put in the hands, as a pick's result would say it
                     svc.world.apply(WorldUpdate("held", ref, arm))
                 observer = CaptureObserver(sim, host, segmenter, args.task)
@@ -542,7 +576,7 @@ def main(argv=None) -> None:
                     r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease)
                 held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
-                                observer.steps, held_by))
+                                observer.steps, held_by, host.frames_wall_s))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])

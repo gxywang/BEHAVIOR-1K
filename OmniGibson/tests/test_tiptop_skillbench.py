@@ -36,7 +36,7 @@ from b1k.runtime.compose import ACTION_SLICES, CLOSED
 from b1k.runtime.direct import DirectConnector
 from b1k.tests.fakes import REFS, Env, JointWorld, Scripted, SimV, apple, basket, make_rt, table
 from omnigibson.tiptop.host import skillbench
-from omnigibson.tiptop.host.bench_host import BenchHost
+from omnigibson.tiptop.host.bench_host import BenchHost, Frames
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
 from omnigibson.tiptop.host.legacy_skills import LegacyBackend, classify
 
@@ -113,6 +113,49 @@ def test_the_bench_host_hands_the_runtime_the_eval_proprio_layout_and_what_r1pro
     obs = host.observe_now()
     assert obs.step == 7 and (obs.proprio == p).all()
     assert host.parse(raw, 3).step == 3 and host.commanded_targets()["arm_left"].sum() == 7
+    assert host.parse(raw, 3).sensors is None and host.observe_now().sensors is None, \
+        "no segmenter yet (before the trial's providers exist): no frames"
+
+
+def test_a_bench_step_obs_carries_the_cameras_current_frames_rendered_only_when_a_checker_reads_them():
+    """SPEC §8 gate item 5: at the end of a run the GoalPanel judges the robot cameras' current images (the head and
+    both wrists, where they stand), with the oracle segmenter's per-view masks of every tracked object, keyed by BDDL
+    name and source-tagged. Reading sensors is not a capture: no sim step, no aim; and nothing renders until read."""
+    from b1k.perception.verifier import frames
+
+    n, rendered, asked = 4, [], []
+    frame = {"rgb": np.zeros((n, n, 3), np.uint8), "depth": np.ones((n, n), np.float32),
+             "intrinsics": np.eye(3, dtype=np.float32), "world_from_cam": np.eye(4, dtype=np.float32), "robot_mask": None}
+    masks = {v: {"jar_1": np.eye(n, dtype=bool) if v == "left_wrist" else np.zeros((n, n), bool),
+                 "cabinet_1": np.zeros((n, n), bool)} for v in ("head", "left_wrist", "right_wrist")}  # fmt: skip
+
+    def segment(labels, request, extras):
+        asked.append((labels, request["view_name"], [v["name"] for v in request["views"]], sorted(extras["views"])))
+        return Provided(masks, "oracle", 9)
+
+    sim = SimpleNamespace(robot=fake_robot(), n_steps=9, primary_view="head",
+                          extra_views=("left_wrist", "right_wrist", "head_left"),
+                          robot_cam_names={"head": "h", "left_wrist": "l", "right_wrist": "r"},
+                          view_frame=lambda name: rendered.append(name) or (dict(frame), {"seg_instance": None}),
+                          objects={"jar_1": 1, "cabinet_1": 2},
+                          bddl_names={"jar_1": "jar.n.01_1", "cabinet_1": "cabinet.n.01_1"})  # fmt: skip
+    host = BenchHost(sim, segmenter=SimpleNamespace(masks=segment))
+    obs = host.parse(host.raw(), 3)
+    assert isinstance(obs.sensors, Frames) and rendered == [] and asked == [], "made every step, rendered when read"
+    assert list(obs.sensors.views) == ["head", "left_wrist", "right_wrist"], \
+        "the cameras where they stand: a turned head view (head_left needs a torso ramp) is not one of them"
+    assert rendered == ["head", "left_wrist", "right_wrist"] and sim.n_steps == 9, "one render per camera, no sim step"
+    assert asked == [(["jar_1", "cabinet_1"], "head", ["left_wrist", "right_wrist"], ["left_wrist", "right_wrist"])], \
+        "the segmenter over every tracked object in every view, in the capture's request shape"
+    assert all(isinstance(v, CameraView) for v in obs.sensors.views.values())
+    assert obs.sensors.masks.source == "oracle" and set(obs.sensors.masks.value) == {"jar.n.01_1", "cabinet.n.01_1"}, \
+        "the primary view's masks, keyed by BDDL name as the goal atoms name the objects, source-tagged"
+    assert obs.sensors.view_masks.source == "oracle" and obs.sensors.view_masks.value["left_wrist"]["jar.n.01_1"].any()
+    assert [v.name for v, m, s in frames(obs.sensors)] == ["head", "left_wrist", "right_wrist"], \
+        "the PerceptionVerifier reads it as it reads a Percept: every view"
+    obs.sensors.views
+    assert rendered == ["head", "left_wrist", "right_wrist"] and host.frames_wall_s > 0.0, "cached; its seconds counted"
+    assert host.observe_now().sensors is not obs.sensors, "a new carrier per observation: it renders now, not then"
 
 
 def view(name: str, n: int = 2) -> dict:  # one view as R1ProSim.capture's request carries it
@@ -632,6 +675,7 @@ def test_a_native_row_fails_u0_on_a_sim_step_nobody_charged():
 def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
     events = []
     monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: events.append("torso"))
+    monkeypatch.setattr(skillbench, "aim_overview", lambda sim, *pose, target=None: events.append(("aim", target)))
     sim = SimpleNamespace(OPEN=1.0, place_robot=lambda *pose, note: events.append("place"),
                           look_at=lambda *names: events.append(("look", names)),
                           hold=lambda n, g: events.append("hold"))  # fmt: skip
@@ -639,19 +683,56 @@ def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
     case = {"id": "c", "setup": {"robot_pose": [1.0, 2.0, 0.0]},
             "call": SkillCall("place", PlaceArgs(apple, (Relation(Rel.IN, basket),)))}
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
-    assert events == ["torso", "place", ("look", (apple.id, basket.id)), "hold"], \
-        "place_robot clears the look target: the capture would aim at the default point, not at the objects"
+    assert events == ["torso", "place", ("aim", apple.id), ("look", (apple.id, basket.id)), "hold"], \
+        "place_robot clears the look target: the capture would aim at the default point, not at the objects; the " \
+        "overview camera is aimed at the call's object after the teleport"
     events.clear()
     case["call"] = SkillCall("release", ReleaseArgs())
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
-    assert events == ["torso", "place", "hold"], "a call that names no object frames nothing (look_at() would raise)"
+    assert events == ["torso", "place", ("aim", None), "hold"], \
+        "a call that names no object frames nothing (look_at() would raise); the overview looks at the workspace"
     events.clear()
     sim.scene_object = lambda name: SimpleNamespace(joints={"j_link_4": SimpleNamespace(
         set_pos=lambda v: events.append(("joint", name, v)))})
     case["setup"]["joint_states"] = {"cabinet.n.01_1": {"j_link_4": 0.31}}
     skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
-    assert events == ["torso", "place", ("joint", "cabinet.n.01_1", 0.31), "hold"], \
+    assert events == ["torso", "place", ("aim", None), ("joint", "cabinet.n.01_1", 0.31), "hold"], \
         "a drawer to close starts open: the joint set after the teleport, the settle propagates it"
+
+
+def test_the_overview_camera_takes_the_first_eye_that_sees_the_robot_and_the_target(monkeypatch):
+    """VIDEO_FINDINGS 9: the shoulder eye sat behind a pillar at the jar stance and looked at a window at the drawer
+    stance. Each candidate eye is raycast at the robot's chest and at the call's target; the first clear one wins."""
+    aimed, walls = [], {}
+    key = lambda p: tuple(round(float(v), 2) for v in p)
+
+    def raytest(start, end):  # a wall between some eyes and what they look at
+        body = walls.get((key(start), key(end)))
+        return {"hit": True, "distance": 0.5, "rigidBody": body} if body else {"hit": False}
+
+    monkeypatch.setattr(skillbench, "raytest", raytest)
+    jar = SimpleNamespace(prim_path="/World/scene_0/jar_7", aabb_center=th.tensor([2.0, 2.3, 0.9]))
+    sim = SimpleNamespace(overview_view="shoulder", aim_overview=lambda eye, look: aimed.append((key(eye), key(look))),
+                          robot=SimpleNamespace(prim_path="/World/scene_0/robot0"), scene_object=lambda n: jar)  # fmt: skip
+    shoulder, right, chest, look = (-0.5, 3.1, 1.7), (-0.5, 0.9, 1.7), (1.0, 2.0, 1.1), (2.0, 2.3, 0.9)  # base (1, 2, yaw 0)
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    assert aimed[-1] == (shoulder, look), "every ray clear: the --overview eye as place_robot puts it, at the target"
+    walls[(shoulder, look)] = "/World/scene_0/walls_pillar"
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    assert aimed[-1] == (right, look), "a pillar hides the jar from the shoulder eye: the next eye, over the right"
+    walls[(right, chest)] = "/World/scene_0/window_3"
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    assert aimed[-1][0] == (2.15, 2.75, 1.35), "a window between that eye and the robot: the eye ahead-left"
+    walls[(shoulder, look)], walls[(right, chest)] = jar.prim_path, sim.robot.prim_path
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    assert aimed[-1] == (shoulder, look), "a hit on the target's own body, or on the robot's toward its chest, is clear"
+    walls[(shoulder, look)] = "/World/scene_0/walls_pillar"
+    for e in skillbench.OVERVIEW_EYES:
+        walls[(key((1.0 + e[0], 2.0 + e[1], e[2])), chest)] = "/World/scene_0/walls"
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0, target="jar.n.01_1")
+    assert aimed[-1] == (shoulder, look), "every eye blocked: the --overview eye, as before"
+    skillbench.aim_overview(sim, 1.0, 2.0, 0.0)
+    assert aimed[-1] == (shoulder, (1.7, 2.0, 0.55)), "no target named (a release): the view's own workspace point"
 
 
 class DemoSim:
@@ -664,10 +745,13 @@ class DemoSim:
     def aim_overview(self, eye, target):
         self.events.append(("overview", tuple(round(v, 3) for v in eye), tuple(round(v, 3) for v in target)))
 
+    def scene_object(self, name):
+        return SimpleNamespace(prim_path=f"/World/{name}", aabb_center=th.tensor([1.5, 2.0, 0.9]))
+
     def __init__(self, finger_sum=0.02):
         self.arm, self.other_arm, self.n_steps = "left", "right", 0
         self.robot = SimpleNamespace(arm_joint_names={a: [f"{a}_arm_joint{k}" for k in range(1, 8)]
-                                                      for a in ("left", "right")})  # fmt: skip
+                                                      for a in ("left", "right")}, prim_path="/World/robot0")  # fmt: skip
         self.posture = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)} | {"left_gripper_finger_joint1": 0.05}
         self.locked_nominal = {f"right_arm_joint{k}": 0.0 for k in range(1, 8)}
         self.stance_ready, self.last_gripper, self.other_gripper, self.held_objects = None, 1.0, 1.0, {}
@@ -713,6 +797,7 @@ def demo_env(monkeypatch, tmp_path):
     monkeypatch.setattr(skillbench.demo_cases, "restore",
                         lambda env, snap, inst, mode: restored.append((env, snap, inst, mode)))
     monkeypatch.setattr(skillbench.demo_cases, "held", lambda robot: {"left": "log_176", "right": None})
+    monkeypatch.setattr(skillbench, "raytest", lambda start, end: {"hit": False})  # every overview eye clear
     (tmp_path / "snap.json").write_text('{"log_176": {"pos": [1, 2, 3]}}')
     og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
     return og, restored, tmp_path
@@ -734,9 +819,10 @@ def test_a_demo_case_setup_restores_the_snapshot_adopts_the_human_posture_and_ve
     assert sim.posture["left_gripper_finger_joint1"] == 0.05, "only the idle arm's joints change"
     assert sim.stance_ready == [0.3] * 11, "the planned arm's ready posture is where it stands"
     assert (sim.last_gripper, sim.other_gripper) == (CLOSED, 1.0) and sim.held_objects == {"log_2": "left"}
-    assert sim.events == [("overview", (-0.5, 3.1, 1.7), (1.7, 2.0, 0.55)), ("look", ("log.n.01_2", basket.id)),
+    assert sim.events == [("overview", (-0.5, 3.1, 1.7), (1.5, 2.0, 0.9)), ("look", ("log.n.01_2", basket.id)),
                           ("hold", 3, CLOSED)], \
-        "the overview camera aimed over the shoulder as place_robot aims it (the restore put the base down, no teleport); the settle keeps the hand closed"
+        "the overview camera over the shoulder as place_robot puts it (the restore put the base down, no teleport), " \
+        "at the call's object; the settle keeps the hand closed"
     assert state[1]["last_gripper"] == CLOSED and state[1]["held_objects"] == {"log_2": "left"}
     assert skillbench.pick_arm(case["call"], held) == "left", "the hand that holds the object places it"
     assert skillbench.pick_arm(SkillCall("pick_up", PickArgs(apple)), held) == "right", "a free hand picks"
