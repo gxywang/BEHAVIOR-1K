@@ -6,6 +6,7 @@ from b1k.connector.goals import Clock, goal_panel
 from b1k.connector.world import ProvenancePolicy, guarded
 from b1k.map.collision import MapCollisionWorld
 from b1k.perception.grasp_sensor import ProprioGraspSensor
+from b1k.perception.verifier import PerceptionVerifier
 from b1k.runtime.skillrun import Services
 from omnigibson.tiptop.oracle.articulation import OracleArticulation
 from omnigibson.tiptop.oracle.geometry import OracleGeometry
@@ -34,7 +35,7 @@ def pseudo_services(ep, planner, routing: dict, collision: str = "map") -> tuple
         collision=guarded(room, policy, "collision"),
         grasp=grasp,
         buttons=None,  # oracle/buttons.py lands with press (week 2)
-        goals=goal_panel(routing, "pseudo", scorer=EpisodeScorer(sim)),
+        goals=goal_panel(routing, "pseudo", scorer=EpisodeScorer(sim), perception=PerceptionVerifier()),
         planner=planner,
         percepts={},
         provenance=policy,
