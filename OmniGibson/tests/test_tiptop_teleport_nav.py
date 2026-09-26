@@ -26,17 +26,19 @@ def sim(blocked=lambda x, y: False, refuse=False):
     s.scene_object = lambda name: s.objects[name]
     s.asked = []
 
-    def footprint_free(x, y, ignore, aabbs=None, yaw=None, reaching=()):
-        s.asked.append((round(x, 3), round(y, 3), round(yaw, 3), aabbs, tuple(reaching)))
+    def footprint_free(x, y, ignore, aabbs=None, yaw=None, arms=True, reaching=()):
+        s.asked.append((round(x, 3), round(y, 3), round(yaw, 3), aabbs, tuple(reaching), arms))
         return (False, "overlaps counter", 0.0) if blocked(x, y) else (True, "", 0.4)
 
-    def place_robot(x, y, yaw, note=""):
+    def place_robot(x, y, yaw, note="", min_unfold=0.0):
         from omnigibson.tiptop.r1pro import BasePlacementCollision
 
         s.n_steps += 40
         if refuse:
             raise BasePlacementCollision("base destination rejected: base_link intersects counter", obstacle="counter")
-        s.placed.append((x, y, yaw, note))
+        s.placed.append((x, y, yaw, note, min_unfold))
+
+    s.hands = lambda: {}
 
     s._footprint_free, s.place_robot = footprint_free, place_robot
     return s
@@ -56,8 +58,9 @@ def test_propose_rings_the_reach_point_where_the_footprint_is_free_nearest_first
     for st in out:
         facing = math.atan2(2.0 - st.pose.y, 2.0 - st.pose.x)
         assert min(abs((st.pose.yaw - facing - off + math.pi) % (2 * math.pi) - math.pi) for off in (0, math.pi / 6, -math.pi / 6)) < 1e-9
-    assert all(a[3] == ["boxes"] and a[4] == ("jar_obj",) for a in s.asked), \
-        "one scene reading for the whole search; the arm may rest in what it reaches for"
+    assert all(a[3] == ["boxes"] and a[4] == ("jar_obj",) and a[5] is False for a in s.asked), \
+        "one scene reading for the whole search; the arm may rest in what it reaches for; the arms are not tested " \
+        "at their working posture (the teleport folds them and checks the landing itself)"
     few = TeleportNavigator(sim(blocked=lambda x, y: y > 1.9)).propose(req, k=8)
     assert len(few) == 8 and len({round(math.hypot(st.pose.x - 2.0, st.pose.y - 2.0), 2) for st in few}) > 1, \
         "the next standoffs fill in when the preferred ring has too few free spots"
@@ -74,7 +77,12 @@ def test_go_to_teleports_on_the_sim_clock_and_charges_the_move_to_mean_in_shadow
         next(gen)  # ends before its first yield: 0 Runtime steps
     result, obs = done.value.value
     assert result == NavResult(True, stance, 0, MOVE_TO_STEPS) and obs == "obs"
-    assert s.placed == [(1.5, 2.0, 0.3, "go_to ring:0.60:0")] and nav.steps == 40, "the teleport's own sim steps"
+    assert s.placed == [(1.5, 2.0, 0.3, "go_to ring:0.60:0", 0.5)] and nav.steps == 40, \
+        "the teleport's own sim steps; an empty hand must unfold at least halfway there"
+    s.hands = lambda: {"jar_1": "left"}
+    with pytest.raises(StopIteration):
+        next(nav.go_to(stance, "obs"))
+    assert s.placed[-1][4] == 0.0, "carrying, the unfold is not asked for (place_robot_for's rule)"
     refused = TeleportNavigator(sim(refuse=True))
     with pytest.raises(StopIteration) as done:
         next(refused.go_to(stance, "obs"))

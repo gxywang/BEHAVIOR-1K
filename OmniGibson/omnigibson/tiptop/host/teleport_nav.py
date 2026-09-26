@@ -19,8 +19,8 @@ from b1k.connector.types import Belief, Pose2
 
 MOVE_TO_STEPS = 559  # the human move-to mean (SPEC D20)
 STANDOFFS = (0.6, 0.75, 0.9, 1.05, 0.45)  # m from the reach points' centroid, the preferred first; an object 0.3 m into
-#                                            a counter needs the base a further 0.5 m off its edge (the arm's resting
-#                                            posture is tested too), so the rings reach past the arm's 0.9 m
+#                                            a counter needs the base 0.75 m off, and the perception that follows wants
+#                                            it close (from 1.05 m the jar's support plane was not found)
 ANGLES = np.arange(0.0, 2 * np.pi, np.pi / 6)  # around the centroid
 YAW_OFFSETS = (0.0, np.pi / 6, -np.pi / 6)  # facing the centroid, and the object to the left or right of straight ahead
 
@@ -50,7 +50,9 @@ class TeleportNavigator:
                 x, y = mid + r * np.array([math.cos(a), math.sin(a)])
                 for off in YAW_OFFSETS:
                     yaw = math.atan2(mid[1] - y, mid[0] - x) + off
-                    free = self.sim._footprint_free(x, y, [], aabbs=aabbs, yaw=yaw, reaching=reaching)
+                    # arms=False: the teleport folds the arms and place_robot tests the landing and the unfold itself;
+                    # tested at their working posture, every ring within 0.9 m of a jar on a counter was refused
+                    free = self.sim._footprint_free(x, y, [], aabbs=aabbs, yaw=yaw, arms=False, reaching=reaching)
                     if free[0]:
                         ring.append((math.hypot(x - here.x, y - here.y), float(x), float(y), float(yaw)))
                         break  # one heading per spot: the next offsets are the same stance turned
@@ -65,8 +67,9 @@ class TeleportNavigator:
         from omnigibson.tiptop.r1pro import BasePlacementCollision
 
         n0 = self.sim.n_steps
-        try:
-            self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw, note=f"go_to {stance.key}")
+        try:  # an empty hand must unfold at least halfway there, as place_robot_for asks (UNFOLD_MIN)
+            self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw, note=f"go_to {stance.key}",
+                                 min_unfold=0.0 if self.sim.hands() else 0.5)
         except BasePlacementCollision as e:
             self.steps += self.sim.n_steps - n0
             return NavResult(False, stance, 0, 0, str(e)), obs
