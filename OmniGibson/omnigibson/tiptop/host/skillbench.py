@@ -49,7 +49,7 @@ from b1k.bridge.strategies import STRATEGIES
 from b1k.connector.codec import from_dict, to_dict
 from b1k.connector.api import Unreachable, reach as api_reach
 from b1k.connector.observe import ObserveRequest
-from b1k.connector.skills import Code, SkillCall, WorldUpdate
+from b1k.connector.skills import Code, NavResult, SkillCall, WorldUpdate
 from b1k.connector.types import ObjRef
 from b1k.perception.grasp_sensor import ProprioGraspSensor
 from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q
@@ -232,7 +232,16 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "oracle_reads": dict(r.oracle_reads), "planner_oracle_reads": dict(rt.planner_oracle_reads),
         "requires_sim_clock": r.requires_sim_clock, "evidence": dict(r.evidence),
         "world_updates": [to_dict(u) for u in r.world_updates],  # an open's joint value and its source (SPEC §6.6)
+        "go_to": go_to_rows(rt.results),  # a reach case's teleports: where to, ok or the landing's refusal
     }  # fmt: skip
+
+
+def go_to_rows(results: dict) -> list:
+    """The trial's NavResults (reach(): one per go_to, in order) as rows: the stance, whether the teleport landed, and
+    place_robot's reason when it did not."""
+    return [{"key": n.stance.key if n.stance else None, "pose": to_dict(n.stance.pose) if n.stance else None,
+             "ok": n.ok, "shadow_steps": n.shadow_steps, "detail": n.detail}
+            for n in results.values() if isinstance(n, NavResult)]
 
 
 def summarize(case: dict, rows: list) -> dict:

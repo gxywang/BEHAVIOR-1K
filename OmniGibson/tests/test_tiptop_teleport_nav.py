@@ -124,6 +124,16 @@ class Conn:
         return "result"
 
 
+def test_a_trials_teleports_are_rows_of_their_own_with_the_landings_refusal():
+    stance = Stance("ring:0.60:0", Pose2(1.5, 2.0, 0.3, 0.005), 1.0, "test", "oracle")
+    results = {"c1": NavResult(False, stance, 0, 0, "base destination rejected: base_link intersects counter"),
+               "c2": NavResult(True, stance, 0, MOVE_TO_STEPS), "c3": "a skill result"}
+    rows = skillbench.go_to_rows(results)
+    assert [r["ok"] for r in rows] == [False, True] and rows[0]["detail"].endswith("intersects counter")
+    assert rows[1] == {"key": "ring:0.60:0", "pose": {"__type__": "Pose2", "x": 1.5, "y": 2.0, "yaw": 0.3, "z": 0.005},
+                       "ok": True, "shadow_steps": MOVE_TO_STEPS, "detail": ""}
+
+
 def test_the_one_call_planner_reaches_by_check_stances_before_it_observes_only_for_a_reach_case():
     c = Conn()
     assert skillbench.one_call(c, SkillCall("pick_up", PickArgs(jar), arm="left"), reach=True) == "result"
