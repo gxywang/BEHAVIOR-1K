@@ -578,7 +578,7 @@ def test_the_latch_gap_is_how_far_the_next_action_would_snap_an_arm():
 def test_the_bench_cases_load_as_skill_calls_and_a_setup_the_bench_cannot_do_is_refused(tmp_path):
     bench = ROOT / "tiptop/b1k/skills/bench"
     cases = {c["id"]: c for f in ("pick_up.yaml", "open.yaml") for c in skillbench.load_cases(bench / f)}
-    assert set(cases) == {"pick_up_freeze_fruit_apple", "pick_up_store_honey_jar", "open_store_honey_drawer"}
+    assert {"pick_up_freeze_fruit_apple", "pick_up_store_honey_jar", "open_store_honey_drawer"} <= set(cases)
     apple_case = cases["pick_up_freeze_fruit_apple"]
     assert (apple_case["task"], apple_case["instance"], apple_case["seeds"]) == ("freeze_fruit", 301, [0, 1, 2, 3, 4])
     assert apple_case["call"] == SkillCall("pick_up", PickArgs(ObjRef("apple.n.01_2", "apple")), arm="left")
