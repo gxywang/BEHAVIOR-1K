@@ -969,6 +969,17 @@ def test_the_demo_cases_load_with_their_snapshot_mode_and_hands():
         tmp.unlink()
 
 
+def test_the_place_gate_cases_are_the_positive_control_and_the_crouch_reset_to_ready():
+    """W3-A2: the positive control legacy passes (tidying_bedroom's book onto the nightstand), and chopping_wood's
+    demo situation with the harness's posture reset, since S1 refuses the human's crouch (3.89)."""
+    bench = ROOT / "tiptop/b1k/skills/bench"
+    cases = {c["id"]: c for c in skillbench.load_cases(bench / "place_on.yaml")}
+    tidy, chop = cases["place_on.tidying_bedroom.e3675.f5216"], cases["place_on.chopping_wood.e8933.f625.ready"]
+    assert Path(tidy["demo"]["snapshot"]).is_file() and tidy["setup"]["held"] == {"left": "hardback_188"}
+    demo = next(c for c in skillbench.load_cases(bench / "demo_place_on.yaml") if c["id"] == chop["id"][: -len(".ready")])
+    assert chop["setup"] == {**demo["setup"], "ready": "left"} and chop["demo"]["snapshot"] == demo["demo"]["snapshot"]
+
+
 def test_the_one_call_planner_observes_only_when_the_skill_asks_for_a_percept():
     seen = []
     conn = SimpleNamespace(
@@ -1014,6 +1025,23 @@ def test_the_oracle_world_holds_what_the_skills_said_while_the_fingers_say_held(
     assert w.open_fraction(cab).value == pytest.approx(0.25) and w.is_open(cab).source == "oracle"
     monkeypatch.setattr(oracle_world, "openable_joints", lambda obj: [])
     assert w.is_open(cab).value is None, "nothing that opens: unknown, not shut"
+
+
+def test_the_oracle_segmenter_masks_nothing_for_a_target_no_tracked_object_stands_for():
+    """w2s3 tripod and smoke detector: a place onto the floor or an untracked table ended the observe in
+    object_meshes ("no tracked object for labels ['floor.n.01_1']"). A place's target is the map's support, never a
+    segmented object: an empty mask, and the tracked labels theirs."""
+    from omnigibson.tiptop.oracle.segmenter import OracleSegmenter
+
+    meshed = []
+    sim = SimpleNamespace(objects={"apple_1": SimpleNamespace(aabb=(th.zeros(3), th.ones(3)))}, obstacles={}, n_steps=3,
+                          object_meshes=lambda labels: meshed.append(list(labels)) or {l: l for l in labels},
+                          oracle_masks=lambda view, ex, labels, meshes: np.ones((len(labels), 2, 2), bool))  # fmt: skip
+    sim.tracked_object = lambda label: sim.objects.get(label) or sim.obstacles.get(label)
+    request = {"view_name": "head", "depth": np.ones((2, 2)), "intrinsics": np.eye(3)}
+    got = OracleSegmenter(sim).masks(["apple_1", "floor.n.01_1"], request, {}).value["head"]
+    assert meshed == [["apple_1"]] and got["apple_1"].all() and not got["floor.n.01_1"].any()
+    assert not OracleSegmenter(sim).masks(["floor.n.01_1"], request, {}).value["head"]["floor.n.01_1"].any()
 
 
 def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_from_bddl():
