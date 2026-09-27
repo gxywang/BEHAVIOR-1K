@@ -1154,8 +1154,10 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     s = EpisodeScorer(sim)
     assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
     assert s.holds(Fact("holding", ("apple.n.01_1", "right"))) is False
+    assert s.holds(Fact("lifted", ("apple.n.01_1",))) is True
     touching.append("board")  # week 2's knife: the fingers on the blade, the knife still on its board
-    assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is False, "held, not lifted clear: not picked up"
+    assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
+    assert s.holds(Fact("lifted", ("apple.n.01_1",))) is False, "held, not lifted clear: not picked up"
     touching.clear()
     assert s.holds(Fact("hand_empty", ("left",))) is False and s.holds(Fact("hand_empty", ("right",))) is True
     assert s.holds(Fact("ontop", ("apple.n.01_1", "table.n.02_1"))) is True
