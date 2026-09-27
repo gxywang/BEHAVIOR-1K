@@ -76,6 +76,30 @@ def test_step_action_places_each_runtime_group_on_the_robots_controller_and_read
     assert set(sim.posture) == set(names["right"]), "only the locked joints are latched"
 
 
+def test_a_capture_after_the_camera_moved_waits_past_the_frames_from_before_the_move(monkeypatch):
+    """w2s2 apple_1 t0: the first capture after a 5 cm stance change rendered the old view twice, 'converged after 4
+    renders' on it, and the new pose deprojected it: 84 points on the other apple, closed on air."""
+    from omnigibson.tiptop import r1pro
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    old, new, frames = th.zeros(2, 2, 3), th.full((2, 2, 3), 90.0), []
+    q = th.tensor([0.0, 0.0, 0.0, 1.0])
+    shadow = SimpleNamespace(pose=(th.zeros(3), q), renders=0)
+    shadow.get_position_orientation = lambda: shadow.pose
+    shadow.set_position_orientation = lambda position, orientation: setattr(shadow, "pose", (position, orientation))
+    shadow.get_obs = lambda: ({"rgb": old if shadow.renders <= 4 else new}, {})  # 4 renders of the old view
+    render = lambda: setattr(shadow, "renders", shadow.renders + 1)  # noqa: E731
+    monkeypatch.setattr(r1pro, "og", SimpleNamespace(sim=SimpleNamespace(render=render)))
+    monkeypatch.setattr(r1pro, "_intrinsics", lambda sensor: np.eye(3))
+    cam = SimpleNamespace(get_position_orientation=lambda: (th.tensor([0.054, 0.0, 0.0]), q))
+    sim = SimpleNamespace(robot_cams={"head": cam}, view_sensor=lambda name: shadow)
+    obs, _ = R1ProSim._capture_obs(sim, "head")
+    assert (obs["rgb"] == new).all() and shadow.renders == 8, "two agreeing frames of the new view, not the ghost"
+    shadow.renders = 0  # the camera where it was: the first two agreeing frames are the view
+    obs, _ = R1ProSim._capture_obs(sim, "head")
+    assert shadow.renders == 4 and (obs["rgb"] == old).all()
+
+
 def test_every_env_step_is_kept_as_the_last_action():
     from omnigibson.tiptop.scene import TiptopSim
 
@@ -183,6 +207,12 @@ def capture_sim(n: int = 2) -> SimpleNamespace:
     return sim
 
 
+def observed(gen):
+    with pytest.raises(StopIteration) as done:
+        next(gen)
+    return done.value.value
+
+
 def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_percept():
     host = SimpleNamespace(observe_now=lambda: StepObs(40, np.arange(61, dtype=np.float32), {}))
     sim = capture_sim()
@@ -207,6 +237,9 @@ def test_the_capture_observer_runs_on_the_sim_clock_and_returns_the_planners_per
         "every view's masks too, keyed the same way, so a builder can send the wrist views"
     assert percept.view_masks.source == "oracle" and percept.view_masks.value["left_wrist"][basket.id][0, 0]
     assert (percept.q["trunk"] == np.arange(61)[PROPRIO_SLICES["trunk_qpos"]]).all() and obs.wall_s > 0.0
+    percept, _ = observed(obs.observe(ObserveRequest((apple,), views=obs.views, context=(basket,)), None))
+    assert sim.looked[-1] == (apple.id,), "the context is masked, never aimed at"
+    assert set(percept.masks.value) == {apple.id, basket.id} and percept.view_masks.value["left_wrist"][basket.id][0, 0]
     with pytest.raises(NotImplementedError, match="captures"):  # R1ProSim captures what it was built with
         next(obs.observe(ObserveRequest((apple,), views=("head",)), None))
     with pytest.raises(NotImplementedError, match="captures"):
@@ -993,7 +1026,68 @@ def test_the_one_call_planner_observes_only_when_the_skill_asks_for_a_percept():
     assert skillbench.one_call(conn, call).percept is None and len(seen) == 1
 
 
+def test_the_one_call_planner_observes_a_picks_support_beside_it_and_aims_at_the_object_alone():
+    """w2s2: the Percept masked the apple alone, so the bowl it lies in was in no world and the exempt support never
+    reached cuTAMP. Furniture (a table) is the map room's: framing it would make it a movable nothing exempts."""
+    seen, supports = [], {apple.id: basket}
+    world = SimpleNamespace(support_of=lambda o: Belief(supports.get(o.id), "oracle", 0),
+                            objects=lambda: [apple, basket, table])  # fmt: skip
+    conn = SimpleNamespace(
+        check=lambda call: SimpleNamespace(code=Code.PERCEPT_REQUIRED if call.percept is None else None),
+        observe=lambda req: seen.append(req) or SimpleNamespace(id="c1"), run=lambda call: call, world=lambda: world,
+    )  # fmt: skip
+    skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
+    assert seen[-1].targets == (apple,) and seen[-1].context == (basket,)
+    supports[apple.id] = ObjRef("floor.n.01_1", "floor")  # not an object of the world: nothing to mask
+    skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
+    assert seen[-1].context == ()
+    supports[apple.id] = table  # fixed furniture
+    skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
+    assert seen[-1].context == ()
+    skillbench.one_call(conn, SkillCall("place", PlaceArgs(apple, (Relation(Rel.ON, table),))))
+    assert seen[-1].context == (), "a place frames its own target"
+
+
 # -------------------------------------------------------------------------------------------- the oracle providers
+def test_the_oracle_segmenter_gives_a_touching_neighbours_contact_band_to_the_neighbour():
+    """w2s2 freeze_fruit: masked alone, apple_1 took 18 pixels of the apple_2 it leans on (within gt_masks' 8 mm of
+    its surface), which made its cloud 2 cm taller: the pick got side grasps through the bowl (apple_1 t3)."""
+    import trimesh
+
+    from omnigibson.tiptop.gt_masks import masks_from_geometry
+    from omnigibson.tiptop.oracle.segmenter import OracleSegmenter
+
+    r, n, f = 0.04, 128, 400.0
+    centres = {"apple_1": np.array([-r, 0.0, 0.6]), "apple_2": np.array([r, 0.0, 0.6])}  # touching, side by side
+    far = {"plate_1": np.array([1.0, 0.0, 0.6])}
+    k = np.array([[f, 0.0, n / 2], [0.0, f, n / 2], [0.0, 0.0, 1.0]])
+    u, v = np.meshgrid(np.arange(n) - n / 2, np.arange(n) - n / 2)
+    d = np.stack([u / f, v / f, np.ones_like(u)], -1)
+    d /= np.linalg.norm(d, axis=-1, keepdims=True)
+    t = np.full((n, n), np.inf)
+    for c in centres.values():  # the camera at the origin looking +z: the nearer sphere hit per pixel
+        b = (d @ c) ** 2 - (c @ c - r * r)
+        t = np.where(b > 0, np.minimum(t, d @ c - np.sqrt(np.clip(b, 0, None))), t)
+    depth = np.where(np.isfinite(t), t * d[..., 2], 0.0)
+    boxes = {**centres, **far}
+    objects = {l: SimpleNamespace(aabb=(th.tensor(c - r), th.tensor(c + r))) for l, c in boxes.items()}
+    meshed = []
+
+    def object_meshes(labels):
+        meshed.append(list(labels))
+        return {l: trimesh.creation.icosphere(4, r).apply_translation(boxes[l]) for l in labels}
+
+    sim = SimpleNamespace(objects=objects, n_steps=7, object_meshes=object_meshes,
+                          oracle_masks=lambda view, ex, labels, meshes: np.stack(list(masks_from_geometry(
+                              view["depth"], view["intrinsics"], np.eye(4), {l: meshes[l] for l in labels}).values())))
+    request = {"view_name": "head", "depth": depth, "intrinsics": k}
+    alone = masks_from_geometry(depth, k, np.eye(4), object_meshes(["apple_1"]))["apple_1"]
+    got = OracleSegmenter(sim).masks(["apple_1"], request, {}).value["head"]
+    band = alone & ~got["apple_1"]
+    assert band.sum() > 0 and (u[band] > 0).all(), "the pixels apple_1 took alone are apple_2's, right of the contact"
+    assert set(got) == {"apple_1"} and meshed[-1] == ["apple_1", "apple_2"], "the neighbour masked too, not answered"
+
+
 def test_the_oracle_world_holds_what_the_skills_said_while_the_fingers_say_held(monkeypatch):
     from omnigibson.tiptop.oracle import world as oracle_world
 
@@ -1044,11 +1138,15 @@ def test_the_oracle_segmenter_masks_nothing_for_a_target_no_tracked_object_stand
     assert not OracleSegmenter(sim).masks(["floor.n.01_1"], request, {}).value["head"]["floor.n.01_1"].any()
 
 
-def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_from_bddl():
+def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_from_bddl(monkeypatch):
     from omnigibson.controllers import IsGraspingState
     from omnigibson.tiptop.oracle.goals import EpisodeScorer
+    from omnigibson.utils import usd_utils
 
-    apple_obj = object()
+    apple_obj, touching = SimpleNamespace(scene=SimpleNamespace(idx=0)), []
+    monkeypatch.setattr(usd_utils, "RigidContactAPI", SimpleNamespace(
+        is_in_contact=lambda scene_idx, query_set, with_set, ignore_set, current_only: bool(touching)
+        and query_set == [apple_obj] and ignore_set == [robot]))
     robot = SimpleNamespace(is_grasping=lambda arm, obj=None: IsGraspingState.TRUE
                             if arm == "left" and obj in (None, apple_obj) else IsGraspingState.FALSE)  # fmt: skip
     sim = SimpleNamespace(robot=robot, scene_object=lambda n: apple_obj if n == "apple.n.01_1" else object(),
@@ -1056,6 +1154,9 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     s = EpisodeScorer(sim)
     assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
     assert s.holds(Fact("holding", ("apple.n.01_1", "right"))) is False
+    touching.append("board")  # week 2's knife: the fingers on the blade, the knife still on its board
+    assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is False, "held, not lifted clear: not picked up"
+    touching.clear()
     assert s.holds(Fact("hand_empty", ("left",))) is False and s.holds(Fact("hand_empty", ("right",))) is True
     assert s.holds(Fact("ontop", ("apple.n.01_1", "table.n.02_1"))) is True
     assert s.holds(Fact("levitating", ("apple.n.01_1",))) is None, "a predicate it cannot judge"

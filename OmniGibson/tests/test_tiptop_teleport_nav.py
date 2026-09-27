@@ -128,6 +128,9 @@ class Conn:
         self.here = True
         return NavResult(True, stance, 0, MOVE_TO_STEPS)
 
+    def world(self):  # the jar's support is unknown: nothing framed beside it
+        return SimpleNamespace(support_of=lambda o: SimpleNamespace(value=None))
+
     def observe(self, req):
         self.events.append("observe")
         return SimpleNamespace(id="p1")

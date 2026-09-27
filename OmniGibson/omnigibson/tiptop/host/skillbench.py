@@ -101,6 +101,17 @@ def targets(call: SkillCall) -> tuple:
     return named + tuple(r.target for r in getattr(a, "relations", ()))
 
 
+def support(conn, call: SkillCall) -> tuple:
+    """What a pick's object stands on when it is a movable (a bowl, a plate, a chopping board), observed beside it so
+    the pick's world has it and cutamp-28's exempt support reaches cuTAMP (week 2: the Percept masked the apple alone,
+    and no bench pick ever exempted a support). Furniture is the map room's, the floor is nobody's: neither is framed."""
+    if call.skill != "pick_up":
+        return ()
+    world = conn.world()
+    s = world.support_of(call.args.obj).value
+    return (s,) if s is not None and not s.fixed and s in world.objects() else ()
+
+
 def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[SkillCall] = None,
              reach: bool = False):
     """The bench's TaskPlanner: the one call, after an observe of ``views`` when the skill asks for a Percept (a
@@ -118,7 +129,7 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[Sk
         except Unreachable:  # no candidate, or none the service reaches from: the run answers NO_STANCE_HERE from here
             pass
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
-        req = ObserveRequest(targets(call), views=views, aim=lease is None)
+        req = ObserveRequest(targets(call), views=views, aim=lease is None, context=support(conn, call))
         call = dataclasses.replace(call, percept=conn.observe(req).id)
     r = conn.run(call)
     if h is not None:

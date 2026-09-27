@@ -44,16 +44,17 @@ class CaptureObserver:
             request, extras = self.sim.capture(self.task)
         else:
             request, extras = TiptopSim.capture(self.sim, self.task)  # the cameras where they are: nothing moves
-        labels = [self.sim.tracked_label(o.id) for o in req.targets]
+        seen = tuple(dict.fromkeys((*req.targets, *req.context)))  # the context is masked, never aimed at
+        labels = [self.sim.tracked_label(o.id) for o in seen]
         masks = self.segmenter.masks(labels, request, extras)
         self.wall_s += time.monotonic() - t0
         self.steps += self.sim.n_steps - n0
         after = self.host.observe_now()
         views = {name: CameraView(name, v["rgb"], v["depth"], v["intrinsics"], v["world_from_cam"])
                  for name, v, _ in capture_views(request, extras)}  # fmt: skip
-        by_view = {name: {o.id: masks.value[name][label] for o, label in zip(req.targets, labels)} for name in views}
+        by_view = {name: {o.id: masks.value[name][label] for o, label in zip(seen, labels)} for name in views}
         primary = by_view[next(iter(views))]
-        visible = {o.id: float(primary[o.id].any()) for o in req.targets}
+        visible = {o.id: float(primary[o.id].any()) for o in seen}
         info = PerceptInfo("", after.step, 0, 0, visible, masks.source)  # the Runtime stamps id and epochs
         q = {g: after.proprio[s].copy() for g, s in PROPRIO_Q.items()}
         return Percept(info, views, q, Provided(primary, masks.source, masks.step),
