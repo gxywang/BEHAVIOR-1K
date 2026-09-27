@@ -68,18 +68,20 @@ def test_the_connector_runner_is_refused_until_its_host_lands(capsys):
 
 
 @pytest.mark.parametrize(
-    "flags",
+    "flags, why",
     [
-        ["--route", "place=on=tiptop"],
-        ["--route", "Place.on=tiptop"],
-        ["--wstape-live-at", "2"],
-        ["--wstape", "replay", "--wstape-live-at", "2"],
-        ["--replicate", "-1"],
+        (["--route", "place=on=tiptop"], "--route takes SKILL[.QUAL]=BACKEND"),
+        (["--route", "Place.on=tiptop"], "--route takes SKILL[.QUAL]=BACKEND"),
+        (["--wstape-live-at", "2"], "--wstape-live-at goes with --wstape replay-live"),
+        (["--wstape", "replay", "--wstape-live-at", "2"], "--wstape-live-at goes with --wstape replay-live"),
+        (["--wstape", "replay-live", "--wstape-live-at", "-1"], "N is a frame index"),
+        (["--replicate", "-1"], "R is 0 or more"),
     ],
 )
-def test_a_malformed_week4_flag_is_refused(flags):
+def test_a_malformed_week4_flag_is_refused_with_its_reason(flags, why, capsys):
     with pytest.raises(SystemExit):
         bench.parse_args(MINIMAL + flags)
+    assert why in capsys.readouterr().err
 
 
 def test_seed_everything_seeds_random_and_numpy():
@@ -586,10 +588,11 @@ def test_renders_inside_an_env_step_are_apart_from_the_explicit_ones():
 
 def test_a_hand_record_replaced_inside_an_owner_is_that_owners_write():
     sim, ep, led = ledger_on()
+    sim.held_objects = {"cup": "right"}  # replaced while unowned, and no step before the next owner begins
     with led.owner("restore"):
         sim.held_objects = {"jar": "left"}  # replaced, and no step before the owner ends
     sim.hold(1)
-    assert led.owners["restore"]["held_writes"] == 1 and led.owners[UNOWNED]["held_writes"] == 0
+    assert led.owners["restore"]["held_writes"] == 1 and led.owners[UNOWNED]["held_writes"] == 1
     led.finish()
     with led.owner("after"):
         sim.held_objects = {"lid": "right"}
