@@ -1151,8 +1151,10 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
         and query_set == [apple_obj] and ignore_set == [robot]))
     robot = SimpleNamespace(is_grasping=lambda arm, obj=None: IsGraspingState.TRUE
                             if arm == "left" and obj in (None, apple_obj) else IsGraspingState.FALSE)  # fmt: skip
+    scope = ("apple.n.01_1", "table.n.02_1")  # the task's evaluator raises on a name outside its scope
     sim = SimpleNamespace(robot=robot, scene_object=lambda n: apple_obj if n == "apple.n.01_1" else object(),
-                          holds=lambda p, *a: {"ontop": True}[p])  # fmt: skip
+                          holds=lambda p, *a: {"ontop": True}[p] and all(scope.index(n) + 1 for n in a),
+                          env=SimpleNamespace(task=SimpleNamespace(object_scope=scope)))  # fmt: skip
     s = EpisodeScorer(sim)
     assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
     assert s.holds(Fact("holding", ("apple.n.01_1", "right"))) is False
@@ -1164,6 +1166,13 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     assert s.holds(Fact("hand_empty", ("left",))) is False and s.holds(Fact("hand_empty", ("right",))) is True
     assert s.holds(Fact("ontop", ("apple.n.01_1", "table.n.02_1"))) is True
     assert s.holds(Fact("levitating", ("apple.n.01_1",))) is None, "a predicate it cannot judge"
+    from omnigibson.object_states import OnTop
+
+    burner = object()  # w3 A2 brisket: the pan onto burner_mdanhg_0, a scene object the task does not name, judged None
+    apple_obj.states = {OnTop: SimpleNamespace(get_value=lambda other: other is burner)}
+    sim.scene_object = lambda n: {"apple.n.01_1": apple_obj, "burner_mdanhg_0": burner}.get(n, object())
+    assert s.holds(Fact("ontop", ("apple.n.01_1", "burner_mdanhg_0"))) is True
+    assert s.holds(Fact("ontop", ("apple.n.01_1", "table.n.02_1"))) is True, "a task object: the task's evaluator"
 
 
 def test_gravity_turns_a_lid_shut_and_leaves_a_door_and_a_drawer_alone():
