@@ -380,9 +380,12 @@ def setup(og, sim, args, case: dict, embodiment: dict, host=None) -> tuple:
         aim_overview(sim, *s["robot_pose"], target=named[0].id if named else None)
     if s.get("ready"):  # the holding arm where a pick leaves it (SPEC §5.6: hold "here"): its planner's ready posture
         #                 set outright as apply_posture does, the object welded to the hand following at the settle
-        if s["ready"] != sim.arm:
-            raise ValueError(f"{case['id']}: ready: {s['ready']} is not on the bench (the {sim.arm} arm is planned)")
         import torch as th
+
+        from omnigibson.tiptop.r1pro import load_embodiment_meta
+
+        if s["ready"] != sim.arm:  # the other hand holds (the desk mouse, right): its planner, as the call adopts it
+            sim.adopt_embodiment(load_embodiment_meta(f"r1pro_{s['ready']}"))
 
         sim.robot.set_joint_positions(th.tensor(sim.q_home), indices=sim.arm_idx, drive=False)  # no sim read here
         sim.robot.keep_still()

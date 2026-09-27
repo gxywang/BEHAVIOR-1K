@@ -52,3 +52,28 @@ def test_the_under_and_touching_demo_cases_load_as_named():
     assert [c["setup"].get("ready") for c in under + touching].count("left") == 4
     assert [c["setup"].get("ready") for c in under].count("right") == 2
     assert [next(iter(c["setup"]["held"])) for c in under] == ["left"] + ["right"] * 4 + ["left"] * 2
+
+
+def test_a_ready_reset_of_the_other_arm_adopts_its_planner_first(monkeypatch):
+    """The desk mouse is held in the right hand while the bench plans the left: setup.ready: right adopts r1pro_right,
+    as the right-hand call would, and sets that arm to its planner's ready posture (it raised ValueError)."""
+    from omnigibson.tiptop.host import skillbench
+    from omnigibson.tiptop.r1pro import load_embodiment_meta
+    from b1k.connector.skills import ReleaseArgs, SkillCall
+
+    events = []
+    monkeypatch.setattr(skillbench, "apply_embodiment_posture", lambda sim, args, emb: None)
+
+    def adopt(emb):
+        sim.arm, sim.q_home, sim.arm_idx = emb["arm"], emb["q_home"], "right arm"
+        events.append(("adopt", emb["robot_type"]))
+
+    robot = SimpleNamespace(set_joint_positions=lambda q, indices, drive: events.append(("set", indices, q.tolist())),
+                            keep_still=lambda: None)
+    sim = SimpleNamespace(arm="left", OPEN=1.0, robot=robot, adopt_embodiment=adopt, hold=lambda n, g: None)
+    og = SimpleNamespace(sim=SimpleNamespace(dump_state=lambda serialized: "physics"))
+    case = {"id": "c", "setup": {"ready": "right"}, "call": SkillCall("release", ReleaseArgs())}
+    skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
+    q = load_embodiment_meta("r1pro_right")["q_home"]
+    assert events[0] == ("adopt", "r1pro_right") and events[1][1] == "right arm" and np.allclose(events[1][2], q)
+    assert len(events) == 2 and sim.stance_ready == q

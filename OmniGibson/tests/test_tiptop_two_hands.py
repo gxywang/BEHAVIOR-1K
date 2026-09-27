@@ -162,9 +162,6 @@ def test_the_setup_puts_the_holding_arm_at_its_ready_posture_where_a_pick_leaves
         "the planned joints at q_home outright by index (no get_joint_positions: a privileged read outside oracle/), " \
         "nothing else moved, then the settle"
     assert sim.stance_ready == [9.0, 8.0], "the capture's ready posture is where the arm now stands"
-    case["setup"]["ready"] = "right"
-    with pytest.raises(ValueError, match="not on the bench"):
-        skillbench.setup(og, sim, SimpleNamespace(settle_steps=3), case, {})
 
 
 def test_a_new_instance_resets_the_lock_a_legacy_round_of_the_last_one_adopted(monkeypatch):
