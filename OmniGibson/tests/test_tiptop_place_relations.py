@@ -76,6 +76,21 @@ def test_the_next_to_demo_cases_load_on_the_floor_next_to_their_reference():
         assert {f["pred"] for f in case["success"]} == {"ontop", "nextto"}
 
 
+def test_the_place_in_cases_load_in_the_right_hand_into_their_containers():
+    """SPEC §9's first place-in set as demo situations: the honey drawer, the fancyy cabinet, the tote."""
+    from b1k.connector.skills import Rel
+    from omnigibson.tiptop.host import skillbench
+
+    cases = skillbench.load_cases(BENCH / "place_in.yaml")
+    assert [c["task"] for c in cases] == ["store_honey", "storing_food", "organizing_art_supplies"]
+    assert all((BENCH / c["demo"]["snapshot"]).exists() for c in cases)
+    for case in cases:
+        (r,) = case["call"].args.relations
+        assert r.rel is Rel.IN and [f["pred"] for f in case["success"]] == ["inside"]
+        held = case["setup"]["held"]["right"]  # jar_of_honey_72 for jar__of__honey.n.01_1
+        assert held.startswith(case["call"].args.obj.category.replace("__", "_")), "the right hand holds the placed one"
+
+
 def test_inside_rect_sizes_the_compartment_by_the_callers_height_over_the_captures():
     """W3-L3: a native place's item was never in the sim's captures, so item_height read 0 and the desk's board choice
     took a 7 mm slot inside the bookcase's board; the caller's perceived height is used when it gives one."""
