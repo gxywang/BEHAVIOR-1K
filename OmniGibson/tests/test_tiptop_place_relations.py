@@ -41,17 +41,19 @@ def test_a_static_next_to_reference_is_its_map_voxels_box_and_a_movable_one_its_
     assert sandal.source == "oracle" and np.allclose(sandal.value.hi, (0.31, 0.81, 1.2))
 
 
-def test_the_cavity_is_inside_rects_and_the_voxel_compartment_accepting_it_is_logged(caplog):
+def test_the_cavity_is_inside_rects_under_the_roof_of_the_voxel_compartment_accepting_it(caplog):
+    """inside_rect's ceiling is the fillable volume's top, no roof (clean_up_your_desk: 0.955-0.962 m under a roof at
+    1.308 m: no folder fits, and the side entry turned for a 7 mm 'roof'); the roof is the accepting compartment's."""
     shelf, book, logged = ObjRef("bookcase.n.01_1", "bookcase", True), ObjRef("book.n.02_1", "book"), "accepted by"
     with caplog.at_level(logging.INFO, logger="omnigibson.tiptop.oracle.geometry"):
-        got = _geometry(((0.15, 0.4), (0.1, 0.3), 0.35, 0.6)).cavity(shelf, book)
-    assert got.source == "oracle" and np.isclose(got.value.floor.z, 0.35) and np.isclose(got.value.top_z, 0.6)
+        got = _geometry(((0.15, 0.4), (0.1, 0.3), 0.35, 0.36)).cavity(shelf, book)
+    assert got.source == "oracle" and np.isclose(got.value.floor.z, 0.35) and np.isclose(got.value.top_z, 0.36)
+    assert np.isclose(got.value.floor.ceiling, 0.6), "the middle compartment's roof, not the fillable top"
     line = next(r.getMessage() for r in caplog.records if logged in r.getMessage())
     assert "voxel compartments 3" in line and "None" not in line.split(logged)[1], line
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="omnigibson.tiptop.oracle.geometry"):
-        assert _geometry(None).cavity(shelf, book).value is None
-    assert any("inside_rect None" in r.getMessage() for r in caplog.records)
+    assert _geometry(((0.15, 0.4), (0.1, 0.3), 0.5, 0.52)).cavity(shelf, book).value.floor.ceiling is None, \
+        "no compartment has its floor there: no roof known"
+    assert _geometry(None).cavity(shelf, book).value is None
 
 
 def test_the_next_to_demo_cases_load_on_the_floor_next_to_their_reference():
@@ -59,7 +61,8 @@ def test_the_next_to_demo_cases_load_on_the_floor_next_to_their_reference():
     from omnigibson.tiptop.host import skillbench
 
     cases = skillbench.load_cases(BENCH / "demo_place_next_to.yaml")
-    assert len(cases) == 4 and all((BENCH / c["demo"]["snapshot"]).exists() for c in cases)
+    assert len(cases) == 6 and all((BENCH / c["demo"]["snapshot"]).exists() for c in cases)
+    assert [c["setup"].get("ready") for c in cases].count("left") == 2, "the tidying crouch reset for S1"
     for case in cases:
         rels = case["call"].args.relations
         assert [r.rel for r in rels] == [Rel.ON, Rel.NEXT_TO] and rels[0].target.id == "floor.n.01_1"

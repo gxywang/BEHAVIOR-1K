@@ -43,20 +43,25 @@ class OracleGeometry:
         return Provided(Region(rect(lo, hi), float(hi[2])), "oracle", self.sim.n_steps)
 
     def cavity(self, target, item) -> Provided:
+        """inside_rect's rectangle and floor, its fillable top as top_z; the floor's ceiling is the ROOF: the top of
+        the map's compartment that accepts the rectangle (the voxel cavity's gate, logged), None without one (an open
+        top, a movable container). The fillable top is no roof: clean_up_your_desk's bookcase gives 0.955-0.962 m,
+        where the compartment's roof is at 1.308 m and legacy's folder lies inside 5/5."""
         got = self.sim.inside_rect(item.id, target.id)
-        found = None
-        if got is not None:
-            centre, half, floor, ceiling = got
-            c, h = np.asarray(centre, float), np.asarray(half, float)
-            found = Cavity(Region(rect(c - h, c + h), floor, ceiling), ceiling)
+        if got is None:
+            return Provided(None, "oracle", self.sim.n_steps)
+        centre, half, floor, ceiling = got
+        c, h = np.asarray(centre, float), np.asarray(half, float)
+        found, match = Cavity(Region(rect(c - h, c + h), floor), ceiling), None
         piece = self.map.piece(target).value if self.map is not None else None
         if piece is not None:  # the voxel cavity's gate: does a compartment accept what inside_rect accepts
             voxels = cavities(piece)
-            match = accepting(voxels, found.floor) if found is not None else None
+            match = accepting(voxels, found.floor)
             said = lambda c: None if c is None else (c.floor.polygon, round(c.floor.z, 3), round(c.top_z, 3))  # noqa
             log.info(f"cavity {target.id}: inside_rect {said(found)}; voxel compartments {len(voxels)}; "
                      f"accepted by {said(match)}")
-        return Provided(found, "oracle", self.sim.n_steps)
+        roof = None if match is None else match.top_z
+        return Provided(Cavity(Region(found.floor.polygon, floor, roof), ceiling), "oracle", self.sim.n_steps)
 
     def extent(self, o) -> Provided:
         lo, hi = self._aabb(o)
