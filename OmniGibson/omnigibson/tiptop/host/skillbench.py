@@ -101,15 +101,26 @@ def targets(call: SkillCall) -> tuple:
     return named + tuple(r.target for r in getattr(a, "relations", ()))
 
 
-def support(conn, call: SkillCall) -> tuple:
-    """What a pick's object stands on when it is a movable (a bowl, a plate, a chopping board), observed beside it so
-    the pick's world has it and cutamp-28's exempt support reaches cuTAMP (week 2: the Percept masked the apple alone,
-    and no bench pick ever exempted a support). Furniture is the map room's, the floor is nobody's: neither is framed."""
+NEAR = 0.2  # m between world boxes: the movables a pick's hand can meet on its way to the object
+
+
+def context(conn, call: SkillCall) -> tuple:
+    """The movables within NEAR of a pick's object, observed beside it (masked, never aimed at) so the pick's world has
+    them, as legacy's capture masks every task object in view: the bowl an apple lies in (week-3 g1 apple_1 t0 and t3:
+    the approach turned the unseen bowl over and closed on air), the can beside a wine bottle (bench_w1), the plate or
+    board it stands on, whose cutamp-28 exemption then reaches cuTAMP. Furniture is the map room's, the floor nobody's."""
     if call.skill != "pick_up":
         return ()
-    world = conn.world()
-    s = world.support_of(call.args.obj).value
-    return (s,) if s is not None and not s.fixed and s in world.objects() else ()
+    world, obj = conn.world(), call.args.obj
+    box = world.box(obj).value
+    if box is None:
+        return ()
+
+    def gap(b) -> float:
+        return float(np.linalg.norm(np.maximum(np.maximum(np.subtract(b.lo, box.hi), np.subtract(box.lo, b.hi)), 0.0)))
+
+    boxes = {o: world.box(o).value for o in world.objects() if o.id != obj.id and not o.fixed}
+    return tuple(o for o, b in boxes.items() if b is not None and gap(b) <= NEAR)
 
 
 def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[SkillCall] = None,
@@ -129,7 +140,7 @@ def one_call(conn, call: SkillCall, views: tuple = ("head",), lease: Optional[Sk
         except Unreachable:  # no candidate, or none the service reaches from: the run answers NO_STANCE_HERE from here
             pass
     if conn.check(call).code is Code.PERCEPT_REQUIRED:
-        req = ObserveRequest(targets(call), views=views, aim=lease is None, context=support(conn, call))
+        req = ObserveRequest(targets(call), views=views, aim=lease is None, context=context(conn, call))
         call = dataclasses.replace(call, percept=conn.observe(req).id)
     r = conn.run(call)
     if h is not None:

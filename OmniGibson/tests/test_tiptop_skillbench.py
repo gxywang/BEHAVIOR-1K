@@ -34,7 +34,7 @@ from b1k.connector.world import ProvenancePolicy, link_pose
 from b1k.observation import PROPRIO_SLICES, CameraView
 from b1k.runtime.compose import ACTION_SLICES, CLOSED
 from b1k.runtime.direct import DirectConnector
-from b1k.tests.fakes import REFS, Env, JointWorld, Scripted, SimV, apple, basket, make_rt, table
+from b1k.tests.fakes import REFS, Env, JointWorld, Scripted, SimV, apple, basket, make_rt, radio, table
 from omnigibson.tiptop.host import overview, skillbench
 from omnigibson.tiptop.host.bench_host import BenchHost, Frames
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
@@ -1026,22 +1026,24 @@ def test_the_one_call_planner_observes_only_when_the_skill_asks_for_a_percept():
     assert skillbench.one_call(conn, call).percept is None and len(seen) == 1
 
 
-def test_the_one_call_planner_observes_a_picks_support_beside_it_and_aims_at_the_object_alone():
+def test_the_one_call_planner_observes_the_movables_near_a_pick_beside_it_and_aims_at_the_object_alone():
     """w2s2: the Percept masked the apple alone, so the bowl it lies in was in no world and the exempt support never
-    reached cuTAMP. Furniture (a table) is the map room's: framing it would make it a movable nothing exempts."""
-    seen, supports = [], {apple.id: basket}
-    world = SimpleNamespace(support_of=lambda o: Belief(supports.get(o.id), "oracle", 0),
-                            objects=lambda: [apple, basket, table])  # fmt: skip
+    reached cuTAMP; week-3 g1 apple_1 t0 and t3: the approach turned that unseen bowl over and closed on air. The
+    movables near the object are observed beside it; far ones and furniture (the map room's) are not."""
+    from b1k.connector.types import AABB
+
+    seen = []
+    boxes = {apple.id: AABB((0.0, 0.0, 0.9), (0.08, 0.08, 0.98)), basket.id: AABB((0.1, 0.0, 0.88), (0.3, 0.2, 1.0)),
+             "radio.n.01_1": AABB((1.0, 1.0, 0.9), (1.1, 1.1, 1.0)), table.id: AABB((-1, -1, 0), (1, 1, 0.88))}
+    world = SimpleNamespace(box=lambda o: Belief(boxes.get(o.id), "oracle", 0),
+                            objects=lambda: [apple, basket, radio, table])  # fmt: skip
     conn = SimpleNamespace(
         check=lambda call: SimpleNamespace(code=Code.PERCEPT_REQUIRED if call.percept is None else None),
         observe=lambda req: seen.append(req) or SimpleNamespace(id="c1"), run=lambda call: call, world=lambda: world,
     )  # fmt: skip
     skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
-    assert seen[-1].targets == (apple,) and seen[-1].context == (basket,)
-    supports[apple.id] = ObjRef("floor.n.01_1", "floor")  # not an object of the world: nothing to mask
-    skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
-    assert seen[-1].context == ()
-    supports[apple.id] = table  # fixed furniture
+    assert seen[-1].targets == (apple,) and seen[-1].context == (basket,), "2 cm away: framed; the radio, the table not"
+    boxes.pop(apple.id)  # never localized: nothing to measure from
     skillbench.one_call(conn, SkillCall("pick_up", PickArgs(apple)))
     assert seen[-1].context == ()
     skillbench.one_call(conn, SkillCall("place", PlaceArgs(apple, (Relation(Rel.ON, table),))))
