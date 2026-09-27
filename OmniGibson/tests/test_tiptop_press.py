@@ -42,7 +42,8 @@ def test_the_pseudo_stack_serves_the_oracle_buttons_counted(monkeypatch):
 
     sim = _sim(**{radio.id: (np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.02)})
     sim.max_steps, sim.robot, sim.task_scope = None, None, lambda: {}
-    sim.env, sim.scene_object = SimpleNamespace(scene=SimpleNamespace(objects=[])), lambda n: None
+    sim.env = SimpleNamespace(scene=SimpleNamespace(objects=[]), task=SimpleNamespace(object_scope={}))
+    sim.scene_object = lambda n: None
     routing = {"goal_checker": "scorer", "goal_checkers_shadow": []}
     svc, _ = pseudo_services(SimpleNamespace(sim=sim), "planner", routing)
     assert svc.buttons.button(radio).value.radius == 0.02 and svc.provenance.take() == {"buttons.button": 1}

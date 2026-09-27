@@ -1302,17 +1302,23 @@ def test_the_pseudo_stack_counts_every_oracle_read_and_judges_with_the_scorer(mo
                           category="cabinet", name="cab_1")
     wall = SimpleNamespace(aabb=(th.tensor([0.0, 0.0, 0.0]), th.tensor([1.0, 0.5, 2.9])), fixed_base=True,
                            category="floors", name="floor_1")  # no map piece: NOT_FURNITURE
+    scope = {"cabinet.n.01_1": cab, "floor.n.01_1": wall}
     sim = SimpleNamespace(n_steps=9, max_steps=None, scene_object=lambda n: cab if "cabinet" in n else wall, robot=None,
-                          task_scope=lambda: {}, env=SimpleNamespace(scene=SimpleNamespace(objects=[])))  # fmt: skip
+                          task_scope=lambda: {},
+                          env=SimpleNamespace(scene=SimpleNamespace(objects=[]),
+                                              task=SimpleNamespace(object_scope=scope)))
     occupied = np.zeros((50, 25, 45), dtype=bool)
     occupied[:, :, :40] = True  # the cabinet's body: top at 0.80; its AABB top is 0.90 (a rail, say)
     occupied[:2, :, :] = True
     mapbuild._MAPS[id(sim)] = mapbuild.PseudoMap(sim)  # the per-sim cache is keyed by id(): a collected fake's id can recur
     mapbuild._MAPS[id(sim)].pieces["cab_1"] = FurniturePiece(ObjRef("cabinet.n.01_1", "cabinet", True), tuple(map(tuple, np.eye(4))),
                                                              {"body": VoxelGrid(0.02, (0.0, 0.0, 0.0), occupied)}, ())
-    routing = {"goal_checker": "scorer", "goal_checkers_shadow": []}
-    svc, segmenter = pseudo_services(SimpleNamespace(sim=sim), "planner", routing)
+    routing = {"goal_checker": "scorer", "goal_checkers_shadow": ["perception"]}
+    ep = SimpleNamespace(sim=sim, is_floor=lambda n: n.startswith("floor."))
+    svc, segmenter = pseudo_services(ep, "planner", routing)
     assert isinstance(svc.goals, GoalPanel) and svc.goals.primary == "scorer" and svc.planner == "planner"
+    assert svc.goals.checkers["perception"].floor == "floor.n.01_1", \
+        "the task's one floor (task_scope() leaves floors out: W3-A2's tripod put-downs read perception None)"
     top = svc.geometry.top_support(ObjRef("cabinet.n.01_1", "cabinet", True))
     assert top.value.z == pytest.approx(0.8) and top.source == "map", \
         "the map's modal top (SPEC 6.2), never the AABB's maximum: bed_1's headboard put the pillow 6.5 cm high"
@@ -1321,7 +1327,7 @@ def test_the_pseudo_stack_counts_every_oracle_read_and_judges_with_the_scorer(mo
     assert svc.provenance.take() == {"geometry.top_support": 1}, "the oracle read is counted in pseudo; the map read is not privileged"
     assert isinstance(svc.provenance, ProvenancePolicy) and segmenter.sim is sim
     sim.nearby_obstacles, sim.obstacles, sim.room_collision_scene = lambda collision_map: None, {}, dict
-    mesh, _ = pseudo_services(SimpleNamespace(sim=sim), "planner", routing, collision="mesh")
+    mesh, _ = pseudo_services(ep, "planner", routing, collision="mesh")
     assert mesh.collision.room((0.0, 0.0, 0.0), 3.0) == Provided([], "oracle", 9)
     assert mesh.provenance.take() == {"collision.room": 1}, "the mesh room is oracle and counted"
 

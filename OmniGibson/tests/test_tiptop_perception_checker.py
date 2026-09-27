@@ -10,7 +10,7 @@ from omnigibson.tiptop.oracle import pseudo_services
 
 def test_the_pseudo_stack_registers_the_perception_checker_routing_names():
     sim = SimpleNamespace(n_steps=0, max_steps=None, scene_object=lambda n: None, robot=None, task_scope=lambda: {},
-                          env=SimpleNamespace(scene=SimpleNamespace(objects=[])))
+                          env=SimpleNamespace(scene=SimpleNamespace(objects=[]), task=SimpleNamespace(object_scope={})))
     routing = load_routing()
     assert routing["goal_checkers_shadow"] == ["perception"]
     svc, _ = pseudo_services(SimpleNamespace(sim=sim), "planner", routing)

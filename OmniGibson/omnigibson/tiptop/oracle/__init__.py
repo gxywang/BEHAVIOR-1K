@@ -26,8 +26,9 @@ def pseudo_services(ep, planner, routing: dict, collision: str = "map") -> tuple
     it. The segmenter is the bench Observer's."""
     sim, policy = ep.sim, ProvenancePolicy("pseudo")
     grasp, joints, map_ = ProprioGraspSensor(), OracleJoints(sim), pseudo_map(sim)
-    floors = [n for n in sim.task_scope() if ep.is_floor(n)]  # one floor: the base plane answers its atoms; several
-    #                                                            (bringing_in_wood's garden and corridor): none of them
+    # the task's own scope (task_scope() leaves the floors out, so none was ever found). One floor: the base plane
+    # answers its atoms; several (bringing_in_wood's garden and corridor): none of them
+    floors = [n for n in sim.env.task.object_scope if ep.is_floor(n)]
     room = MeshRoom(sim) if collision == "mesh" else MapCollisionWorld(map_, joints, lambda: sim.n_steps)
     svc = Services(
         world=guarded(OracleWorld(ep, grasp), policy, "world"),
