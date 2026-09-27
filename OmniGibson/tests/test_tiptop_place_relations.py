@@ -55,8 +55,10 @@ def test_the_cavity_is_inside_rects_under_the_roof_of_the_voxel_compartment_acce
     assert np.isclose(got.value.floor.ceiling, 0.6), "the middle compartment's roof, not the fillable top"
     line = next(r.getMessage() for r in caplog.records if logged in r.getMessage())
     assert "voxel compartments 3" in line and "None" not in line.split(logged)[1], line
-    assert _geometry(((0.15, 0.4), (0.1, 0.3), 0.5, 0.52)).cavity(shelf, book).value.floor.ceiling is None, \
-        "no compartment has its floor there: no roof known"
+    assert np.isclose(_geometry(((0.15, 0.4), (0.1, 0.3), 0.5, 0.52)).cavity(shelf, book).value.floor.ceiling, 0.6), \
+        "no compartment has its floor there: the board over the rectangle's columns (map.geometry.roof, W3-L3)"
+    assert _geometry(((0.15, 0.4), (0.1, 0.3), 0.97, 0.99)).cavity(shelf, book).value.floor.ceiling is None, \
+        "over the top board: an open top"
     assert _geometry(None).cavity(shelf, book).value is None
     asked = []
     _geometry(None, asked).cavity(shelf, book, 0.3)

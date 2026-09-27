@@ -8,7 +8,7 @@ import numpy as np
 from b1k.connector.types import AABB, Provided
 from b1k.connector.world import Cavity, Region
 from b1k.map.geometry import aabb as voxel_aabb
-from b1k.map.geometry import accepting, cavities
+from b1k.map.geometry import accepting, cavities, roof
 from b1k.map.geometry import top_support as voxel_top_support
 
 log = logging.getLogger(__name__)
@@ -44,9 +44,10 @@ class OracleGeometry:
 
     def cavity(self, target, item, height=None) -> Provided:
         """inside_rect's rectangle and floor, its fillable top as top_z; the floor's ceiling is the ROOF: the top of
-        the map's compartment that accepts the rectangle (the voxel cavity's gate, logged), None without one (an open
-        top, a movable container). The fillable top is no roof: clean_up_your_desk's bookcase gives 0.955-0.962 m,
-        where the compartment's roof is at 1.308 m and legacy's folder lies inside 5/5. ``height``: the item's
+        the map's compartment that accepts the rectangle (the voxel cavity's gate, logged), else the board over the
+        rectangle's voxel columns (map.geometry.roof), None without either (an open top, a movable container). The
+        fillable top is no roof: clean_up_your_desk's bookcase gives 0.955-0.962 m, where the compartment's roof is
+        at 1.308 m and legacy's folder lies inside 5/5. ``height``: the item's
         perceived height (the caller's Percept), the headroom inside_rect's board choice needs; the sim's own
         captures' otherwise."""
         got = self.sim.inside_rect(item.id, target.id, height)
@@ -62,8 +63,9 @@ class OracleGeometry:
             said = lambda c: None if c is None else (c.floor.polygon, round(c.floor.z, 3), round(c.top_z, 3))  # noqa
             log.info(f"cavity {target.id}: inside_rect {said(found)}; voxel compartments {len(voxels)}; "
                      f"accepted by {said(match)}")
-        roof = None if match is None else match.top_z
-        return Provided(Cavity(Region(found.floor.polygon, floor, roof), ceiling), "oracle", self.sim.n_steps)
+        # no one compartment takes a rectangle over a row of cubbies (the desk's top row): the board over its columns
+        top = match.top_z if match is not None else roof(piece, found.floor) if piece is not None else None
+        return Provided(Cavity(Region(found.floor.polygon, floor, top), ceiling), "oracle", self.sim.n_steps)
 
     def extent(self, o) -> Provided:
         lo, hi = self._aabb(o)
