@@ -1157,9 +1157,11 @@ class R1ProSim(TiptopSim):
         return (np.array([xs[i0] + xs[i1], ys[k0] + ys[k1]]) / 2.0,
                 (np.array([xs[i1] - xs[i0], ys[k1] - ys[k0]]) + cell) / 2.0, floor)  # fmt: skip
 
-    def inside_rect(self, item: str, container: str) -> tuple | None:
+    def inside_rect(self, item: str, container: str, height: float | None = None) -> tuple | None:
         """The compartment of ``container`` that ``item`` goes into: (centre xy, half xy, floor z, ceiling z), world
-        frame, a rectangle the fillable volume itself accepts; None, with the reason logged, when there is none."""
+        frame, a rectangle the fillable volume itself accepts; None, with the reason logged, when there is none.
+        ``height``: how tall the item stands when the caller has seen it (a native skill's Percept), else the
+        captures' (item_height)."""
         from omnigibson.tiptop.articulation import openable_joints
 
         from b1k.bridge.articulation import is_open
@@ -1201,7 +1203,7 @@ class R1ProSim(TiptopSim):
                     hi[k] = min(hi[k], float(blo[k]))
                 else:
                     lo[k] = max(lo[k], float(bhi[k]))
-        height = self.item_height(item)  # the captures' points, never the item's simulator box (spec 1.1)
+        height = self.item_height(item) if height is None else height  # seen points, never its simulator box (1.1)
         if j is None and obj.fixed_base and hi[2] - lo[2] > SHELF_CASE_HEIGHT:
             # a case of shelves has ONE fillable volume: aim at a reachable compartment, not its bottom board
             # (32 of 32 bookcase regions went to the bottom shelf, IK 0/256, and the fallback landed on the lid).

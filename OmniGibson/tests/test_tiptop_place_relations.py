@@ -24,11 +24,15 @@ def _bookcase():
                           {"body": VoxelGrid(0.02, (0.0, 0.0, 0.0), occupied)}, ())
 
 
-def _geometry(inside):
+def _geometry(inside, asked=None):
     from omnigibson.tiptop.oracle.geometry import OracleGeometry
 
     obj = SimpleNamespace(aabb=(th.tensor([-0.01, -0.01, 0.0]), th.tensor([0.31, 0.81, 1.2])))  # the visual box: taller
-    sim = SimpleNamespace(scene_object=lambda n: obj, inside_rect=lambda item, container: inside, n_steps=7)
+
+    def rect(item, container, height=None):
+        return inside if asked is None else asked.append(height) or inside
+
+    sim = SimpleNamespace(scene_object=lambda n: obj, inside_rect=rect, n_steps=7)
     pieces = {"bookcase.n.01_1": _bookcase()}
     return OracleGeometry(sim, SimpleNamespace(piece=lambda o: Provided(pieces.get(o.id), "map", 7)))
 
@@ -54,6 +58,9 @@ def test_the_cavity_is_inside_rects_under_the_roof_of_the_voxel_compartment_acce
     assert _geometry(((0.15, 0.4), (0.1, 0.3), 0.5, 0.52)).cavity(shelf, book).value.floor.ceiling is None, \
         "no compartment has its floor there: no roof known"
     assert _geometry(None).cavity(shelf, book).value is None
+    asked = []
+    _geometry(None, asked).cavity(shelf, book, 0.3)
+    assert asked == [0.3], "the caller's perceived height reaches inside_rect's board choice (0 chose a 7 mm slot)"
 
 
 def test_the_next_to_demo_cases_load_on_the_floor_next_to_their_reference():
@@ -67,3 +74,24 @@ def test_the_next_to_demo_cases_load_on_the_floor_next_to_their_reference():
         rels = case["call"].args.relations
         assert [r.rel for r in rels] == [Rel.ON, Rel.NEXT_TO] and rels[0].target.id == "floor.n.01_1"
         assert {f["pred"] for f in case["success"]} == {"ontop", "nextto"}
+
+
+def test_inside_rect_sizes_the_compartment_by_the_callers_height_over_the_captures():
+    """W3-L3: a native place's item was never in the sim's captures, so item_height read 0 and the desk's board choice
+    took a 7 mm slot inside the bookcase's board; the caller's perceived height is used when it gives one."""
+    from omnigibson.tiptop.r1pro import R1ProSim
+
+    checked = []
+    top = th.tensor([0.4, 0.4, 0.3])
+    link = SimpleNamespace(is_meta_link=True, meta_link_type="fillable", visual_aabb=(th.zeros(3), top),
+                           visual_aabb_extent=top,
+                           check_points_in_volume=lambda pts: checked.append(pts) or th.ones(len(pts), dtype=th.bool))
+    box = SimpleNamespace(links={"fill": link}, joints={}, fixed_base=False)
+
+    def captured(name):
+        raise AssertionError("the captures were asked though the caller knew the height")
+
+    sim = SimpleNamespace(scene_object=lambda n: box, item_height=captured,
+                          bay=lambda link, lo, hi, near=None: (np.array([0.2, 0.2]), np.array([0.2, 0.2]), 0.0))
+    got = R1ProSim.inside_rect(sim, "cup.n.01_1", "bin.n.01_1", 0.1)
+    assert got is not None and np.allclose(checked[0][:, 2], 0.05), "the corners are checked at the item's mid-height"

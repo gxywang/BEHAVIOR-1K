@@ -42,12 +42,14 @@ class OracleGeometry:
         lo, hi = self._aabb(target)  # no voxels for it: the AABB (bed_1's headboard top, 6.5 cm over the mattress)
         return Provided(Region(rect(lo, hi), float(hi[2])), "oracle", self.sim.n_steps)
 
-    def cavity(self, target, item) -> Provided:
+    def cavity(self, target, item, height=None) -> Provided:
         """inside_rect's rectangle and floor, its fillable top as top_z; the floor's ceiling is the ROOF: the top of
         the map's compartment that accepts the rectangle (the voxel cavity's gate, logged), None without one (an open
         top, a movable container). The fillable top is no roof: clean_up_your_desk's bookcase gives 0.955-0.962 m,
-        where the compartment's roof is at 1.308 m and legacy's folder lies inside 5/5."""
-        got = self.sim.inside_rect(item.id, target.id)
+        where the compartment's roof is at 1.308 m and legacy's folder lies inside 5/5. ``height``: the item's
+        perceived height (the caller's Percept), the headroom inside_rect's board choice needs; the sim's own
+        captures' otherwise."""
+        got = self.sim.inside_rect(item.id, target.id, height)
         if got is None:
             return Provided(None, "oracle", self.sim.n_steps)
         centre, half, floor, ceiling = got
