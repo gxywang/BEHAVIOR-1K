@@ -8,8 +8,11 @@ While a close is pending, every closed step reads the robot's grasp assist into 
 TRUE), -1 closed on air (FALSE), 0 unknown. It settles -- the reading is final -- once the command has held one
 value for ``settle_steps`` steps (the executor's gripper hold: a creeping close ramps the command down and then
 holds CLOSE 25 steps before it logs is_grasping, so the settled reading is taken on the same step as the executor's),
-or at the last closed step before the command opens again, or when the watch is finished. Measurement only: nothing
-it reads steers anything.
+or at the last closed step before the command opens again, or when the watch is finished. ``via`` names who issued
+the close: ``executor`` for a plan's gripper event (PlanExecutor.set_gripper under execute, the close the executor
+logs with is_grasping=), ``executor.start`` for its start_gripper (not logged so), ``sim`` for any other (a closed-fist
+drawer pull, a sticky grasp), read off the call stack at the close. Measurement only: nothing it reads steers
+anything.
 
 ``state_digest(sim, knowledge)`` is what the Runner tape takes before and after every write: the step count, the
 env.step count, the teleports, the hand record in order, a hash of the robot's base pose and joint positions, a hash
@@ -20,18 +23,20 @@ first place two runs stopped being the same episode (scripts/tape_diff.py).
 from __future__ import annotations
 
 import hashlib
+import sys
 
 import numpy as np
 
 # The executor holds a gripper command for gripper_hold_steps (25) env steps before it reads is_grasping.
 SETTLE_STEPS = 25
 ARMS = ("left", "right")
+EXECUTOR = "b1k.bridge.executor"  # PlanExecutor's module: its set_gripper issues a plan's gripper events
 
 
 class GripperWatch:
     """See the module docstring. ``events`` rows are counters.py's gripper.jsonl schema: step, arm, event,
-    is_grasping, owner, call_id (plus ``settled_at``: the step the final reading was taken on, None while pending). An
-    ``open`` row's is_grasping is read after the opening step."""
+    is_grasping, owner, call_id (plus ``settled_at``: the step the final reading was taken on, None while pending, and
+    a close's ``via``). An ``open`` row's is_grasping is read after the opening step."""
 
     def __init__(self, sim, ledger, settle_steps: int = SETTLE_STEPS):
         self.sim, self.ledger, self.settle_steps = sim, ledger, int(settle_steps)
@@ -50,6 +55,7 @@ class GripperWatch:
             self._closed[arm] = closed
             if closed and was is False:
                 row = self._row(arm, "close")
+                row["via"] = self._issuer()
                 self.events.append(row)
                 self._pending[arm] = [row, value, 0, None]
             if closed and arm in self._pending:
@@ -88,7 +94,24 @@ class GripperWatch:
             "owner": self.ledger.current,
             "call_id": self.ledger.call_id,
             "settled_at": None,
+            "via": None,
         }
+
+    @staticmethod
+    def _issuer() -> str:
+        """Who issued the command this env step carries: PlanExecutor.set_gripper under start_gripper, under
+        anything else (execute), or not the executor at all."""
+        f, via = sys._getframe(1), "sim"
+        while f is not None:
+            code, module = f.f_code, f.f_globals.get("__name__")
+            if module == EXECUTOR and code.co_name == "set_gripper":
+                via = "executor"
+            elif module == EXECUTOR and code.co_name == "start_gripper" and via == "executor":
+                return "executor.start"
+            elif via == "executor" and module == EXECUTOR and code.co_name == "execute":
+                return via
+            f = f.f_back
+        return via
 
     def _settle(self, arm: str) -> None:
         """The pending close's latest reading is final; ``settled_at`` is the step it was taken on."""

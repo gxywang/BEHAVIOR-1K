@@ -10,7 +10,10 @@ nests: the steps go to ``ep.stand_for``, the innermost, and each TOP-LEVEL ``ep.
 ``calls``. Anything stepped outside every owner is ``unowned``; steps taken while ``sim.episode_open`` is False (the
 video tail) are counted apart, in ``closed``.
 
-Also counted per owner, never changed: ``sim.place_robot``, ``sim.capture`` and ``sim.look_at`` (instance wrappers),
+Also counted per owner, never changed: the teleports (``place_robot``: the ``sim.teleports`` delta across each
+``sim.move_base``, the one place a teleport is counted, so the column sums to the result's ``bench.teleports``; a
+refused placement raises before it and ``place_robot_calls`` counts every ``sim.place_robot`` call, refused or not),
+``sim.capture`` and ``sim.look_at`` (instance wrappers),
 the renderer's ``render`` (``og.sim`` at the bench: ``renders`` are the calls made outside an env step, a capture's
 say; the one every ``og.sim.step`` makes of itself is ``renders_in_step``), the robot's ``set_joint_positions``
 (instance wrapper), every object class's ``set_position_orientation`` (class-level wrappers, restored on ``finish``)
@@ -42,6 +45,7 @@ class Row:
     steps: int = 0
     env_step_calls: int = 0
     place_robot: int = 0
+    place_robot_calls: int = 0
     capture: int = 0
     look_at: int = 0
     renders: int = 0
@@ -174,9 +178,12 @@ class StepLedger:
         self._installed = True
         self.step_env = _StepEnv(self, sim.step_env)
         self._wrap(sim, "step_env", self.step_env)
-        for name in ("place_robot", "capture", "look_at"):
+        for name, column in (("place_robot", "place_robot_calls"), ("capture", "capture"), ("look_at", "look_at")):
             if callable(getattr(sim, name, None)):
-                self._count_calls(sim, name, name)
+                self._count_calls(sim, name, column)
+        mover = "move_base" if callable(getattr(sim, "move_base", None)) else "place_robot"
+        if callable(getattr(sim, mover, None)):
+            self._count_delta(sim, mover, "place_robot", lambda: int(getattr(sim, "teleports", 0)))
         if renderer is not None and hasattr(renderer, "render"):
             self._count_calls(renderer, "render", lambda: "renders_in_step" if self.step_env.depth else "renders")
         robot = getattr(sim, "robot", None) if robot is _MISSING else robot
@@ -277,6 +284,26 @@ class StepLedger:
                 depth[name] -= 1
 
         self._wrap(target, name, wrapper, class_level=class_level)
+
+    def _count_delta(self, target, name: str, column: str, probe) -> None:
+        """Add ``probe()``'s change across each outermost call of ``target.name`` to ``column`` of the owner the call
+        began under, whether it returned or raised."""
+        fn = getattr(target, name)
+        depth, key = self._depth, f"delta:{name}"
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            outer = depth.get(key, 0) == 0
+            depth[key] = depth.get(key, 0) + 1
+            row, before = (self.row(self.current), probe()) if outer else (None, None)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                depth[key] -= 1
+                if row is not None:
+                    setattr(row, column, getattr(row, column) + probe() - before)
+
+        self._wrap(target, name, wrapper)
 
     def _wrap(self, target, name: str, wrapper, class_level: bool = False) -> None:
         previous = target.__dict__.get(name, _MISSING) if hasattr(target, "__dict__") else _MISSING

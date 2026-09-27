@@ -155,10 +155,31 @@ class Sim:
             self.step_env(self.action(gripper))
 
     def place_robot(self, x, y, yaw):
-        self.teleports += 1
-        self.robot.set_position_orientation()
+        if (x, y) == (9.0, 9.0):
+            raise RuntimeError("base destination rejected")  # R1ProSim: BasePlacementCollision before move_base
+        self.move_base(x, y, yaw)
         self.robot.set_joint_positions(np.ones(4))
         self.robot.set_joint_positions(np.zeros(4))
+
+    def move_base(self, x, y, yaw):  # the one place R1ProSim counts a teleport (right_robot calls it too)
+        self.robot.set_position_orientation()
+        self.teleports += 1
+
+    # what PlanExecutor drives
+    OPEN, CLOSE, arm, last_gripper = 1.0, -1.0, "left", 1.0
+
+    def q_arm(self):
+        return np.zeros(4)
+
+    def step(self, q_arm, gripper):
+        self.last_gripper = float(gripper)
+        return self.step_env(self.action(gripper))
+
+    def finger_travel(self, arm=None):
+        return 0.04
+
+    def eef_pose_base(self, arm=None):
+        return np.eye(4)
 
     def capture(self, task):
         self.hold(2)
@@ -869,3 +890,33 @@ def test_the_runner_tape_diff_names_the_first_divergence_and_the_per_write_delta
     assert d["kind"] == "answer" and d["a"]["member"] == "pick" and d["a"]["ret"] is True and d["b"]["ret"] is False
     first = next(w for w in r["per_write"] if not (w["same_call"] and w["outcome_equal"]))
     assert r["prefix"] == d["index"] and first["member"] == "pick" and first["same_call"] and not first["outcome_equal"]
+
+
+def test_teleports_are_counted_where_they_happen_and_a_refused_placement_is_a_call_only():
+    sim, ep, led = ledger_on()
+    with led.owner("go_to"):
+        sim.place_robot(1.0, 2.0, 0.0)
+        with pytest.raises(RuntimeError):
+            sim.place_robot(9.0, 9.0, 0.0)  # refused: no teleport
+    with led.owner("ep.stand_for"):
+        sim.move_base(0.0, 0.0, 0.0)  # bench's right_robot: a teleport outside place_robot
+    o = led.owners
+    assert (o["go_to"]["place_robot"], o["go_to"]["place_robot_calls"]) == (1, 2)
+    assert (o["ep.stand_for"]["place_robot"], o["ep.stand_for"]["place_robot_calls"]) == (1, 0)
+    assert sum(r["place_robot"] for r in o.values()) == sim.teleports == 2, "the column sums to bench.teleports"
+
+
+def test_a_close_names_who_issued_it_the_plan_executor_or_the_sim():
+    from b1k.bridge.executor import PlanExecutor
+
+    sim = Sim()
+    led = make_ledger(sim)
+    g = GripperWatch(sim, led)
+    ex = PlanExecutor(sim)
+    ex.set_gripper("close", creep=True)  # a plan's Pick close: the one the executor logs with is_grasping=
+    ex.set_gripper("open")
+    assert ex.start_gripper("closed") is True  # closed before the plan: not logged with is_grasping=
+    ex.set_gripper("open")
+    sim.hold(3, -1.0)  # a closed fist the sim itself commands (a drawer pull)
+    assert [c["via"] for c in g.closes] == ["executor", "executor.start", "sim"]
+    assert g.closes[0]["settled_at"] is not None and g.closes[0]["is_grasping"] == 1
