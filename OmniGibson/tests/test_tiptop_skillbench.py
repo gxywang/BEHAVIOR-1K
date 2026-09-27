@@ -87,7 +87,10 @@ def test_a_capture_after_the_camera_moved_waits_past_the_frames_from_before_the_
     shadow = SimpleNamespace(pose=(th.zeros(3), q), renders=0)
     shadow.get_position_orientation = lambda: shadow.pose
     shadow.set_position_orientation = lambda position, orientation: setattr(shadow, "pose", (position, orientation))
-    shadow.get_obs = lambda: ({"rgb": old if shadow.renders <= 4 else new}, {})  # 4 renders of the old view
+    lag = {"rgb": 4, "depth": 4}  # renders of the old view (and of the old depth) after the move
+    far, near = th.full((2, 2), 3.0), th.full((2, 2), 1.0)
+    shadow.get_obs = lambda: ({"rgb": old if shadow.renders <= lag["rgb"] else new,
+                               "depth_linear": far if shadow.renders <= lag["depth"] else near}, {})
     render = lambda: setattr(shadow, "renders", shadow.renders + 1)  # noqa: E731
     monkeypatch.setattr(r1pro, "og", SimpleNamespace(sim=SimpleNamespace(render=render)))
     monkeypatch.setattr(r1pro, "_intrinsics", lambda sensor: np.eye(3))
@@ -98,6 +101,9 @@ def test_a_capture_after_the_camera_moved_waits_past_the_frames_from_before_the_
     shadow.renders = 0  # the camera where it was: the first two agreeing frames are the view
     obs, _ = R1ProSim._capture_obs(sim, "head")
     assert shadow.renders == 4 and (obs["rgb"] == old).all()
+    shadow.pose, shadow.renders, lag["depth"] = (th.zeros(3), q), 0, 8  # W3 fix (w3k7 reach t1, t4): the depth
+    obs, _ = R1ProSim._capture_obs(sim, "head")  #                        lags the rgb: wait for it too
+    assert (obs["depth_linear"] == near).all() and shadow.renders == 12, shadow.renders
 
 
 def test_every_env_step_is_kept_as_the_last_action():
@@ -457,9 +463,49 @@ def test_a_legacy_failure_takes_its_code_from_the_rounds_own_error_text():
     ("the joint did not move", "open", (Status.FAILED, Code.STALLED, "execute")),
     ("TiptopPlanningError: the start posture is in self-collision (the human's idle right arm; cuRobo self-collision "
      "cost 4.01)", "place", (Status.INFEASIBLE, Code.NO_MOTION, "motion")),  # the server's S1 precheck: no place ran
+    # W3 fixes: the toy box in view (5433 head px) but out of the workspace was not_visible; the sandal still in the
+    # closed hand after the executor stopped mid-carry was placed_wrong
+    ("goal objects ['toy_box_1'] were not found in any of the 3 view(s); ['toy_box_1'] were segmented but have no "
+     "valid depth points inside the workspace", "place", (Status.INFEASIBLE, Code.NO_STANCE_HERE, "check")),
+    ("trajectory 1 failed to track the checked path; replan", "place", (Status.FAILED, Code.BLOCKED, "execute")),
 ])  # fmt: skip
 def test_the_one_classifier_maps_todays_error_text_to_codes(why, skill, expected):
     assert classify(why, skill) == expected
+
+
+def test_a_legacy_pick_the_scorer_fails_is_coded_as_a_native_one_and_judged_against_the_frames_before_it():
+    """W3 fixes: legacy called every scorer failure of a pick grasp_missed (g2: the full basket held clear, the
+    atomizer held and carried); the pick's own atoms say it: held, not lifted is NOT_LIFTED. And the end-of-run
+    judgement had no reference, so a perception shadow read None on every legacy pick: the frames before the run are
+    rendered and passed as the Percept."""
+    from b1k.connector.goals import GoalPanel
+
+    env = Env()
+    rt, ep, _ = legacy_rt(env, truth={"lifted": False})
+    r = DirectConnector(rt, env.step, Host(env), env.raw()).run(SkillCall("pick_up", PickArgs(apple), arm="left"))
+    assert (r.status, r.code, r.phase, r.evidence["legacy_ok"]) == (Status.FAILED, Code.NOT_LIFTED, "verify", True)
+
+    class Framed(Host):
+        n = 0
+
+        def observe_now(self):
+            Framed.n += 1
+            return dataclasses.replace(super().observe_now(), sensors=SimpleNamespace(views={"head": Framed.n}))
+
+    class Shadow:
+        seen = []
+
+        def check(self, goal, obs=None, percept=None):
+            Shadow.seen.append((percept.views["head"] if percept else None, obs.sensors.views["head"]))
+            return Belief(None, "perceived", 0)
+
+    h = Framed(env)
+    lb = LegacyBackend(FakeEpisode(h), h.observe_now, single_round=True)
+    rt = make_rt(backends={"legacy": lb}, routing={"pick_up": {"default": "legacy"}}, host=h,
+                 goals=GoalPanel({"scorer": SimV(), "perception": Shadow()}, "scorer"))
+    DirectConnector(rt, env.step, h, env.raw()).run(SkillCall("pick_up", PickArgs(apple), arm="left"))
+    (before, now), = Shadow.seen
+    assert before is not None and before < now, "the reference is the frames before the run, the obs the after"
 
 
 def test_a_legacy_crash_before_any_sim_step_is_a_backend_fault_not_a_wrong_placement():
@@ -703,6 +749,9 @@ def test_a_native_row_fails_u0_on_a_sim_step_nobody_charged():
     case = {"id": "c", "call": SkillCall("pick_up", PickArgs(apple))}
     assert skillbench.row(case, 0, 3, r, rt, rt.step + 61, 2.0, 0.5, 1.0, 61)["u0"]
     assert not skillbench.row(case, 0, 3, r, rt, rt.step + 62, 2.0, 0.5, 1.0, 61)["u0"]
+    reached = skillbench.row(case, 0, 3, r, rt, rt.step + 101, 2.0, 0.5, 1.0, 61, nav_steps=40)
+    assert reached["u0"] and (reached["observe_steps"], reached["nav_steps"]) == (61, 40), \
+        "W3 fix: a reach's teleport steps join the U0 check in their own column, not inside observe_steps"
 
 
 def test_the_setup_frames_the_calls_objects_after_the_teleport(monkeypatch):
@@ -1134,10 +1183,15 @@ def test_the_oracle_segmenter_masks_nothing_for_a_target_no_tracked_object_stand
                           object_meshes=lambda labels: meshed.append(list(labels)) or {l: l for l in labels},
                           oracle_masks=lambda view, ex, labels, meshes: np.ones((len(labels), 2, 2), bool))  # fmt: skip
     sim.tracked_object = lambda label: sim.objects.get(label) or sim.obstacles.get(label)
+    scene = {"floor.n.01_1": SimpleNamespace(fixed_base=True), "pan.n.01_1": SimpleNamespace(fixed_base=False)}
+    sim.scene_object = lambda label: scene.get(label) or (_ for _ in ()).throw(ValueError(f"no object {label!r}"))
     request = {"view_name": "head", "depth": np.ones((2, 2)), "intrinsics": np.eye(3)}
     got = OracleSegmenter(sim).masks(["apple_1", "floor.n.01_1"], request, {}).value["head"]
     assert meshed == [["apple_1"]] and got["apple_1"].all() and not got["floor.n.01_1"].any()
     assert not OracleSegmenter(sim).masks(["floor.n.01_1"], request, {}).value["head"]["floor.n.01_1"].any()
+    for stray in ("pan.n.01_1", "pann.n.01_1"):  # W3 fix: an untracked movable or a misnamed label is the harness's
+        with pytest.raises(ValueError, match="no tracked object"):  # error, not a NOT_VISIBLE charged to the skill
+            OracleSegmenter(sim).masks(["apple_1", stray], request, {})
 
 
 def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_from_bddl(monkeypatch):
@@ -1145,12 +1199,17 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     from omnigibson.tiptop.oracle.goals import EpisodeScorer
     from omnigibson.utils import usd_utils
 
-    apple_obj, touching = SimpleNamespace(scene=SimpleNamespace(idx=0)), []
+    touching = []  # what the apple's links touch, by prim path
+    board = SimpleNamespace(fixed_base=True)
+    paths = {"/W/robot": None, "/W/board": board}
+    apple_obj = SimpleNamespace(scene=SimpleNamespace(idx=0, object_registry=lambda key, path, default: paths.get(path, default)))
     monkeypatch.setattr(usd_utils, "RigidContactAPI", SimpleNamespace(
-        is_in_contact=lambda scene_idx, query_set, with_set, ignore_set, current_only: bool(touching)
-        and query_set == [apple_obj] and ignore_set == [robot]))
+        get_contact_row_indices=lambda idx, objs: [0],
+        get_contact_pairs=lambda idx, query, with_set, current: {("/W/apple/link", p) for p in touching}
+        if query == [apple_obj] else set()))
     robot = SimpleNamespace(is_grasping=lambda arm, obj=None: IsGraspingState.TRUE
                             if arm == "left" and obj in (None, apple_obj) else IsGraspingState.FALSE)  # fmt: skip
+    paths["/W/robot"] = robot
     scope = ("apple.n.01_1", "table.n.02_1")  # the task's evaluator raises on a name outside its scope
     sim = SimpleNamespace(robot=robot, scene_object=lambda n: apple_obj if n == "apple.n.01_1" else object(),
                           holds=lambda p, *a: {"ontop": True}[p] and all(scope.index(n) + 1 for n in a),
@@ -1159,7 +1218,9 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
     assert s.holds(Fact("holding", ("apple.n.01_1", "right"))) is False
     assert s.holds(Fact("lifted", ("apple.n.01_1",))) is True
-    touching.append("board")  # week 2's knife: the fingers on the blade, the knife still on its board
+    touching.append("/W/robot/finger")  # the robot does not count
+    assert s.holds(Fact("lifted", ("apple.n.01_1",))) is True
+    touching.append("/W/board/link")  # week 2's knife: the fingers on the blade, the knife still on its board
     assert s.holds(Fact("holding", ("apple.n.01_1", "left"))) is True
     assert s.holds(Fact("lifted", ("apple.n.01_1",))) is False, "held, not lifted clear: not picked up"
     touching.clear()
@@ -1364,3 +1425,54 @@ def test_a_demo_restore_loads_the_instance_in_the_cases_mode(monkeypatch):
     demo_cases.restore(env, {}, 301, "public_test")
     demo_cases.restore(env, {}, 188)
     assert loaded == [(301, "public_test"), (188, "train")] and len(resets) == 4
+
+
+def test_the_scorer_reads_a_container_lifted_with_its_contents_in_it():
+    """W3 fix (g2 Christmas e1986, sorting_vegetables e4004): the full wicker basket held clear at waist height read
+    not lifted, because its contents touch it; legacy's 4 lifts scored grasp_missed. What it carries is carried: the
+    contact cluster, the robot left out, must reach no fixed piece and nothing outside the scene's objects. A cloth
+    (no rigid contact rows) is not judged."""
+    from omnigibson.tiptop.oracle.goals import lifted
+
+    robot, floor = SimpleNamespace(), SimpleNamespace(fixed_base=True)
+    basket, wreath, candy = (SimpleNamespace(fixed_base=False) for _ in range(3))
+    by_path = {"/W/basket": basket, "/W/wreath": wreath, "/W/candy": candy, "/W/floor": floor, "/W/robot": robot}
+    names = {id(v): k for k, v in by_path.items()}
+    scene = SimpleNamespace(idx=0, object_registry=lambda key, path, default: by_path.get(path, default))
+    for o in by_path.values():
+        o.scene = scene
+    edges = {("/W/basket", "/W/wreath"), ("/W/wreath", "/W/candy"), ("/W/basket", "/W/robot")}
+
+    class Contacts:
+        rows = True
+
+        def get_contact_row_indices(self, idx, objs):
+            return [0] if self.rows else []
+
+        def get_contact_pairs(self, idx, query, with_set, current):
+            q = {names[id(o)] for o in query}
+            return {(a + "/l", b + "/l") for a, b in edges | {(b, a) for a, b in edges} if a in q}
+
+    c = Contacts()
+    assert lifted(basket, robot, c) is True, "held clear, its decorations in it"
+    edges.add(("/W/candy", "/W/floor"))
+    assert lifted(basket, robot, c) is False, "a candy cane in it still on the floor: the cluster stands"
+    edges.discard(("/W/candy", "/W/floor"))
+    edges.add(("/W/basket", "/W/ground"))  # a prim no object owns (the ground plane)
+    assert lifted(basket, robot, c) is False
+    c.rows = False
+    assert lifted(basket, robot, c) is None, "a cloth: no rigid rows, not judged"
+
+
+def test_every_success_fact_of_a_case_is_judged_beside_the_status():
+    """W3 fix (L4 touching): the status judges the call's effects, touching(shoe, hallstand); the case's floor half,
+    touching(shoe, floor) false, was never read. Each fact is judged by the scorer at the trial's end, in the row."""
+    from b1k.connector.goals import GoalPanel, ScorerChecker
+
+    truth = {("touching", ("shoe_1", "hallstand_1")): True, ("touching", ("shoe_1", "floor_1")): True}
+    panel = GoalPanel({"scorer": ScorerChecker(SimpleNamespace(holds=lambda f: truth[(f.pred, f.args)]))}, "scorer")
+    case = {"success": [Fact("touching", ("shoe_1", "hallstand_1")),
+                        {"__type__": "Fact", "pred": "touching", "args": ["shoe_1", "floor_1"], "value": False}]}
+    assert skillbench.success_facts(case, panel) == {"touching(shoe_1, hallstand_1)": True,
+                                                     "not touching(shoe_1, floor_1)": False}
+    assert skillbench.success_facts({}, panel) == {}

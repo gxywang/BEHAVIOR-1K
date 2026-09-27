@@ -212,6 +212,22 @@ def test_the_lease_runs_beside_the_call_by_the_routed_backend_not_the_call_field
     assert skillbench.lease_for(case, press, 3, tiptop) == dataclasses.replace(lease, seed=3)
     assert skillbench.lease_for(case, dataclasses.replace(press, backend="legacy"), 3, tiptop) is None
     assert skillbench.lease_for({}, press, 3, tiptop) is None
+    # W3 fix: by_joint reads the map through the trial's Services; without them the route was always the default
+    from b1k.connector.skills import CloseArgs
+    from b1k.connector.types import Provided
+    from b1k.connector.world import JointFrame
+
+    class Close(Press):
+        def supports(self, call):
+            return True
+
+    drawer = JointFrame("j_link_4", "prismatic", "link_4", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.0, 0.3)
+    svc = SimpleNamespace(map=SimpleNamespace(piece=lambda o: Provided(SimpleNamespace(joints=(drawer,)), "map", 0)))
+    joint = SkillRegistry(SPECS, {"legacy": Legacy(), "tiptop": Close()},
+                          {"close": {"default": "legacy", "by_joint": {"prismatic": "tiptop"}}})
+    close = SkillCall("close", CloseArgs(dataclasses.replace(radio, part="j_link_4")), arm="right")
+    assert skillbench.lease_for(case, close, 3, joint, svc) == dataclasses.replace(lease, seed=3), \
+        "a drawer close routes native with the trial's svc: the lease runs beside it"
 
 
 def test_a_refused_lease_ends_the_trial_with_its_refusal_and_never_runs_the_press():

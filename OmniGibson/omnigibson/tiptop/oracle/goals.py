@@ -4,10 +4,12 @@
 class EpisodeScorer:
     """ScorerChecker's Scorer: the task's own predicates (env.task._evaluate_predicate, through R1ProSim.holds), plus
     the two skill-level atoms BDDL has no predicate for, read off the robot's grasp: holding(obj, arm) and
-    hand_empty(arm), and lifted(obj): the object touches nothing but the robot, so a pick_up (holding and lifted) is
-    not a grasp alone: the knife held on its board and the basket closed on at the floor both scored succeeded in
-    week 2 (VIDEO_FINDINGS 2, 11). None when it cannot judge (an unknown predicate or object). Oracle; the GoalPanel
-    counts it."""
+    hand_empty(arm), and lifted(obj): clear of everything that stands, so a pick_up (holding and lifted) is not a
+    grasp alone: the knife held on its board and the basket closed on at the floor both scored succeeded in week 2
+    (VIDEO_FINDINGS 2, 11). Clear: the object's contact cluster, the robot left out, reaches no fixed_base piece (a
+    floor, a wall, furniture) and nothing outside the scene's objects; what it carries (a basket's decorations or
+    vegetables, W3 g2) touches it and is carried too. None when it cannot judge (an unknown predicate or object, an
+    object with no rigid contact rows: a cloth). Oracle; the GoalPanel counts it."""
 
     def __init__(self, sim):
         self.sim = sim
@@ -24,8 +26,7 @@ class EpisodeScorer:
             if fact.pred == "lifted":  # ponytail: contact only, so a hover of a few mm over the support counts as
                 #                        clear; add a height margin over support_of's top when a case shows one
                 o = self.sim.scene_object(fact.args[0])
-                return not RigidContactAPI.is_in_contact(scene_idx=o.scene.idx, query_set=[o], with_set=None,
-                                                         ignore_set=[robot], current_only=True)
+                return lifted(o, robot, RigidContactAPI)
             if fact.pred == "hand_empty":
                 return robot.is_grasping(fact.args[0]) != IsGraspingState.TRUE
             if fact.pred in ("ontop", "nextto", "inside") and not set(fact.args) <= set(self.sim.env.task.object_scope):
@@ -37,3 +38,25 @@ class EpisodeScorer:
             return self.sim.holds(fact.pred, *fact.args)
         except Exception:  # noqa: BLE001 - not a predicate or an object the evaluator knows: cannot judge
             return None
+
+
+def lifted(o, robot, contacts) -> bool | None:
+    """Whether ``o``'s contact cluster (``contacts``: RigidContactAPI), the robot left out, reaches nothing that stands:
+    no fixed_base object and no prim outside the scene's objects (the ground plane). None for an object with no rigid
+    contact rows (a cloth: RigidContactAPI rows are RIGID links only, so "touches nothing" would be vacuous)."""
+    idx = o.scene.idx
+    if not len(contacts.get_contact_row_indices(idx, [o])):
+        return None
+    cluster, frontier = {id(o)}, [o]
+    while frontier:
+        found = []
+        for _, path in contacts.get_contact_pairs(idx, frontier, None, True):
+            other = o.scene.object_registry("prim_path", "/".join(path.split("/")[:-1]), None)
+            if other is robot or id(other) in cluster:
+                continue
+            if other is None or other.fixed_base:
+                return False
+            cluster.add(id(other))
+            found.append(other)
+        frontier = found
+    return True

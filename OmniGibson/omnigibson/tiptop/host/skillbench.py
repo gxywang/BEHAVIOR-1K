@@ -50,7 +50,7 @@ from b1k.connector.codec import from_dict, to_dict
 from b1k.connector.api import Unreachable, reach as api_reach
 from b1k.connector.observe import ObserveRequest
 from b1k.connector.skills import Code, NavResult, SkillCall, WorldUpdate
-from b1k.connector.types import ObjRef
+from b1k.connector.types import Fact, ObjRef
 from b1k.perception.grasp_sensor import ProprioGraspSensor
 from b1k.runtime.compose import ACTION_SLICES, CLOSED, FINGER_Q, OPEN, PROPRIO_Q
 from b1k.runtime.core import Runtime
@@ -192,12 +192,13 @@ def make_backends(ep, host, svc) -> dict:
             "scripted": ScriptedBackend()}  # fmt: skip
 
 
-def lease_for(case: dict, call: SkillCall, seed: int, registry: SkillRegistry) -> Optional[SkillCall]:
+def lease_for(case: dict, call: SkillCall, seed: int, registry: SkillRegistry, svc=None) -> Optional[SkillCall]:
     """The case's lease beside the call, unless the backend routing.yaml resolves for the call captures in its own run
     (a legacy round holds the other hand itself, and steps the sim under a live lease): by the route, not by
-    call.backend, so `press: {default: legacy}` in routing.yaml drops the lease as --backend legacy does."""
+    call.backend, so `press: {default: legacy}` in routing.yaml drops the lease as --backend legacy does. ``svc``: the
+    trial's, so a route that reads the map (by_joint) resolves as the Runtime resolves it."""
     lease = case.get("lease")
-    if lease is None or getattr(registry.backend_for(call), "captures_in_own_run", False):
+    if lease is None or getattr(registry.backend_for(call, svc), "captures_in_own_run", False):
         return None
     return dataclasses.replace(lease, seed=seed)
 
@@ -233,7 +234,7 @@ def latch_gap(rt) -> float:
 
 def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float, env_wall_s: float,
         observe_wall_s: float = 0.0, observe_steps: int = 0, lease: Optional[dict] = None,
-        frames_wall_s: float = 0.0) -> dict:
+        frames_wall_s: float = 0.0, nav_steps: int = 0) -> dict:
     """planning_wall_s is what is neither an env step nor the planner's capture: planning, resampling and
     verification (for a legacy run, which captures and steps inside itself, all of it); ``frames_wall_s``, the part
     of it spent rendering the end-of-run frames the GoalPanel read, is shown beside it. ``lease``: the skill_calls
@@ -244,10 +245,11 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "detail": r.detail, "binding": [dataclasses.asdict(b) for b in r.binding], "primary": r.primary,
         "verdicts": dict(r.verdicts), "steps": r.steps,
         "rt_step": rt.step, "idle_steps": rt.idle_steps, "charged": dict(rt.charged),
-        "u0": u0(rt, None if r.requires_sim_clock else sim_steps, observe_steps,  # legacy steps the sim itself
-                 lease["steps"] if lease else 0),
+        "u0": u0(rt, None if r.requires_sim_clock else sim_steps, observe_steps + nav_steps,  # legacy steps the sim
+                 lease["steps"] if lease else 0),  #                                              itself
         "lease": None if lease is None else {k: lease[k] for k in ("skill", "backend", "status", "code", "steps")},
-        "sim_steps": sim_steps, "observe_steps": observe_steps, "latch_gap_rad": round(latch_gap(rt), 4),
+        "sim_steps": sim_steps, "observe_steps": observe_steps, "nav_steps": nav_steps,  # a reach's teleports
+        "latch_gap_rad": round(latch_gap(rt), 4),
         "wall_s": round(wall_s, 2),
         "env_wall_s": round(env_wall_s, 2), "observe_wall_s": round(observe_wall_s, 2),
         "planning_wall_s": round(wall_s - env_wall_s - observe_wall_s, 2), "frames_wall_s": round(frames_wall_s, 2),
@@ -256,6 +258,15 @@ def row(case: dict, trial: int, seed: int, r, rt, sim_steps: int, wall_s: float,
         "world_updates": [to_dict(u) for u in r.world_updates],  # an open's joint value and its source (SPEC §6.6)
         "go_to": go_to_rows(rt.results),  # a reach case's teleports: where to, ok or the landing's refusal
     }  # fmt: skip
+
+
+def success_facts(case: dict, goals) -> dict:
+    """The case's own success facts (its demo segment's goal atoms: a touching case's floor half, touching(shoe,
+    floor) false, too), each judged by the scorer at the trial's end: the status judges the call's effects alone."""
+    scorer = goals.checkers.get("scorer")
+    facts = [f if isinstance(f, Fact) else from_dict(f, Fact) for f in case.get("success") or ()]  # as the yaml has it
+    return {("" if f.value else "not ") + f"{f.pred}({', '.join(f.args)})": None if scorer is None
+            else scorer.check((f,)).value for f in facts}
 
 
 def go_to_rows(results: dict) -> list:
@@ -282,6 +293,7 @@ def summarize(case: dict, rows: list) -> dict:
         "agree": sum(any(v is not None for n, v in r["verdicts"].items() if n != r["primary"])
                      and all(v is None or v == r["verdicts"][r["primary"]] for v in r["verdicts"].values()) for r in rows),
         "u0_all": all(r["u0"] for r in rows), "requires_sim_clock": sum(r["requires_sim_clock"] for r in rows),
+        "success_all": sum(bool(r.get("success_facts")) and all(r["success_facts"].values()) for r in rows),
         "wall_s_mean": round(float(np.mean([r["wall_s"] for r in rows])), 1),
         "lease_kept": sum((r.get("lease") or {}).get("status") == "aborted" for r in rows),  # held to the end
     }  # fmt: skip
@@ -582,14 +594,15 @@ def main(argv=None) -> None:
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
                                            arm=pick_arm(case["call"], held))
                 backends = make_backends(ep, host, svc)
-                lease = lease_for(case, call, seed, SkillRegistry(SPECS, backends, routing))
+                lease = lease_for(case, call, seed, SkillRegistry(SPECS, backends, routing), svc)
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
                     r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease, nav,
                                                      bool(case.get("reach")))
                 held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
-                                observer.steps + nav.steps, held_by, host.frames_wall_s))
+                                observer.steps, held_by, host.frames_wall_s, nav.steps)
+                            | {"success_facts": success_facts(case, svc.goals)})
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])

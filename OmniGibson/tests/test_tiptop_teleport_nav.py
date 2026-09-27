@@ -36,11 +36,15 @@ def sim(blocked=lambda x, y: False, refuse=False, search=None):
         from omnigibson.tiptop.r1pro import BasePlacementCollision
 
         s.n_steps += 40
+        if refuse == "unfold":  # the landing's own check after the fold (r1pro.place_robot wraps it)
+            raise RuntimeError("cannot validate base destination: the unfold hits the counter")
         if refuse:
             raise BasePlacementCollision("base destination rejected: base_link intersects counter", obstacle="counter")
         s.placed.append((x, y, yaw, note, min_unfold))
 
     s.xy_radius = lambda name: 0.07
+    s.looked = []
+    s.look_at = lambda *names: s.looked.append(names)
     s.best_base_pose = lambda points, **kw: (s.searched.append((points, kw)), (search, {}))[1]
 
     s._footprint_free, s.place_robot = footprint_free, place_robot
@@ -101,6 +105,16 @@ def test_go_to_teleports_on_the_sim_clock_and_charges_the_move_to_mean_in_shadow
         next(refused.go_to(stance, "obs"))
     result, _ = done.value.value
     assert not result.ok and "counter" in result.detail and result.shadow_steps == 0 and refused.steps == 40
+    unfold = TeleportNavigator(sim(refuse="unfold"))  # W3 fix: any other landing failure escaped go_to, its fold's
+    with pytest.raises(StopIteration) as done:        # steps uncounted, and the row's U0 check ended the bench
+        next(unfold.go_to(stance, "obs"))
+    assert not done.value.value[0].ok and "validate" in done.value.value[0].detail and unfold.steps == 40
+    aimed = sim()
+    nav = TeleportNavigator(aimed)
+    nav.propose(StanceRequest((jar,), ((2.0, 2.0, 0.9),)), k=1)
+    with pytest.raises(StopIteration):
+        next(nav.go_to(stance, "obs"))
+    assert aimed.looked == [(jar.id,)], "W3 fix: place_robot clears the look target; the landing aims it again"
     assert nav.base_pose().value == Pose2(0.0, 0.0, 0.0, 0.0) and nav.base_pose().source == "oracle"
 
 

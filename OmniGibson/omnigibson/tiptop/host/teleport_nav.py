@@ -35,7 +35,7 @@ class TeleportNavigator:
     requires_sim_clock = True
 
     def __init__(self, sim):
-        self.sim, self.steps = sim, 0
+        self.sim, self.steps, self.looking = sim, 0, ()  # looking: the last proposal's targets
 
     def base_pose(self) -> Belief:
         import omnigibson.utils.transform_utils as T
@@ -44,6 +44,7 @@ class TeleportNavigator:
         return Belief(Pose2(float(pos[0]), float(pos[1]), float(T.quat2euler(quat)[2]), float(pos[2])), "oracle", 0)
 
     def propose(self, req, k: int = 8) -> list:
+        self.looking = tuple(o.id for o in req.targets)
         pts = np.asarray(req.reach_points, dtype=np.float64)[:, :2]
         mid = pts.mean(axis=0)
         here = self.base_pose().value
@@ -82,17 +83,18 @@ class TeleportNavigator:
         return [] if best is None else [tuple(float(v) for v in best[1:4])]
 
     def go_to(self, stance: Stance, obs):
-        from omnigibson.tiptop.r1pro import BasePlacementCollision
-
         n0 = self.sim.n_steps
         try:  # the arm unfolds as far as it can: UNFOLD_MIN refused every stance the IK service reached from at the
             #   store_honey jar (25%, the countertop) and the wall switch (0%, a cabinet), where the press succeeded
             #   with no minimum; place_robot_for itself falls back to the furthest unfold when no stance makes it
             self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw, note=f"go_to {stance.key}")
-        except BasePlacementCollision as e:
-            self.steps += self.sim.n_steps - n0
+        except Exception as e:  # noqa: BLE001 - BasePlacementCollision, or the landing's or the unfold's own check
+            #                     (RuntimeError 'cannot validate base destination'): a teleport that did not land
             return NavResult(False, stance, 0, 0, str(e)), obs
-        self.steps += self.sim.n_steps - n0
+        finally:  # the fold's ramps stepped the sim whether or not it landed: the U0 check counts them
+            self.steps += self.sim.n_steps - n0
+        if self.looking:  # place_robot cleared what the captures look at; a capture that does not aim (the legacy
+            self.sim.look_at(*self.looking)  # round's own) looked at DEFAULT_LOOK_TARGET after a reach
         return NavResult(True, stance, 0, MOVE_TO_STEPS), obs
         yield  # a generator that yields nothing: the teleport stepped the sim itself (requires_sim_clock)
 

@@ -6,6 +6,7 @@ from typing import Callable, ClassVar
 
 import b1k.runtime.skillrun as skillrun
 from b1k.connector.skills import Code, PlaceArgs, Precheck, Rel, SkillResult, Status, WorldUpdate, effects
+from b1k.skills.tiptop.backend import wrong_or_not_lifted
 
 # Legacy error text -> (status, code, phase); the first match wins. The texts are the manip2 corpus' round errors
 # and open/close "why"s (2026-09-25), most frequent first.
@@ -13,6 +14,10 @@ LEGACY_CODES = (
     ("No satisfying particle", Status.INFEASIBLE, None, "particles"),  # the skill's own: NO_GRASP / NO_PLACEMENT
     ("Motion planning", Status.INFEASIBLE, Code.NO_MOTION, "motion"),
     ("motion validation rejected", Status.INFEASIBLE, Code.EXEC_REFUSED, "motion"),
+    ("failed to track the checked path", Status.FAILED, Code.BLOCKED, "execute"),  # the executor stopped mid-way,
+    #   held back (fell_behind): the object still in the hand, nothing placed (W3 L4 shoe2 t0: it read placed_wrong)
+    ("no valid depth points inside the workspace", Status.INFEASIBLE, Code.NO_STANCE_HERE, "check"),  # in view (the
+    #   toy box: 5433 head pixels), out of the planner's workspace: out of reach from here, not unseen (W3 A1/L3)
     ("not visible", Status.PRECONDITION_UNMET, Code.NOT_VISIBLE, "check"),
     ("were not found", Status.PRECONDITION_UNMET, Code.NOT_VISIBLE, "check"),
     ("no stance", Status.INFEASIBLE, Code.NO_STANCE_HERE, "check"),
@@ -107,6 +112,11 @@ class LegacyBackend:
         if call.skill == "press" and goal and svc.goals.judge(goal, self.observe_now(), who=call.call_id)[0].value is True:
             return SkillResult(call.call_id, call.skill, self.name, Status.SUCCEEDED, None, "", "already in the wanted "
                                "state", goal, {}, svc.goals.primary, requires_sim_clock=True)  # SPEC 6.5: 0 steps
+        # the frames before the run, the reference a perception shadow judges holding and lifted against (a
+        # legacy pick read None on every row without one); rendered now, as nothing renders until it is read
+        ref = self.observe_now().sensors if set(getattr(svc.goals, "checkers", ())) - {"scorer", "none"} else None
+        if ref is not None and getattr(ref, "views", None) is None:
+            ref = None
         try:
             legacy_ok = bool(self.dispatch[call.skill](call))
         except skillrun.PASSTHROUGH:
@@ -114,7 +124,8 @@ class LegacyBackend:
         except Exception as e:  # noqa: BLE001 - a legacy crash is a result
             err = e
         records = json.loads(json.dumps(self.ep.records[r0:], default=_plain))
-        verdict, verdicts = svc.goals.judge(goal, self.observe_now(), who=call.call_id)  # the frames after the run
+        after = self.observe_now()
+        verdict, verdicts = svc.goals.judge(goal, after, ref, who=call.call_id)  # the frames after the run
         ok = legacy_ok and err is None if verdict.value is None else bool(verdict.value)
         if ok:
             status, code, phase = Status.SUCCEEDED, None, ""
@@ -126,6 +137,9 @@ class LegacyBackend:
                 status, code, phase = Status.FAILED, Code.BACKEND_ERROR, None  # executed, so no execution code
         else:  # the legacy code says it worked; the GoalChecker says the requested relation does not hold
             status, code, phase = Status.FAILED, FAILED_AS.get(call.skill, Code.PLACED_WRONG), "verify"
+            if call.skill == "pick_up":  # as a native pick's: held and still on its support is NOT_LIFTED (the full
+                #                          baskets held clear read grasp_missed), another object WRONG_OBJECT
+                code = wrong_or_not_lifted(svc, goal, after, ref, call.call_id, call.arm or "left")
         ev = {"legacy_ok": legacy_ok, "single_round": self.single, "records": records}
         if bent:
             ev.update(degraded_to="on", relations=bent)

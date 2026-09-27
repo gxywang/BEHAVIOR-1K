@@ -60,7 +60,7 @@ def test_the_legacy_baseline_presses_through_todays_toggled_on_round_with_the_ca
         return True
 
     ep.achieve = achieve
-    goals = SimpleNamespace(judge=lambda goal, obs, who: (SimpleNamespace(value=None), {}), primary="scorer")
+    goals = SimpleNamespace(judge=lambda goal, obs, percept=None, who="": (SimpleNamespace(value=None), {}), primary="scorer")
     lb = LegacyBackend(ep, lambda: None, single_round=True)
     call = SkillCall("press", PressArgs(ObjRef("switch.n.01_1", "switch", True), want_on=False), arm="left")
     assert lb.supports(call)

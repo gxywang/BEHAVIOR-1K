@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from b1k.bridge.protocol import capture_views
+from b1k.bridge.protocol import FLOOR_CATEGORIES, capture_views, label_category
 from b1k.connector.types import Provided
 
 TOUCH = 0.01  # m: gt_masks' 8 mm surface tolerance, with margin
@@ -19,9 +19,14 @@ class OracleSegmenter:
         self.sim = sim
 
     def masks(self, labels: list, request: dict, extras: dict) -> Provided:
-        # a place's target may be furniture no tracked object stands for (the floor, an untracked table): an empty
-        # mask; its region is the map's support (SPEC 6.2), never a segmented object
+        # a place's target may be furniture no tracked object stands for (the floor, an untracked table, a burner):
+        # an empty mask; its region is the map's support (SPEC 6.2), never a segmented object. Any other label no
+        # tracked object stands for (a movable the bench did not track, a misnamed object) is the harness's error,
+        # never an empty mask a skill would answer NOT_VISIBLE to
         tracked = [label for label in labels if label in self.sim.objects or self.sim.tracked_object(label) is not None]
+        stray = [label for label in labels if label not in tracked and not self.furniture(label)]
+        if stray:
+            raise ValueError(f"no tracked object for labels {stray}")
         every = [*tracked, *self.touching(tracked)]
         meshes = self.sim.object_meshes(every)  # one set of meshes for every view, as OracleKnowledge.describe
         out = {}
@@ -30,6 +35,16 @@ class OracleSegmenter:
             out[name] = {**{label: np.zeros(view["depth"].shape, bool) for label in labels},
                          **dict(zip(tracked, masks))}
         return Provided(out, "oracle", self.sim.n_steps)
+
+    def furniture(self, label: str) -> bool:
+        """Whether an untracked label is what the bench leaves untracked on purpose, a support: a fixed piece of the
+        scene (a floor, a burner) or a task table (track_task_objects skips tables and floors)."""
+        if label_category(label) in ("table", *FLOOR_CATEGORIES):
+            return True
+        try:
+            return bool(getattr(self.sim.scene_object(label), "fixed_base", False))
+        except ValueError:  # no such object in the scene
+            return False
 
     def touching(self, labels: list) -> list:
         """The other tracked objects whose world box comes within TOUCH of a label's."""

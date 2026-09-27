@@ -302,6 +302,17 @@ PRESENT_OFFSETS = (
 CAPTURE_MAX_RENDERS = 40  # render pairs after moving the capture camera (temporal accumulation)
 CAPTURE_CONVERGED_DIFF = 0.25  # mean absolute rgb change (0-255) between consecutive renders that counts as settled
 CAPTURE_MOVED_M = 0.01  # a capture camera moved this far (or 1 deg) must render something other than before the move
+CAPTURE_DEPTH_DIFF = 0.002  # m: mean absolute depth change between consecutive renders that counts as settled
+
+
+def _rgbd(obs) -> tuple:
+    """A render's rgb (float) and its depth_linear with the invalid values 0."""
+    return (obs["rgb"][..., :3].to(th.float32),
+            th.nan_to_num(obs["depth_linear"].to(th.float32), nan=0.0, posinf=0.0, neginf=0.0))
+
+
+def _same(a, b, tol: float) -> bool:
+    return float((a - b).abs().mean()) < tol
 HEAD_APERTURE_MM = 40.0  # BEHAVIOR challenge eval setting (99 deg HFOV); OmniGibson's default 20.995 gives 63 deg
 WRIST_APERTURE_MM = 20.995  # OmniGibson VisionSensor default, set explicitly so the shadow camera matches exactly
 CAMERA_MIN_MARGIN = 0.08  # added to where the bottom image edge meets an object's support: room to be whole.
@@ -5346,23 +5357,29 @@ class R1ProSim(TiptopSim):
         was_pos, was_quat = shadow.get_position_orientation()
         turn = 2.0 * math.acos(min(1.0, abs(float((quat * was_quat).sum()))))
         moved = float(th.linalg.norm(pos - was_pos)) > CAPTURE_MOVED_M or turn > math.radians(1.0)
-        before = shadow.get_obs()[0]["rgb"][..., :3].to(th.float32) if moved else None
+        before = _rgbd(shadow.get_obs()[0]) if moved else None
         shadow.set_position_orientation(position=pos, orientation=quat)
         # The renderer accumulates frames over time: after the camera jumps (base teleport, look posture) the first
         # frames are a ghost of the previous view, so render until two consecutive frames agree. They can agree on
         # that ghost: the first capture after a 5 cm stance change rendered the old view 4 times and "converged"
         # on it, deprojected by the new pose (w2s2 apple_1 t0: 84 points on the other apple, closed on air). A
         # moved camera's frame that is still the one from before the move is not the view.
+        # The depth is read beside the rgb and must settle too: w3k7 reach t1 and t4 converged on the rgb, and the
+        # depth the masks are cut from matched neither the robot's meshes nor the jar's (no robot pixels masked in
+        # the head and left wrist, the jar in plain view with no mask: NOT_VISIBLE), as a depth still from before
+        # the teleport would.
         previous = None
         for i in range(CAPTURE_MAX_RENDERS):
             og.sim.render()
             og.sim.render()
-            rgb = shadow.get_obs()[0]["rgb"][..., :3].to(th.float32)
-            stale = before is not None and float((rgb - before).abs().mean()) < CAPTURE_CONVERGED_DIFF
-            if previous is not None and not stale and float((rgb - previous).abs().mean()) < CAPTURE_CONVERGED_DIFF:
+            rgb, depth = _rgbd(shadow.get_obs()[0])
+            stale = before is not None and (_same(rgb, before[0], CAPTURE_CONVERGED_DIFF)
+                                            or _same(depth, before[1], CAPTURE_DEPTH_DIFF))
+            if (previous is not None and not stale and _same(rgb, previous[0], CAPTURE_CONVERGED_DIFF)
+                    and _same(depth, previous[1], CAPTURE_DEPTH_DIFF) and bool((depth > 0).any())):
                 log.info(f"{name}: capture converged after {2 * (i + 1)} renders")
                 break
-            previous = rgb
+            previous = rgb, depth
         else:
             log.warning(
                 f"{name}: capture did not converge after {2 * CAPTURE_MAX_RENDERS} renders; using the last frame"
