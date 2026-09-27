@@ -28,11 +28,12 @@ class EpisodeScorer:
                                                          ignore_set=[robot], current_only=True)
             if fact.pred == "hand_empty":
                 return robot.is_grasping(fact.args[0]) != IsGraspingState.TRUE
-            if fact.pred == "ontop" and not set(fact.args) <= set(self.sim.env.task.object_scope):
-                from omnigibson.object_states import OnTop  # a support the task does not name (the brisket's burner,
-                #                                             a scene object): the state BDDL's ontop reads, directly
-                obj, support = (self.sim.scene_object(n) for n in fact.args)
-                return bool(obj.states[OnTop].get_value(support))
+            if fact.pred in ("ontop", "nextto", "inside") and not set(fact.args) <= set(self.sim.env.task.object_scope):
+                from omnigibson.object_states import Inside, NextTo, OnTop  # a target the task does not name (the
+                #    brisket's burner, the toilet a mousetrap goes beside): the state BDDL's predicate reads, directly
+                obj, target = (self.sim.scene_object(n) for n in fact.args)
+                state = {"ontop": OnTop, "nextto": NextTo, "inside": Inside}[fact.pred]
+                return bool(obj.states[state].get_value(target))
             return self.sim.holds(fact.pred, *fact.args)
         except Exception:  # noqa: BLE001 - not a predicate or an object the evaluator knows: cannot judge
             return None

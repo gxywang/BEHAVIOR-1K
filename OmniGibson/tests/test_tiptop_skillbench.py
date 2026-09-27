@@ -1173,6 +1173,12 @@ def test_the_scorer_answers_holding_and_hand_empty_from_the_grasp_and_the_rest_f
     sim.scene_object = lambda n: {"apple.n.01_1": apple_obj, "burner_mdanhg_0": burner}.get(n, object())
     assert s.holds(Fact("ontop", ("apple.n.01_1", "burner_mdanhg_0"))) is True
     assert s.holds(Fact("ontop", ("apple.n.01_1", "table.n.02_1"))) is True, "a task object: the task's evaluator"
+    from omnigibson.object_states import NextTo
+
+    toilet = object()  # w3 L3: a mousetrap next to toilet_udiezm_0, which setting_mousetraps does not name
+    apple_obj.states[NextTo] = SimpleNamespace(get_value=lambda other: other is toilet)
+    sim.scene_object = lambda n: {"apple.n.01_1": apple_obj, "toilet_udiezm_0": toilet}.get(n, object())
+    assert s.holds(Fact("nextto", ("apple.n.01_1", "toilet_udiezm_0"))) is True
 
 
 def test_gravity_turns_a_lid_shut_and_leaves_a_door_and_a_drawer_alone():
