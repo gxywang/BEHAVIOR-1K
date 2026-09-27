@@ -61,10 +61,10 @@ def test_runner_tape_without_a_path_means_the_out_dirs_tapes():
     assert bench.parse_args(MINIMAL + ["--runner-tape", "--wstape", "log"]).runner_tape == ""
 
 
-def test_the_connector_runner_is_refused_until_its_host_lands(capsys):
-    with pytest.raises(SystemExit):
-        bench.parse_args(MINIMAL + ["--runner", "connector"])
-    assert "W4-E" in capsys.readouterr().err
+def test_the_connector_runner_is_accepted_now_that_its_host_has_landed():
+    """W4-E: host/episode_host.py is in this checkout; the flag was refused with a W4-E notice until then."""
+    args = bench.parse_args(MINIMAL + ["--runner", "connector"])
+    assert args.runner == "connector" and bench.instrumented(args)
 
 
 @pytest.mark.parametrize(
