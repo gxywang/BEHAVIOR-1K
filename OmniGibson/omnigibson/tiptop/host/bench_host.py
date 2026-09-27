@@ -54,8 +54,10 @@ class BenchHost:
     owns observation). Counts the wall seconds spent inside env steps and inside frame renders, so a trial can tell
     the planning wall time from the execution's."""
 
-    def __init__(self, sim, segmenter=None):
+    def __init__(self, sim, segmenter=None, sim_clock: bool = False):
         self.sim, self.segmenter, self.env_wall_s, self.frames_wall_s = sim, segmenter, 0.0, 0.0
+        self.sim_clock = sim_clock  # the episode host: a StepObs carries sim.n_steps, whatever step the Runtime gives
+        self._teleports = int(getattr(sim, "teleports", 0) or 0)  # base_moved()'s reference
 
     def proprio(self) -> np.ndarray:
         d = self.sim.robot._get_proprioception_dict()
@@ -74,7 +76,17 @@ class BenchHost:
         return Frames(self) if self.segmenter is not None else None
 
     def parse(self, raw: dict, step: int) -> StepObs:
-        return StepObs(step, raw["proprio"], raw, sensors=self.frames())
+        """``sim_clock``: the StepObs is stamped with sim.n_steps, whatever ``step`` the Runtime gives, so the
+        observation's clock is the Episode's (as observe_now's is) and the two agree; the sim's own count is never
+        written. Default: the Runtime's step, as the skill bench reads it."""
+        return StepObs(self.sim.n_steps if self.sim_clock else step, raw["proprio"], raw, sensors=self.frames())
+
+    def base_moved(self) -> bool:
+        """True iff sim.teleports changed since the previous call (the first: since construction): the optional
+        HostHooks member the Runtime bumps its base epoch by after a self-stepping run."""
+        t = int(getattr(self.sim, "teleports", 0) or 0)
+        moved, self._teleports = t != self._teleports, t
+        return moved
 
     def commanded_targets(self) -> dict:
         return self.sim.commanded_targets()
