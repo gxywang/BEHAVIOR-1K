@@ -1003,9 +1003,8 @@ def add_week4_args(p: argparse.ArgumentParser) -> None:
 
 
 def check_week4_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.runner == "connector":
-        p.error("--runner connector: the connector host (W4-E, host/episode_host.py) has not landed in this "
-                "checkout; run --runner legacy")
+    if args.audit and args.routing_profile != "parity":
+        p.error("--audit is parity only: DualEpisode compares the shim with the legacy Episode (WEEK4_PLAN 3.1)")
     bad = [r for r in args.route if not ROUTE_RE.match(r)]
     if bad:
         p.error(f"--route takes SKILL[.QUAL]=BACKEND, e.g. place.on=tiptop; not {bad}")
@@ -1081,6 +1080,12 @@ def main(argv=None) -> None:
     if instrumented(args):
         from omnigibson.tiptop.host.instruments import StepLedger
         from omnigibson.tiptop.oracle import watch
+    if args.runner == "connector":  # the pseudo planner over the connector (WEEK4_PLAN 3.1, 3.3; W4-E): the host
+        import importlib  # reads the simulator through the providers package alone, and never names it
+
+        from omnigibson.tiptop.host import episode_host
+
+        providers = importlib.import_module(args.providers)
     if args.runner_tape is not None:
         from b1k.planner.pseudo import tape as tp
 
@@ -1121,7 +1126,7 @@ def main(argv=None) -> None:
             metrics = [AgentMetric(human), TaskMetric(human)]
             # from here on every step counts
             sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps, name=name)
-            ledger = gripper = runner_tape = raised = None
+            ledger = gripper = runner_tape = raised = conn_host = connector = None
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")
             if video is not None:
                 sim.recorders.append(video)
@@ -1158,6 +1163,7 @@ def main(argv=None) -> None:
                     ledger.install_episode(episode)
                     if wstape is not None:
                         wstape.ledger = ledger
+                tape_around = None
                 if args.runner_tape is not None:
                     runner_tape = tp.Tape(tp.header(
                         args.task_name, int(instance_id), args.runner, args.routing_profile, args.replicate,
@@ -1166,11 +1172,22 @@ def main(argv=None) -> None:
                     # the Runner's construction inputs whole, so scripts/tape_diff.py e0 can build the same Runner
                     runner_tape.header["options"] = goal_options
                     runner_tape.header["scope"] = list(strategy.scope)
-                    runner_ep = tp.TapeRecorder(
-                        episode, runner_tape, exc_classes=(TapeDiverged,),
+                    tape_around = lambda inner: tp.TapeRecorder(  # noqa: E731 - around whatever the Runner holds
+                        inner, runner_tape, exc_classes=(TapeDiverged,),
                         step_probe=lambda: sim.n_steps, digest=lambda: watch.state_digest(sim, knowledge),
                     )
-                strategy.run(runner_ep)
+                    if args.runner == "legacy":
+                        runner_ep = tape_around(episode)
+                if args.runner == "connector":
+                    # the one branch (WEEK4_PLAN 3.1): the pseudo planner's Runner over the connector, its Episode
+                    # the shim; n0 and the digest are taken inside build, before anything is wired
+                    conn_host = episode_host.build(
+                        episode, sim, planners, args, providers, strategy_for, strategy, ledger, watch,
+                        tape=tape_around, inst_dir=inst_dir, max_steps=max_steps, wstape=wstape,
+                    )
+                    conn_host.run()
+                else:
+                    strategy.run(runner_ep)
                 reason = "strategy finished"
             except EpisodeOver as e:
                 reason, raised = e.reason, e
@@ -1190,6 +1207,11 @@ def main(argv=None) -> None:
                 reason, raised = f"crash: {type(e).__name__}: {e}", e
             if runner_tape is not None:  # how the Runner's run ended, for scripts/tape_diff.py e0
                 runner_tape.header["ending"] = {"reason": reason, "raised": None if raised is None else tp.exc_of(raised)}
+            if conn_host is not None:  # before end_episode and the video tail: U0 is judged on the open episode
+                connector = conn_host.close(reason, raised)  # never raises
+                log.info(
+                    f"connector: {'PASS' if connector.get('ok') else 'FAIL'} {json.dumps(connector.get('g3'), default=str)}"
+                )
             steps = sim.end_episode()  # scored on the state now; the video tail below counts for nothing
             success = bool(sim.env.task.success)
             goal = sim.goal_status()
@@ -1234,6 +1256,8 @@ def main(argv=None) -> None:
             }
             if instrumented(args):  # only under a week-4 flag: the key set is otherwise today's
                 result["bench"]["instruments"] = instruments  # None when the instance ended before its Runner ran
+            if args.runner == "connector":  # the connector block (WEEK4_PLAN 3.1); None when build never ran
+                result["bench"]["connector"] = connector
             with open(json_dir / f"{name}.json", "w") as f:
                 json.dump(result, f, indent=2, default=float)
             results.append(result)
