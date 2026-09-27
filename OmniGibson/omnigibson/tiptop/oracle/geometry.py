@@ -9,6 +9,8 @@ from b1k.connector.types import AABB, Provided
 from b1k.connector.world import Cavity, Region
 from b1k.map.geometry import aabb as voxel_aabb
 from b1k.map.geometry import accepting, cavities, roof
+from b1k.map.geometry import boards as voxel_boards
+from b1k.map.geometry import overhang as voxel_overhang
 from b1k.map.geometry import top_support as voxel_top_support
 
 log = logging.getLogger(__name__)
@@ -26,7 +28,8 @@ class OracleGeometry:
     cavity: the compartment the fillable meta-link accepts (inside_rect, the scorer's own Inside volume), tagged
     oracle, with the map's voxel compartments logged beside it (SPEC §8 week 3: the voxel cavity replaces it once it
     accepts what inside_rect accepts); extent: a fixed piece's map voxel box (next_to's static reference), else the
-    AABB. World frame. overhang and boards come with their week-3 skills."""
+    AABB; overhang (under) and boards (touching): the map's, tagged map, none for a target the map has no piece for.
+    World frame."""
 
     def __init__(self, sim, map=None):
         self.sim, self.map = sim, map
@@ -66,6 +69,19 @@ class OracleGeometry:
         # no one compartment takes a rectangle over a row of cubbies (the desk's top row): the board over its columns
         top = match.top_z if match is not None else roof(piece, found.floor) if piece is not None else None
         return Provided(Cavity(Region(found.floor.polygon, floor, top), ceiling), "oracle", self.sim.n_steps)
+
+    def _piece(self, o):
+        return self.map.piece(o).value if self.map is not None else None
+
+    def overhang(self, target, z) -> Provided:
+        """The floor at ``z`` under the target's map voxels, their underside its ceiling (SPEC 6.2 under)."""
+        piece = self._piece(target)
+        return Provided(None if piece is None else voxel_overhang(piece, z), "map", self.sim.n_steps)
+
+    def boards(self, target) -> Provided:
+        """The target's boards from its map voxels, each under its roof (SPEC 6.2 touching, rest_on)."""
+        piece = self._piece(target)
+        return Provided(() if piece is None else voxel_boards(piece), "map", self.sim.n_steps)
 
     def extent(self, o) -> Provided:
         lo, hi = self._aabb(o)
