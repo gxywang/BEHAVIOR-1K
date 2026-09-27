@@ -179,7 +179,7 @@ def load_cases(path, ids=None) -> list:
     return cases
 
 
-def make_backends(ep, host, svc) -> dict:
+def make_backends(ep, host, svc, whole_body: bool = False) -> dict:
     """legacy (the baseline, one round), tiptop (a RequestBuilder per native skill) and scripted, the last two found
     by file (b1k/skills/tiptop/builders/<skill>.py, b1k/skills/scripted/<skill>.py): a new skill is a new module
     there, not an edit here. A call picks one by its backend, then routing.yaml. The legacy wire sends a compartment
@@ -188,7 +188,7 @@ def make_backends(ep, host, svc) -> dict:
     has_cavity = lambda target, item: bool(getattr(ep.sim, "send_inside", False)) and \
         svc.geometry.cavity(target, item).value is not None
     return {"legacy": LegacyBackend(ep, host.observe_now, has_cavity=has_cavity, single_round=True),
-            "tiptop": TiptopBackend.from_modules(builders.discover()),  # its hooks (check, stop_state, ...) by its list
+            "tiptop": TiptopBackend.from_modules(builders.discover(), **({"whole_body": True} if whole_body else {})),
             "scripted": ScriptedBackend()}  # fmt: skip
 
 
@@ -210,6 +210,7 @@ def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCal
     # the Runtime seeds its latch from the host: what the setup left commanded (a demo's held hand stays closed)
     rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer, navigator=nav)
     host.env_wall_s, host.frames_wall_s, t0 = 0.0, 0.0, time.monotonic()
+    host.base_trace = []
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
                  lease, reach)
     return r, rt, calls, time.monotonic() - t0
@@ -294,6 +295,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--case", nargs="+", required=True, help="case files (b1k/skills/bench/<skill>.yaml)")
     p.add_argument("--ids", nargs="+", default=None, help="the cases to run, all of one (task, instance)")
     p.add_argument("--backend", default=None, help="run every call on this backend (the baseline: legacy)")
+    p.add_argument("--whole-body", action="store_true",
+                   help="bounded base + torso + arm inside native skills, using evaluator base velocity commands")
     p.add_argument("--trials", type=int, default=None, help="run only the first N seeds of each case")
     p.add_argument("--mode", choices=("train", "public_test", "hidden_test"), default="public_test")
     p.add_argument("--rounds", type=int, default=1, help="Episode's rounds (a single_round legacy call runs one)")
@@ -309,7 +312,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    "from each case's restored state; the proprio and object spread is the sim's noise floor")
     p.add_argument("--finger-settled", type=float, default=None,
                    help="the proprio GraspSensor's settled test (rad/s) for this process, over its own 0.01")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.whole_body:
+        if args.backend not in (None, "tiptop"):
+            p.error("--whole-body requires the native tiptop backend")
+        args.backend = "tiptop"
+        args.no_state_stream = True  # a physical-joint setup mirror cannot encode virtual planner coordinates
+    return args
 
 
 def held_refs(sim, held: dict, call: SkillCall) -> dict:
@@ -432,6 +441,9 @@ def load_instance(og, sim, instance: int, mode: str, embodiment: dict) -> tuple:
     """One (instance, mode) of the loaded task, as the evaluator loads it, the embodiment planned afresh; the base
     state every case of it starts from."""
     from omnigibson.eval.evaluator import load_task_instance
+    from omnigibson.tiptop.wholebody import physical_embodiment
+
+    embodiment = physical_embodiment(embodiment)
 
     sim.env.reset()
     load_task_instance(sim.env, sim.robot, instance, mode=mode)
@@ -536,7 +548,7 @@ def main(argv=None) -> None:
     exit_code, summaries, loaded, strategy = 0, [], None, None
     try:
         sim = build_r1pro_sim(args, embodiment)
-        host = BenchHost(sim)
+        host = BenchHost(sim, whole_body=args.whole_body)
         for case in cases:
             key = (int(case["instance"]), case.get("mode") or args.mode)
             if key != loaded:
@@ -578,7 +590,7 @@ def main(argv=None) -> None:
                 nav = TeleportNavigator(sim)  # a reach case's go_to; its teleports' sim steps join the U0 check
                 call = dataclasses.replace(case["call"], seed=seed, backend=args.backend or case["call"].backend,
                                            arm=pick_arm(case["call"], held))
-                backends = make_backends(ep, host, svc)
+                backends = make_backends(ep, host, svc, whole_body=args.whole_body)
                 lease = lease_for(case, call, seed, SkillRegistry(SPECS, backends, routing))
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
@@ -588,6 +600,8 @@ def main(argv=None) -> None:
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
                                 observer.steps + nav.steps, held_by, host.frames_wall_s))
                 _append(out / f"{case['id']}.jsonl", [rows[-1]])
+                if args.whole_body:
+                    _append(out / "base_trace.jsonl", [dict(sample, trial=name) for sample in host.base_trace])
                 _append(out / "skill_calls.jsonl", [dict(c, trial=name) for c in calls])
                 _append(out / "goal_checks.jsonl", [dict(g, trial=name) for g in svc.goals.log])
                 log.info(f"TRIAL {name}: {r.status.value} {r.code} steps {r.steps} rt {rt.step} "

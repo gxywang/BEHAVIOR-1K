@@ -556,6 +556,7 @@ def make_r1pro_env_config(
     load_room_instances=None,
     segmentation: bool = True,
     max_steps: int = 10**8,
+    whole_body: bool = False,
 ) -> dict:
     """OmniGibson config: BEHAVIOR scene + R1Pro with absolute joint controllers on every group.
 
@@ -573,6 +574,8 @@ def make_r1pro_env_config(
     robot-mounted camera leaks GPU memory every step in this Isaac Sim build and segfaults the synthetic-data
     graph after ~35 steps; an external camera does not.
     """
+    from omnigibson.tiptop.wholebody import base_controller
+
     jc = {
         "name": "JointController",
         "motor_type": "position",
@@ -679,12 +682,7 @@ def make_r1pro_env_config(
                     },
                 },
                 "controller_config": {
-                    "base": {
-                        "name": "HolonomicBaseJointController",
-                        "motor_type": "position",
-                        "command_input_limits": None,
-                        "command_output_limits": None,
-                    },
+                    "base": base_controller(whole_body),
                     "trunk": dict(jc),
                     "arm_left": dict(jc),
                     "arm_right": dict(jc),
@@ -3248,6 +3246,9 @@ class R1ProSim(TiptopSim):
     def reset_embodiment(self, embodiment: dict) -> None:
         """Plan ``embodiment``'s arm from the start of a fresh episode, no questions asked (``apply_posture`` follows
         and teleports the joints): the other arm's gripper opens, the look posture is back, the mirror follows."""
+        from omnigibson.tiptop.wholebody import physical_embodiment
+
+        embodiment = physical_embodiment(embodiment)
         self.arm = embodiment["arm"]
         self.other_arm = "right" if self.arm == "left" else "left"
         self.other_gripper = self.OPEN
@@ -3270,6 +3271,9 @@ class R1ProSim(TiptopSim):
         radio was commanded open by the next left plan and dropped it).
         A capture still poses the free arm for its wrist camera (the held arm never moves), and the Rerun mirror
         keeps reporting the first embodiment's joints."""
+        from omnigibson.tiptop.wholebody import physical_embodiment
+
+        embodiment = physical_embodiment(embodiment)
         arm = embodiment["arm"]
         if arm == self.arm:
             return
@@ -5301,7 +5305,7 @@ class R1ProSim(TiptopSim):
         a[idx[f"gripper_{self.arm}"]] = float(gripper)
         a[idx["arm_right"]] = th.tensor([targets[j] for j in self.robot.arm_joint_names["right"]], dtype=th.float32)
         a[idx[f"gripper_{self.other_arm}"]] = float(self.other_gripper)
-        # base: HolonomicBaseJointController in position mode takes deltas, zeros hold the base still
+        # Zero base is a no-op in both the fixed-base position bench and whole-body evaluator velocity mode.
         return {self.robot.name: a}
 
     def step_action(self, a23):

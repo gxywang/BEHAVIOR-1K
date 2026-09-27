@@ -2,10 +2,12 @@
 
 import time
 
+import numpy as np
+
 from b1k.bridge.protocol import capture_views
 from b1k.connector.observe import Percept, PerceptInfo
 from b1k.connector.types import Provided
-from b1k.observation import CameraView
+from b1k.observation import CameraView, pose_to_matrix
 from b1k.runtime.compose import PROPRIO_Q
 from omnigibson.tiptop.scene import TiptopSim
 
@@ -50,13 +52,31 @@ class CaptureObserver:
         self.wall_s += time.monotonic() - t0
         self.steps += self.sim.n_steps - n0
         after = self.host.observe_now()
-        views = {name: CameraView(name, v["rgb"], v["depth"], v["intrinsics"], v["world_from_cam"])
-                 for name, v, _ in capture_views(request, extras)}  # fmt: skip
+        map_from_base = after.raw.get("map_from_base")
+        mobile = bool(getattr(self.host, "whole_body", False))
+        if mobile:
+            if map_from_base is None or map_from_base.source != "oracle" or map_from_base.step != after.step:
+                raise ValueError("whole-body oracle capture requires a fresh oracle map_from_base")
+            base_from_map = np.linalg.inv(map_from_base.value)
+        views = {}
+        for name, view, camera in capture_views(request, extras):
+            base_from_cam = view["world_from_cam"]
+            if mobile:
+                # A capture can step between views and while returning the arm. Each camera's render-time
+                # world pose is authoritative; express every saved view in the SAME measured after-base.
+                if "cam_pos_world" not in camera or "cam_quat_xyzw_world_cv" not in camera:
+                    raise ValueError(f"whole-body capture {name} lacks render-time world camera pose")
+                map_from_cam = pose_to_matrix(camera["cam_pos_world"], camera["cam_quat_xyzw_world_cv"])
+                if not np.isfinite(map_from_cam).all():
+                    raise ValueError(f"whole-body capture {name} has invalid render-time camera pose")
+                base_from_cam = np.asarray(base_from_map @ map_from_cam, dtype=np.float32)
+                base_from_cam.setflags(write=False)
+            views[name] = CameraView(name, view["rgb"], view["depth"], view["intrinsics"], base_from_cam)
         by_view = {name: {o.id: masks.value[name][label] for o, label in zip(seen, labels)} for name in views}
         primary = by_view[next(iter(views))]
         visible = {o.id: float(primary[o.id].any()) for o in seen}
         info = PerceptInfo("", after.step, 0, 0, visible, masks.source)  # the Runtime stamps id and epochs
         q = {g: after.proprio[s].copy() for g, s in PROPRIO_Q.items()}
         return Percept(info, views, q, Provided(primary, masks.source, masks.step),
-                       Provided(by_view, masks.source, masks.step)), after
+                       Provided(by_view, masks.source, masks.step), map_from_base), after
         yield {}  # unreachable: a generator that ends before its first yield

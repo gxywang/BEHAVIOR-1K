@@ -253,6 +253,7 @@ def build_r1pro_sim(args, embodiment: dict | None, max_steps: int = 10**8):
         load_room_instances=room_instances,
         segmentation=args.seg_instance,  # the annotator is opt-in; oracle masks come from geometry
         max_steps=max_steps,
+        whole_body=bool(getattr(args, "whole_body", False)),
     )
     sim = R1ProSim(
         cfg,
@@ -305,6 +306,10 @@ def apply_embodiment_posture(sim, args, embodiment: dict | None) -> dict:
     """Hold the planner's locked joints and go to its home pose (``--torso`` overrides the torso entries); the
     embodiment comes from the server metadata or a plan's provenance, else from the submodule's meta file."""
     from omnigibson.tiptop.r1pro import ROBOT_TYPE, load_embodiment_meta
+    from omnigibson.tiptop.wholebody import physical_embodiment
+
+    if embodiment is not None:
+        embodiment = physical_embodiment(embodiment)
 
     if embodiment is None:
         embodiment = load_embodiment_meta()
@@ -499,24 +504,34 @@ def connect_planners(args):
     """The planning server(s) of a live run, checked against the embodiments this client executes on, before Isaac
     Sim starts: (client, its metadata, press client or None, its metadata or None)."""
     from b1k.bridge.client import TiptopClient
+    from omnigibson.tiptop.wholebody import ROBOT_TYPES, validate_planner_metadata
+
+    whole_body = bool(getattr(args, "whole_body", False))
+    if whole_body and args.embodiment != "r1pro":
+        raise ValueError("--whole-body requires R1Pro")
 
     client = TiptopClient(
         args.host,
         args.port,
-        expected_robot_type=EXPECTED_ROBOT_TYPE[args.embodiment],
+        expected_robot_type=ROBOT_TYPES["left"] if whole_body else EXPECTED_ROBOT_TYPE[args.embodiment],
         expected_dof=EXPECTED_DOF[args.embodiment],
     )
     client.wait_for_server()
     metadata = client.fetch_metadata()
     client.check_embodiment()  # fail here, before Isaac Sim starts, if the server plans for another robot
+    if whole_body:
+        validate_planner_metadata(metadata, "left")
     press_client = press_meta = None
     if args.press_port:
         press_client = TiptopClient(
-            args.press_host or args.host, args.press_port, expected_robot_type=PRESS_ROBOT_TYPE, expected_dof=None
+            args.press_host or args.host, args.press_port,
+            expected_robot_type=ROBOT_TYPES["right"] if whole_body else PRESS_ROBOT_TYPE, expected_dof=None
         )
         press_client.wait_for_server()
         press_meta = press_client.fetch_metadata()
         press_client.check_embodiment()
+        if whole_body:
+            validate_planner_metadata(press_meta, "right")
     return client, metadata, press_client, press_meta
 
 

@@ -35,7 +35,7 @@ import numpy as np
 from b1k.observation import PROPRIO_SLICES
 
 DATASET = Path(os.environ.get("B1K_DEMOS", "/shared/perception/datasets/behavior1k-20k"))
-OUT_DIR = Path("/home/wding8/projects/BEHAVIOR-1K/runs/skill_arch_20260925/demo_cases")
+OUT_DIR = Path(__file__).resolve().parents[4] / "runs/wholebody/demo_cases"
 FPS = 30
 DT = 1.0 / FPS
 
