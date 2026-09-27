@@ -34,19 +34,20 @@ def test_the_overhang_and_the_boards_are_the_maps_and_a_target_it_has_no_piece_f
 def test_the_under_and_touching_demo_cases_load_as_named():
     """The under set: the mousetrap under the wall-hung sink ojjqku (reset to ready: S1 refuses the crouch), the mouse
     under the desk uqcmzf (the right hand, as the humans hold it), the detergent under the multi-station sink (the
-    'place under' demos); the touching set: a shoe in the left hand at the hall tree, each with its ready reset."""
+    'place under' demos, also reset: S1 refuses the human's idle right arm); the touching set: a shoe in the left hand
+    at the hall tree, each with its ready reset."""
     from b1k.connector.skills import Rel
     from omnigibson.tiptop.host import skillbench
 
     under = skillbench.load_cases(BENCH / "demo_place_under.yaml")
     touching = skillbench.load_cases(BENCH / "demo_place_touching.yaml")
     assert [c["task"] for c in under] == ["setting_mousetraps", "getting_organized_for_work",
-                                          "getting_organized_for_work", "sorting_household_items"]
+                                          "getting_organized_for_work", "sorting_household_items", "sorting_household_items"]
     assert [c["task"] for c in touching] == ["putting_shoes_on_rack"] * 4
     for cases, rel, target in ((under, Rel.UNDER, None), (touching, Rel.TOUCHING, "hallstand.n.01_1")):
         for case in cases:
             (r,) = case["call"].args.relations
             assert r.rel is rel and (target is None or r.target.id == target) and Path(case["demo"]["snapshot"]).exists()
             assert case["success"][0]["pred"] == rel.value
-    assert [c["setup"].get("ready") for c in under + touching].count("left") == 3
-    assert [next(iter(c["setup"]["held"])) for c in under] == ["left", "right", "right", "left"]
+    assert [c["setup"].get("ready") for c in under + touching].count("left") == 4
+    assert [next(iter(c["setup"]["held"])) for c in under] == ["left", "right", "right", "left", "left"]
