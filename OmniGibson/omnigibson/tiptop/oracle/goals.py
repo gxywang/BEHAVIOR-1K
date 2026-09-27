@@ -9,10 +9,14 @@ class EpisodeScorer:
     (VIDEO_FINDINGS 2, 11). Clear: the object's contact cluster, the robot left out, reaches no fixed_base piece (a
     floor, a wall, furniture) and nothing outside the scene's objects; what it carries (a basket's decorations or
     vegetables, W3 g2) touches it and is carried too. None when it cannot judge (an unknown predicate or object, an
-    object with no rigid contact rows: a cloth). Oracle; the GoalPanel counts it."""
+    object with no rigid contact rows: a cloth). Oracle; the GoalPanel counts it.
 
-    def __init__(self, sim):
-        self.sim = sim
+    ``scope_only`` (the pseudo planner's host, WEEK4_PLAN 3.4): the task's evaluator alone, as Episode.goal_already_holds
+    reads it. An ontop, nextto or inside of a name the task does not scope then falls to sim.holds, which raises
+    KeyError, which is None here: legacy's False through the shim."""
+
+    def __init__(self, sim, scope_only: bool = False):
+        self.sim, self.scope_only = sim, scope_only
 
     def holds(self, fact):
         from omnigibson.controllers import IsGraspingState
@@ -29,7 +33,8 @@ class EpisodeScorer:
                 return lifted(o, robot, RigidContactAPI)
             if fact.pred == "hand_empty":
                 return robot.is_grasping(fact.args[0]) != IsGraspingState.TRUE
-            if fact.pred in ("ontop", "nextto", "inside") and not set(fact.args) <= set(self.sim.env.task.object_scope):
+            if (not self.scope_only and fact.pred in ("ontop", "nextto", "inside")
+                    and not set(fact.args) <= set(self.sim.env.task.object_scope)):
                 from omnigibson.object_states import Inside, NextTo, OnTop  # a target the task does not name (the
                 #    brisket's burner, the toilet a mousetrap goes beside): the state BDDL's predicate reads, directly
                 obj, target = (self.sim.scene_object(n) for n in fact.args)

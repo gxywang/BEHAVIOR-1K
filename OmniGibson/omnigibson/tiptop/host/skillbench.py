@@ -204,12 +204,14 @@ def lease_for(case: dict, call: SkillCall, seed: int, registry: SkillRegistry, s
 
 
 def run_trial(host, svc, backends: dict, routing: dict, observer, call: SkillCall,
-              lease: Optional[SkillCall] = None, nav=None, reach: bool = False) -> tuple:
+              lease: Optional[SkillCall] = None, nav=None, reach: bool = False, task_info=None) -> tuple:
     """One trial: the production Runtime and registry over these providers and backends, DirectConnector on the
-    host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds)."""
+    host, the one-call planner. (result, runtime, its skill_calls rows, wall seconds). ``task_info``: the providers'
+    TaskInfo reader bound to this trial's sim and planners, so conn.task() is real (None: it answers None)."""
     calls = []
     # the Runtime seeds its latch from the host: what the setup left commanded (a demo's held hand stays closed)
-    rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer, navigator=nav)
+    rt = Runtime(SkillRegistry(SPECS, backends, routing), svc, host=host, log=calls, observer=observer, navigator=nav,
+                 task_info=task_info)
     host.env_wall_s, host.frames_wall_s, t0 = 0.0, 0.0, time.monotonic()
     r = one_call(DirectConnector(rt, host.env_step, host, host.raw()), call, getattr(observer, "views", ("head",)),
                  lease, reach)
@@ -598,7 +600,9 @@ def main(argv=None) -> None:
                 video = contextlib.nullcontext() if args.no_video else sim.recording(out / case["id"] / f"{name}.mp4")
                 with video:
                     r, rt, calls, wall_s = run_trial(host, svc, backends, routing, observer, call, lease, nav,
-                                                     bool(case.get("reach")))
+                                                     bool(case.get("reach")),
+                                                     task_info=lambda: providers.task_info(sim, planners, sim.max_steps,
+                                                                                           task))
                 held_by = next((c for c in calls if lease is not None and c["skill"] == lease.skill), None)
                 rows.append(row(case, i, seed, r, rt, sim.n_steps, wall_s, host.env_wall_s, observer.wall_s,
                                 observer.steps, held_by, host.frames_wall_s, nav.steps)
