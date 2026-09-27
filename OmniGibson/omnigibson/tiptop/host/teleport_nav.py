@@ -83,6 +83,9 @@ class TeleportNavigator:
         return [] if best is None else [tuple(float(v) for v in best[1:4])]
 
     def go_to(self, stance: Stance, obs):
+        if stance.key.startswith("legacy:"):  # the pseudo planner's Episode.stand_for op (skills.py:186): the episode
+            #   host's EpisodeNavigator alone runs it; its (0, 0, 0) sentinel pose would teleport to the map origin
+            return NavResult(False, stance, 0, 0, "a legacy stance outside the episode host"), obs
         n0 = self.sim.n_steps
         try:  # the arm unfolds as far as it can: UNFOLD_MIN refused every stance the IK service reached from at the
             #   store_honey jar (25%, the countertop) and the wall switch (0%, a cabinet), where the press succeeded
