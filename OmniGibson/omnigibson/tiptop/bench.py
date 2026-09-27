@@ -953,13 +953,88 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="only rewrite summary.json from the result JSONs already in --out-dir/json (no simulation)",
     )
+    add_week4_args(p)
     args = p.parse_args(argv)
     # what run.py's helpers read: the challenge robot, the activity to load, the instruction the planner is given
     args.embodiment = "r1pro"
     args.activity = args.task_name
     spec = STRATEGIES.get(args.task_name)
     args.task = spec.instruction if spec is not None else args.task_name.replace("_", " ")
+    check_week4_args(p, args)
     return args
+
+
+# The week-4 switch and instruments (WEEK4_PLAN 3.1). Every default reproduces today's run: with none of these set no
+# wrapper is installed and the result JSON's key set is unchanged (test_tiptop_instruments).
+WSTAPE_MODES = ("off", "log", "record", "replay", "replay-log", "replay-live")
+ROUTE_RE = re.compile(r"^[a-z_]+(\.[a-z_]+)?=[a-z_][\w:.-]*$")
+
+
+def add_week4_args(p: argparse.ArgumentParser) -> None:
+    w4 = p.add_argument_group("week 4", "the runner switch and the instruments both runners share")
+    w4.add_argument("--runner", choices=("legacy", "connector"), default="legacy",
+                    help="legacy: strategies.Runner on the Episode (today); connector: the pseudo planner over the "
+                    "connector (W4-E)")
+    w4.add_argument("--routing-profile", choices=("parity", "native"), default="parity",
+                    help="connector only: every skill on legacy (parity) or routing.yaml's lines (native)")
+    w4.add_argument("--route", action="append", default=[], metavar="SKILL[.QUAL]=BACKEND",
+                    help="connector only: a ladder overlay on the profile, e.g. place.on=tiptop (repeatable)")
+    w4.add_argument("--audit", action="store_true",
+                    help="connector only: DualEpisode plus PurityAudit (parity); installs the StepLedger either way")
+    w4.add_argument("--runner-tape", nargs="?", const="", default=None, metavar="PATH",
+                    help="record the Runner's tape (TapeRecorder around whatever the Runner holds) under PATH "
+                    "(default <out-dir>/tapes/<instance>.json)")
+    w4.add_argument("--wstape", choices=WSTAPE_MODES, default="off",
+                    help="the websocket tape: record every planner frame, log its digests, or replay a record "
+                    "(replay stops at the first mismatch, replay-log logs every diff, replay-live switches to real "
+                    "connections at the first mismatch or at --wstape-live-at)")
+    w4.add_argument("--wstape-path", default=None, metavar="DIR",
+                    help="the tape directory (default <out-dir>/wstape); a record never overwrites one")
+    w4.add_argument("--wstape-live-at", type=int, default=None, metavar="N",
+                    help="replay-live: go live at frame N (0-based) whether or not it matches")
+    w4.add_argument("--replicate", type=int, default=0,
+                    help="R in the stamped planner seed 2300 + 1000*R + k on every legacy request")
+    w4.add_argument("--seed", type=int, default=None,
+                    help="seed random, numpy and torch at each instance start (reaches only the native builders' "
+                    "random.randrange; the legacy planner's seed is the stamped request seed)")
+    w4.add_argument("--shadow", action="store_true", help="connector only: the perception shadow (default off)")
+    w4.add_argument("--providers", default="omnigibson.tiptop.oracle",
+                    help="connector only: the package whose providers the host reads the simulator through")
+
+
+def check_week4_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.runner == "connector":
+        p.error("--runner connector: the connector host (W4-E, host/episode_host.py) has not landed in this "
+                "checkout; run --runner legacy")
+    bad = [r for r in args.route if not ROUTE_RE.match(r)]
+    if bad:
+        p.error(f"--route takes SKILL[.QUAL]=BACKEND, e.g. place.on=tiptop; not {bad}")
+    if args.wstape_live_at is not None and args.wstape != "replay-live":
+        p.error("--wstape-live-at goes with --wstape replay-live")
+    if args.wstape_live_at is not None and args.wstape_live_at < 0:
+        p.error("--wstape-live-at N: N is a frame index, 0 or more")
+    if args.replicate < 0:
+        p.error("--replicate R: R is 0 or more")
+
+
+def instrumented(args: argparse.Namespace) -> bool:
+    """Whether the StepLedger and the GripperWatch are installed: any of --runner-tape, --wstape, --audit or --runner
+    connector. With none of them, nothing is wrapped."""
+    return (getattr(args, "runner_tape", None) is not None or getattr(args, "wstape", "off") != "off"
+            or bool(getattr(args, "audit", False)) or getattr(args, "runner", "legacy") == "connector")
+
+
+def seed_everything(seed: int) -> None:
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
 
 
 def main(argv=None) -> None:
@@ -989,6 +1064,29 @@ def main(argv=None) -> None:
     instance_ids = resolve_instance_ids(args.task_name, args.instances, mode=args.mode)
     log.info(f"{args.task_name}: {args.mode} instances {instance_ids}, timeout {max_steps} env steps")
 
+    # The week-4 instruments (WEEK4_PLAN 3.1, 3.3): nothing below is built unless a week-4 flag asks for it. The
+    # websocket tape patches the bridge client before the planners are connected (a replay serves fetch_metadata
+    # too); the ledger, the watch and the Runner tape are per instance. bench.py is not scanned for privileged
+    # names: it imports the watch from the oracle package and passes its readings in; host/ never names it.
+    from omnigibson.tiptop.host.wstape import TapeDiverged  # a BaseException; raised only under --wstape replay
+
+    wstape = None
+    if args.wstape != "off":
+        from omnigibson.tiptop.host.wstape import WsTape
+
+        wstape = WsTape(
+            args.wstape, args.wstape_path or out_dir / "wstape", replicate=args.replicate,
+            live_at=args.wstape_live_at, log_dir=out_dir,
+        ).install()
+    if instrumented(args):
+        from omnigibson.tiptop.host.instruments import StepLedger
+        from omnigibson.tiptop.oracle import watch
+    if args.runner_tape is not None:
+        from b1k.planner.pseudo import tape as tp
+
+        tape_dir = Path(args.runner_tape) if args.runner_tape else out_dir / "tapes"
+        tape_dir.mkdir(parents=True, exist_ok=True)
+
     exit_code, stream, results = 0, None, []
     try:
         client, metadata, press_client, press_meta = connect_planners(args)
@@ -999,15 +1097,18 @@ def main(argv=None) -> None:
         sim = build_r1pro_sim(args, metadata["embodiment"], max_steps=max_steps)
         if not args.no_state_stream:
             stream = open_state_stream(f"{args.host}:{args.port}", sim)
+        goal_atoms, goal_options = task_goal_atoms(sim), task_goal_options(sim)
         strategy = strategy_for(
             args.task_name,
-            task_goal_atoms(sim),
-            options=task_goal_options(sim),
+            goal_atoms,
+            options=goal_options,
             attempts=args.attempts_per_item,
             scope=sorted(sim.task_scope()),  # the objects that exist at reset: a cut's halves are not among them
         )
         for index, instance_id in zip(args.instances, instance_ids):
             t0 = time.time()
+            if args.seed is not None:
+                seed_everything(args.seed)
             name = f"{args.task_name}_{instance_id}_0"
             inst_dir = out_dir / name
             inst_dir.mkdir(parents=True, exist_ok=True)
@@ -1020,6 +1121,7 @@ def main(argv=None) -> None:
             metrics = [AgentMetric(human), TaskMetric(human)]
             # from here on every step counts
             sim.begin_episode(metrics, stop_when_done=True, max_steps=max_steps, name=name)
+            ledger = gripper = runner_tape = raised = None
             video = None if args.no_video else VideoRecorder(video_dir / f"{name}.mp4")
             if video is not None:
                 sim.recorders.append(video)
@@ -1049,11 +1151,34 @@ def main(argv=None) -> None:
                 apply_embodiment_posture(sim, posture_args, metadata["embodiment"])
                 sim.mark_goal_initial()
                 episode = Episode(sim, args, planners, knowledge, inst_dir, spec=getattr(strategy, "spec", None))
-                strategy.run(episode)
+                runner_ep = episode
+                if instrumented(args):  # from the Runner's first call on: the posture above is not the Runner's
+                    ledger = StepLedger(sim, renderer=og.sim)
+                    gripper = watch.GripperWatch(sim, ledger)
+                    ledger.install_episode(episode)
+                    if wstape is not None:
+                        wstape.ledger = ledger
+                if args.runner_tape is not None:
+                    runner_tape = tp.Tape(tp.header(
+                        args.task_name, int(instance_id), args.runner, args.routing_profile, args.replicate,
+                        strategy=strategy, arms=tuple(planners), floor=episode.floor, max_steps=max_steps,
+                    ))
+                    # the Runner's construction inputs whole, so scripts/tape_diff.py e0 can build the same Runner
+                    runner_tape.header["options"] = goal_options
+                    runner_tape.header["scope"] = list(strategy.scope)
+                    runner_ep = tp.TapeRecorder(
+                        episode, runner_tape, exc_classes=(TapeDiverged,),
+                        step_probe=lambda: sim.n_steps, digest=lambda: watch.state_digest(sim, knowledge),
+                    )
+                strategy.run(runner_ep)
                 reason = "strategy finished"
             except EpisodeOver as e:
-                reason = e.reason
+                reason, raised = e.reason, e
+            except TapeDiverged as e:  # a BaseException: the per-round catch (plan_and_execute) cannot swallow it
+                reason, raised = f"tape diverged: {e.path}", e
+                log.warning(f"{reason} ({e})")
             except TransferBlocked as e:
+                raised = e
                 reason = f"blocked: {e}"
                 log.warning(reason)
                 if episode is not None:
@@ -1062,7 +1187,9 @@ def main(argv=None) -> None:
                     )
             except Exception as e:  # noqa: BLE001 - score what happened and go on to the next instance
                 log.exception(f"instance {instance_id} crashed")
-                reason = f"crash: {type(e).__name__}: {e}"
+                reason, raised = f"crash: {type(e).__name__}: {e}", e
+            if runner_tape is not None:  # how the Runner's run ended, for scripts/tape_diff.py e0
+                runner_tape.header["ending"] = {"reason": reason, "raised": None if raised is None else tp.exc_of(raised)}
             steps = sim.end_episode()  # scored on the state now; the video tail below counts for nothing
             success = bool(sim.env.task.success)
             goal = sim.goal_status()
@@ -1076,6 +1203,16 @@ def main(argv=None) -> None:
                 finally:
                     sim.recorders.remove(video)
                     video.close()
+            instruments = None
+            if ledger is not None:  # after the video tail: its steps are the ledger's "closed" row
+                try:
+                    instruments = write_instruments(
+                        inst_dir, ledger, gripper, wstape, runner_tape,
+                        None if runner_tape is None else tape_dir / f"{name}.json",
+                    )
+                except Exception as e:  # noqa: BLE001 - a measurement must not cost the instance its result
+                    log.exception("writing the instruments failed")
+                    instruments = {"error": f"{type(e).__name__}: {e}"}
             result = {
                 "task": args.task_name,
                 "instance_id": int(instance_id),
@@ -1095,6 +1232,8 @@ def main(argv=None) -> None:
                     "rounds": episode.records if episode is not None else [],
                 },
             }
+            if instrumented(args):  # only under a week-4 flag: the key set is otherwise today's
+                result["bench"]["instruments"] = instruments  # None when the instance ended before its Runner ran
             with open(json_dir / f"{name}.json", "w") as f:
                 json.dump(result, f, indent=2, default=float)
             results.append(result)
@@ -1110,9 +1249,46 @@ def main(argv=None) -> None:
     finally:
         if stream is not None:
             stream.close()
+        if wstape is not None:
+            wstape.uninstall()
+            log.info(f"wstape: {json.dumps(wstape.summary(), default=float)}")
         if og.app is not None:
             og.shutdown()
     sys.exit(exit_code)
+
+
+def write_instruments(inst_dir: Path, ledger, gripper, wstape, runner_tape, tape_path) -> dict:
+    """Close the instruments of one instance and write what they measured: ``ledger.jsonl`` and ``gripper.jsonl``
+    in the instance dir (counters.py's schema), the Runner tape at ``tape_path``; the block for the result JSON."""
+    summary = ledger.finish()
+    events = gripper.finish() if gripper is not None else []
+    with open(inst_dir / "ledger.jsonl", "w") as f:
+        for row in summary["owners"].values():
+            f.write(json.dumps(row) + "\n")
+    with open(inst_dir / "gripper.jsonl", "w") as f:
+        for row in events:
+            f.write(json.dumps(row) + "\n")
+    block = {
+        "ledger": summary,
+        "gripper": events,
+        "wstape": None if wstape is None else wstape.summary(),
+        "runner_tape": None,
+    }
+    if runner_tape is not None:
+        runner_tape.save(tape_path)
+        block["runner_tape"] = {
+            "path": str(tape_path),
+            "records": len(runner_tape.records),
+            "writes": len(runner_tape.writes),
+        }
+    totals = summary["totals"]
+    log.info(
+        f"instruments: {len(summary['calls'])} top-level ep.* calls, owners {sorted(summary['owners'])}; "
+        f"owned steps {totals['owned_steps']} of {totals['n_steps'] - totals['n0']} "
+        f"(unowned {totals['unowned_steps']}, closed calls {totals['closed_env_step_calls']}); "
+        f"gripper closes {sum(e['event'] == 'close' for e in events)}"
+    )
+    return block
 
 
 def write_summary(out_dir: Path, args, results: list[dict], max_steps: int) -> dict:
