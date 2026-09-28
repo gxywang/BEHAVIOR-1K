@@ -470,3 +470,29 @@ def test_the_mde_is_the_smallest_drop_the_rule_fails_on():
     assert m >= 0.25 and counters.fisher_one_sided(22, 26, round((22 / 26 - m) * 23), 23) < 0.10
     assert counters.minimum_detectable_effect(22, 26, 23, 0.10) < 0.25, "the p threshold alone"
     assert counters.minimum_detectable_effect(21, 21, 21, 0.10, 0.25) >= 0.25
+
+
+# ------------------------------------------------------------------------------------------ one episode, both runners
+WEEK4 = RUNS / "skill_arch_20260925" / "week4"
+REPLAYED = [  # (the task's L-rec, W4-F2's connector E-rep of it whose Runner tape matched the L-rec's to the end)
+    ("store_honey", "store_honey_r1"),
+    ("tidying_bedroom", "tidying_bedroom_r1"),
+    ("dispose_of_batteries", "dispose_of_batteries_r1"),
+]
+
+
+@pytest.mark.parametrize("task,erep", REPLAYED, ids=[t for t, _ in REPLAYED])
+def test_an_e_rep_reads_every_counter_its_l_rec_reads(task, erep):
+    """One definition per counter for both runners: the same episode, run by the legacy Runner (the L-rec) and by the
+    pseudo planner over the connector replaying it to the end (the E-rep), extracts to the same counters, the round
+    EpisodeOver cut off included (it is in bench.rounds, never in a skill row)."""
+    lrec, rep = WEEK4 / "legacy_ref" / "L-rec" / task, WEEK4 / "q1" / "E-rep" / erep
+    _needs(lrec)
+    _needs(rep)
+    a, b = counters.extract(lrec), counters.extract(rep)
+    assert (a.runner, b.runner) == ("legacy", "connector")
+    skip = {"job", "calls", "runner", "on_air_causes"}  # the connector's on-air cause names its call id as well
+    assert {k: v for k, v in vars(a).items() if k not in skip} == {k: v for k, v in vars(b).items() if k not in skip}
+    strip = lambda causes: [{k: v for k, v in x.items() if k != "call_id"} for x in causes]  # noqa: E731
+    assert strip(a.on_air_causes) == strip(b.on_air_causes)
+    assert a.cut_off == 1 and a.notes == b.notes == []

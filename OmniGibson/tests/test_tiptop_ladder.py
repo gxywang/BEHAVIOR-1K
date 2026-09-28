@@ -812,6 +812,16 @@ def test_the_carried_gate_lists_each_native_call_and_writes_its_table(tmp_path, 
     assert "native: `q1-4` place on tiptop@x/place-1 succeeded/None phase home steps 300" in md and "| demo | True |" in md
 
 
+def test_out_moves_every_file_of_a_ladder_run_to_another_root(tmp_path, monkeypatch, capsys):
+    """A re-run from a new snapshot writes its plan, tapes, runs and gate files under --out, never over the week's
+    evidence in week4/ladder."""
+    monkeypatch.setattr(ladder, "OUT", ladder.OUT)  # restored after the test: main() sets the module's root
+    assert ladder.main(["status", "--out", str(tmp_path / "rerun"), "--gpus", "3"]) == 0
+    assert ladder.OUT == tmp_path / "rerun" and ladder.run_dir("S1", "t", "C", 0) == tmp_path / "rerun" / "S1" / "t_C0"
+    assert ladder.main(["gate", "--stage", "witness", "--out", str(tmp_path / "rerun")]) == 0
+    assert (tmp_path / "rerun" / "witness" / "gate.json").exists(), "the gate file lands under --out"
+
+
 def test_the_queue_launches_only_on_the_allowed_cards(monkeypatch):
     assert ladder.parse_gpus("3") == (3,) and ladder.parse_gpus("1,3") == (1, 3)
     for bad in ("2", "3,4", "0", ""):

@@ -58,6 +58,7 @@ class FakeSim:
     def __init__(self, max_steps=10**6, over_at=None):
         self.n_steps, self.max_steps, self.teleports, self.over_at = 0, max_steps, 0, over_at
         self.episode_open = True
+        self.step_size = 1  # 2: one env.step that moves the sim twice (a planted fault)
         self.held_objects, self.bddl_names = {}, {JAR: JAR, CAB: CAB}
         self.robot, self.objects, self.last_action = None, {}, None
         self.primary_view, self.extra_views, self.last_gripper = "head", (), 1.0
@@ -76,7 +77,7 @@ class FakeSim:
     def step_env(self, action):
         self.last_action = action
         if self.episode_open:
-            self.n_steps += 1
+            self.n_steps += self.step_size
             if self.over_at is not None and self.n_steps >= self.over_at:
                 raise EpisodeOver("timeout", self.n_steps)
         return {}
@@ -306,6 +307,8 @@ class FakeWorld:
 
     def base_pose(self):
         k = self.ep.stance_key()
+        if k is not None and self.fault == "pose_off":  # the providers' pose one cell off the Episode's stance key
+            k = (k[0] + 1, k[1], k[2])
         return B(None if k is None else Pose2(k[0] * 0.1, k[1] * 0.1, k[2] * (np.pi / 12)))
 
 
@@ -409,10 +412,11 @@ class FakeObserver:
 
     def __init__(self, sim):
         self.sim, self.steps, self.wall_s, self.views = sim, 0, 0.0, ("head",)
+        self.miscount = 0  # a planted fault: steps the observer took and did not count
 
     def observe(self, req, obs):
         self.sim.step(3)
-        self.steps += 3
+        self.steps += 3 - self.miscount
         info = PerceptInfo("", self.sim.n_steps, 0, 0, {o.id: 1.0 for o in req.targets}, "oracle")
         return Percept(info, {}, {}, None), obs
         yield
@@ -423,6 +427,8 @@ class FakeTeleport:
 
     def __init__(self):
         self.steps, self.gone = 0, []
+        self.sim = None  # with a sim: teleports as TeleportNavigator does
+        self.miscount = 0  # a planted fault: steps the teleport took and did not count
 
     def base_pose(self):
         return B(Pose2(0.0, 0.0, 0.0))
@@ -434,7 +440,12 @@ class FakeTeleport:
         self.gone.append(stance.key)
         from b1k.connector.skills import NavResult
 
-        return NavResult(False, stance, 0, 0, "the fake teleport refuses"), obs
+        if self.sim is None:
+            return NavResult(False, stance, 0, 0, "the fake teleport refuses"), obs
+        n0 = self.sim.n_steps
+        self.sim.place_robot(stance.pose.x, stance.pose.y, stance.pose.yaw)
+        self.steps += self.sim.n_steps - n0 - self.miscount
+        return NavResult(True, stance, 0, 559, "teleported"), obs
         yield
 
     def apply(self, u):
@@ -497,7 +508,8 @@ def fake_backends(ep, host, svc):
 
 
 def build(tmp_path, *, fault=None, over_at=None, audit=True, routes=(), tape=False, host_attempts=2, ok=True,
-          wstape=None, tape_the_episode=False):
+          wstape=None, tape_the_episode=False, runner=None):
+    """``runner``: the Runner class the planner's factory builds (FakeRunner by default)."""
     sim = FakeSim(over_at=over_at)
     ep = FakeEpisode(sim, ok=ok, fault=fault)
     ledger = StepLedger(sim)
@@ -509,8 +521,11 @@ def build(tmp_path, *, fault=None, over_at=None, audit=True, routes=(), tape=Fal
     around = (lambda inner: tp.TapeRecorder(inner, recorded, exc_classes=(), step_probe=lambda: sim.n_steps)) if tape else None
     if tape_the_episode:  # the wiring slip U0-c must see: the tape factory around the bench's Episode, not the shim
         around = lambda inner: tp.TapeRecorder(ep, recorded)  # noqa: E731
+    factory = strategy_for if runner is None else (
+        lambda task, goal, options=None, attempts=None, scope=(), **kw: runner(SPEC, goal, options=options,
+                                                                               attempts=attempts, scope=scope))
     host = episode_host.build(
-        ep, sim, PLANNERS, args, providers, strategy_for, strategy, ledger, watch, tape=around, inst_dir=tmp_path,
+        ep, sim, PLANNERS, args, providers, factory, strategy, ledger, watch, tape=around, inst_dir=tmp_path,
         max_steps=sim.max_steps, planner_client=NoPlanner(), bench_host=FakeHost(sim), observer=FakeObserver(sim),
         teleport=FakeTeleport(), make_backends=fake_backends, wstape=wstape,
     )
@@ -692,6 +707,99 @@ def test_each_planted_fault_fails_u0(tmp_path, monkeypatch, fault, failing):
     if fault == "step_in_read":
         assert any("world.support_of" in v for v in block["u0d"]["violations"]), block["u0d"]
         assert block["purity"]["summary"]["digest_changes"] >= 1, "the digest moved across a read"
+
+
+def _observe(h):
+    """The planner's observe through the connector, after the Runner's run (the observer steps the sim 3 times)."""
+    from b1k.connector.observe import ObserveRequest
+
+    return h.host.conn.observe(ObserveRequest((REFS[JAR],), views=("head",), aim=False))
+
+
+def _teleport(h):
+    """A native go_to through the connector: EpisodeNavigator hands a non-legacy stance to the teleport, which
+    teleports (place_robot: 2 steps) under the ledger's go_to owner."""
+    from b1k.connector.skills import Stance
+
+    h.host.teleport.sim = h.sim
+    return h.host.conn.go_to(Stance("s0", Pose2(1.0, 0.0, 0.0), 1.0, "fake", "oracle"))
+
+
+def _failing_checks(block) -> list:
+    return sorted(k for k, v in block["u0b"]["checks"].items() if not v)
+
+
+def test_the_planners_observe_and_a_native_go_to_are_counted_alike_by_the_ledger_and_their_services(tmp_path):
+    """The control for the planted cross-check faults below: an observe and a teleport after the Runner's run, each
+    counted once by its own service and once by the ledger's owner, and every U0-b check holds."""
+    h = build(tmp_path)
+    h.host.run()
+    _observe(h)
+    assert _teleport(h).ok
+    block = h.host.close("strategy finished", None)
+    rows = block["ledger"]
+    assert rows["observe"]["steps"] == h.host.observer.steps == 3
+    assert rows["go_to"]["steps"] == h.host.teleport.steps == 2
+    assert _failing_checks(block) == [] and block["g3"]["u0b"], block["u0b"]
+
+
+@pytest.mark.parametrize(
+    "plant, check",
+    [
+        ("observer_miscount", "observe_equals_observer_steps"),  # the observer took a step it did not count
+        ("teleport_miscount", "go_to_equals_teleport_steps"),  # the teleport did the same
+        ("bypass_step_env", "sum_owners_equals_sim"),  # n_steps moved without step_env: no owner ever saw it
+        ("ledger_n0", "ledger_n0_equals_n0"),  # the ledger counts from another step than the host's n0
+        ("rt_outside_runtime", "rt_equals_rt_step"),  # an env step through the host that the Runtime never took
+        ("two_steps_one_call", "env_step_calls_equal_deltas"),  # one env.step that moved the sim twice
+    ],
+)
+def test_each_u0b_cross_check_fails_when_its_two_counts_disagree(tmp_path, plant, check):
+    h = build(tmp_path)
+    h.host.run()
+    if plant == "observer_miscount":
+        h.host.observer.miscount = 1
+        _observe(h)
+    elif plant == "teleport_miscount":
+        h.host.teleport.miscount = 1
+        _teleport(h)
+    elif plant == "bypass_step_env":
+        h.sim.n_steps += 1
+    elif plant == "ledger_n0":
+        h.ledger.n0 += 1
+    elif plant == "rt_outside_runtime":
+        h.host.env_step(np.zeros(23, dtype=np.float32))
+    elif plant == "two_steps_one_call":
+        h.sim.step_size = 2
+        with h.ledger.owner("ep.pick"):
+            h.sim.step_env({"r": "twice"})
+    block = h.host.close("strategy finished", None)
+    assert _failing_checks(block) == [check], (plant, block["u0b"])
+    assert block["g3"]["u0b"] is False and not block["g3"]["pass"] and not block["ok"]
+
+
+class FloorRunner(FakeRunner):
+    """free_hand's shape: a pick, then a put-down on the floor that fails, and no read of floor_failed_at after it,
+    so only DualEpisode's own comparison after the write sees the shim's set against the Episode's (row 15)."""
+
+    def run(self, ep):
+        ep.stand_for(JAR)
+        self.seen.append(("pick", ep.pick(JAR, into=CAB)))
+        self.seen.append(("put_down", ep.put_down(JAR, FLOOR)))
+
+
+def test_the_dual_episode_compares_floor_failed_at_after_a_failed_floor_put_down(tmp_path):
+    h = build(tmp_path, ok=False, runner=FloorRunner)
+    block, raised = run(h)
+    rows = [r for r in h.host.dual.rows if r["member"] == "floor_failed_at"]
+    assert raised is None and ("put_down", False) in seen(h)
+    assert len(rows) == 1 and rows[0]["equal"] and rows[0]["kwargs"] == {"after": "put_down"}, rows
+    assert block["g3"]["dual_mismatches"] == 0
+    h = build(tmp_path, ok=False, runner=FloorRunner, fault="pose_off")  # the shim keys its stance one cell off
+    block, raised = run(h)
+    rows = [r for r in h.host.dual.rows if r["member"] == "floor_failed_at"]
+    assert len(rows) == 1 and not rows[0]["equal"], rows
+    assert block["dual"]["summary"]["mismatched"] == {"floor_failed_at": 1} and not block["g3"]["pass"]
 
 
 def test_an_apply_that_changes_the_hand_record_on_a_parity_run_fails_g3(tmp_path):

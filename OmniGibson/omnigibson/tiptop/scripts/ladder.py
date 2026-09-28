@@ -1522,7 +1522,7 @@ def gate_md(g: dict) -> str:
 
 # ------------------------------------------------------------------------------------------------- main
 def main(argv=None) -> int:
-    global GPUS
+    global GPUS, OUT
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("mode", choices=("plan", "run", "gate", "status"))
     ap.add_argument("--stage", default="S1")
@@ -1533,9 +1533,12 @@ def main(argv=None) -> int:
     ap.add_argument("--max-sims", type=int, default=MAX_SIMS)
     ap.add_argument("--max-planners", type=int, default=MAX_PLANNERS)
     ap.add_argument("--gpus", default=",".join(map(str, GPUS)), help="the cards to launch on, a subset of 1,3")
+    ap.add_argument("--out", type=Path, default=OUT,
+                    help="the ladder's root: plan, derived tapes, runs and gate files (default week4/ladder; a re-run "
+                    "from a new snapshot goes elsewhere, never over the week's evidence)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    GPUS = parse_gpus(a.gpus)
+    GPUS, OUT = parse_gpus(a.gpus), a.out
     reps = tuple(int(x) for x in a.reps.split(",") if x != "")
     arms = tuple(x for x in a.arms.split(",") if x)
     if a.mode == "plan":
