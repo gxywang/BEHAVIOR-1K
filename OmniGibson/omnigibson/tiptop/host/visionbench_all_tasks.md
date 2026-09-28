@@ -35,6 +35,56 @@ they are outside rigid-instance mask scoring. Floor/lawn/agent categories are ex
 Coverage of all 100 tasks does not mean complete visibility of every object or full task
 execution.
 
+## Verify the capture provenance companion
+
+The main inference data archive contains `plan.json` and the eight native files in
+`captures/<case_id>/`. Its separate companion is
+`vision-bench-comprehensive-capture-provenance.tar`. Extract them into separate roots:
+
+```bash
+export VISION_RUN=/path/to/comprehensive_v1
+export VISION_CAPTURE_PROVENANCE=/path/to/capture-provenance
+export SIM_PY=/path/to/sim/python
+mkdir -p "$VISION_RUN" "$VISION_CAPTURE_PROVENANCE"
+# Extract the main inference data archive into "$VISION_RUN" using its handoff guide.
+tar -xf vision-bench-comprehensive-capture-provenance.tar -C "$VISION_CAPTURE_PROVENANCE"
+
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package.py verify \
+  --provenance "$VISION_CAPTURE_PROVENANCE"
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package.py audit-overlay \
+  --provenance "$VISION_CAPTURE_PROVENANCE" --main-captures "$VISION_RUN/captures" \
+  --mount /path/to/fresh-capture-audit-mount --output /path/to/fresh-capture-audit.json
+```
+
+Run these from this simulator checkout. The companion has its own
+`ARTIFACT_MANIFEST.json` verifier. `audit-overlay` first checks all 2,920 main capture
+files against the original sealed hashes, then runs the independent capture auditor
+using the companion's archived snapshots and receipts. The new mount consists of
+symlinks; the original selection, case data, and provenance bytes are unchanged. Both
+mount and audit output must be new paths. The audit requires CPU dependencies from the
+existing simulator environment and does not launch Isaac Sim or run either model.
+
+The companion contains these paths:
+
+- `selection/selection_fullcoverage.json` and preserved initial 300-case selection.
+- `metadata/catalog.parquet`, `metadata/inventory.json`, dataset metadata, 100 task
+  templates, 100 BDDL definitions, the evaluator robot configuration, and 365 selected
+  task-instance configuration JSON files under `metadata/sim_data/`.
+- The 365 selected annotation JSON files in `annotations/`, frozen capture sources in
+  `source_capture/`, and explicitly named selection ancestry and launch receipts.
+- `snapshots/`, `provenance/case_receipts/`, `provenance/materialization/`,
+  `provenance/task_receipts/`, final execution receipts, and the four `sealed/` files.
+- `replay_fidelity_summary.json`, comparing every final saved head-depth frame with
+  the recorded dataset frame while retaining the separate preliminary depth probe.
+
+Mesh and texture assets, video/action shards, model weights, reference images, and
+unrelated experiments are outside this companion. Recapturing still requires the
+complete installed simulation and demonstration datasets. Packaged instance/template
+JSON files preserve the configurations for inspection and checksum comparison; the
+package does not overwrite an installed dataset. The separate inference handoff covers
+reference-bank and model dependencies. Rebuilding a newly selected reference bank is
+not implied by reproducing this frozen capture cohort.
+
 ## Capture an existing selection
 
 Set paths for your checkout, installed simulation interpreter, datasets, and output.
@@ -44,12 +94,12 @@ replaying on another machine. Do not edit an archived manifest in place.
 
 ```bash
 /path/to/sim/python OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_rebase.py \
-  --selection /path/to/artifacts/selection_fullcoverage.json \
+  --selection "$VISION_CAPTURE_PROVENANCE/selection/selection_fullcoverage.json" \
   --output /path/to/new-run/selection_replay.json \
   --checkout /path/to/BEHAVIOR-1K \
   --dataset /path/to/behavior1k-20k --sim-data /path/to/BEHAVIOR-1K/datasets \
-  --catalog /path/to/artifacts/catalog.parquet \
-  --inventory /path/to/artifacts/inventory.json \
+  --catalog "$VISION_CAPTURE_PROVENANCE/metadata/catalog.parquet" \
+  --inventory "$VISION_CAPTURE_PROVENANCE/metadata/inventory.json" \
   --snapshot-root /path/to/new-run/snapshots --capture-root /path/to/new-run/captures \
   --python /path/to/sim/python
 ```
@@ -134,7 +184,8 @@ Metadata-only tests (no simulator launch):
 OMNIGIBSON_HEADLESS=1 /path/to/sim/python -m pytest -q \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks.py \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_rebase.py \
-  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_fidelity.py
+  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_fidelity.py \
+  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_package.py
 ```
 
 ## Check replay fidelity against the final saved query
@@ -159,3 +210,25 @@ from the primary score. Base-versus-dead-reckoned differences are against integr
 odometry, not measured world-pose ground truth. The raw replay-depth aggregates in the
 capture quality summary describe the preliminary probe; use the fidelity diagnostic's
 `saved_depth_*` fields for conclusions about the final model inputs.
+
+## Produce the companion artifact on the capture host
+
+Stage only explicitly named immutable metadata while capture is running. Use a new
+staging path. After capture sealing, run the fidelity command above with `--fresh`,
+then finalize. Finalization requires complete execution, a valid seal, and all 365
+fresh saved-query comparisons; it will not publish a partial capture as complete.
+
+```bash
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package.py stage \
+  --selection /path/to/comprehensive_v1/selection_fullcoverage.json \
+  --sim-data "$OMNIGIBSON_DATA_PATH" --stage /path/to/comprehensive_v1/provenance-stage
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package.py finalize \
+  --stage /path/to/comprehensive_v1/provenance-stage \
+  --archive /path/to/comprehensive_v1/vision-bench-comprehensive-capture-provenance.tar
+```
+
+Staging and finalization copy original file bytes and record SHA-256 receipts. They
+never edit the frozen selection or active capture sources. A staging directory is not
+a publishable artifact. Finalization refuses to overwrite an existing final manifest
+or archive. Validate the extracted result with `verify` and `audit-overlay` before
+sharing it with a coworker.
