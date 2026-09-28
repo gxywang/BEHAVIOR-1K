@@ -549,6 +549,15 @@ def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_n
     valued = [dict(r) for r in lrec]
     valued[1] = {"kind": "read", "member": "distance", "args": ["floor.n.01_2", "a"], "kwargs": {}, "ret": 1.5}
     assert ladder.runner_prefix_compare(lrec, valued, 4)["first_divergence"]["index"] == 1
+    # the same pair as Tape.load decodes it (the exception an Exc named tuple), and one with a value on one side
+    assert ladder.exc_type(tp.Exc("KeyError", "builtins", "'x'", ("x",))) == "KeyError" and ladder.exc_type({"type": "ValueError"}) == "ValueError"
+    assert ladder.exc_type(None) is None
+    decoded_l = tp.Tape.loads(tp.Tape({}, lrec).dumps()).records
+    decoded_r = tp.Tape.loads(tp.Tape({}, run[:2] + lrec[2:]).dumps()).records
+    assert ladder.runner_prefix_compare(decoded_l, decoded_r, 4) == {"compared": 4, "first_divergence": None, "neutral": [1], "identical_before_branch": True}
+    as_exc_l = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in lrec]  # the form Tape.load gives a file's records
+    as_exc_r = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in run[:2] + lrec[2:]]
+    assert ladder.runner_prefix_compare(as_exc_l, as_exc_r, 4)["neutral"] == [1] and ladder.runner_prefix_compare(as_exc_l, as_exc_r, 4)["identical_before_branch"]
     # only the records before the branch count; a shorter run tape is a divergence
     assert ladder.runner_prefix_compare(lrec, run[:2], 4)["first_divergence"] == {"index": 2, "why": "the run's tape is shorter"}
     assert ladder.runner_prefix_compare(lrec, run[:2], 2)["identical_before_branch"]
@@ -561,8 +570,42 @@ def test_a_switched_write_cut_off_at_success_is_a_cut_off_delivery(tmp_path):
     records[-1] = _write("achieve", [[ONTOP]], {}, [3000, 3100], exc="EpisodeOver")  # the last write: place.on, cut off
     tp.Tape({"task": "demo"}, records).save(ep / "tapes" / "demo_301_0.json")
     run = {"runner_tape": str(ep / "tapes" / "demo_301_0.json"), "json": {"reason": "success"}}
-    assert ladder.cut_off_delivery(run, "place.on") == {"call_id": "q1-6", "member": "achieve", "args": [[ONTOP]]}
+    assert ladder.cut_off_delivery(run, "place.on") == {"call_id": "q1-6", "member": "achieve", "args": [[ONTOP]], "line": "place.on"}
     assert ladder.cut_off_delivery(run, "place.in") is None, "another line"
     assert ladder.cut_off_delivery(dict(run, json={"reason": "episode over after 5000 steps: timeout"}), "place.on") is None
     tp.Tape({"task": "demo"}, RECORDS).save(ep / "tapes" / "demo_301_0.json")  # the last write is a close
     assert ladder.cut_off_delivery(run, "place.on") is None
+
+
+def test_the_ordinal_pairing_names_the_same_write_once_the_sequences_part(tmp_path):
+    """After the branch C's and T's Runner writes differ, so a call id no longer names the same write; the switched
+    skill's k-th call does, and the stage-failing cause is judged there, never on another skill sharing an id."""
+    def run(inst, rows, cut=None):
+        d = tmp_path / inst
+        d.mkdir()
+        (d / "runner_tape.jsonl").write_text("".join(json.dumps(r) + "\n" for r in
+                                                     [{"call_id": r["call_id"], "skill": r["skill"], "qual": r.get("qual"), "args": r.get("args")} for r in rows]))
+        return {"inst": str(d), "skill_calls": rows, "cut_off_delivery": cut, "ended": True}
+    row = lambda cid, skill, backend, status, code=None, steps=100, scorer=True, qual=None, ok=True: {  # noqa: E731
+        "call_id": cid, "skill": skill, "backend": backend, "status": status, "code": code, "steps": steps,
+        "verdicts": {"scorer": scorer}, "evidence": {"legacy_ok": ok} if backend == "legacy" else {}, "qual": qual, "effects": []}
+    runs = {("C", 0): run("c0", [row("q1-1", "pick_up", "legacy", "succeeded"), row("q1-2", "place", "legacy", "succeeded", qual="on"),
+                               row("q1-3", "pick_up", "legacy", "succeeded"), row("q1-4", "place", "legacy", "infeasible", "no_placement", scorer=False, qual="on", ok=False),
+                               row("q1-5", "place", "legacy", "succeeded", qual="on")], cut={"call_id": "q1-7", "member": "put_down", "args": [], "line": "place.on"}),
+            ("T", 0): run("t0", [row("q1-1", "pick_up", "legacy", "succeeded"), row("q1-2", "place", "tiptop@x/place-1", "succeeded", qual="on"),
+                               row("q1-3", "pick_up", "legacy", "succeeded"), row("q1-4", "place", "tiptop@x/place-1", "succeeded", qual="on"),
+                               row("q1-6", "pick_up", "legacy", "infeasible", "no_stance_here", steps=0, scorer=False, ok=False)])}
+    table = ladder.ordinal_pairing(runs, "place.on")
+    assert [r["ordinal"] for r in table] == [1, 2, 3, 4]
+    assert (table[0]["C0"]["backend"], table[0]["T0"]["backend"]) == ("legacy", "tiptop@x/place-1")
+    assert table[1]["C0"]["code"] == "no_placement" and table[1]["T0"]["status"] == "succeeded"
+    assert table[3]["C0"]["status"] == "cut_off" and table[3]["T0"] is None, "C's fourth is the cut-off delivery; T never made one"
+    assert table[2]["T0"] is None, "T's pick_up q1-6 is not a place, whatever its id"
+    assert ladder.switched_failed_where_c_succeeded(table) == [], "T's places all succeeded: no cause"
+    runs[("T", 0)]["skill_calls"][3] = row("q1-4", "place", "tiptop@x/place-1", "failed", "no_placement", scorer=False, qual="on")
+    table = ladder.ordinal_pairing(runs, "place.on")
+    assert ladder.switched_failed_where_c_succeeded(table) == [], "at ordinal 2 C failed too"
+    runs[("C", 0)]["skill_calls"][3] = row("q1-4", "place", "legacy", "succeeded", qual="on")
+    table = ladder.ordinal_pairing(runs, "place.on")
+    assert ladder.switched_failed_where_c_succeeded(table) == [{"ordinal": 2, "c_ok": [True], "t_failed": [("T0", "no_placement")]}]
+    assert ladder.ordinal_pairing(runs, "place.in") == [], "no place.in in either run"

@@ -217,7 +217,7 @@ def writes_of(tape: tp.Tape) -> list[Write]:
             k += 1
             call = SkillCall(tc[0], tc[1], arm=tc[2])
             skill, qual = call.skill, qualifier(call)
-        exc = (r.get("exc") or {}).get("type") if isinstance(r.get("exc"), dict) else None
+        exc = exc_type(r.get("exc"))
         ret = r.get("ret")
         out.append(Write(i, record, member, args, kwargs, k if tc is not None else None, skill, qual,
                          None if exc is not None or not isinstance(ret, bool) else ret, exc, r.get("step")))
@@ -828,8 +828,14 @@ def neutral_pair(a: dict, b: dict) -> bool:
         return False
     if a.get("args") != b.get("args") or a.get("kwargs") != b.get("kwargs"):
         return False
-    ea, eb = (a.get("exc") or {}), (b.get("exc") or {})
-    return ea.get("type") == "KeyError" and eb.get("type") == "KeyError"
+    return exc_type(a.get("exc")) == "KeyError" and exc_type(b.get("exc")) == "KeyError"
+
+
+def exc_type(e) -> Optional[str]:
+    """The recorded exception's class name, from a raw dict or the Exc named tuple Tape.load decodes it into."""
+    if e is None:
+        return None
+    return e.get("type") if isinstance(e, dict) else getattr(e, "type", None)
 
 
 def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: Optional[int]) -> dict:
@@ -946,7 +952,50 @@ def cut_off_delivery(run: dict, switched: str) -> Optional[dict]:
     last = next((w for w in reversed(ws) if w.k is not None), None)
     if last is None or last.line != switched or last.exc != "EpisodeOver":
         return None
-    return {"call_id": last.call_id, "member": last.member, "args": last.args}
+    return {"call_id": last.call_id, "member": last.member, "args": last.args, "line": last.line}
+
+
+def ordinal_pairing(runs: dict, switched: str) -> list:
+    """The switched skill's calls by their order within each run (the first place.on, the second, ...): once the
+    arms' write sequences part after the branch, the call ids no longer name the same Runner write, and the ordinal
+    is what "the same write" means. Each cell: backend, status/code, steps, the scorer's verdict, the return."""
+    name, _, qual = switched.partition(".")
+    per_run = {}
+    for (arm, rep), run in sorted(runs.items()):
+        rows = []
+        tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
+        for r in run.get("skill_calls") or []:
+            if r.get("skill") != name:
+                continue
+            q = (tape.get(r.get("call_id")) or {}).get("qual")
+            if q is None:
+                quals = {counters.PLACE_PREDS[e["pred"]] for e in r.get("effects") or () if e.get("pred") in counters.PLACE_PREDS}
+                q = quals.pop() if len(quals) == 1 else None
+            if qual and q != qual:
+                continue
+            rows.append({"call_id": r.get("call_id"), "backend": r.get("backend"), "status": r.get("status"), "code": r.get("code"),
+                         "steps": r.get("steps"), "scorer": (r.get("verdicts") or {}).get("scorer"),
+                         "returned": (r.get("evidence") or {}).get("legacy_ok") if r.get("backend") == "legacy" else r.get("status") == "succeeded",
+                         "target": (tape.get(r.get("call_id")) or {}).get("args")})
+        co = run.get("cut_off_delivery")
+        if co and co.get("line") == switched:
+            rows.append({"call_id": co["call_id"], "backend": "(cut off at success)", "status": "cut_off", "code": None, "steps": None,
+                         "scorer": True, "returned": None})
+        per_run[f"{arm}{rep}"] = rows
+    n = max((len(v) for v in per_run.values()), default=0)
+    return [{"ordinal": j + 1, **{k: (v[j] if j < len(v) else None) for k, v in per_run.items()}} for j in range(n)]
+
+
+def switched_failed_where_c_succeeded(ordinal: list) -> list:
+    """The cause the stage fails on: at an ordinal where a C run's switched call succeeded, a T run's failed."""
+    out = []
+    for row in ordinal:
+        c_ok = [v["returned"] is True and v["scorer"] is True for k, v in row.items() if k[:1] == "C" and isinstance(v, dict)]
+        t = [(k, v) for k, v in row.items() if k[:1] == "T" and isinstance(v, dict)]
+        t_bad = [(k, v["code"]) for k, v in t if not (v["returned"] is True and v["scorer"] is True) and v["status"] != "cut_off"]
+        if c_ok and any(c_ok) and t_bad:
+            out.append({"ordinal": row["ordinal"], "c_ok": c_ok, "t_failed": t_bad})
+    return out
 
 
 def legacy_dependencies(run: dict) -> dict:
@@ -1022,8 +1071,12 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
                                     "d21_debt": rule2_of(run.get("connector")).get("d21_debt"), "calls": (run.get("connector") or {}).get("calls"),
                                     "charged": (run.get("connector") or {}).get("charged"), "live_index": [(x.get("i"), x.get("op"), x.get("owner"), x.get("call_id")) for x in run.get("live_index") or []][:40]}
             g["runs"][f"{task}/{key}"] = t_entry["runs"][key]
+        for (arm, rep), run in runs.items():
+            run["cut_off_delivery"] = cut_off_delivery(run, switched)
         t_entry["pairing"] = pairing(p, runs, switched)
-        t_entry["structural"] = structural_shifts(runs, (p["branch"] or {}).get("write", 0))
+        t_entry["ordinal"] = ordinal_pairing(runs, switched)
+        t_entry["switched_failed_where_c_succeeded"] = switched_failed_where_c_succeeded(t_entry["ordinal"])
+        t_entry["structural"] = structural_shifts({k: r for k, r in runs.items() if r["ended"]}, (p["branch"] or {}).get("write", 0))
         C = [counters.extract(Path(run["out"])) for (a, _), run in sorted(runs.items()) if a == "C" and run["ended"]]
         T = [counters.extract(Path(run["out"])) for (a, _), run in sorted(runs.items()) if a == "T" and run["ended"]]
         pairs[task] = (C, T)
@@ -1054,14 +1107,8 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
     if cmp is not None:
         for f in cmp.flagged:
             t_entry = per_task.get(f.task) or {}
-            cause = []
-            for row in t_entry.get("pairing") or []:
-                c_ok = [v["returned"] and v["scorer"] for k, v in row.items() if k[:1] == "C" and isinstance(v, dict)]
-                t_ok = [v["returned"] and v["scorer"] for k, v in row.items() if k[:1] == "T" and isinstance(v, dict)]
-                if c_ok and t_ok and any(c_ok) and not all(t_ok):
-                    cause.append(f"{row['call_id']} {row['member']}{row['args']}: C ok {c_ok}, T ok {t_ok}")
             flags_fail.append({"task": f.task, "counter": f.counter, "control": f.control, "treatment": f.treatment,
-                               "switched_failed_where_c_succeeded": cause})
+                               "switched_failed_where_c_succeeded": t_entry.get("switched_failed_where_c_succeeded") or []})
     g["flags"] = flags_fail
     verdict = {
         "a_prefix": all(r["prefix"]["ok"] for t in per_task.values() for r in t["runs"].values() if r["ended"]),
@@ -1199,7 +1246,17 @@ def gate_md(g: dict) -> str:
                 v = row.get(k)
                 cells.append("-" if v is None else f"{v['backend']} {v['status']}/{v['code']} {v['steps']} sc {v['scorer']} ret {v['returned']}{'' if v['same_write'] else ' (other skill)'}")
             o.append(f"| {row['call_id']} | {row['write']} {row['member']} | {row['args']} | {row['lrec_returned']} | " + " | ".join(cells) + " |")
-        o += ["", "Structural shifts (e), T against C after the branch, per replicate:", ""]
+        o += ["", "The switched skill by ordinal within each run (the same write once the sequences part; a cut-off row is the write EpisodeOver ended at success):", ""]
+        cols_o = sorted({k for row in t["ordinal"] for k in row if k != "ordinal"})
+        o += ["| # | " + " | ".join(cols_o) + " |", "|---|" + "---|" * len(cols_o)]
+        for row in t["ordinal"]:
+            cells = []
+            for k in cols_o:
+                v = row.get(k)
+                cells.append("-" if v is None else f"{v['backend']} {v['status']}/{v['code']} {v['steps']} sc {v['scorer']} ret {v['returned']}")
+            o.append(f"| {row['ordinal']} | " + " | ".join(cells) + " |")
+        o += ["", f"Switched skill failed where a C run's succeeded (the cause that fails the stage): {t['switched_failed_where_c_succeeded'] or 'none'}"]
+        o += ["", "Structural shifts (e), T against C after the branch, per replicate (ended pairs only):", ""]
         for s in t["structural"]:
             o.append(f"- r{s['rep']}: first difference at write {s['first_difference']}; T extra {s['t_extra']}; C extra {s['c_extra']}")
         o += ["", "Counters (raw; compare normalises per delivered atom):", ""]
