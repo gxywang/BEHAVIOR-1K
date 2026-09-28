@@ -49,9 +49,9 @@ mkdir -p "$VISION_RUN" "$VISION_CAPTURE_PROVENANCE"
 # Extract the main inference data archive into "$VISION_RUN" using its handoff guide.
 tar -xf vision-bench-comprehensive-capture-provenance.tar -C "$VISION_CAPTURE_PROVENANCE"
 
-"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v2.py verify \
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py verify \
   --provenance "$VISION_CAPTURE_PROVENANCE"
-"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v2.py audit-overlay \
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py audit-overlay \
   --provenance "$VISION_CAPTURE_PROVENANCE" --main-captures "$VISION_RUN/captures" \
   --mount /path/to/fresh-capture-audit-mount --output /path/to/fresh-capture-audit.json
 ```
@@ -74,7 +74,8 @@ The companion contains these paths:
   `source_capture/`, and explicitly named selection ancestry and launch receipts.
   `source_geometry/` and `source_diagnostics/` preserve geometry dependencies and the
   additive audit/packaging sources; `diagnostic_amendment/` preserves the failed earlier
-  audit and independent saved-array evidence. Geometry source receipts match the original
+  audit and independent saved-array evidence. `diagnostic_amendment_v3/` also preserves
+  the failed foreground-union audit and its measured support changes. Geometry source receipts match the original
   committed simulator and TiPToP sources.
 - `snapshots/`, `provenance/case_receipts/`, `provenance/materialization/`,
   `provenance/task_receipts/`, final execution receipts, and the four `sealed/` files.
@@ -116,7 +117,7 @@ interpreter's virtual-environment symlink; and creates a separate mapping receip
 The original selection stays byte-identical. Missing optional historical provenance
 documents are listed explicitly; they are not read by replay and are not silently
 asserted to have been verified. The output includes the required environment and validation/capture commands. Its
-archived audit-command field still names the original auditor; run the explicit v2
+archived audit-command field still names the original auditor; run the explicit v3
 audit command below for this amended cohort. This validates portable deployment inputs; it
 does not promise identical rendering on different simulator versions or hardware.
 
@@ -154,27 +155,32 @@ bounds, target flags, and masks are evaluation-only labels.
 
 ## Audit and seal before inference
 
-The additive v2 auditor records the pre-TEST diagnostic amendment. The first auditor
-incorrectly required every object's 4mm mask to be a subset of its 8mm mask. Three
-coffee-station cases exposed contact ownership transfers. The original masks and primary
-8mm score remain unchanged. The v2 auditor requires that each tolerance has disjoint
-instance masks and that the 4mm foreground union is contained in the 8mm union, and
-reports every ownership transfer separately. A synthetic test of the frozen labeler
-reproduces one possible NaN/degenerate-triangle mechanism; the cause in these real cases
-is not proven because raw meshes and per-pixel distances were not archived. This is a
-numerical limitation of approximate geometry labels, not a calibrated accuracy bound.
+The additive v3 auditor records the pre-TEST diagnostic amendments. Coffee-station
+cases exposed instance ownership transfers between the independently computed 4mm and
+8mm masks; desk cases also exposed small foreground support additions at 4mm. Neither
+per-instance nor foreground-union nesting is therefore assumed. Both captured masks and
+the primary 8mm score remain unchanged.
 
+The v3 auditor requires native Boolean masks, matching shapes, disjoint instances at
+each tolerance, exact stored pixel counts, and per-object/foreground conservation. It
+reports foreground additions, removals, and ownership transfers separately. Changed
+pixels are counted once as additions + removals + transfers; Boolean instance-stack
+XOR instead counts transfers twice. Synthetic tests of the unchanged labeler reproduce
+NaN/degenerate-triangle mechanisms, including hit rejection before ownership assignment.
+The causes in the actual coffee/laptop cases remain unproven because their raw mesh
+arrays and per-pixel distances were not archived. These are numerical limitations of
+approximate geometry labels, not calibrated accuracy bounds.
 
 ```bash
-/path/to/sim/python OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_audit_v2.py \
+/path/to/sim/python OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_audit_v3.py \
   --selection /path/to/new-run/selection_replay.json --captures /path/to/new-run/captures \
   --out /path/to/new-run/sealed --seal
 ```
 
 Without `--seal`, the command produces a progress audit without pretending incomplete
 captures are a final dataset. `--seal` requires every selected case and verifies array
-shapes, native Boolean masks, disjoint instances at each tolerance, nested foreground
-unions, object pixel counts, frozen
+shapes, native Boolean masks, disjoint instances at each tolerance, foreground/instance
+conservation, object pixel counts, frozen
 poses, snapshots, selection receipts, and absence of label identity fields in inputs.
 Sealed outputs are `query_manifest.json`, `capture_audit.json`,
 `capture_quality_summary.json`, and a hash-linked `seal_receipt.json`.
@@ -202,7 +208,7 @@ OMNIGIBSON_HEADLESS=1 /path/to/sim/python -m pytest -q \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks.py \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_rebase.py \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_fidelity.py \
-  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_package_v2.py
+  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_package_v3.py
 ```
 
 ## Check replay fidelity against the final saved query
@@ -236,10 +242,10 @@ then finalize. Finalization requires complete execution, a valid seal, and all 3
 fresh saved-query comparisons; it will not publish a partial capture as complete.
 
 ```bash
-"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v2.py stage \
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py stage \
   --selection /path/to/comprehensive_v1/selection_fullcoverage.json \
   --sim-data "$OMNIGIBSON_DATA_PATH" --stage /path/to/comprehensive_v1/provenance-stage
-"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v2.py finalize \
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py finalize \
   --stage /path/to/comprehensive_v1/provenance-stage \
   --archive /path/to/comprehensive_v1/vision-bench-comprehensive-capture-provenance.tar
 ```
