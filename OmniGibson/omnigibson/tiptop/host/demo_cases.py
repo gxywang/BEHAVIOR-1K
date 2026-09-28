@@ -359,7 +359,7 @@ def object_positions(env) -> dict:
             for o in env.task.object_scope.values() if hasattr(o, "get_position_orientation")}
 
 
-def materialize(case: dict, env, method: str | None = None, settle: int = 10) -> dict:
+def materialize(case: dict, env, method: str | None = None, settle: int = 10, depth_audit=None) -> dict:
     """Bring ``env`` (``make_env(case["task"])``) to the human's situation at the case's start frame and return the
     setup: robot pose + joints, what each hand holds, the fidelity numbers, and the snapshot (object states).
 
@@ -400,7 +400,7 @@ def materialize(case: dict, env, method: str | None = None, settle: int = 10) ->
         "at_start": proprio_error(robot, state[start]),
         "base_vs_reckoned": {"xy_m": round(math.hypot(pose[0] - reckoned[0], pose[1] - reckoned[1]), 4),
                              "yaw_deg": round(math.degrees(math.remainder(pose[3] - reckoned[2], math.tau)), 2)},
-        "depth": depth_error(env, ep, start),
+        "depth": (depth_audit or depth_error)(env, ep, start),
         "grasps": grasps,
         "held": held(robot),
         "human_gripper_closed": held_at(action, start),
