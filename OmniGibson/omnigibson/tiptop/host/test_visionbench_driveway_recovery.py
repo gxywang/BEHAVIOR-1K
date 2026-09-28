@@ -443,3 +443,22 @@ def test_gpu_readiness_rejects_any_compute_owner_or_low_memory(monkeypatch):
     state["compute"] = ""
     state["free"] = 39000
     assert not continuation.gpu_readiness([1, 3], 40000)[0]
+
+
+def test_split_main_capture_artifact_uses_companion_receipts(verified_capture, tmp_path):
+    import shutil
+
+    base, root, captures, identifier = verified_capture
+    publish_fixture(root, captures, identifier)
+    companion = tmp_path / "companion"
+    shutil.copytree(base, companion)
+    main = tmp_path / "main_captures"
+    shutil.copytree(captures / identifier, main / identifier)
+    mapping = {str(p): companion / p.relative_to(base) for p in base.rglob("*") if p.is_file()}
+    for path in (captures / identifier).iterdir():
+        mapping[str(path)] = main / identifier / path.name
+    shutil.rmtree(companion / "captures" / identifier)
+    shutil.rmtree(base)
+    assert not (main / "case_receipts").exists()
+    result = verifier.verify(companion / "recovery", main, published=True, mapping=mapping)
+    assert result["ok"]

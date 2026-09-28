@@ -177,7 +177,9 @@ def verify(recovery, captures, published=False, mapping=None):
             checked(record)
         folder = captures / identifier if published else recovery / "captures" / identifier
         receipt_path = (
-            captures / "case_receipts" / (identifier + ".json")
+            resolve(Path(preparation["captures"]) / "case_receipts" / (identifier + ".json"))
+            if published and strict_mapping
+            else captures / "case_receipts" / (identifier + ".json")
             if published
             else recovery / "captures/case_receipts" / (identifier + ".json")
         )
