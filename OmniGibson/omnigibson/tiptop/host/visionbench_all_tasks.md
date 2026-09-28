@@ -51,6 +51,9 @@ tar -xf vision-bench-comprehensive-capture-provenance.tar -C "$VISION_CAPTURE_PR
 
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py verify \
   --provenance "$VISION_CAPTURE_PROVENANCE"
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_driveway_recovery_verify.py verify-portable \
+  --provenance "$VISION_CAPTURE_PROVENANCE" --captures "$VISION_RUN/captures" \
+  --output /path/to/fresh-recovery-audit.json
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py audit-overlay \
   --provenance "$VISION_CAPTURE_PROVENANCE" --main-captures "$VISION_RUN/captures" \
   --mount /path/to/fresh-capture-audit-mount --output /path/to/fresh-capture-audit.json
@@ -63,6 +66,11 @@ using the companion's archived snapshots and receipts. The new mount consists of
 symlinks; the original selection, case data, and provenance bytes are unchanged. Both
 mount and audit output must be new paths. The audit requires CPU dependencies from the
 existing simulator environment and does not launch Isaac Sim or run either model.
+For this run, `verify-portable` additionally checks the driveway recovery chain and
+unchanged successful captures. Use the **complete main data artifact**, including its
+original overlay PNGs; an input-only inference fork omits protected capture files and
+cannot satisfy this audit. Published success receipts resolve from the companion, so
+`$VISION_RUN/captures` does not need a separate `case_receipts` directory.
 
 The companion contains these paths:
 
@@ -81,6 +89,11 @@ The companion contains these paths:
   `provenance/task_receipts/`, final execution receipts, and the four `sealed/` files.
 - `replay_fidelity_summary.json`, comparing every final saved head-depth frame with
   the recorded dataset frame while retaining the separate preliminary depth probe.
+- `driveway_recovery/`, `driveway_failure_originals/`, and `source_recovery/`, preserving
+  the recovery amendment, original failures, snapshot bindings, successful-capture
+  hash inventory, verification/publication receipts, and the additive implementation.
+- `saved_query_outlier_diagnosis/`, with the saved-query replay diagnosis, previously
+  extracted recorded-frame PNGs, and the robot pose representation source evidence.
 
 Mesh and texture assets, video/action shards, model weights, reference images, and
 unrelated experiments are outside this companion. Recapturing still requires the
@@ -152,6 +165,43 @@ Outputs per case are `input.json`, `input.npz`, three PNG camera images, `labels
 `labels.npz`, and `labels_strict4mm.npz`, with independent materialization/case/task
 receipts. The model receives only the input files. Runtime asset identity, geometry
 bounds, target flags, and masks are evaluation-only labels.
+
+## Recover the declared driveway binding failures
+
+The original bridge excludes driveway from `task_scope()` with floors and lawns, while
+this benchmark's frozen selection excludes only floor/lawn. Seven predeclared cases
+contain a driveway target. The additive recovery accepts only those exact IDs **after**
+the original capture records the matching missing-driveway error and saves its immutable
+snapshot. It restores that snapshot, exposes the existing fixed driveway's raw BDDL
+binding, and calls the unchanged capture and geometry-labeling functions. It does not
+replay actions, substitute a frame, or take physics steps after snapshot restoration.
+Environment setup/reset occurs before restoration. Annotation targets include support
+surfaces; the driveway-only `chopping_wood` case retains its original target scope.
+
+On the capture host, `runs/vision/comprehensive_v1/driveway_recovery_v2/` contains the
+frozen amendment/configuration and `launch.json`. Read `status.json` for current phase;
+launching the continuation is not evidence that recovery or the benchmark has finished.
+The superseded V1 prelaunch revision was never executed and remains preserved.
+The continuation waits for the original supervisor and observers to finish naturally,
+then runs one recovery worker at a time on GPU1 after both assigned GPUs1/3 are idle.
+Do not launch a duplicate continuation while this one is active.
+
+Recovery writes into a separate directory and preserves original failed task receipts
+and the original `execution.json` with status `incomplete`. A CPU verifier checks the
+failure/materialization/snapshot chain, restored poses/joints, zero capture physics,
+unchanged successful files, and recovered masks. Only absent case outputs are published.
+The published outputs are verified again **before** task receipts and execution status
+are reconciled to complete. The original failed attempt history remains in the reconciled
+execution receipt; it is not a claim that every original attempt succeeded.
+
+This continuation owns the remaining sequence: verified recovery, V3 capture seal,
+fresh saved-query fidelity diagnostic, recovery-aware metadata staging, companion
+finalization, extraction, portable recovery verification, and independent overlay audit.
+The original monitor/finalizer exits on incomplete execution; it does not handle this
+recovery chain. Successful publication is recorded in `publication.json`, and the final
+continuation phase is `complete`. A failure stops the continuation with preserved evidence.
+This recovery wrapper is bound to the original selection SHA and seven case IDs; it is
+not a general retry command for a rebased or newly selected run.
 
 ## Audit and seal before inference
 
@@ -234,6 +284,17 @@ odometry, not measured world-pose ground truth. The raw replay-depth aggregates 
 capture quality summary describe the preliminary probe; use the fidelity diagnostic's
 `saved_depth_*` fields for conclusions about the final model inputs.
 
+One preserved outlier, `comprehensive.sorting_household_items.e5484.f5179`, has a
+723.7mm median saved head-depth difference and a robot base tilted 123.91 degrees: the saved
+query looks toward the ceiling while the exact recorded frame looks toward a basket.
+The frozen capture itself did not move. The snapshot is consistent with that pose:
+its upright `root_link` is a virtual root, and its six base joints encode the translation
+and tilt. Reconstruction matches the saved base position within 0.64 micrometers and
+quaternion components within 8.8e-8. A direct root-link/base-footprint comparison would
+incorrectly suggest stale snapshot state. The diagnosis preserves the images, calculation,
+and source evidence. The case is retained; its zero-visible-pixel targets remain ineligible
+under the original 25-pixel recall rule, without a new exclusion or model-based replacement.
+
 ## Produce the companion artifact on the capture host
 
 Stage only explicitly named immutable metadata while capture is running. Use a new
@@ -249,6 +310,21 @@ fresh saved-query comparisons; it will not publish a partial capture as complete
   --stage /path/to/comprehensive_v1/provenance-stage \
   --archive /path/to/comprehensive_v1/vision-bench-comprehensive-capture-provenance.tar
 ```
+
+The active comprehensive run uses recovery-aware staging instead of the plain `stage`
+command above. Its running continuation performs this automatically after verification;
+for a completed recovery, the equivalent manual staging command is:
+
+```bash
+"$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_driveway_recovery_verify.py stage \
+  --selection /path/to/comprehensive_v1/selection_fullcoverage.json \
+  --recovery /path/to/comprehensive_v1/driveway_recovery_v2 \
+  --sim-data "$OMNIGIBSON_DATA_PATH" \
+  --stage /path/to/comprehensive_v1/capture_provenance_stage_driveway_recovery
+```
+
+Pass that stage to the unchanged V3 `finalize` command. This includes the complete
+recovery/failure chain and fidelity diagnosis in the same checksummed companion.
 
 Staging and finalization copy original file bytes and record SHA-256 receipts. They
 never edit the frozen selection or active capture sources. A staging directory is not
