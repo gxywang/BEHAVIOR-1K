@@ -12,6 +12,10 @@ from omnigibson.tiptop.articulation import openable_joints
 RESOLUTION = 0.02  # m, the voxel edge: the working value until the competition map's own is known (SPEC Q11)
 NOT_FURNITURE = ("floors", "lawn", "driveway", "ceilings")  # the scene's categories of the ground and what is overhead
 EPS = 1e-9  # m and voxels: float dust, never geometry
+# voxel x hull-face tests evaluated at once (x-slabs of a hull's box): each float64 temporary stays near 128 MB. The
+# whole box at once cost voxels x faces x 8 bytes several times over: a house's large hulls at 2 cm took the sim to
+# 200 GB in the first native place's room() (week-4 fix pass, the S1 re-run on bringing_in_wood)
+CHUNK = 1 << 24
 
 
 def voxelize(hulls: list, resolution: float) -> tuple:
@@ -28,10 +32,15 @@ def voxelize(hulls: list, resolution: float) -> tuple:
     occupied = np.zeros(np.max([i1 for _, i1 in spans], 0), dtype=bool)
     for v, (i0, i1) in zip(hulls, spans):
         eq = ConvexHull(v, qhull_options="QJ").equations  # n . x + d <= 0 inside; QJ: a flat piece still has a hull
-        idx = np.stack(np.meshgrid(*(np.arange(a, b) for a, b in zip(i0, i1)), indexing="ij"), -1)
-        centres = origin + (idx + 0.5) * resolution
-        inside = (centres @ eq[:, :3].T + eq[:, 3] < 0.5 * resolution * np.abs(eq[:, :3]).sum(1) - EPS).all(-1)
-        occupied[i0[0]:i1[0], i0[1]:i1[1], i0[2]:i1[2]] |= inside
+        lim = 0.5 * resolution * np.abs(eq[:, :3]).sum(1) - EPS
+        ys, zs = np.arange(i0[1], i1[1]), np.arange(i0[2], i1[2])
+        step = max(1, CHUNK // max(1, len(ys) * len(zs) * len(eq)))  # x layers per slab (one at least)
+        for x0 in range(int(i0[0]), int(i1[0]), step):
+            x1 = min(x0 + step, int(i1[0]))
+            idx = np.stack(np.meshgrid(np.arange(x0, x1), ys, zs, indexing="ij"), -1)
+            centres = origin + (idx + 0.5) * resolution
+            inside = (centres @ eq[:, :3].T + eq[:, 3] < lim).all(-1)
+            occupied[x0:x1, i0[1]:i1[1], i0[2]:i1[2]] |= inside
     return tuple(map(float, origin)), occupied
 
 

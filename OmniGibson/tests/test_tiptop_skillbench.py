@@ -1268,6 +1268,33 @@ def test_voxels_cover_every_hull_and_a_panel_thinner_than_a_voxel():
     assert origin == pytest.approx((-0.06, -0.06, -0.06)) and occ.shape == (6, 6, 6) and occ.all()
 
 
+def test_voxelize_evaluates_a_hull_in_bounded_slabs_and_the_slabs_never_change_the_grid(monkeypatch):
+    """A hull's box is tested in x-slabs of at most CHUNK voxel x face tests (one x layer at least): a house's large
+    hulls at 2 cm, tested whole, took the sim to 200 GB in the first native place's room(). Whatever the slab size,
+    the grid is the same."""
+    from omnigibson.tiptop.oracle import mapbuild
+
+    rng = np.random.default_rng(3)
+    hulls = [rng.uniform(-0.2, 0.2, (60, 3)) + rng.uniform(-0.6, 0.6, 3) for _ in range(4)]
+    hulls += [box_vertices((0.0, 0.0, 0.0), (1.1, 0.04, 0.6)), box_vertices((0.3, 0.3, 0.0), (0.305, 0.9, 0.5))]
+    monkeypatch.setattr(mapbuild, "CHUNK", 1 << 40, raising=False)  # one slab per hull: the whole box at once
+    whole = mapbuild.voxelize(hulls, 0.02)
+    sizes, meshgrid = [], np.meshgrid
+
+    def recording(*axes, **kw):
+        sizes.append(int(np.prod([len(a) for a in axes])))
+        return meshgrid(*axes, **kw)
+
+    monkeypatch.setattr(mapbuild, "CHUNK", 4000, raising=False)
+    monkeypatch.setattr(mapbuild.np, "meshgrid", recording)
+    sliced = mapbuild.voxelize(hulls, 0.02)
+    monkeypatch.setattr(mapbuild.np, "meshgrid", meshgrid)
+    assert sliced[0] == whole[0] and sliced[1].shape == whole[1].shape and np.array_equal(sliced[1], whole[1])
+    assert whole[1].any() and len(sizes) > len(hulls), "several slabs a hull"
+    wall_layer = int(np.ceil(0.04 / 0.02)) * int(np.ceil(0.6 / 0.02))  # the long panel's one x layer: 2 x 30 voxels
+    assert max(sizes) <= max(4000 // 6, wall_layer) * 6, "a slab's voxels x a box's 6 faces stay within CHUNK"
+
+
 def test_a_moving_link_is_mapped_at_its_closed_value_and_posed_back_by_the_estimated_one(monkeypatch):
     import omnigibson.utils.usd_utils as usd_utils
     from omnigibson.tiptop.oracle import mapbuild
