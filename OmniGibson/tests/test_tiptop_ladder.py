@@ -717,3 +717,15 @@ def test_the_carried_gate_lists_each_native_call_and_writes_its_table(tmp_path, 
     assert g["verdict"]["runs_ended"] == 1 and g["verdict"]["hard_ok"]
     md = ladder.carried_md(g)
     assert "native: `q1-4` place on tiptop@x/place-1 succeeded/None phase home steps 300" in md and "| demo | True |" in md
+
+
+def test_the_queue_launches_only_on_the_allowed_cards(monkeypatch):
+    assert ladder.parse_gpus("3") == (3,) and ladder.parse_gpus("1,3") == (1, 3)
+    for bad in ("2", "3,4", "0", ""):
+        with pytest.raises(ValueError):
+            ladder.parse_gpus(bad)
+    monkeypatch.setattr(ladder, "GPUS", (1, 3))
+    monkeypatch.setattr(ladder.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "0, 90000\n1, 90000\n2, 90000\n3, 60000\n"})())
+    assert ladder.pick_gpu() == 1
+    monkeypatch.setattr(ladder, "GPUS", ladder.parse_gpus("3"))
+    assert ladder.gpu_free() == {3: 60000} and ladder.pick_gpu() == 3, "a card left out is never picked, however free"

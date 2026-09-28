@@ -89,6 +89,16 @@ COMMON = ("--knowledge", "oracle", "--grasping-mode", "assisted", "--views", "he
 PLANNER_ARGS = ("--num-particles", "256", "--max-planning-time", "40", "--seed", "2300")
 REPS = (0, 1, 2)
 MAX_SIMS, MAX_PLANNERS, GPUS, MIN_FREE_MIB = 5, 4, (1, 3), 30000
+ALLOWED_GPUS = (1, 3)  # the user's rule for this track; 0, 2 and 4-7 are other people's
+
+
+def parse_gpus(text: str) -> tuple:
+    """``--gpus 3``: the cards this queue may use, a subset of ALLOWED_GPUS (a coworker may hold the other one)."""
+    gpus = tuple(int(x) for x in text.split(",") if x.strip())
+    bad = [g for g in gpus if g not in ALLOWED_GPUS]
+    if not gpus or bad:
+        raise ValueError(f"--gpus {text!r}: only {ALLOWED_GPUS} may be used (refused {bad or 'an empty list'})")
+    return gpus
 PORT_BASE, TICK, SETTLE, SIM_TIMEOUT_S = 8850, 30, 120, 21600
 WITNESS_TASK, WITNESS_ROUTES = "cook_bacon", ("press=tiptop", "place.on=tiptop")
 STRICT_TASK, STRICT_REF = "store_honey", Q1 / "E-rep" / "store_honey_r1"  # W4-F2's E-rep that matched to the end
@@ -1395,6 +1405,7 @@ def gate_md(g: dict) -> str:
 
 # ------------------------------------------------------------------------------------------------- main
 def main(argv=None) -> int:
+    global GPUS
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("mode", choices=("plan", "run", "gate", "status"))
     ap.add_argument("--stage", default="S1")
@@ -1404,8 +1415,10 @@ def main(argv=None) -> int:
     ap.add_argument("--snap", type=Path, default=SNAP)
     ap.add_argument("--max-sims", type=int, default=MAX_SIMS)
     ap.add_argument("--max-planners", type=int, default=MAX_PLANNERS)
+    ap.add_argument("--gpus", default=",".join(map(str, GPUS)), help="the cards to launch on, a subset of 1,3")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    GPUS = parse_gpus(a.gpus)
     reps = tuple(int(x) for x in a.reps.split(",") if x != "")
     arms = tuple(x for x in a.arms.split(",") if x)
     if a.mode == "plan":
