@@ -55,6 +55,8 @@ STREAM_TYPES = ("sim_scene", "sim_state")
 PIPELINE_OPS = ("plan", "skill")  # what the server's _request_n counts
 OWN_SOLVE_SKILLS = ("articulate",)  # served by the skill's own solve, never through _run_pipeline
 BUILD_REFUSALS = ("unsupported", "not_visible")  # registry.dispatch refuses these before _run_pipeline (phase None)
+ROOT = Path(__file__).resolve().parents[4]  # the checkout this process runs (run.check_imports' root)
+LIVE_RETRY_WAIT_S, LIVE_CONNECT_RETRIES = 5.0, 12  # TiptopClient._open's retries
 
 
 class TapeDiverged(BaseException):
@@ -243,6 +245,7 @@ class Frame:
     wall_s: float | None = None
     live: bool = False
     recv_error: tuple | None = None  # (which recv: 0 metadata, 1 answer; module, type, message) when it raised
+    send_error: tuple | None = None  # (module, type, message) when the request's send raised: the server never saw it
 
     def request_dict(self):
         return None if self.request is None else unpackb(self.request)
@@ -282,6 +285,7 @@ class Frame:
             "wall_s": self.wall_s,
             "live": self.live,
             "recv_error": None if self.recv_error is None else list(self.recv_error),
+            "send_error": None if self.send_error is None else list(self.send_error),
         }
 
 
@@ -333,6 +337,7 @@ class TapeDir:
             d.get("wall_s"),
             bool(d.get("live", False)),
             None if d.get("recv_error") is None else tuple(d["recv_error"]),
+            None if d.get("send_error") is None else tuple(d["send_error"]),
         )
 
     def append(self, frame: Frame, whole: bool) -> dict:
@@ -361,6 +366,7 @@ class TapeDir:
                         "wall_s": frame.wall_s,
                         "live": frame.live,
                         "recv_error": None if frame.recv_error is None else list(frame.recv_error),
+                        "send_error": None if frame.send_error is None else list(frame.send_error),
                     }
                 )
             )
@@ -368,18 +374,42 @@ class TapeDir:
 
 
 def _recorded_error(err: tuple) -> Exception:
-    """The exception a recorded recv raised, as its own class when that takes a message (TimeoutError), else a
-    RuntimeError naming it: the client's per-round handling sees an Exception with the same message."""
+    """The exception a recorded recv raised: ``err`` is (which recv, module, type, message)."""
     _, module, name, message = err
+    return rebuilt_error(module, name, message)
+
+
+def rebuilt_error(module: str, name: str, message: str) -> Exception:
+    """A recorded exception as its own class with its recorded message, so the client's per-round handling records
+    the same ``Type: message`` it did: cls(message) when that constructor takes a message (TimeoutError), else the
+    class built without its constructor (websockets' ConnectionClosedError(rcvd, sent) takes no message), a subclass
+    of the same name whose str is the message when even its __str__ needs the missing fields; RuntimeError naming it
+    only when the class is gone."""
     try:
         import importlib
 
         cls = getattr(importlib.import_module(module), name)
-        if isinstance(cls, type) and issubclass(cls, Exception):
-            return cls(message)
     except Exception:  # noqa: BLE001
+        cls = None
+    if not (isinstance(cls, type) and issubclass(cls, Exception)):
+        return RuntimeError(f"{module}.{name}: {message}")
+    try:
+        e = cls(message)
+        if str(e) == message:
+            return e
+    except Exception:  # noqa: BLE001 - a constructor with its own signature
         pass
-    return RuntimeError(f"{module}.{name}: {message}")
+    e = cls.__new__(cls)
+    Exception.__init__(e, message)
+    try:
+        if str(e) == message:
+            return e
+    except Exception:  # noqa: BLE001 - a __str__ that reads fields the constructor would have set
+        pass
+    same = type(cls.__name__, (cls,), {"__module__": cls.__module__, "__str__": lambda self, m=message: m})
+    e = same.__new__(same)
+    Exception.__init__(e, message)
+    return e
 
 
 def _json_default(x):
@@ -428,7 +458,12 @@ class _Recording:
         self.frame.op = op
         payload = self.tape._stamp(self.frame, request, payload)
         self.frame.request = payload
-        return self.ws.send(payload, **kw)
+        try:
+            return self.ws.send(payload, **kw)
+        except Exception as e:  # the server never saw it: taped, raised again on replay, its k not counted
+            self.frame.send_error = (type(e).__module__, type(e).__name__, str(e))
+            self.tape._unstamp(self.frame)
+            raise
 
     def close(self, *a, **k):
         try:
@@ -465,6 +500,17 @@ class _Replaying:
         if self.n_recv == 0:
             self.n_recv += 1
             frame = self.tape.dir.load(i)
+            if frame is not None:  # the planner the run talks to must be the one the tape's frame came from
+                conflict = self.tape._pair(frame.server, server_of(self.uri), frame.op)
+                if conflict is not None:
+                    self.diffs = [conflict]
+                    self.tape.mismatches += 1
+                    if self.tape.mode == "replay":
+                        raise TapeDiverged(conflict[0], i, conflict[1], "metadata")
+                    if self.tape.mode == "replay-live":
+                        self._switch(i, [conflict])
+                        return self.real.recv(timeout=timeout, **kw)
+                    log.warning(f"wstape frame {i}: {conflict[1]}")
             if frame is not None and frame.recv_error is not None and frame.recv_error[0] == 0:
                 self.frame, self.done = frame, True
                 self.tape._served(self, frame)  # the connection ends here, as it did on the tape
@@ -472,7 +518,7 @@ class _Replaying:
             frame = frame or self.tape.dir.load(len(self.tape.dir) - 1)
             if frame is None or frame.metadata is None:
                 raise TapeExhausted(i, "metadata")
-            return packb(frame.metadata)
+            return packb(self.tape._rerooted(frame.metadata))
         if self.frame is None:
             raise TapeExhausted(i, self.op)
         self.n_recv += 1
@@ -518,7 +564,24 @@ class _Replaying:
                 f"wstape frame {i} ({self.op}): {len(self.diffs)} field(s) differ from the tape; first {self.diffs[0][0]}: "
                 f"{self.diffs[0][1]}"
             )
+        if want.send_error is not None:  # the recorded send failed: the server never saw it, so neither does the k
+            tape._unstamp(probe)
+            self.done = True
+            tape._served(self, want)
+            raise rebuilt_error(*want.send_error)
         return None
+
+    def _switch(self, i: int, diffs: list) -> None:
+        """Real connections from here on, before this connection's request is known (a metadata-stage mismatch):
+        the live connection's own recv answers the client, and its send stamps as any live frame does."""
+        tape = self.tape
+        why = f"frame {i} (metadata) differs at {diffs[0][0]}: {diffs[0][1]}"
+        log.warning(f"wstape: switching to live connections: {why}")
+        tape.live, tape.switched_at, tape.switch_reason = True, i, why
+        tape._log_switch(i, "metadata", diffs)
+        ws = tape._live_connect(self.uri, self.kwargs, i)
+        self.real = _Recording(tape, self.uri, ws, live=True)
+        self.real.frame.owner, self.real.frame.call_id = self.owner, self.call_id
 
     def _go_live(self, payload, probe: Frame, i: int, diffs: list):
         """Real connections from here on. This request goes out as stamped (its k is already counted), so the
@@ -531,11 +594,13 @@ class _Replaying:
         )
         log.warning(f"wstape: switching to live connections: {why}")
         tape.live, tape.switched_at, tape.switch_reason = True, i, why
-        ws = tape.real_connect(self.uri, **self.kwargs)
+        tape._log_switch(i, self.op, diffs)
+        ws = tape._live_connect(self.uri, self.kwargs, i)
         self.real = _Recording(tape, self.uri, ws, live=True)
         frame = self.real.frame
         frame.owner, frame.call_id = self.owner, self.call_id
         self.real.recv(timeout=60.0)  # the real server's metadata; the client already has the tape's
+        tape._check_live(frame.metadata, i)
         frame.op, frame.request, frame.k, frame.seed = self.op, payload, probe.k, probe.seed
         return ws.send(payload)
 
@@ -546,15 +611,24 @@ class _Replaying:
             return None
         self.done = True
         if not self.sent:  # a metadata-only connection (fetch_metadata): the tape's frame here must be one too
-            want = self.tape.dir.load(self.tape.index)
+            tape, i = self.tape, self.tape.index
+            want = tape.dir.load(i)
             self.frame = want
             if want is None:
-                self.diffs = [("<end of tape>", f"the tape has {self.tape.index} frames")]
+                self.diffs = self.diffs or [("<end of tape>", f"the tape has {i} frames")]
             elif want.op != "metadata":
-                self.diffs = [("op", f"{want.op} on the tape, metadata in the replay")]
+                self.diffs = self.diffs or [("op", f"{want.op} on the tape, metadata in the replay")]
             if self.diffs:
-                self.tape.mismatches += 1
-                log.warning(f"wstape frame {self.tape.index} (metadata): {self.diffs[0][1]}")
+                tape.mismatches += 1
+                log.warning(f"wstape frame {i} (metadata): {self.diffs[0][1]}")
+                tape._served(self, self.frame)
+                if tape.mode == "replay":  # strict: the first mismatch stops the instance, here as at a send
+                    raise TapeDiverged(self.diffs[0][0], i, self.diffs[0][1], "metadata")
+                if tape.mode == "replay-live":  # the next connection is live: the tape no longer describes the run
+                    tape.live, tape.switched_at = True, i
+                    tape.switch_reason = f"frame {i} (metadata) differs at {self.diffs[0][0]}: {self.diffs[0][1]}"
+                    log.warning(f"wstape: switching to live connections: {tape.switch_reason}")
+                return None
         self.tape._served(self, self.frame)
         return None
 
@@ -587,6 +661,9 @@ class WsTape:
         self.switched_at: int | None = None
         self.switch_reason: str | None = None
         self.stamped: list = []  # (server, k, seed) per stamped legacy request
+        self.servers: dict = {}  # replay: the tape's server -> the replay's, paired at first sight (a port may move)
+        self.rerooted: dict | None = None  # replay: the served metadata's module root, and the root it was mapped to
+        self.live_imports: list = []  # replay-live: the live planner's modules, checked against this checkout
         self._installed = False
         self._lock = threading.Lock()
         self.real_connect = bridge_client.connect
@@ -664,16 +741,93 @@ class WsTape:
             return packb(request)
         return payload
 
-    def _count_skill(self, frame: Frame) -> None:
-        """A skill request that reached the pipeline counts toward the server's k, as the plan requests do."""
-        if frame.op != "skill":
+    def _unstamp(self, frame: Frame) -> None:
+        """A stamped request whose send failed never reached the server: its k is given back."""
+        if frame.op == "plan" and frame.k is not None and self.k.get(frame.server) == frame.k:
+            self.k[frame.server] = frame.k - 1
+            if self.stamped and self.stamped[-1] == (frame.server, frame.k, frame.seed):
+                self.stamped.pop()
+
+    def _count_skill(self, frame: Frame, server: str | None = None) -> None:
+        """A skill request that reached the pipeline counts toward the server's k, as the plan requests do.
+        ``server``: the connection's own (a replay on another port than the recording's counts under the port it
+        talks to, the key _stamp uses); else the frame's."""
+        if frame.op != "skill" or frame.send_error is not None:
             return
         req = frame.request_dict() or {}
         ans = frame.response_json() or {}
         refused = not ans.get("ok", False) and ans.get("phase") is None and ans.get("code") in BUILD_REFUSALS
         if req.get("skill") in OWN_SOLVE_SKILLS or refused:
             return
-        frame.k = self.k[frame.server] = self.k.get(frame.server, 0) + 1
+        key = server or frame.server
+        frame.k = self.k[key] = self.k.get(key, 0) + 1
+
+    # ---------------------------------------------------------------- replay: which planner, which checkout
+    def _pair(self, taped: str, now: str, op: str = ""):
+        """The replay talks to the planner the tape's frame came from: each server on the tape is paired with the
+        replay's server it is first served on (a replay may run on another port); a later frame of that server on
+        another one, or another server on its partner, is a mismatch ("server", detail). None when it pairs."""
+        if not taped:
+            return None
+        paired = self.servers.setdefault(taped, now)
+        other = next((t for t, n in self.servers.items() if n == now and t != taped), None)
+        if paired != now or other is not None:
+            return (
+                "server",
+                f"{taped} on the tape (paired with {paired}); the replay talks to {now}"
+                + (f", paired with {other}" if other else ""),
+            )
+        return None
+
+    def _rerooted(self, metadata):
+        """A replay has no planner: the tape is it, and its metadata names the recording's checkout. Its module
+        paths are mapped onto this checkout (the part from ``/tiptop/`` on kept), logged and summarised, so
+        run.check_imports judges the replay's own code and a tape replays from another snapshot of the same code."""
+        modules = (metadata or {}).get("modules") if isinstance(metadata, dict) else None
+        if not modules:
+            return metadata
+        root = str(ROOT)
+        out, moved = {}, None
+        for name, path in modules.items():
+            if isinstance(path, str) and "/tiptop/" in path and not path.startswith(root + "/"):
+                recorded, rest = path.split("/tiptop/", 1)
+                out[name] = f"{root}/tiptop/{rest}"
+                moved = recorded
+            else:
+                out[name] = path
+        if moved is None:
+            return metadata
+        if self.rerooted is None:
+            self.rerooted = {"from": moved, "to": root}
+            log.info(f"wstape: the tape's planner modules name {moved}; served as {root} (a replay runs no planner)")
+        return {**metadata, "modules": out}
+
+    def _check_live(self, metadata, i: int) -> None:
+        """The live planner a replay-live switched to must run this checkout's tiptop and cutamp (D25), as
+        check_imports requires of a planner at connect: logged, summarised, and a TapeDiverged("imports") if not."""
+        modules = (metadata or {}).get("modules") or {} if isinstance(metadata, dict) else {}
+        files = {name: modules.get(name) for name in ("tiptop", "cutamp")}
+        outside = sorted(n for n, p in files.items() if p is None or not Path(p).resolve().is_relative_to(ROOT))
+        self.live_imports.append({"frame": i, "modules": files, "ok": not outside})
+        log.info("imports (live planner): " + ", ".join(f"{n}={p}" for n, p in files.items()))
+        if outside:
+            raise TapeDiverged(
+                "imports", i, f"the live planner's {', '.join(outside)} not imported from {ROOT}", "metadata"
+            )
+
+    def _live_connect(self, uri: str, kwargs: dict, i: int):
+        """The real connection a replay-live switches to, retried on OSError as TiptopClient._open retries: the
+        server opens its port only once its warm-up is done (tiptop_websocket_server.run), so a fresh planner still
+        warming up, or one relaunching after a start-up crash, refuses the connection for a while."""
+        last = None
+        for attempt in range(LIVE_CONNECT_RETRIES):
+            try:
+                return self.real_connect(uri, **kwargs)
+            except OSError as e:
+                last = e
+                log.warning(f"wstape: live connect to {uri} failed ({e}); retry {attempt + 1}/{LIVE_CONNECT_RETRIES}")
+                time.sleep(LIVE_RETRY_WAIT_S)
+        raise last
 
     # ---------------------------------------------------------------- the records
     def _taped(self, frame: Frame) -> None:
@@ -708,7 +862,7 @@ class WsTape:
                 "live": False,
             }
             if frame is not None:
-                self._count_skill(frame)
+                self._count_skill(frame, server_of(conn.uri))
             self.frames.append(row)
             self.log_dir.mkdir(parents=True, exist_ok=True)
             with open(self.replay_log, "a") as f:
@@ -717,6 +871,26 @@ class WsTape:
             f"wstape frame {i} ({conn.op}) served from the tape"
             + ("" if not conn.diffs else f"; {len(conn.diffs)} diff(s), first {conn.diffs[0][0]}")
         )
+
+    def _log_switch(self, i: int, op: str, diffs: list) -> None:
+        """The frame a replay-live switched at, in the replay's own log (``live``: true, ``matched``: whether its
+        request agreed with the tape, a forced switch). The frame itself is taped live, under wstape_live."""
+        row = {
+            "i": i,
+            "op": op,
+            "owner": self.owner,
+            "call_id": self.call_id,
+            "server": None,
+            "tape_op": None,
+            "matched": not diffs,
+            "n_diffs": len(diffs),
+            "diffs": [{"path": p, "detail": d} for p, d in diffs],
+            "live": True,
+            "switched": True,
+        }
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.replay_log, "a") as f:
+            f.write(json.dumps(row, default=_json_default) + "\n")
 
     def summary(self) -> dict:
         return {
@@ -731,5 +905,8 @@ class WsTape:
             "live": self.live,
             "switched_at": self.switched_at,
             "switch_reason": self.switch_reason,
+            "servers": dict(self.servers),
+            "rerooted": self.rerooted,
+            "live_imports": list(self.live_imports),
             "replay_log": str(self.replay_log) if self.mode in REPLAY_MODES else None,
         }

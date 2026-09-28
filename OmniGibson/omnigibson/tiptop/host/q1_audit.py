@@ -10,7 +10,8 @@ disagreement is a row in ``mismatches``, never a substitute.
 PurityAudit wraps the connector the planner sees: around every 0-step op (b1k.runtime.audit.zero_step: task,
 skills, clock, stance_request, propose_stances, check_stances, check, goal_status, holds, abort and every
 world.<member>) and around every comparison read DualEpisode makes on the real Episode, it takes the host's state
-digest before and after and requires it unchanged, and takes the StepLedger's write-calls total before and after
+digest before and after and requires it unchanged (world.appeared and world.fixture_for may change its ``objects``
+alone: they track what they name, STATEFUL_OPS), and takes the StepLedger's write-calls total before and after
 and requires it unchanged; ``check(ledger)`` also requires the unowned write-calls to be 0. The digest is a callable
 the bench passes in (the oracle package's state_digest bound to the sim and the knowledge source): nothing here
 reads the simulator, and host/ never names that package.
@@ -26,16 +27,10 @@ from typing import Any, Callable, Optional
 from b1k.runtime.audit import ConnectorAudit, zero_step
 
 
-class AuditedConnector(ConnectorAudit):
-    """ConnectorAudit with the Connector's ``check(call)`` op restored. b1k/runtime/audit.py defines the op and then
-    its verdict under the same name ``check``, so on the proxy a planner's ``check(call)`` answered the verdict tuple
-    (found by the episode host's unit twin, W4-E). The verdict is ``verdict(n0)`` here; the op is the op."""
-
-    def check(self, call):
-        return self._op("check", self.conn.check, call)
-
-    def verdict(self, n0: Optional[int] = None) -> tuple:
-        return ConnectorAudit.check(self, n0)
+# The name the episode host imports. b1k/runtime/audit.py once defined its verdict under the op's name ``check``, so a
+# planner's check(call) through it answered the verdict tuple (found by the episode host's unit twin, W4-E); since
+# the week-4 fix pass the b1k class has the op ``check(call)`` and the verdict ``verdict(n0)`` itself.
+AuditedConnector = ConnectorAudit
 
 # The reads compared (WEEK4_PLAN §3.3): the Runner's pure questions. sim.n_steps / sim.max_steps are compared after
 # every write instead (the ClockView against the Episode's own clock, row 16).
@@ -43,6 +38,10 @@ PURE_READS = ("is_shut", "holding", "held_names", "support_of", "distance", "edg
               "goal_already_holds", "stance_key", "is_floor", "has_arm")
 ATTR_READS = ("floor",)
 SKIPPED = ("after_transition", "fixture_for")  # stateful: never asked twice
+# Their world ops change the digest's ``objects`` (what the sim tracks) by design: appeared() tracks a cut's halves
+# (knowledge.appeared), fixture_for tracks the fixture it names (sim.track), exactly as Episode.after_transition and
+# Episode.fixture_for do. PurityAudit allows that key alone to change across them; any other change is a violation.
+STATEFUL_OPS = ("world.appeared", "world.fixture_for")
 WRITES = ("pick", "achieve", "put_down", "open_up", "release", "pour", "dwell", "stand_for", "walk_to_floor")
 _MISSING = object()
 
@@ -118,8 +117,8 @@ class DualEpisode:
 
     def _record(self, member: str, args: tuple, kwargs: dict, shim_out: tuple, ep_out: tuple) -> None:
         (sv, se), (ev, ee) = shim_out, ep_out
-        if se is not None or ee is not None:
-            equal = se is not None and ee is not None and type(se) is type(ee)
+        if se is not None or ee is not None:  # the type and the message, as the Runner tape compares them
+            equal = se is not None and ee is not None and type(se) is type(ee) and str(se) == str(ee)
         else:
             equal = same(sv, ev)
         self._compared[member] += 1
@@ -240,6 +239,8 @@ class PurityAudit:
             d1, w1 = self.digest(), self.writes()
             changed = sorted(k for k in set(d0) | set(d1) if d0.get(k) != d1.get(k))
             row = {"kind": "purity", "op": label, "digest_changed": changed, "writes": int(w1 - w0)}
+            if label in STATEFUL_OPS and set(changed) <= {"objects"}:  # the tracked set grew, as legacy's read does
+                row["stateful"], changed = bool(changed), []
             self.rows.append(row)
             if changed or w1 != w0:
                 self.violations.append(

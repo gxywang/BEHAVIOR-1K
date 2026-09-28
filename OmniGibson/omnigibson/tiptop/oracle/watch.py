@@ -211,6 +211,22 @@ def state_digest(sim, knowledge=None) -> dict:
             d["objects"] = _hex(h)
     except Exception:  # noqa: BLE001
         d["objects"] = None
+    # the tracked objects' joints: a drawer that slid open moves no root pose (store_honey's cabinet, j_link_4),
+    # so an open or a close is visible here alone
+    try:
+        objects = getattr(sim, "objects", None)
+        if objects is None:
+            d["joints"] = None
+        else:
+            h, n = hashlib.sha256(), 0
+            for name in sorted(objects):
+                obj = objects[name]
+                if int(getattr(obj, "n_dof", 0) or 0) > 0:
+                    h.update(name.encode() + _bytes(obj.get_joint_positions()))
+                    n += 1
+            d["joints"] = (n, _hex(h))
+    except Exception:  # noqa: BLE001
+        d["joints"] = None
     memory = getattr(knowledge, "seen", None) if knowledge is not None else None
     if memory is None and knowledge is not None:
         memory = getattr(getattr(knowledge, "sim", None), "seen_boxes", None)

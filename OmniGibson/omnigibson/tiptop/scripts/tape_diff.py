@@ -111,32 +111,71 @@ def _fields(row: dict) -> dict:
     return {k: v for k, v in (row.get("fields") or {}).items() if not _volatile(k)}
 
 
+def _on_tape(replay_log: Path) -> int | None:
+    """How many frames the tape a replay was served from holds: the run's result JSON (bench.instruments.wstape
+    .on_tape, written by WsTape.summary), else None."""
+    for js in sorted((replay_log.parent / "json").glob("*.json")) if (replay_log.parent / "json").is_dir() else ():
+        try:
+            ws = ((json.loads(js.read_text()).get("bench") or {}).get("instruments") or {}).get("wstape") or {}
+        except (OSError, ValueError):
+            continue
+        if ws.get("on_tape") is not None:
+            return int(ws["on_tape"])
+    return None
+
+
+def _replay_side(rows: list, on_tape: int | None) -> dict:
+    """One replay log as served: its matched prefix, its first frame that did not match (or, all matched, the end
+    of a stream shorter than its tape), the mismatched frames and the frame it went live at."""
+    matched = 0
+    for row in rows:
+        if not row.get("matched", False) or row.get("live"):
+            break
+        matched += 1
+    first = next((r for r in rows if not r.get("matched", False) or r.get("live")), None)
+    div = None
+    if first is not None:
+        div = {
+            "frame": first["i"],
+            "op": first["op"],
+            "tape_op": first.get("tape_op"),
+            "fields": [d["path"] for d in first.get("diffs", [])] or (["<forced live>"] if first.get("live") else []),
+            "diffs": first.get("diffs", []),
+        }
+    elif on_tape is not None and matched < on_tape:
+        div = {"frame": matched, "op": "<end>", "tape_op": None, "fields": ["<end of stream>"], "diffs": []}
+    return {
+        "prefix": matched,
+        "first_divergence": div,
+        "on_tape": on_tape,
+        "mismatched_frames": [r["i"] for r in rows if not r.get("matched", False)],
+        "live_from": next((r["i"] for r in rows if r.get("live")), None),
+    }
+
+
 def stream_report(a: tuple, b: tuple) -> dict:
     (ka, pa), (kb, pb) = a, b
     ra, rb = _rows(pa), _rows(pb)
     out = {"a": str(pa), "b": str(pb), "kind": [ka, kb], "frames": [len(ra), len(rb)]}
     if "replay" in (ka, kb):  # a replay log names its own diffs against the tape it was served from
-        rep = ra if ka == "replay" else rb
-        matched = 0
-        for row in rep:
-            if not row.get("matched", False):
-                break
-            matched += 1
-        first = next((r for r in rep if not r.get("matched", False)), None)
+        sides = {}
+        for key, kind, rows, path, other in (("a", ka, ra, pa, rb), ("b", kb, rb, pb, ra)):
+            if kind == "replay":  # served from a tape: the other side, when it is that tape's index, or its JSON
+                n = len(other) if (ka, kb).count("replay") == 1 else _on_tape(path)
+                sides[key] = _replay_side(rows, n)
+        rep = [sides[k] for k in ("a", "b") if k in sides]
+        first = min(
+            (s["first_divergence"] for s in rep if s["first_divergence"] is not None),
+            key=lambda d: d["frame"],
+            default=None,
+        )
         out.update(
             {
-                "prefix": matched,
-                "first_divergence": None
-                if first is None
-                else {
-                    "frame": first["i"],
-                    "op": first["op"],
-                    "tape_op": first.get("tape_op"),
-                    "fields": [d["path"] for d in first.get("diffs", [])],
-                    "diffs": first.get("diffs", []),
-                },
-                "mismatched_frames": [r["i"] for r in rep if not r.get("matched", False)],
-                "live_from": next((r["i"] for r in rep if r.get("live")), None),
+                "prefix": min(s["prefix"] for s in rep),  # every side matched its tape this far
+                "first_divergence": first,
+                "mismatched_frames": sorted({i for s in rep for i in s["mismatched_frames"]}),
+                "live_from": min((s["live_from"] for s in rep if s["live_from"] is not None), default=None),
+                "replays": sides,
             }
         )
         return out

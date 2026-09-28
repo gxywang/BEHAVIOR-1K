@@ -3,6 +3,7 @@
 from b1k.bridge.articulation import is_open
 from b1k.bridge.protocol import bddl_category
 from b1k.connector.types import AABB, Belief, ObjRef, Pose2
+from b1k.connector.world import derived_source
 from omnigibson.tiptop.articulation import openable_joints
 
 ARMS = ("left", "right")
@@ -56,22 +57,28 @@ class OracleWorld:
             self.hands[u.arm] -= {u.obj} if u.obj is not None else self.hands[u.arm]
 
     def _apply_record(self, u) -> None:
-        """The robot's own record, by tracked label, as note_hands writes it: idempotent."""
+        """The robot's own record, by tracked label, as note_hands writes it: idempotent. A release names the arm
+        that let go: a label the record has in the OTHER hand stays (a hand-to-hand move is released(old arm) and
+        held(new arm), in either order), as legacy's release pops its own arm's entries only (bench.py release)."""
         record = self.sim.held_objects
         if u.kind == "held" and u.obj is not None:
             record[self.sim.tracked_label(u.obj.id)] = u.arm
         elif u.kind == "released" and u.obj is not None:
-            record.pop(self.sim.tracked_label(u.obj.id), None)
+            label = self.sim.tracked_label(u.obj.id)
+            if record.get(label) == u.arm:
+                record.pop(label)
         elif u.kind == "released":
             for label in [label for label, holder in record.items() if holder == u.arm]:
                 record.pop(label)
 
     # -- the hands ----------------------------------------------------------------------------------------------------
     def _record(self, arm) -> tuple:
-        """Episode mode: what the record says ``arm`` holds, as BDDL names, in the record's insertion order."""
+        """Episode mode: what the record says ``arm`` holds, as BDDL names, in the record's insertion order; a label
+        with no BDDL name (an object a transition removed) is left out, as Episode.held_names leaves it out."""
         sim = self.sim
+        names = getattr(sim, "bddl_names", {})
         return tuple(
-            self.ref(sim.bddl_names.get(label, label)) for label, holder in sim.hands().items() if holder == arm
+            self.ref(names[label]) for label, holder in sim.hands().items() if holder == arm and label in names
         )
 
     def held(self, arm) -> Belief:
@@ -95,17 +102,20 @@ class OracleWorld:
             return self._b(tuple(a for a in ARMS if self.sim.hands().get(label) == a))
         return self._b(tuple(a for a in ARMS if o in (self.held(a).value or ())), "belief")
 
-    def refresh_hands(self) -> list:
+    def _refresh_hands(self, after=None) -> list:
         """Pop the record's entries that localization says have left the hand: run.note_hands with no atoms
         (run.py:812-817), which only pops and never steps; the episode host calls it after a native pick, place,
-        release, hold or press (WEEK4_PLAN 3.3 HandRefresh). The popped labels. RuntimeError if the sim stepped."""
+        release, hold or press (WEEK4_PLAN 3.3 HandRefresh), through oracle.refresh_hands. ``after``: the step the
+        run started at, as legacy passes its plan's start step: a remembered look from before it (the onboard source
+        keeps its last) is unknown, never evidence that the hand let go. The popped labels. RuntimeError if the sim
+        stepped. Private: not a WorldView member, so neither the planner's world() nor a skill reaches it."""
         from types import SimpleNamespace
 
         from omnigibson.tiptop.run import note_hands
 
         sim = self.sim
         before, n0 = list(sim.hands()), sim.n_steps
-        note_hands(sim, [], SimpleNamespace(close_eef=None, gripper=None), self.ep.knowledge)
+        note_hands(sim, [], SimpleNamespace(close_eef=None, gripper=None), self.ep.knowledge, after=after)
         if sim.n_steps != n0:
             raise RuntimeError(f"refresh_hands stepped the sim: {n0} -> {sim.n_steps}")
         return [label for label in before if label not in sim.hands()]
@@ -119,21 +129,29 @@ class OracleWorld:
         return self._b(None if b is None else AABB(tuple(map(float, b["lo"])), tuple(map(float, b["hi"]))))
 
     def _joints(self, o, joint) -> tuple:
-        """(the object's openable joints, the source of their positions): openable_joints' frames and limits, the
-        position the JointStateEstimator's when one is given."""
+        """(the object's openable joints, the source of the answer): openable_joints' frames and limits, the position
+        the JointStateEstimator's when one is given. The limits and the closed frame are openable_joints' (the
+        simulator's, oracle data) whatever the estimator is, so the answer is as privileged as its most privileged
+        input (derived_source): oracle, even over a proprio or depth estimator."""
         js = [j for j in openable_joints(self.sim.scene_object(o.id)) if joint is None or j["name"] == joint]
         if self.joints is None:
             return js, "oracle"
         read = [self.joints.value(o, j["name"]) for j in js]
-        return [dict(j, position=p.value) for j, p in zip(js, read)], (read[0].source if read else "oracle")
+        return [dict(j, position=p.value) for j, p in zip(js, read)], derived_source(
+            "oracle", *(p.source for p in read)
+        )
 
     def is_open(self, o, joint=None) -> Belief:
         js, source = self._joints(o, joint)
+        if any(j["position"] is None for j in js):  # an estimator that cannot see the joint: unknown, not an error
+            return self._b(None, source)
         shut = [not is_open(j["lower"], j["upper"], j["position"], closed=j["closed"]) for j in js]
         return self._b(not all(shut) if js else None, source)
 
     def open_fraction(self, o, joint=None) -> Belief:
         js, source = self._joints(o, joint)
+        if any(j["position"] is None for j in js):
+            return self._b(None, source)
         return self._b(
             max(abs(j["position"] - j["closed"]) / (j["upper"] - j["lower"]) for j in js) if js else None, source
         )

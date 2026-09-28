@@ -170,9 +170,14 @@ class Host:
 
 
 class NoPlanner:
-    """The planner server as a legacy route must see it: never. Any touch is the test's failure, not a refusal."""
+    """The planner server as a legacy route must see it: never. Every touch is counted in ``touched`` (a handler
+    that swallows the AssertionError cannot hide it) and raises."""
+
+    def __init__(self):
+        object.__setattr__(self, "touched", [])
 
     def __getattr__(self, name):
+        self.touched.append(name)
         raise AssertionError(f"planner.{name} was asked on a legacy route")
 
 
@@ -286,6 +291,9 @@ def test_the_literal_call_is_executed_with_its_declared_extras_and_the_rebuild_c
     assert b.lb.steps == b.ep.sim.n_steps == 40 + 30 + 30 + 20 + 20 + 30 + 45 + 25 + 30 + 30
     assert [r["evidence"]["records"] for r in b.rt.log][0] == [{"round": 0, "pick": jar.id, "step": 40}], \
         "the round records the call added, and those alone"
+    assert b.rt.log[1]["evidence"]["records"] == [
+        {"round": 1, "atoms": [{"predicate": "inside", "args": [jar.id, cabinet.id]}], "step": 70}], \
+        "a later call's records are its own, never the earlier calls' as well"
     assert b.ch.outcome("q1-99") is None, "never executed: None"
 
 
@@ -315,6 +323,15 @@ def test_the_rebuild_check_records_a_typed_call_that_disagrees_with_the_literal_
             SkillCall("open", OpenArgs(cabinet, min_fraction=0.8), arm="left"))
     assert (b.ch.mismatches[-1]["rebuilt"]["fraction"], b.ch.mismatches[-1]["literal"]["fraction"]) == (0.8, 0.0)
     assert len(b.ch.mismatches) == 4 and b.ep.calls[-1][1] == (cabinet.id,)
+    # an intent whose typed TARGET differs from the atom's second argument
+    put_run(b, "q1-5", entry("achieve", [{"predicate": "attached", "args": [camera.id, tripod.id]}]),
+            SkillCall("intent.attach", IntentArgs(camera, basket, "attached"), arm="left"))
+    assert b.ch.mismatches[-1]["rebuilt"]["atoms"] == [{"predicate": "attached", "args": [camera.id, basket.id]}]
+    # a pairing the table does not know: an achieve typed as a pick
+    put_run(b, "q1-6", entry("achieve", [{"predicate": "ontop", "args": [jar.id, table.id]}]),
+            SkillCall("pick_up", PickArgs(jar), arm="left"))
+    assert b.ch.mismatches[-1]["rebuilt"] == {"method": "achieve", "skill": "pick_up", "pairing": "unknown"}
+    assert len(b.ch.mismatches) == 6
 
 
 def test_a_wait_is_checked_against_the_literal_dwell_capped_by_what_the_episode_has_left():
@@ -324,8 +341,8 @@ def test_a_wait_is_checked_against_the_literal_dwell_capped_by_what_the_episode_
     r = put_run(b, "q1-1", entry("dwell", 600), SkillCall("wait", WaitArgs(20), budget_steps=20))
     assert b.ep.calls == [("dwell", (20,), {})] and r.steps == 20 and b.ch.mismatches == []
     put_run(b, "q1-2", entry("dwell", 600), SkillCall("wait", WaitArgs(600), budget_steps=600))
-    assert b.ch.mismatches[-1]["rebuilt"] == {"method": "dwell", "typed_steps": 0}, "the shim forgot the cap"
-    assert b.ch.mismatches[-1]["literal"]["typed_steps"] == 600
+    assert b.ch.mismatches[-1]["rebuilt"] == {"method": "dwell", "typed_steps": 600}, "the typed call carried 600"
+    assert b.ch.mismatches[-1]["literal"]["typed_steps"] == 0, "the literal capped by what is left: 0"
     b2 = build(FakeEpisode())  # no limit: the literal
     put_run(b2, "q1-1", entry("dwell", 600), SkillCall("wait", WaitArgs(600), budget_steps=600))
     assert b2.ch.mismatches == [] and b2.ep.calls == [("dwell", (600,), {})]
@@ -377,10 +394,10 @@ def test_the_advisory_precheck_never_refuses_and_records_what_it_would_have():
     assert b.conn.check(call).ok, "check() is ok on every legacy route"
     r = put_run(b, "q1-1", entry("pick", jar.id), call)
     assert r.status is Status.SUCCEEDED and b.ep.calls == [("pick", (jar.id,), {"into": None, "single_round": False})]
-    assert b.reg.advisory == {"hand_full": 2}, "check() and the run's own precheck, each counted, neither refused"
+    assert b.reg.advisory == {"hand_full": 1}, "once per call: the run's own precheck, not check() before it"
     put_run(b, "q1-2", entry("achieve", [{"predicate": "ontop", "args": [jar.id, table.id]}]),
             SkillCall("place", ON_TABLE, arm="right"))  # the right hand holds nothing: NOT_HOLDING would refuse
-    assert b.reg.advisory == {"hand_full": 2, "not_holding": 1} and len(b.ep.calls) == 2
+    assert b.reg.advisory == {"hand_full": 1, "not_holding": 1} and len(b.ep.calls) == 2
     b.reg.routing["press"] = {"default": "scripted"}  # scripted owns nothing: needs_percept refuses as ever
     r = b.conn.run(SkillCall("press", PressArgs(radio), arm="left"))
     assert (r.status, r.code) == (Status.PRECONDITION_UNMET, Code.PERCEPT_REQUIRED), r
@@ -393,10 +410,127 @@ def test_a_legacy_route_makes_no_reach_or_ik_call_where_the_plain_registry_would
     b = build(FakeEpisode(), world=BoxWorld(ALL))
     r = put_run(b, "q1-1", entry("pick", apple.id), call)
     assert r.status is Status.SUCCEEDED and b.ep.calls == [("pick", (apple.id,), {"into": None, "single_round": False})]
+    assert b.rt.svc.planner.touched == [], "no IK request, not even one a handler swallowed"
+    assert not any(k.startswith("error:") for k in b.reg.advisory), b.reg.advisory
     plain = build(FakeEpisode(), world=BoxWorld(ALL), registry=SkillRegistry)  # the control: the stub bites there
     r = put_run(plain, "q1-1", entry("pick", apple.id), call)
     assert (r.status, r.code) == (Status.FAILED, Code.BACKEND_ERROR) and "planner.reach" in r.detail, r
-    assert plain.ep.calls == [], "the plain registry never reached the Episode"
+    assert plain.ep.calls == [] and plain.rt.svc.planner.touched == ["reach"], "the plain registry asked it"
+
+
+def test_an_advisory_check_that_raises_is_counted_and_the_call_still_runs():
+    def boom(call, svc):
+        raise KeyError("typo")
+
+    specs = {**EPISODE_SPECS, "pick_up": dataclasses.replace(EPISODE_SPECS["pick_up"], check=boom)}
+    b = build(FakeEpisode(), registry=lambda sp, be, ro: EpisodeRegistry(specs, be, ro))
+    r = put_run(b, "q1-1", entry("pick", jar.id), SkillCall("pick_up", PickArgs(jar), arm="left"))
+    assert r.status is Status.SUCCEEDED and b.reg.advisory == {"error:KeyError": 1}, (r, b.reg.advisory)
+
+
+def test_the_judge_reads_the_observation_after_the_run():
+    b = build(FakeEpisode())
+    after = StepObs(777, b.env.p.copy(), {})
+    b.lb.observe_now = lambda: after
+    put_run(b, "q1-1", entry("pick", jar.id), SkillCall("pick_up", PickArgs(jar), arm="left"))
+    assert b.v.obs_seen and b.v.obs_seen[-1] is after, "the frames after the legacy call, not the Runtime's before it"
+
+
+class ZeroStepPour(FakeEpisode):
+    def pour(self, item, target):
+        return self._did("pour", (item, target), {}, 0)
+
+
+def test_a_failure_with_no_text_that_never_stepped_is_a_backend_error():
+    b = build(ZeroStepPour(ok=False))
+    r = put_run(b, "q1-1", entry("pour", jar.id, basket.id), SkillCall("intent.pour", IntentArgs(jar, basket, "pour"),
+                                                                       arm="left"))
+    assert (r.status, r.code, r.phase, r.steps) == (Status.FAILED, Code.BACKEND_ERROR, None, 0), r
+
+
+def test_a_bent_relation_is_reported_on_the_result_and_still_runs():
+    """SPEC F16's degrade marker, as LegacyBackend names it: under and touching always, an in whose target has no
+    compartment floor on the legacy wire; reported, never refused (PARITY runs the literal call)."""
+    b = build(FakeEpisode())
+    b.lb.has_cavity = lambda target, item: False  # the bench without --inside-region
+    r = put_run(b, "q1-1", entry("achieve", [{"predicate": "inside", "args": [jar.id, cabinet.id]}]),
+                SkillCall("place", IN_CABINET, arm="left"))
+    assert r.status is Status.SUCCEEDED and (r.evidence["degraded_to"], r.evidence["relations"]) == ("on", ["in->on"])
+    r = put_run(b, "q1-2", entry("achieve", [{"predicate": "under", "args": [jar.id, table.id]}]),
+                SkillCall("place", PlaceArgs(jar, (Relation(Rel.UNDER, table),)), arm="left"))
+    assert r.evidence["relations"] == ["under->on"]
+    r = put_run(b, "q1-3", entry("achieve", [{"predicate": "ontop", "args": [jar.id, table.id]}]),
+                SkillCall("place", ON_TABLE, arm="left"))
+    assert "degraded_to" not in r.evidence and b.lb.degraded == 2 and len(b.ep.calls) == 3
+    b.lb.has_cavity = lambda target, item: True
+    r = put_run(b, "q1-4", entry("achieve", [{"predicate": "inside", "args": [jar.id, cabinet.id]}]),
+                SkillCall("place", IN_CABINET, arm="left"))
+    assert "degraded_to" not in r.evidence, "a compartment floor on the wire: not bent"
+
+
+class HandOver(FakeEpisode):
+    def achieve(self, atoms, arm="left", floor=None, done=None):
+        ok = self._did("achieve", (atoms,), {"arm": arm, "floor": floor, "done": done}, 30, {"round": 1})
+        self.sim.held_objects[self._label(jar.id)] = "right"  # the jar changed hands within the call
+        return ok
+
+
+def test_a_label_that_changes_hands_within_a_call_is_released_before_it_is_held():
+    ep = HandOver()
+    ep.sim.held_objects["jar_1"] = "left"
+    b = build(ep)
+    r = put_run(b, "q1-1", entry("achieve", [{"predicate": "inside", "args": [jar.id, cabinet.id]}], arm="right"),
+                SkillCall("place", IN_CABINET, arm="right"))
+    assert r.world_updates == (WorldUpdate("released", jar, "left", source="oracle"),
+                               WorldUpdate("held", jar, "right", source="oracle")), r.world_updates
+
+
+class Rounds(FakeEpisode):
+    """achieve adds the scripted round records and returns ``ok`` (tidying_bedroom's rows, G3)."""
+
+    def __init__(self, rounds, **kw):
+        super().__init__(**kw)
+        self.rounds = rounds
+
+    def achieve(self, atoms, arm="left", floor=None, done=None):
+        self.calls.append(("achieve", (atoms,), {"arm": arm}))
+        for r in self.rounds:
+            self.sim.n_steps += int(r.get("env_steps", 0)) + 100  # the captures and the plan
+            self.records.append({**r, "step": self.sim.n_steps})
+        return self.ok
+
+
+NEXT_TO_BED = PlaceArgs(jar, (Relation(Rel.NEXT_TO, table),))
+
+
+def test_a_call_whose_rounds_never_executed_is_coded_by_its_rounds_error_whatever_the_episode_returned():
+    """tidying q1-4: every round failed to plan (No satisfying particles), yet Episode.achieve returned True (the
+    held sandal hung beside the bed, and its own nextto test is geometric); the judge says no. Nothing was placed:
+    the cause is the planner's, not a wrong placement."""
+    ep = Rounds([{"round": 11, "error": "TiptopPlanningError: planning failed: cuTAMP failed to find a plan: No "
+                  "satisfying particles found after optimizing all 1 plan(s)"}], ok=True)
+    b = build(ep, truth={"nextto": False})
+    r = put_run(b, "q1-4", entry("achieve", [{"predicate": "nextto", "args": [jar.id, table.id]}]),
+                SkillCall("place", NEXT_TO_BED, arm="left"))
+    assert (r.status, r.code, r.phase) == (Status.INFEASIBLE, Code.NO_PLACEMENT, "particles"), r
+    assert r.evidence["legacy_ok"] is True
+
+
+def test_a_call_whose_last_round_executed_is_coded_by_that_execution_not_an_earlier_refusal():
+    """tidying q1-7: round 17 was rejected by motion validation after 40 steps, round 18 ran its plan and set the
+    sandal down in the wrong place; the Episode returned False and the judge says no: an executed wrong placement."""
+    ep = Rounds([{"round": 17, "env_steps": 40, "error": "motion validation rejected PlaceNear(sandal_2, ...)"},
+                 {"round": 18, "env_steps": 258}], ok=False)
+    b = build(ep, truth={"nextto": False})
+    r = put_run(b, "q1-7", entry("achieve", [{"predicate": "nextto", "args": [jar.id, table.id]}]),
+                SkillCall("place", NEXT_TO_BED, arm="left"))
+    assert (r.status, r.code, r.phase) == (Status.FAILED, Code.PLACED_WRONG, "execute"), r
+    ep = Rounds([{"round": 18, "env_steps": 258}, {"round": 19, "env_steps": 40, "error": "motion validation "
+                  "rejected PlaceNear(sandal_2, ...)"}], ok=False)
+    b = build(ep, truth={"nextto": False})
+    r = put_run(b, "q1-8", entry("achieve", [{"predicate": "nextto", "args": [jar.id, table.id]}]),
+                SkillCall("place", NEXT_TO_BED, arm="left"))
+    assert (r.status, r.code, r.phase) == (Status.INFEASIBLE, Code.EXEC_REFUSED, "motion"), "the last round's own"
 
 
 # ----------------------------------------------------------------------------------------------- hands and status
@@ -436,13 +570,24 @@ def test_a_call_with_no_entry_is_unsupported_except_a_wait_which_dwells_the_type
     assert b.rt.step == 0 and b.rt.charged == {"skill": 0, "wait": 0}
 
 
-def test_an_empty_effects_call_takes_its_status_from_the_literal_return_and_the_error():
-    """A press without a state check and an intent have nothing the GoalChecker judges: the literal decides."""
-    b = build(FakeEpisode(ok=False), truth={"toggled_on": True})
+def test_a_press_without_a_state_check_is_judged_on_the_literal_atom_it_asked_for():
+    """The Runner's achieve([toggled_on(t)]) is typed as a press with want_on None, which effects() leaves unstated:
+    the result is judged on that literal atom, so a press that turned its switch on says so in its effects (the
+    cook_bacon stove) and one that did not is not a success, whatever the literal returned."""
+    b = build(FakeEpisode(ok=True), truth={"toggled_on": True})
     r = put_run(b, "q1-1", entry("achieve", [{"predicate": "toggled_on", "args": [radio.id]}]),
                 SkillCall("press", PressArgs(radio, want_on=None), arm="left"))
-    assert r.status is not Status.SUCCEEDED and r.evidence["legacy_ok"] is False and r.effects == (), r
-    assert b.v.obs_seen == [], "nothing to judge: the scorer was not asked"
+    assert r.status is Status.SUCCEEDED and r.effects == (Fact("toggled_on", (radio.id,)),), r
+    assert len(b.v.obs_seen) == 1, "judged once, after the run"
+    b = build(FakeEpisode(ok=True), truth={"toggled_on": False})
+    r = put_run(b, "q1-1", entry("achieve", [{"predicate": "toggled_on", "args": [radio.id]}]),
+                SkillCall("press", PressArgs(radio, want_on=None), arm="left"))
+    assert r.status is not Status.SUCCEEDED and r.effects == () and r.evidence["legacy_ok"] is True, r
+
+
+def test_an_empty_effects_call_takes_its_status_from_the_literal_return_and_the_error():
+    """An intent has nothing the GoalChecker judges: the literal decides."""
+    b = build(FakeEpisode(ok=False))
     r = put_run(b, "q1-2", entry("achieve", [{"predicate": "attached", "args": [camera.id, tripod.id]}]),
                 SkillCall("intent.attach", IntentArgs(camera, tripod, "attached"), arm="left"))
     assert r.status is Status.FAILED and r.code is Code.PLACED_WRONG and r.phase == "execute", r
@@ -525,7 +670,25 @@ def test_a_nav_entry_that_does_not_name_the_stances_objects_is_a_harness_error()
     b = build(FakeEpisode())
     b.ch.put_nav(entry("stand_for", jar.id))
     nr = b.conn.go_to(STANCE)
-    assert nr.ok is False and "AssertionError" in nr.detail and b.ep.calls == []
+    assert nr.ok is False and "is not the stance's" in nr.detail and b.ep.calls == []
+    assert b.ch.nav_outcome() is None, "never executed: the shim raises Q1HarnessError on this"
+    assert b.ch.mismatches[-1] == {"call_id": "nav", "rebuilt": {"method": "stand_for", "args": [cabinet.id]},
+                                   "literal": {"method": "stand_for", "args": [jar.id]}}
+
+
+def test_a_leftover_nav_entry_after_a_served_nav_leaves_no_stale_outcome():
+    """After one stand_for ran, an entry that does not match the next stance (a FIFO out of step) is not executed,
+    and the channel holds no outcome for it: the previous nav's value can never answer the next nav."""
+    b = build(FakeEpisode())
+    b.ch.put_nav(entry("stand_for", cabinet.id))
+    assert b.conn.go_to(STANCE).ok and b.ch.nav_outcome()["executed"]
+    b.ch.put_nav(entry("stand_for", tripod.id))  # a leftover entry
+    nr = b.conn.go_to(Stance("legacy:" + jar.id, Pose2(0.0, 0.0, 0.0), 0.0, "Episode.stand_for", "oracle"))
+    assert nr.ok is False and b.ch.nav_outcome() is None and len(b.ep.calls) == 1
+    b.ch.put_nav(entry("walk_to_floor", cabinet.id))  # the right names, the wrong method
+    nr = b.conn.go_to(STANCE)
+    assert nr.ok is False and b.ch.nav_outcome() is None and len(b.ep.calls) == 1
+    assert [m["literal"]["method"] for m in b.ch.mismatches] == ["stand_for", "walk_to_floor"]
 
 
 def test_the_teleport_navigator_refuses_a_legacy_key_without_place_robot():

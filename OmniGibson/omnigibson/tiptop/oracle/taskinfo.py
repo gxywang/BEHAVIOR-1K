@@ -1,8 +1,8 @@
 """TaskInfo for the pseudo planner (SPEC 5.2 task(); WEEK4_PLAN 3.4): the task the sim loaded, read once per instance
 and served through the Runtime, so conn.task() is real on the bench and under the episode host. The goal options are
-strategies.task_goal_options(sim) as Facts, the same call the host-built strategy makes (and so the same Random(0)
-sample when the read is capped), never re-sampled here: the pseudo planner's Runner and the host's strategy must
-see the same options (the equality assert, WEEK4_PLAN 3.3)."""
+strategies.task_goal_options(sim) as Facts, the same call the host-built strategy makes (and so the same capped read:
+the first ground option, then a Random(0) sample), never re-sampled here: the pseudo planner's Runner and the host's
+strategy must see the same options (the equality assert, WEEK4_PLAN 3.3)."""
 
 import logging
 
@@ -36,8 +36,8 @@ def task_info(sim, planners, max_steps, name: str) -> TaskInfo:
         total = len(task.ground_goal_state_options)
         if total > GOAL_OPTIONS_READ:
             log.warning(
-                f"{name}: {total} ground goal options, capped at {GOAL_OPTIONS_READ} (a Random(0) sample): "
-                f"goal_options[0] is not task_goal_atoms(sim)"
+                f"{name}: {total} ground goal options, capped at {GOAL_OPTIONS_READ} (the first ground option, then a "
+                f"Random(0) sample): goal_options[0] is task_goal_atoms(sim)"
             )
         options = tuple(tuple(atom_to_fact(a) for a in opt) for opt in task_goal_options(sim))
         scope = tuple(ref(sim, n) for n in sorted(sim.task_scope()))

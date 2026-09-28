@@ -57,6 +57,7 @@ def pseudo_services(ep, planner, routing: dict, collision: str = "map", hands: s
     return svc, OracleSegmenter(sim)
 
 
-def refresh_hands(world) -> list:
-    """OracleWorld.refresh_hands through the guarded world a host holds (Services.world): the popped labels."""
-    return world.refresh_hands()
+def refresh_hands(world, after=None) -> list:
+    """OracleWorld._refresh_hands through the guarded world a host holds (Services.world): the popped labels.
+    ``after``: the step the native run started at (a look from before it is unknown)."""
+    return world._refresh_hands(after=after)

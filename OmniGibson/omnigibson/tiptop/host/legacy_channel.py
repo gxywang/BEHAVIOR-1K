@@ -41,6 +41,9 @@ class LegacyChannel:
         self._nav.append(entry)
 
     def take_nav(self) -> dict:
+        """The next nav entry. The last outcome is cleared first: nav_outcome() only ever describes the entry just
+        taken, so an entry taken and never executed (a navigator that raised before nav_done) reads None."""
+        self._nav_outcome = None
         return self._nav.popleft()
 
     def nav_done(self, executed: bool, value: Any, exc: Optional[BaseException]) -> None:

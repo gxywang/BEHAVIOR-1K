@@ -44,8 +44,6 @@ def test_flags_that_only_the_connector_reads_install_nothing_on_the_legacy_runne
             "--route",
             "place.on=tiptop",
             "--shadow",
-            "--replicate",
-            "2",
             "--seed",
             "7",
             "--providers",
@@ -53,7 +51,16 @@ def test_flags_that_only_the_connector_reads_install_nothing_on_the_legacy_runne
         ]
     )
     assert bench.instrumented(args) is False
-    assert args.route == ["place.on=tiptop"] and args.replicate == 2 and args.seed == 7
+    assert args.route == ["place.on=tiptop"] and args.replicate == 0 and args.seed == 7
+
+
+def test_a_replicate_without_the_websocket_tape_is_refused():
+    """The seed stamp rides the websocket tape: --replicate R > 0 with --wstape off would record R in the Runner
+    tape's header while the planner seeded every request 2300 + k, as replicate 0's."""
+    with pytest.raises(SystemExit):
+        bench.parse_args(MINIMAL + ["--replicate", "2"])
+    assert bench.parse_args(MINIMAL + ["--replicate", "2", "--wstape", "log"]).replicate == 2
+    assert bench.parse_args(MINIMAL + ["--replicate", "0"]).replicate == 0
 
 
 def test_runner_tape_without_a_path_means_the_out_dirs_tapes():
@@ -556,7 +563,7 @@ def test_the_state_digest_moves_with_the_state_and_round_trips_the_tape_codec():
     led = make_ledger(sim)
     knowledge = SimpleNamespace(seen={"jar": np.array([1.0, 2.0])})
     d0 = state_digest(sim, knowledge)
-    assert set(d0) == {"n_steps", "env_steps", "teleports", "held", "robot", "objects", "memory"}
+    assert set(d0) == {"n_steps", "env_steps", "teleports", "held", "robot", "objects", "joints", "memory"}
     assert (d0["n_steps"], d0["env_steps"], d0["teleports"], d0["held"], d0["memory"][0]) == (0, 0, 0, (), 1)
     assert tp.loads(tp.dumps(d0)) == d0
     sim.hold(1)
@@ -703,7 +710,7 @@ TODAY_BENCH = {
 }
 
 
-def run_main(tmp_path, monkeypatch, extra):
+def run_main(tmp_path, monkeypatch, extra, strategy=None):
     """bench.main end to end on fakes: every simulator and planner piece faked at its seam, nothing else."""
     import omnigibson.eval.evaluator as evaluator
     import omnigibson.eval.utils.score_utils as score_utils
@@ -740,7 +747,7 @@ def run_main(tmp_path, monkeypatch, extra):
     monkeypatch.setattr(metrics, "AgentMetric", Metric)
     monkeypatch.setattr(metrics, "TaskMetric", Metric)
     monkeypatch.setattr(knowledge_mod, "make_knowledge", lambda *a, **k: SimpleNamespace(report=lambda: {}, seen={}))
-    monkeypatch.setattr(strategies, "strategy_for", lambda *a, **k: MainStrategy(seen))
+    monkeypatch.setattr(strategies, "strategy_for", lambda *a, **k: (strategy or MainStrategy)(seen))
     monkeypatch.setattr(strategies, "task_goal_atoms", lambda sim: [])
     monkeypatch.setattr(strategies, "task_goal_options", lambda sim: [[{"predicate": "inside", "args": ["a", "b"]}]])
     monkeypatch.setattr(bench, "connect_planners", lambda args: (None, {"embodiment": {}}, None, None))
@@ -811,9 +818,66 @@ def test_bench_main_under_week4_flags_writes_the_instruments_and_the_runner_tape
     assert tape.writes[0]["step"] == [3, 3 + 8] and tape.writes[0]["digest"][1]["held"] == (("jar.n.01_1", "left"),)
     assert tape.header["ending"] == {"reason": "strategy finished", "raised": None}
     assert tape.header["options"] == [[{"predicate": "inside", "args": ["a", "b"]}]]
+    assert tape.header["planner_modules"] == {"left": {}}, "the planner's own provenance, off its metadata"
     rows = [json.loads(line) for line in (out / "store_honey_301_0" / "ledger.jsonl").read_text().splitlines()]
     assert {r["owner"] for r in rows} == {"ep.pick", "ep.stand_for", "ep.achieve"}
     assert type(sim.held_objects) is dict and "step_env" not in vars(sim), "finished at the instance's end"
+
+
+class DivergingStrategy(MainStrategy):
+    """A strict --wstape replay's divergence, raised out of the Runner's run: a BaseException bench.main names."""
+
+    def run(self, ep):
+        from omnigibson.tiptop.host.wstape import TapeDiverged
+
+        ep.pick("jar.n.01_1")
+        raise TapeDiverged("q_init", 1, "3 of 8 elements differ", "plan")
+
+
+def test_bench_main_names_a_tape_divergence_as_the_reason_and_still_writes_the_instruments(tmp_path, monkeypatch):
+    result, seen, sim, out = run_main(
+        tmp_path, monkeypatch, ["--runner-tape", "--wstape", "log"], strategy=DivergingStrategy
+    )
+    assert result["bench"]["reason"] == "tape diverged: q_init"
+    assert result["bench"]["instruments"]["runner_tape"]["writes"] == 1
+    tape = tp.Tape.load(out / "tapes" / "store_honey_301_0.json")
+    assert tape.header["ending"]["raised"].type == "TapeDiverged"
+    assert (out / "store_honey_301_0" / "gripper.jsonl").exists()
+
+
+def test_bench_main_settles_the_gripper_watch_on_the_executors_own_hold(tmp_path, monkeypatch):
+    made = []
+    real = watch.GripperWatch
+
+    def recording(sim, ledger, settle_steps=watch.SETTLE_STEPS):
+        made.append(settle_steps)
+        return real(sim, ledger, settle_steps=settle_steps)
+
+    monkeypatch.setattr(watch, "GripperWatch", recording)
+    run_main(tmp_path, monkeypatch, ["--runner-tape", "--gripper-hold-steps", "40"])
+    assert made == [40]
+
+
+def test_the_digest_sees_a_joint_that_moves_no_root_pose():
+    """An open or a close slides a drawer and moves no object's root: the tracked objects' joint positions are
+    their own digest key (store_honey's cabinet, j_link_4)."""
+
+    class Cabinet(Body):
+        n_dof = 1
+
+        def __init__(self, name):
+            super().__init__(name)
+            self.q = np.zeros(1)
+
+        def get_joint_positions(self):
+            return self.q
+
+    sim = Sim()
+    sim.objects["cabinet"] = Cabinet("cabinet")
+    d0 = state_digest(sim, None)
+    sim.objects["cabinet"].q = np.array([0.317])
+    d1 = state_digest(sim, None)
+    assert d0["objects"] == d1["objects"] and d0["joints"] != d1["joints"] and d1["joints"][0] == 1
 
 
 # ------------------------------------------------------------------------------------------------- scripts/tape_diff.py

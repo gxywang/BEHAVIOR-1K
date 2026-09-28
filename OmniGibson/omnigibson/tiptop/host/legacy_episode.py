@@ -19,14 +19,16 @@ from b1k.connector.skills import (
     Code,
     IntentArgs,
     NavResult,
+    PlaceArgs,
     Precheck,
+    Rel,
     SkillResult,
     Stance,
     Status,
     WorldUpdate,
     effects,
 )
-from b1k.connector.types import ObjRef
+from b1k.connector.types import Fact, ObjRef
 from b1k.skills.registry import SkillRegistry
 from b1k.skills.specs import SPECS, spec
 from b1k.skills.tiptop.backend import wrong_or_not_lifted
@@ -123,9 +125,23 @@ class EpisodeLegacyBackend:
     captures_in_own_run: ClassVar[bool] = True  # exempt from PERCEPT_REQUIRED: the Episode captures inside its run
     owns_preconditions: ClassVar[bool] = True  # the Episode's own retries and checks: the registry's are advisory
 
-    def __init__(self, ep, channel, observe_now: Callable, classify: Callable = classify):
+    BENT = (Rel.UNDER, Rel.TOUCHING)  # LegacyBackend's: what the legacy wire sends as on() (SPEC F16)
+
+    def __init__(self, ep, channel, observe_now: Callable, classify: Callable = classify,
+                 has_cavity: Callable = lambda target, item: True):
         self.ep, self.channel, self.observe_now, self.classify = ep, channel, observe_now, classify
+        self.has_cavity = has_cavity  # LegacyBackend's rule: an in with no compartment floor on the wire is bent
         self.steps = 0
+        self.degraded = 0  # results whose relations the legacy wire bent onto on(): reported, never refused
+
+    def bent(self, call) -> list:
+        """SPEC F16's degrade marker, as LegacyBackend names it: every under and touching, and an in whose target
+        ``has_cavity`` says the legacy wire sends no compartment floor for, travel as on(). Reported only (plan §2
+        rule 5: reported, not wired): the literal call still runs."""
+        if not isinstance(call.args, PlaceArgs):
+            return []
+        return [f"{r.rel.value}->on" for r in call.args.relations
+                if r.rel in self.BENT or (r.rel is Rel.IN and not self.has_cavity(r.target, call.args.obj))]
 
     def supports(self, call) -> bool:
         return call.skill in EPISODE_SPECS
@@ -152,8 +168,9 @@ class EpisodeLegacyBackend:
             lit = int(args[0] if args else kwargs.get("steps"))
             max_steps = getattr(sim, "max_steps", None)
             expect = min(lit, max_steps - _n_steps(self.ep)) if max_steps else lit
-            if call.args.steps != expect:
-                self.channel.mismatch(cid, {"method": method, "typed_steps": expect}, {**literal, "typed_steps": call.args.steps})
+            if call.args.steps != expect:  # rebuilt: what the typed call carried; literal: what the literal implies
+                self.channel.mismatch(cid, {"method": method, "typed_steps": call.args.steps},
+                                      {**literal, "typed_steps": expect})
             return
         built = rebuild(call, entry, self.ep)
         if built is None:
@@ -191,7 +208,7 @@ class EpisodeLegacyBackend:
         # a release returns None and raises when it cannot open the hand (LegacyBackend: ``release() or True``)
         legacy_ok = (err is None) if (method == "release" and value is None) else bool(value)
         new_records = _json(records[r0:]) if records is not None else []
-        goal = effects(call)
+        goal = self._goal(call)
         verdict, verdicts, after = None, {}, None
         if goal:
             try:
@@ -202,31 +219,61 @@ class EpisodeLegacyBackend:
                 log.warning(f"{cid}: the goal judge failed: {type(e).__name__}: {e}")
                 verdict, verdicts = None, {}
         ok = (legacy_ok and err is None) if verdict is None else bool(verdict)
+        rounds = [r for r in new_records if isinstance(r, dict) and "round" in r]  # the planning rounds this call ran
+        last_ran = bool(rounds) and not (rounds[-1].get("error") or rounds[-1].get("why"))
+        none_ran = bool(rounds) and all(r.get("error") or r.get("why") for r in rounds)
         if ok:
             status, code, phase = Status.SUCCEEDED, None, ""
-        elif err is not None or not legacy_ok:
-            why = err if err is not None else next((r.get("error") or r.get("why") for r in reversed(new_records)
-                                                    if isinstance(r, dict) and (r.get("error") or r.get("why"))), None)
+        elif err is not None or not legacy_ok or none_ran:
+            # a crash; the literal return says no; or no round of this call executed although the Episode's own
+            # check passed (a held sandal beside the bed reads nextto: every round failed to plan, tidying q1-4)
+            if err is not None:
+                why = err
+            elif last_ran:  # the call's last round ran its plan to the end: what failed is that execution, not an
+                why = None  # earlier round's refusal (tidying q1-7: a rejected round 17, then round 18 set it down)
+            else:
+                why = next((r.get("error") or r.get("why") for r in reversed(new_records)
+                            if isinstance(r, dict) and (r.get("error") or r.get("why"))), None)
             status, code, phase = self.classify(why, call.skill)
             if phase == "execute" and steps == 0:  # no known text and the sim never stepped: nothing executed
                 status, code, phase = Status.FAILED, Code.BACKEND_ERROR, None
         else:  # the legacy code says it worked; the GoalChecker says the requested relation does not hold
-            status, code, phase = Status.FAILED, FAILED_AS.get(call.skill, Code.PLACED_WRONG), "verify"
-            if call.skill == "pick_up":
-                try:
-                    code = wrong_or_not_lifted(svc, goal, after, None, cid, call.arm or "left")
-                except Exception:  # noqa: BLE001 - a panel that cannot judge the holding atom: the plain code
-                    code = Code.GRASP_MISSED
+            status, code, phase = self._executed_but_wrong(call, svc, goal, after, cid)
         known, hands1 = self._refs(call), _hands(self.ep)
-        updates = tuple(WorldUpdate("held", self._ref(label, known), arm, source="oracle")
-                        for label, arm in hands1.items() if hands0.get(label) != arm)
-        updates += tuple(WorldUpdate("released", self._ref(label, known), arm, source="oracle")
-                         for label, arm in hands0.items() if hands1.get(label) != arm)
+        # released first, then held: a label that changed arms within the call is released from the old arm and held
+        # by the new one, in that order, so applying them leaves it held (OracleWorld pops a released label)
+        updates = tuple(WorldUpdate("released", self._ref(label, known), arm, source="oracle")
+                        for label, arm in hands0.items() if hands1.get(label) != arm)
+        updates += tuple(WorldUpdate("held", self._ref(label, known), arm, source="oracle")
+                         for label, arm in hands1.items() if hands0.get(label) != arm)
         ev = {"legacy_ok": legacy_ok, "legacy_return": _json(value), "method": method, "records": new_records}
+        bent = self.bent(call)
+        if bent:  # SPEC F16: reported, not refused (PARITY runs the literal call as legacy always did)
+            ev.update(degraded_to="on", relations=bent)
+            self.degraded += 1
         return SkillResult(cid, call.skill, self.name, status, code, phase, str(err or ""), goal if ok else (),
                            verdicts, svc.goals.primary, world_updates=updates, steps=steps, requires_sim_clock=True,
                            evidence=ev)
         yield {}  # unreachable: makes run() a generator that ends before its first yield
+
+    @staticmethod
+    def _goal(call) -> tuple:
+        """What the call is judged on: effects(call); for a press the shim typed with want_on None (the Runner's
+        literal achieve([toggled_on(t)]), which effects() leaves unstated), that literal atom, so a press that
+        turned its switch on says so in its effects (cook_bacon's stove) and one that did not is not a success."""
+        goal = effects(call)
+        if goal or call.skill != "press" or getattr(call.args, "want_on", None) is not None:
+            return goal
+        return (Fact("toggled_on", (call.args.target.id,)),)
+
+    def _executed_but_wrong(self, call, svc, goal, after, cid) -> tuple:
+        status, code, phase = Status.FAILED, FAILED_AS.get(call.skill, Code.PLACED_WRONG), "verify"
+        if call.skill == "pick_up":
+            try:
+                code = wrong_or_not_lifted(svc, goal, after, None, cid, call.arm or "left")
+            except Exception:  # noqa: BLE001 - a panel that cannot judge the holding atom: the plain code
+                code = Code.GRASP_MISSED
+        return status, code, phase
 
 
 class EpisodeNavigator:
@@ -258,9 +305,14 @@ class EpisodeNavigator:
     def go_to(self, stance: Stance, obs):
         if not stance.key.startswith(LEGACY_KEY):
             return (yield from self.tp.go_to(stance, obs))
-        e = self.channel.take_nav()
+        e = self.channel.take_nav()  # clears the last outcome: nav_outcome() is None until this entry is executed
         names = tuple(stance.key[len(LEGACY_KEY):].split(","))
-        assert tuple(e["args"]) == names, f"the nav entry {e['args']} is not the stance's {names}"
+        method = stance.why.removeprefix("Episode.")
+        if tuple(e["args"]) != names or e["method"] != method:  # never executed: a harness error, not a legacy result
+            self.channel.mismatch("nav", {"method": method, "args": list(names)},
+                                  {"method": e["method"], "args": list(e["args"])})
+            return NavResult(False, None, 0, 0, f"the nav entry {e['method']}{tuple(e['args'])} is not the stance's "
+                                                f"{method}{names}"), obs
         sim = getattr(self.ep, "sim", None)
         t0, n0, value, exc = int(getattr(sim, "teleports", 0) or 0), _n_steps(self.ep), None, None
         try:
@@ -290,10 +342,12 @@ class EpisodeRegistry(SkillRegistry):
         self.advisory: Counter = Counter()
 
     def precheck(self, call, svc, resources=None, obs=None) -> Precheck:
+        """``advisory`` counts once per call: the run's own precheck (SkillRun.start passes its resources) counts,
+        the planner's check() before it (Runtime.query("check"): no resources) does not."""
         if not getattr(self.backend_for(call, svc), "owns_preconditions", False):
             return super().precheck(call, svc, resources, obs)
-        check = self.specs[call.skill].check
-        if check is not None:
+        check = self.spec_for(call).check
+        if check is not None and resources is not None:
             try:
                 pre = check(call, svc)
             except Exception as e:  # noqa: BLE001 - an advisory never refuses, a check that crashed least of all

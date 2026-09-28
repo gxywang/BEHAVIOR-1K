@@ -117,6 +117,55 @@ def _record():
     return tp.Tape.loads(t.dumps())
 
 
+def test_a_tape_the_bench_probed_replays_both_ways():
+    """bench.py's TapeRecorder takes the step and the state digest around every write; the replays' own recorders
+    have no sim to probe. G2 compares the records without those diagnostics (G4 compares them) and says how many
+    records carried them."""
+    import itertools
+
+    from b1k.bridge.strategies import atom, strategy_for
+
+    runner = strategy_for("t", [atom("inside", "apple.n.01_1", "basket.n.01_1")], attempts=1)
+    t = tp.Tape(tp.header("t", "unit", "legacy", "parity", 0, strategy=runner, floor="floor.n.01_1"))
+    clock = itertools.count(0, 40)
+    runner.run(tp.TapeRecorder(_Ep(), t, step_probe=lambda: next(clock), digest=lambda: {"robot": "x"}))
+    t = tp.Tape.loads(t.dumps())
+    assert all("step" in w and "digest" in w for w in t.writes)
+    r = qh.replay(t)
+    assert r["ok"] and r["probed_records"] == len(t.writes), r
+
+
+class _Diverging(_Ep):
+    """A strict --wstape replay stops at the pick: TapeDiverged, a BaseException, on the write in flight."""
+
+    def pick(self, bddl, into=None):
+        from omnigibson.tiptop.host.wstape import TapeDiverged
+
+        self.calls.append(("pick", bddl, into))
+        raise TapeDiverged("depth", 3, "476754 of 518400 elements differ", "plan")
+
+
+def test_a_tape_that_ends_in_a_tape_divergence_replays_both_ways():
+    """bench.py records the TapeDiverged on the write in flight (its TapeRecorder names it in exc_classes): the
+    replays tape it too, and both end the way the recording did."""
+    from b1k.bridge.strategies import atom, strategy_for
+    from omnigibson.tiptop.host.wstape import TapeDiverged
+
+    runner = strategy_for("t", [atom("inside", "apple.n.01_1", "basket.n.01_1")], attempts=1)
+    t = tp.Tape(tp.header("t", "unit", "connector", "parity", 0, strategy=runner, floor="floor.n.01_1"))
+    with pytest.raises(TapeDiverged):
+        runner.run(tp.TapeRecorder(_Diverging(), t, exc_classes=(TapeDiverged,)))
+    t = tp.Tape.loads(t.dumps())
+    assert t.writes[-1]["exc"].type == "TapeDiverged"
+    r = qh.replay(t)
+    assert r["ok"], r
+    assert (
+        r["e0"]["ending"]
+        == r["connector"]["ending"]
+        == ["TapeDiverged", str(TapeDiverged("depth", 3, "476754 of 518400 elements differ", "plan"))]
+    )
+
+
 def test_a_recorded_tape_replays_the_same_both_ways():
     r = qh.replay(_record())
     assert r["writes"] >= 2 and r["ok"], r
@@ -152,7 +201,81 @@ def test_a_header_in_the_bench_form_is_rebuilt_from_its_options():
 
 def test_a_header_without_the_options_is_not_rebuilt():
     t = _record()
-    del t.header["construction"]
+    del t.header["construction"], t.header["options"]  # tape.header() carries the options since the fix pass
     t.header["inputs"] = {**t.header["inputs"], "n_options": 2, "options_sha256": "0" * 64}
     r = qh.replay(t)
     assert not r["ok"] and "construction" in r["error"], r
+
+
+# ------------------------------------------------------------------------------------------------- the fix pass
+class FloorEp:
+    """An Episode with a stance_key and a floor put_down that fails, re-stancing inside it (Episode.put_down adds
+    the key it stands at AFTER the achieve to floor_failed_at, bench.py put_down)."""
+
+    floor = "floor.n.01_1"
+
+    def __init__(self, key=(10, -3, 5)):
+        self.key, self.calls = key, []
+
+    def is_floor(self, name):
+        return str(name).startswith("floor.")
+
+    def stance_key(self):
+        return self.key
+
+    def holding(self, bddl):
+        return True
+
+    def put_down(self, bddl, support, floor=None):
+        self.calls.append(("put_down", bddl, support))
+        self.key = (self.key[0] + 7, self.key[1] - 2, self.key[2] + 1)  # the achieve inside re-stanced
+        self.__dict__.setdefault("floor_failed_at", set()).add(self.stance_key())
+        return False
+
+
+def test_the_worlds_base_pose_round_trips_the_episodes_stance_key_through_the_shim():
+    """EpisodeWorld.base_pose is the Episode's stance_key at 10 cm and 15 degrees; the shim's stance_key recovers
+    the key exactly (a Pose2(k0, k1, k2) without the scaling, or a None pose, would not)."""
+    from b1k.planner.pseudo.shim import EpisodeOverConnector
+
+    for key in ((10, -3, 5), (0, 0, 0), (-123, 45, -11), (7, 7, 12)):
+        ep = FloorEp(key)
+        with qh.build_episode_connector(ep, qh.members_of(ep)) as h:
+            assert EpisodeOverConnector(h.conn, h.channel).stance_key() == key
+
+
+def test_a_failed_floor_put_down_leaves_the_shims_floor_failed_at_equal_to_the_episodes():
+    """The shim adds the stance it reads after the put_down: the key the Episode's put_down re-stanced to, as the
+    Episode's own floor_failed_at holds it."""
+    from b1k.planner.pseudo.shim import EpisodeOverConnector
+
+    ep = FloorEp()
+    with qh.build_episode_connector(ep, qh.members_of(ep)) as h:
+        shim = EpisodeOverConnector(h.conn, h.channel, members=qh.members_of(ep) | {"floor_failed_at"})
+        assert shim.put_down("plywood.n.01_1", ep.floor) is False
+        assert shim.floor_failed_at == ep.floor_failed_at == {(17, -5, 6)}
+        assert shim.put_down("plywood.n.01_1", ep.floor) is False
+        assert shim.floor_failed_at == ep.floor_failed_at == {(17, -5, 6), (24, -7, 7)}
+        assert h.channel.mismatches == []
+
+
+def test_the_harness_world_turns_an_unperceived_distance_into_none_as_the_oracle_world_does():
+    """OracleWorld.distance maps the Episode's KeyError to a None belief and the shim raises the Episode's KeyError
+    back (by the name without a box): the harness's world must convert the same way, or E1 and G2 never run the
+    shim's None path production takes."""
+    from b1k.planner.pseudo.shim import EpisodeOverConnector
+
+    class Far(_Ep):
+        def distance(self, a, b):
+            if self.is_floor(a) or self.is_floor(b):
+                raise KeyError(a if self.is_floor(a) else b)
+            return 1.0
+
+    ep = Far()
+    with qh.build_episode_connector(ep, qh.members_of(ep)) as h:
+        assert h.world.distance(qh.ref("floor.n.01_2"), qh.ref("plywood.n.01_1")).value is None
+        with pytest.raises(KeyError) as e:
+            EpisodeOverConnector(h.conn, h.channel).distance("plywood.n.01_1", "floor.n.01_2")
+    with pytest.raises(KeyError) as legacy:
+        ep.distance("plywood.n.01_1", "floor.n.01_2")
+    assert e.value.args == legacy.value.args == ("floor.n.01_2",)

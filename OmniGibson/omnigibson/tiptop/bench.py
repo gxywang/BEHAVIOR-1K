@@ -993,7 +993,8 @@ def add_week4_args(p: argparse.ArgumentParser) -> None:
     w4.add_argument("--wstape-live-at", type=int, default=None, metavar="N",
                     help="replay-live: go live at frame N (0-based) whether or not it matches")
     w4.add_argument("--replicate", type=int, default=0,
-                    help="R in the stamped planner seed 2300 + 1000*R + k on every legacy request")
+                    help="R in the stamped planner seed 2300 + 1000*R + k on every legacy request (needs a --wstape "
+                    "mode: the stamp rides the websocket tape; the server seeds a legacy request with it)")
     w4.add_argument("--seed", type=int, default=None,
                     help="seed random, numpy and torch at each instance start (reaches only the native builders' "
                     "random.randrange; the legacy planner's seed is the stamped request seed)")
@@ -1014,6 +1015,8 @@ def check_week4_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> No
         p.error("--wstape-live-at N: N is a frame index, 0 or more")
     if args.replicate < 0:
         p.error("--replicate R: R is 0 or more")
+    if args.replicate > 0 and args.wstape == "off":  # the stamp rides the websocket tape: without it the planner
+        p.error("--replicate R > 0 needs a --wstape mode: the seed stamp is the tape's (off seeds 2300 + k whatever R)")
 
 
 def instrumented(args: argparse.Namespace) -> bool:
@@ -1159,7 +1162,8 @@ def main(argv=None) -> None:
                 runner_ep = episode
                 if instrumented(args):  # from the Runner's first call on: the posture above is not the Runner's
                     ledger = StepLedger(sim, renderer=og.sim)
-                    gripper = watch.GripperWatch(sim, ledger)
+                    gripper = watch.GripperWatch(sim, ledger, settle_steps=args.gripper_hold_steps)  # the
+                    #   executor's own hold: the settled reading is the one it reads is_grasping on
                     ledger.install_episode(episode)
                     if wstape is not None:
                         wstape.ledger = ledger
@@ -1172,6 +1176,11 @@ def main(argv=None) -> None:
                     # the Runner's construction inputs whole, so scripts/tape_diff.py e0 can build the same Runner
                     runner_tape.header["options"] = goal_options
                     runner_tape.header["scope"] = list(strategy.scope)
+                    # the planners' own provenance, as check_imports read it off their metadata (the header's is
+                    # this process's; the planner is another process, and a replay's is the tape's, rerooted)
+                    runner_tape.header["planner_modules"] = {
+                        arm: dict((meta or {}).get("modules") or {}) for arm, (_, meta) in planners.items()
+                    }
                     tape_around = lambda inner: tp.TapeRecorder(  # noqa: E731 - around whatever the Runner holds
                         inner, runner_tape, exc_classes=(TapeDiverged,),
                         step_probe=lambda: sim.n_steps, digest=lambda: watch.state_digest(sim, knowledge),

@@ -33,12 +33,16 @@ job dir, under ``episode/`` (the bench's --out-dir) or one level below either (t
   ``go_to`` owner's are the planner's, owners named ``ep.<member>`` are teleports inside a legacy call.
 - ``gripper.jsonl`` (read for either runner whenever the bench wrote it): one GripperWatch row per gripper event:
   ``{"step": int, "arm": "left"|"right", "event": "close"|"open", "is_grasping": 1|0|-1, "owner": str,
-  "call_id": str|null}``. A close with ``is_grasping == 1`` is a weld and one with ``-1`` an on-air close, whose
-  cause is its ``owner`` and ``call_id``. Without this file the executor lines in ``sim.log`` are used, and an
-  on-air close has no owner to name.
+  "call_id": str|null, "via": "executor"|"executor.start"|"sim"}``. A close the EXECUTOR issued (``via`` executor,
+  or no ``via``: the log's definition, its ``is_grasping=`` lines) with ``is_grasping == 1`` is a weld and one with
+  ``-1`` an on-air close, whose cause is its ``owner`` and ``call_id``; every other close (a closed-fist drawer
+  pull, ``via`` sim; a start_gripper, ``via`` executor.start) is counted apart, in ``closes_other``, never as a weld
+  or an on-air close. Without this file the executor lines in ``sim.log`` are used, and an on-air close has no
+  owner to name. With both, welds and on-air closes are cross-checked (a difference is a note).
 - ``runner_tape.jsonl`` (optional): ``{"call_id": str, "skill": str, "qual": str|null, "returned": bool|null}``
   per Runner write, joining a skill row to the Runner's typed call; it qualifies ``place.on`` against ``place.in``.
-  Without it the qualifier is read from the row's ``effects`` predicates, and a row with none stays unqualified.
+  Without it the qualifier is read from the row's ``effects`` predicates, and a row with none stays unqualified: a
+  failed call has no effects, so a qualified line's pooled test is then UNJUDGED (never a pass).
 - the result JSON's ``connector`` block (``bench.connector`` as bench.py writes it, or top-level): ``step``,
   ``idle_steps``, ``charged`` (steps per run kind), ``ledger``
   (the same rows as ledger.jsonl, keyed by owner; the fallback when the file is missing) and ``live_at_end``
@@ -74,12 +78,18 @@ class CounterSpec:
 
 
 COUNTERS: tuple[CounterSpec, ...] = (
-    CounterSpec("executed", ATOMS, HIGHER, "legacy rounds with env_steps > 0 and no error, plus native runs with "
-                "steps > 0 (+1 per resample)"),
+    CounterSpec("executed", ATOMS, HIGHER, "legacy rounds with env_steps > 0 that motion validation did not reject "
+                "(an error after they moved included: a native FAILED run that stepped counts too), plus native runs "
+                "with steps > 0 (+1 per resample)"),
     CounterSpec("cut_off", None, REPORTED, "1 if EpisodeOver ended a live round"),
-    CounterSpec("rejections", ATOMS, HIGHER, "legacy rounds with env_steps == 0 (motion validation rejected)"),
-    CounterSpec("welds", ITEMS, HIGHER, "gripper closes with is_grasping=1"),
-    CounterSpec("on_air", None, CAUSE, "gripper closes with is_grasping=-1"),
+    CounterSpec("rejections", ATOMS, HIGHER, "legacy rounds motion validation rejected ('motion validation "
+                "rejected'), whatever env_steps they ran before it"),
+    CounterSpec("planning_failures", None, REPORTED, "legacy rounds that never executed and were not rejected: the "
+                "planner found no plan (no env_steps, an error)"),
+    CounterSpec("welds", ITEMS, HIGHER, "executor gripper closes with is_grasping=1"),
+    CounterSpec("on_air", None, CAUSE, "executor gripper closes with is_grasping=-1"),
+    CounterSpec("closes_other", None, REPORTED, "gripper closes the executor did not issue (via sim: a closed-fist "
+                "pull; via executor.start)"),
     CounterSpec("open_attempts", None, HIGHER, "open attempts (legacy open records, native open calls)"),
     CounterSpec("open_rate", None, LOWER, "open successes / open attempts (None without an attempt)"),
     CounterSpec("close_attempts", None, HIGHER, "close attempts (legacy close records, native close calls)"),
@@ -129,8 +139,10 @@ class Counters:
     executed: int = 0
     cut_off: int = 0
     rejections: int = 0
+    planning_failures: int = 0
     welds: int = 0
     on_air: int = 0
+    closes_other: int = 0
     on_air_causes: list = field(default_factory=list)  # [{"step", "arm", "owner", "call_id"}] or "unknown ..."
     open_attempts: int = 0
     open_successes: int = 0
@@ -234,18 +246,26 @@ def result_line(text: str) -> Optional[dict]:
     return None
 
 
+REJECTED = "motion validation rejected"  # the executor's own validation, before (or between) the segments it runs
+
+
 def _count_records(c: Counters, records: list[dict]) -> None:
-    """Episode records: round records (executed / rejected / cut off) and open / close records. The same for
-    bench.rounds and for a legacy skill row's evidence.records."""
+    """Episode records: round records (executed / rejected / never planned / cut off) and open / close records. The
+    same for bench.rounds and for a legacy skill row's evidence.records. A round in no category is a note."""
     for r in records:
         if "round" in r:
-            err = r.get("error")
+            err, moved = r.get("error"), int(r.get("env_steps") or 0)
             if err == "episode over":
                 c.cut_off += 1
-            elif r.get("env_steps") == 0:
+            elif REJECTED in str(err or ""):
                 c.rejections += 1
-            elif err is None and (r.get("env_steps") or 0) > 0:
+            elif moved > 0:
                 c.executed += 1
+            elif err:
+                c.planning_failures += 1
+            else:
+                c.notes.append(f"round {r.get('round')}: no error and no env_steps {r.get('env_steps')!r}: counted "
+                               f"in no category")
         elif "open" in r:
             c.open_attempts += 1
             c.open_successes += bool(r.get("opened"))
@@ -372,20 +392,31 @@ def extract(job: Path, instance: Optional[int] = None) -> Counters:
             _count_skill_rows(c, _read_jsonl(calls_path), tape, records=not from_rounds)
         else:
             c.notes.append("no skill_calls.jsonl")
-        if block and block.get("live_at_end"):
+        live = (block or {}).get("live_at_end")
+        if live:  # a native run EpisodeOver cut off: the cut-off round, and a native call no skill row carries
             c.cut_off += 1
+            if live.get("call_id") not in {x.call_id for x in c.calls}:
+                skill = (tape.get(live.get("call_id")) or {}).get("skill") or "unknown"
+                c.native_calls += 1
+                key = f"{skill}@live_at_end"
+                c.native_by[key] = c.native_by.get(key, 0) + 1
 
     # welds and on-air closes: the GripperWatch rows whichever runner wrote them (a legacy run under a week-4 flag
     # has them too, and its on-air close then has an owner); the executor's lines otherwise
     gp = _find(job, "gripper.jsonl")
     if gp:
-        rows = [r for r in _read_jsonl(gp) if r.get("event") == "close"]
+        closes = [r for r in _read_jsonl(gp) if r.get("event") == "close"]
+        rows = [r for r in closes if r.get("via") in (None, "executor")]  # the executor's: the log's definition
+        c.closes_other += len(closes) - len(rows)
         _count_closes(c, [int(r.get("is_grasping")) for r in rows],
                       [{k: r.get(k) for k in ("step", "arm", "owner", "call_id")} for r in rows])
         if log:
-            n = sum(1 for v in closes_from_log(log) if v == 1)
+            logged = closes_from_log(log)
+            n, air = sum(1 for v in logged if v == 1), sum(1 for v in logged if v == -1)
             if n != c.welds:
                 c.notes.append(f"sim.log shows {n} welds, gripper.jsonl {c.welds}")
+            if air != c.on_air:
+                c.notes.append(f"sim.log shows {air} on-air closes, gripper.jsonl {c.on_air}")
     elif log:
         _count_closes(c, closes_from_log(log))
     else:
@@ -444,14 +475,16 @@ def fisher_one_sided(c_succ: int, c_n: int, t_succ: int, t_n: int) -> float:
     return sum(math.comb(n, k) * math.comb(N - n, K - k) for k in range(lo, min(t_succ, K, n) + 1)) / denom
 
 
-def minimum_detectable_effect(c_succ: int, c_n: int, t_n: int, alpha: float) -> Optional[float]:
-    """The smallest drop in T's rate below C's observed rate that the one-sided test can call at this n: C's rate
-    minus the largest T success rate with p < alpha. None when even 0 successes in T would not reach alpha."""
+def minimum_detectable_effect(c_succ: int, c_n: int, t_n: int, alpha: float, delta: float = 0.0) -> Optional[float]:
+    """The smallest drop in T's rate below C's observed rate that the pre-registered rule FAILS at this n: C's rate
+    minus the largest T success rate k/t_n with both p < alpha and a drop of at least ``delta``. None when even 0
+    successes in T would not fail it."""
     if c_n == 0 or t_n == 0:
         return None
     for k in range(t_n, -1, -1):
-        if fisher_one_sided(c_succ, c_n, k, t_n) < alpha:
-            return c_succ / c_n - k / t_n
+        drop = c_succ / c_n - k / t_n
+        if drop >= delta - 1e-12 and fisher_one_sided(c_succ, c_n, k, t_n) < alpha:
+            return drop
     return None
 
 
@@ -476,6 +509,9 @@ class Pooled:
     mde: Optional[float]
     fail: bool
     unqualified: int = 0  # rows of the skill that carried no qualifier while one was asked for
+    judged: bool = True  # False: a qualifier was asked for and some rows had none, or an arm has no call at all;
+    #                      the verdict then says nothing, and a gate must not read it as a pass
+    why_unjudged: str = ""
 
     @property
     def c_rate(self) -> Optional[float]:
@@ -502,8 +538,26 @@ class Comparison:
         return len(self.flags)
 
     @property
+    def informative(self) -> list:
+        """The tests that could flag: both arms have values, not all of them equal, and not the same values as an
+        earlier test of the task (teleports_ep is teleports while no run asked for a go_to)."""
+        out, seen = [], set()
+        for f in self.flags:
+            cs, ts = [v for v in f.control if v is not None], [v for v in f.treatment if v is not None]
+            key = (f.task, tuple(f.control), tuple(f.treatment))
+            if cs and ts and len(set(cs + ts)) > 1 and key not in seen:
+                out.append(f)
+            seen.add(key)
+        return out
+
+    @property
+    def n_informative(self) -> int:
+        return len(self.informative)
+
+    @property
     def expected_false_flags(self) -> float:
-        return 0.05 * self.n_tests
+        """0.05 per test that could flag (n_informative); n_tests counts every one run."""
+        return 0.05 * self.n_informative
 
     @property
     def flagged(self) -> list:
@@ -511,7 +565,8 @@ class Comparison:
 
 
 def _matches(call: CallOutcome, skill: str, qual: Optional[str], backend: Optional[str]) -> Optional[bool]:
-    """True: the call is the switched skill; None: the skill but unqualified (counted, reported); False: another."""
+    """True: the call is the switched skill; None: the skill but unqualified (counted, reported); False: another.
+    ``backend``: the treatment arm's alone (compare passes None for the control, whose line is on its old backend)."""
     if call.skill != skill or (backend and call.backend != backend):
         return False
     if qual is None:
@@ -550,7 +605,8 @@ def compare(pairs: dict, skill: str, *, backend: Optional[str] = None, alpha: fl
         for arm, runs in (("C", C), ("T", T)):
             for x in runs:
                 for call in x.calls:
-                    m = _matches(call, name, qual or None, backend)
+                    # --backend filters the treatment alone: the control runs the line on its previous backend
+                    m = _matches(call, name, qual or None, backend if arm == "T" else None)
                     if m is None:
                         unq += 1
                     if not m:
@@ -561,8 +617,11 @@ def compare(pairs: dict, skill: str, *, backend: Optional[str] = None, alpha: fl
                         t_n, t_s = t_n + 1, t_s + call.ok
     p = fisher_one_sided(c_s, c_n, t_s, t_n)
     drop = (c_s / c_n - t_s / t_n) if c_n and t_n else 0.0
-    cmp.pooled = Pooled(skill, c_n, c_s, t_n, t_s, p, minimum_detectable_effect(c_s, c_n, t_n, alpha),
-                        bool(c_n and t_n and drop >= delta and p < alpha), unq)
+    why = (f"{unq} row(s) of {name} carry no qualifier (a failed call has no effects; runner_tape.jsonl names it)"
+           if unq and qual else "no call of the skill in " + " and ".join(a for a, n in (("C", c_n), ("T", t_n)) if not n)
+           if not (c_n and t_n) else "")
+    cmp.pooled = Pooled(skill, c_n, c_s, t_n, t_s, p, minimum_detectable_effect(c_s, c_n, t_n, alpha, delta),
+                        bool(c_n and t_n and drop >= delta and p < alpha), unq, judged=not why, why_unjudged=why)
     for task, x in carried or []:
         cmp.carried.append({"task": task, "job": x.job, "native_calls": x.native_calls,
                             "native_by": dict(x.native_by)})
@@ -597,12 +656,12 @@ def format_comparison(cmp: Comparison) -> str:
     p = cmp.pooled
     if p is not None:
         out.append(f"pooled per-call: C {p.c_succ}/{p.c_n} ({_fmt(p.c_rate)}), T {p.t_succ}/{p.t_n} "
-                   f"({_fmt(p.t_rate)}), one-sided Fisher p {p.p:.3f}, MDE at this n "
-                   f"{'not reachable' if p.mde is None else _fmt(p.mde)}, "
-                   f"{'FAIL' if p.fail else 'pass'}"
+                   f"({_fmt(p.t_rate)}), one-sided Fisher p {p.p:.3f}, MDE at this n (drop >= {cmp.delta} and "
+                   f"p < {cmp.alpha}) {'not reachable' if p.mde is None else _fmt(p.mde)}, "
+                   f"{('FAIL' if p.fail else 'pass') if p.judged else 'UNJUDGED: ' + p.why_unjudged}"
                    + (f"; {p.unqualified} unqualified rows of the skill left out" if p.unqualified else ""))
-    out.append(f"flag tests {cmp.n_tests}, flagged {len(cmp.flagged)}, expected false flags "
-               f"{cmp.expected_false_flags:.2f}")
+    out.append(f"flag tests {cmp.n_tests} ({cmp.n_informative} could flag), flagged {len(cmp.flagged)}, expected "
+               f"false flags {cmp.expected_false_flags:.2f}")
     for f in cmp.flags:
         if f.flagged:
             out.append(f"  FLAG {f.task} {f.counter}{'' if f.normalised else ' (raw)'}: "
@@ -621,6 +680,7 @@ def format_comparison(cmp: Comparison) -> str:
 def _comparison_dict(cmp: Comparison) -> dict:
     d = dataclasses.asdict(cmp)
     d["n_tests"], d["expected_false_flags"] = cmp.n_tests, cmp.expected_false_flags
+    d["n_informative"] = cmp.n_informative
     if cmp.pooled is not None:
         d["pooled"]["c_rate"], d["pooled"]["t_rate"] = cmp.pooled.c_rate, cmp.pooled.t_rate
     return d
@@ -640,7 +700,8 @@ def main(argv: Optional[list] = None) -> int:
     ex.add_argument("--json", action="store_true")
     cp = sub.add_parser("compare", help="the ladder: control against treatment per task, the pooled per-call test")
     cp.add_argument("--skill", required=True, help="the switched skill, e.g. place or place.on")
-    cp.add_argument("--backend", default=None, help="count only calls on this backend (e.g. tiptop)")
+    cp.add_argument("--backend", default=None, help="count only the treatment's calls on this backend (e.g. "
+                    "tiptop); the control's line runs on its previous backend")
     cp.add_argument("--pair", nargs=3, action="append", metavar=("TASK", "C_DIRS", "T_DIRS"), default=[],
                     help="a task's control and treatment job dirs, comma-separated")
     cp.add_argument("--carried", nargs=2, action="append", metavar=("TASK", "DIR"), default=[])

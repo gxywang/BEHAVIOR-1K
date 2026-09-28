@@ -3,7 +3,10 @@ wrong, each applied by monkeypatch, each of which must be caught by E1 (the stra
 the connector stack, logs compared), by G2 on the tapes the fake suite records, or by a named unit test.
 
   1  is_shut as ``not is_open``                         (a jointless or unknown container reads shut)
-  2  holding from an updates-only ledger                (the legacy backend's hand updates, not the Episode's record)
+  2  holding from an updates-only ledger                (the legacy backend's hand updates, not the Episode's record;
+                                                          it patches the harness's own EpisodeWorld, not a provider a
+                                                          host wires, and no fake here has sim.hands(), so the ledger
+                                                          stays empty: it guards the harness's world alone)
   3  pick without into                                  (HEAD's LegacyBackend drops it: legacy_skills.py:77)
   4  put_down as a plain achieve                        (the Episode's put_down never runs)
   5  the return read from status, not the channel's literal

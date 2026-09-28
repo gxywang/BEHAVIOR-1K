@@ -61,6 +61,8 @@ PLANNER_FRAMES_IGNORED = ("metadata", "stream")  # the connect frame and the sta
 HAND_SKILLS = ("pick_up", "place", "release", "hold", "press")  # the skills a HandRefresh follows (W4-I)
 LEGACY_BACKEND = "legacy"
 REFRESH_OWNER = "refresh"
+PLANNER_SERVICES = ("observe", "go_to")  # the planner's own services: their captures and renders are the planner's
+RULE2 = ("place_robot", "place_robot_calls", "capture", "look_at")  # never owned by a skill run (rule 2)
 
 
 def _plain(x: Any) -> Any:
@@ -133,14 +135,15 @@ def planner_client_of(planners: dict):
 class HandRefresh:
     """The HandRefresh proxy (WEEK4_PLAN 3.3, W4-I), between ConnectorAudit and DirectConnector. Every op passes
     through; ``run`` and ``wait`` look at their results, and after one whose backend is not legacy, with steps > 0,
-    for a skill in HAND_SKILLS, ``refresh()`` (providers.refresh_hands over the host's world: it pops the hand
-    record's entries that localization says have left the hand and answers the popped labels) runs under the ledger
+    for a skill in HAND_SKILLS, ``refresh(result)`` (providers.refresh_hands over the host's world, ``after`` the
+    step the run started at: it pops the hand record's entries that a look taken since says have left the hand, and
+    answers the popped labels; an older look is unknown, never evidence) runs under the ledger
     owner ``refresh``. It must take 0 steps (U0-b's refresh_zero; the provider raises if the sim moved) and it never
     runs inside a skill's owner scope: the run has returned by then, so the ledger's innermost owner is UNOWNED, and
     any other owner in flight is recorded in ``inside_owner``. A legacy result (PARITY: every one) never triggers it.
     ``summary()`` is the connector block's ``hand_refresh``: the count, the popped labels, one row per refresh."""
 
-    def __init__(self, conn: Any, refresh: Callable[[], list], ledger):
+    def __init__(self, conn: Any, refresh: Callable[[Any], list], ledger):
         self._conn, self._refresh, self._ledger = conn, refresh, ledger
         self.calls: list = []  # {"call_id", "skill", "backend", "steps", "popped", "owner_before"}
         self.inside_owner: list = []
@@ -177,7 +180,7 @@ class HandRefresh:
         popped: list = []
         with self._ledger.owner(REFRESH_OWNER):
             try:
-                popped = list(self._refresh())
+                popped = list(self._refresh(r))  # r: the result, whose steps say when the run started (``after``)
             except Exception as e:  # noqa: BLE001 - a broken refresh is a block failure, never the instance's crash
                 self.errors.append(f"{r.call_id}: {type(e).__name__}: {e}")
         self.calls.append({"call_id": r.call_id, "skill": r.skill, "backend": r.backend, "steps": int(r.steps),
@@ -263,6 +266,7 @@ class EpisodeHost:
             "go_to_equals_teleport_steps": steps("go_to") == int(getattr(self.teleport, "steps", 0)),
             "host_build_zero": steps("host.build") == 0 and int(rows.get("host.build", {}).get("env_step_calls", 0)) == 0,
             "refresh_zero": steps("refresh") == 0,
+            "apply_zero": steps("apply") == 0 and int(rows.get("apply", {}).get("env_step_calls", 0)) == 0,
             "sum_owners_equals_sim": totals["owned_steps"] == int(self.sim.n_steps) - self.n0,
             "ledger_n0_equals_n0": int(self.ledger.n0) == self.n0,
             "env_step_calls_equal_deltas": all(int(r.get("env_step_calls", 0)) == int(r.get("steps", 0))
@@ -278,33 +282,52 @@ class EpisodeHost:
 
     def u0c(self) -> dict:
         """The Runner holds a ClockView, never R1ProSim: the object it holds unwraps (TapeRecorder._inner,
-        DualEpisode._shim) to the shim, whose ``sim`` is the ClockView."""
+        DualEpisode._shim) to the planner's shim itself (identity), no link of the chain is the bench's Episode, and
+        the shim's ``sim`` is the ClockView."""
         shim = getattr(self.planner, "shim", None)
         view = getattr(shim, "sim", None) if shim is not None else None
-        chain, held = [], self.runner_holds
+        chain, links, held = [], [], self.runner_holds
         while held is not None and len(chain) < 8:
             chain.append(type(held).__name__)
+            links.append(held)
             inner = held.__dict__ if hasattr(held, "__dict__") else {}
             held = inner.get("_inner", inner.get("_shim"))
-        ok = shim is not None and isinstance(view, ClockView) and view is not getattr(self.episode, "sim", None)
-        return {"ok": bool(ok), "clock_view": type(view).__name__ if view is not None else None, "chain": chain}
+        ends_at_shim = bool(links) and shim is not None and links[-1] is shim
+        no_episode = not any(link is self.episode for link in links)
+        ok = (shim is not None and isinstance(view, ClockView) and view is not getattr(self.episode, "sim", None)
+              and ends_at_shim and no_episode)
+        return {"ok": bool(ok), "clock_view": type(view).__name__ if view is not None else None, "chain": chain,
+                "ends_at_shim": ends_at_shim, "no_episode": no_episode}
 
     def rule2(self, rows: dict) -> dict:
+        """Rule 2: no teleport, capture or aim owned by anything but the Episode (ep.*: legacy's own, D21 debt) and
+        the planner's services (observe, go_to). A native skill's own code runs outside every owner (``unowned``:
+        DirectConnector starts and resumes it outside env_step's ``rt``), so every other owner is read, ``rt``,
+        ``unowned``, ``apply`` and ``refresh`` among them. place_robot counts the teleports a move landed and
+        place_robot_calls every call, a refused placement too."""
         rt = rows.get("rt", {})
         during_native = {k: int(rt.get(k, 0)) for k in ("place_robot", "capture", "look_at")}
+        outside = {}
         debt = Counter()
         for owner, r in rows.items():
             if owner.startswith(EP_PREFIX):
                 for k in ("place_robot", "capture", "look_at"):
                     debt[k] += int(r.get(k, 0))
-        return {"ok": sum(during_native.values()) == 0, "rt": during_native, "d21_debt": dict(debt)}
+            elif owner not in PLANNER_SERVICES:
+                got = {k: int(r.get(k, 0)) for k in RULE2 if int(r.get(k, 0) or 0)}
+                if got:
+                    outside[owner] = got
+        return {"ok": not outside, "rt": during_native, "outside": outside, "d21_debt": dict(debt)}
 
     def requests(self) -> Optional[dict]:
+        """The planner requests of THIS episode (the frames the websocket tape logged since build: one WsTape serves
+        every instance of a bench process) by type and owner. ``plan_move_outside_ep``: plan and move requests are
+        the legacy Episode's alone on every run; ``ok`` (the parity item) also refuses any skill or reach request."""
         ws = self.wstape
         if ws is None:
             return None
         by = Counter()
-        for row in getattr(ws, "frames", ()):
+        for row in list(getattr(ws, "frames", ()))[self.frames0:]:
             op, owner = row.get("op", "?"), row.get("owner", "unowned")
             by[f"{op}/{owner}"] += 1
         counted = [(k.split("/", 1)[0], k.split("/", 1)[1], n) for k, n in by.items()]
@@ -313,8 +336,11 @@ class EpisodeHost:
         reach = sum(n for op, _, n in requests if op == "reach")
         outside = sum(n for op, owner, n in requests if not owner.startswith(EP_PREFIX))
         other = sum(n for op, _, n in requests if op not in REQUEST_OPS_ALLOWED)
+        plan_move_outside = sum(n for op, owner, n in requests
+                                if op in REQUEST_OPS_ALLOWED and not owner.startswith(EP_PREFIX))
         return {"by_type_and_owner": dict(by), "requests": sum(n for _, _, n in requests), "skill": skill,
                 "reach": reach, "not_owned_by_ep": outside, "not_plan_or_move": other,
+                "plan_move_outside_ep": plan_move_outside, "frames_before_build": self.frames0,
                 "ok": skill == 0 and reach == 0 and outside == 0 and other == 0, "mode": getattr(ws, "mode", None)}
 
     # -- close --------------------------------------------------------------------------------------------------------
@@ -363,6 +389,8 @@ class EpisodeHost:
             dual = {"ok": ds["mismatches"] == 0, "summary": ds, "mismatches": _plain(self.dual.mismatches[:50])}
         renders = {owner: int(r.get("renders", 0)) for owner, r in rows.items() if r.get("renders")}
         renders_outside = sum(n for owner, n in renders.items() if not owner.startswith(EP_PREFIX))
+        renders_by_skills = sum(n for owner, n in renders.items()
+                                if not owner.startswith(EP_PREFIX) and owner not in PLANNER_SERVICES)
         req = self.requests()
         inputs = self.runner_inputs_check or {"equal": False, "planner": None, "host": _plain(runner_inputs(self.host_strategy)),
                                               "note": "the planner never built its Runner"}
@@ -379,28 +407,42 @@ class EpisodeHost:
         # 5.4: a parity run is a legacy episode); a native route captures through the planner's observe and asks the
         # planner for skills and reaches, so on a run with any route off legacy they are reported, not gated
         parity_run = getattr(self.args, "routing_profile", "parity") == "parity" and not list(getattr(self.args, "route", ()) or ())
+        shim = getattr(self.planner, "shim", None)
+        shim_calls = 0 if shim is None else int(shim_counts(shim)["calls"])
+        dual_compared = None if dual is None else sum(dual["summary"]["compared"].values())
         g3 = {
             "dual_mismatches": None if dual is None else dual["summary"]["mismatches"],
             "purity_violations": None if purity is None else purity["summary"]["violations"],
             "typed_literal_mismatches": len(self.channel.mismatches),
             "renders_outside_ep": renders_outside,
+            "renders_by_skills": renders_by_skills,
             "requests_ok": None if req is None else req["ok"],
+            "plan_move_outside_ep": None if req is None else req["plan_move_outside_ep"],
             "runner_inputs_equal": bool(inputs["equal"]),
             "u0a": a["ok"], "u0b": b["ok"], "u0c": c["ok"], "u0d": d["ok"], "rule2": r2["ok"], "build": build["ok"],
             "hand_refresh_ok": hand_refresh["ok"], "parity_run": parity_run,
+            "apply_hand_changes": len(self.apply_changes),
+            "shim_calls": shim_calls, "connector_calls": sum(calls.values()), "dual_compared": dual_compared,
         }
+        # every run: U0, rule 2, the build, the Runner's inputs, the rebuild check, the hand refresh; no render owned
+        # by a skill's code (only ep.* and the planner's observe/go_to render); plan/move requests the Episode's alone
         hard = [g3["u0a"], g3["u0b"], g3["u0c"], g3["u0d"], g3["rule2"], g3["build"], g3["runner_inputs_equal"],
-                g3["typed_literal_mismatches"] == 0, g3["hand_refresh_ok"]]
-        if parity_run:
-            hard.append(g3["renders_outside_ep"] == 0)
+                g3["typed_literal_mismatches"] == 0, g3["hand_refresh_ok"], renders_by_skills == 0]
+        if req is not None:
+            hard.append(req["plan_move_outside_ep"] == 0)
+        if parity_run:  # a parity run is a legacy episode (WEEK4_PLAN 5.4): nothing renders outside ep.*, the
+            #             requests are plan/move alone, and a result's hand updates only repeat the Episode's record
+            hard += [g3["renders_outside_ep"] == 0, not self.apply_changes]
+            if req is not None:
+                hard.append(req["ok"])
         if dual is not None:
             hard.append(dual["ok"])
         if purity is not None:
             hard.append(purity["ok"])
-        if req is not None and parity_run:
-            hard.append(req["ok"])
+        if parity_run and purity is not None:  # the audited parity run went through the connector at all
+            hard += [shim_calls > 0, g3["connector_calls"] > 0, bool(dual_compared)]
         g3["pass"] = all(hard)
-        shim = getattr(self.planner, "shim", None)
+        ledger_summary = getattr(getattr(self.planner, "ledger", None), "summary", None)
         return {
             "ok": g3["pass"],
             "reason": reason,
@@ -425,6 +467,9 @@ class EpisodeHost:
             "channel_exceptions": dict(self.channel.exc_counts),
             "calls": dict(calls),
             "advisory": dict(self.registry.advisory),
+            "degraded": int(getattr(self.legacy, "degraded", 0)),
+            "apply_hand_changes": _plain(self.apply_changes[:50]),
+            "attempts": None if ledger_summary is None else _plain(ledger_summary()),
             "requests": req,
             "renders": renders,
             "hand_refresh": hand_refresh,
@@ -491,13 +536,28 @@ def build(episode, sim, planners: dict, args, providers, strategy_for: Callable,
         # the Runtime applies a result's WorldUpdates (_finish) with no owner in flight; OracleWorld(hands="episode")
         # writes the hand record there, idempotently, so the write-call is owned by ``apply`` and never unowned
         world_apply = svc.world.apply
-        svc.world.apply = lambda u: _owned_call(ledger, "apply", world_apply, u)
+        apply_changes: list = []  # an apply that changed the hand record (PARITY: the Episode wrote it already)
+
+        def owned_apply(u):
+            hands = getattr(sim, "hands", None)
+            before = dict(hands()) if callable(hands) else None
+            _owned_call(ledger, "apply", world_apply, u)
+            after = dict(hands()) if callable(hands) else None
+            if before != after:
+                apply_changes.append({"update": f"{u.kind} {getattr(u.obj, 'id', None)} {u.arm}",
+                                      "before": before, "after": after, "step": int(sim.n_steps)})
+
+        svc.world.apply = owned_apply
         bench_host = BenchHost(sim, segmenter, sim_clock=True) if bench_host is None else bench_host
         if observer is None:
             observer = CaptureObserver(sim, bench_host, segmenter, getattr(args, "task", getattr(args, "task_name", "")))
         teleport = TeleportNavigator(sim) if teleport is None else teleport
         channel = LegacyChannel()
-        legacy = EpisodeLegacyBackend(episode, channel, bench_host.observe_now)
+        # the legacy wire's in(): a compartment floor only under --inside-region where the geometry has a cavity,
+        # else bent onto on() (skillbench.make_backends' rule): reported on the result, never refused
+        has_cavity = lambda target, item: bool(getattr(sim, "send_inside", False)) and \
+            svc.geometry.cavity(target, item).value is not None  # noqa: E731
+        legacy = EpisodeLegacyBackend(episode, channel, bench_host.observe_now, has_cavity=has_cavity)
         if make_backends is None:
             from omnigibson.tiptop.host.skillbench import make_backends as skillbench_backends
 
@@ -522,10 +582,13 @@ def build(episode, sim, planners: dict, args, providers, strategy_for: Callable,
             teleport=teleport, channel=channel, legacy=legacy, backends=backends, registry=registry,
             navigator=navigator, rt=rt, calls=calls, saved_passthrough=saved, inst_dir=inst_dir, wstape=wstape,
             max_steps=max_steps, purity=None, dual=None, runner_holds=None, refresh=None,
+            apply_changes=apply_changes, frames0=len(getattr(wstape, "frames", ()) or ()) if wstape is not None else 0,
         )
         direct = DirectConnector(rt, host.env_step, bench_host, bench_host.raw())
         # the HandRefresh between the audit and the connector: the audit's ``run`` row spans the refresh (0 steps)
-        refresh = HandRefresh(direct, lambda: providers.refresh_hands(svc.world), ledger)
+        refresh = HandRefresh(
+            direct, lambda r: providers.refresh_hands(svc.world, after=int(sim.n_steps) - int(r.steps)), ledger
+        )
         audit = AuditedConnector(refresh, lambda: int(sim.n_steps))
         conn: Any = audit
         if getattr(args, "audit", False):

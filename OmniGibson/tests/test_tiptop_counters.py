@@ -270,8 +270,9 @@ def test_a_flag_when_the_treatments_minimum_exceeds_the_controls_maximum():
     assert flagged == {("wood", "executed")}
     f = cmp.flagged[0]
     assert f.normalised and f.control == [2.0, 2.5, 2.0] and f.treatment == [3.0, 3.5, 3.0]
-    assert cmp.n_tests == 11 and cmp.expected_false_flags == pytest.approx(0.55)
-    assert cmp.raw_tasks == [] and cmp.pooled.fail is False
+    assert cmp.n_tests == 11 and cmp.n_informative == 1, "only executed differs between the runs"
+    assert cmp.expected_false_flags == pytest.approx(0.05), "0.05 per test that could flag, not per test run"
+    assert cmp.raw_tasks == [] and cmp.pooled.fail is False and cmp.pooled.judged is False, "no call: unjudged"
 
 
 def test_no_flag_when_the_arms_overlap():
@@ -319,6 +320,7 @@ def test_the_pooled_test_counts_only_the_switched_skill_and_reports_unqualified_
                    CallOutcome("x4", "place", "on", "legacy", False, False)]  # another backend when one is asked
     p = counters.compare({"wood": (C, T)}, "place.on", backend="tiptop").pooled
     assert (p.c_n, p.t_n, p.t_succ, p.unqualified) == (2, 1, 1, 1)
+    assert p.judged is False and "no qualifier" in p.why_unjudged, "an unqualified row of place.on: unjudged"
     p2 = counters.compare({"wood": (C, T)}, "place").pooled  # unqualified: every place, any backend
     assert (p2.t_n, p2.t_succ, p2.unqualified) == (4, 1, 0)
 
@@ -334,7 +336,7 @@ def test_a_carried_forward_task_must_show_zero_native_calls_or_report_them():
     text = counters.format_comparison(cmp)
     assert "carried attach attach_native: 0 native calls" in text
     assert "carried compost compost_native: 2 native calls {'press@tiptop': 2} (REPORT)" in text
-    assert cmp.n_tests == 0 and cmp.expected_false_flags == 0
+    assert cmp.n_tests == 0 and cmp.expected_false_flags == 0 and cmp.pooled.judged is False
 
 
 def test_on_air_closes_are_listed_with_their_causes():
@@ -359,5 +361,112 @@ def test_the_command_line_extracts_and_compares(tmp_path, capsys):
     out = capsys.readouterr().out
     # c2 ok, c8 not; c3 carries no qualifier (nothing moved, no tape) and is left out; c4 is legacy
     assert "pooled per-call: C 1/2 (0.5), T 1/2 (0.5)" in out and "2 unqualified rows of the skill left out" in out
+    assert "UNJUDGED" in out, "c3 is unqualified: the pooled test says nothing, never pass"
     assert "FLAG demo steps: C ['530'] T ['1000']" in out  # per delivered atom
     assert "on-air demo C c0: needs a cause" in out and "carried demo2 c0: 6 native calls" in out
+
+
+# ------------------------------------------------------------------------------------------------- the fix pass
+def test_a_rejection_is_named_by_its_text_and_a_round_that_moved_then_failed_executed(tmp_path):
+    """Motion validation rejects a segment just before running it, often after earlier ones ran (bringing_in_wood
+    R3: 40 steps). A round that moved and then failed some other way executed, as a native FAILED run that stepped
+    does. A round that never planned is a planning failure; one in no category is a note."""
+    rounds = [{"round": 1, "atoms": [], "arm": "left", "env_steps": 40, "error": "motion validation rejected Place(p)"},
+              {"round": 2, "atoms": [], "arm": "left", "env_steps": 0, "error": "motion validation rejected Pick(p)"},
+              {"round": 3, "atoms": [], "arm": "left", "env_steps": 96, "error": "failed to track the checked path"},
+              {"round": 4, "atoms": [], "arm": "left", "error": "TiptopPlanningError: No satisfying particles"},
+              {"round": 5, "atoms": [], "arm": "left", "env_steps": 120},
+              {"round": 6, "atoms": [], "arm": "left"}]
+    _job(tmp_path, rounds=rounds, steps=100)
+    c = counters.extract(tmp_path)
+    assert (c.rejections, c.executed, c.planning_failures, c.cut_off) == (2, 2, 1, 0)
+    assert "round 6: no error and no env_steps None: counted in no category" in c.notes
+
+
+def test_only_the_executors_closes_are_welds_or_on_air_and_both_are_cross_checked(tmp_path):
+    gripper = [{"step": 125, "arm": "left", "event": "close", "is_grasping": -1, "owner": "ep.open_up", "call_id": None,
+                "via": "sim"},  # store_honey's closed-fist drawer pull
+               {"step": 300, "arm": "left", "event": "close", "is_grasping": 1, "owner": "ep.pick", "call_id": None,
+                "via": "executor"},
+               {"step": 400, "arm": "left", "event": "close", "is_grasping": -1, "owner": "ep.pick", "call_id": None,
+                "via": "executor.start"}]
+    log = "gripper close: Pick(jar) is_grasping=1\n"
+    _job(tmp_path, gripper=gripper, log=log, steps=500)
+    c = counters.extract(tmp_path)
+    assert (c.welds, c.on_air, c.closes_other) == (1, 0, 2) and not any("sim.log shows" in n for n in c.notes)
+    _job(tmp_path, gripper=gripper, log=log + "gripper close: Pick(jar) is_grasping=-1\n", steps=500)
+    assert "sim.log shows 1 on-air closes, gripper.jsonl 0" in counters.extract(tmp_path).notes
+
+
+def test_a_native_call_episode_over_cut_off_is_a_native_call(tmp_path):
+    block = {"step": 90, "idle_steps": 0, "charged": {}, "live_at_end": {"call_id": "q1-9", "steps": 40}}
+    rows = [_row("q1-1", "pick_up", "legacy", "succeeded", 0, sim_clock=True, evidence={"legacy_ok": True})]
+    tape = [{"call_id": "q1-9", "skill": "place", "qual": "on", "returned": None}]
+    _job(tmp_path, connector=block, calls=rows, tape=tape, steps=90)
+    c = counters.extract(tmp_path)
+    assert (c.cut_off, c.native_calls, c.native_by) == (1, 1, {"place@live_at_end": 1})
+
+
+def test_the_bench_layout_itself_is_read(tmp_path):
+    """bench.py writes the connector block at bench.connector and the rows in episode/<task>_<inst>_<rollout>/:
+    a connector run read from that layout is a connector run with its native calls (the schema the writer uses)."""
+    ep = tmp_path / "episode"
+    (ep / "json").mkdir(parents=True)
+    block = {"step": 120, "idle_steps": 0, "charged": {"skill": 120}, "live_at_end": None}
+    data = {"task": "demo", "instance_id": 301, "steps": 900,
+            "bench": {"reason": "success", "rounds": [], "goal": {"satisfied": ["ontop(a, t)"], "new": 1, "total": 1},
+                      "teleports": 0, "connector": block}}
+    (ep / "json" / "demo_301_0.json").write_text(json.dumps(data))
+    inst = ep / "demo_301_0"
+    inst.mkdir()
+    rows = [_row("q1-1", "place", "tiptop", "succeeded", 120, scorer=True, effects=(("ontop", ("a", "t")),))]
+    (inst / "skill_calls.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    c = counters.extract(tmp_path)
+    assert c.runner == "connector" and (c.native_calls, c.native_by, c.executed) == (1, {"place@tiptop": 1}, 1)
+
+
+def _rates(job, close_attempts, close_successes, items=2, welds=2):
+    return Counters(job=job, task="t", runner="connector", delivered_atoms=2, delivered_items=items, welds=welds,
+                    close_attempts=close_attempts, close_successes=close_successes, steps=1000)
+
+
+def test_a_lower_rate_flags_and_a_higher_one_does_not():
+    C = [_rates(f"c{i}", 2, 2) for i in range(3)]  # close_rate 1.0
+    low = counters.compare({"honey": (C, [_rates(f"t{i}", 2, 1) for i in range(3)])}, "close.prismatic")
+    assert {f.counter for f in low.flagged} == {"close_rate"}
+    high = counters.compare({"honey": ([_rates(f"c{i}", 2, 1) for i in range(3)], C)}, "close.prismatic")
+    assert high.flagged == [], "a higher success rate is never worse"
+
+
+def test_welds_are_normalised_by_the_delivered_items():
+    C = [_rates(f"c{i}", 0, 0, items=4, welds=4) for i in range(3)]  # 1.0 per item, 2.0 per atom
+    T = [_rates(f"t{i}", 0, 0, items=4, welds=6) for i in range(3)]  # 1.5 per item
+    f = {x.counter: x for x in counters.compare({"t": (C, T)}, "place.on").flags}["welds"]
+    assert f.control == [1.0] * 3 and f.treatment == [1.5] * 3 and f.flagged
+
+
+def test_a_failed_native_open_is_an_attempt_and_not_a_success(tmp_path):
+    rows = [_row("q1-1", "open", "tiptop", "failed", 60, scorer=False), _row("q1-2", "open", "tiptop", "succeeded", 50)]
+    _job(tmp_path, calls=rows, steps=110)
+    c = counters.extract(tmp_path)
+    assert (c.open_attempts, c.open_successes) == (2, 1)
+
+
+def test_the_backend_filter_is_the_treatments_alone():
+    C = [Counters(job=f"c{i}", task="t", delivered_atoms=1) for i in range(3)]
+    T = [Counters(job=f"t{i}", task="t", delivered_atoms=1) for i in range(3)]
+    for x in C:  # the control runs the line on legacy
+        x.calls = [CallOutcome(f"c{k}", "place", "on", "legacy", True, True) for k in range(3)]
+    for x in T:
+        x.calls = [CallOutcome(f"c{k}", "place", "on", "tiptop", False, False) for k in range(3)]
+    p = counters.compare({"t": (C, T)}, "place.on", backend="tiptop").pooled
+    assert (p.c_succ, p.c_n, p.t_succ, p.t_n) == (9, 9, 0, 9) and p.fail is True and p.judged
+
+
+def test_the_mde_is_the_smallest_drop_the_rule_fails_on():
+    """The rule fails at a drop >= delta with p < alpha: at C 22/26 against 23 calls, a drop of 0.237 has p < 0.10
+    but is under 0.25, so the MDE is the first k/23 that clears both."""
+    m = counters.minimum_detectable_effect(22, 26, 23, 0.10, 0.25)
+    assert m >= 0.25 and counters.fisher_one_sided(22, 26, round((22 / 26 - m) * 23), 23) < 0.10
+    assert counters.minimum_detectable_effect(22, 26, 23, 0.10) < 0.25, "the p threshold alone"
+    assert counters.minimum_detectable_effect(21, 21, 21, 0.10, 0.25) >= 0.25

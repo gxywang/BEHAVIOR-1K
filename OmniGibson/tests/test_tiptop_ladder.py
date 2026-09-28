@@ -10,6 +10,7 @@ each pinned on synthetic tapes and rows.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -62,7 +63,7 @@ class Refresher:
     def __init__(self, ledger, popped=("jar_of_honey_1",), raise_=None, sim=None):
         self.ledger, self.popped, self.raise_, self.sim, self.calls = ledger, list(popped), raise_, sim, []
 
-    def __call__(self):
+    def __call__(self, result=None):
         self.calls.append(self.ledger.current)
         if self.raise_ is not None:
             raise self.raise_
@@ -148,7 +149,7 @@ def test_a_refresh_that_raises_or_runs_inside_an_owner_is_recorded_and_fails_the
 def test_a_refresh_that_steps_the_sim_lands_on_the_refresh_owner_which_u0b_refuses(tmp_path):
     h = th.build(tmp_path, audit=False)
     sim, ledger = h.sim, h.ledger
-    h.providers.refresh_hands = lambda world: Refresher(ledger, sim=sim)()
+    h.providers.refresh_hands = lambda world, after=None: Refresher(ledger, sim=sim)()
     h.host.refresh._after(result("place", "tiptop@abc/place-1", 40, cid="q1-7"))
     block, _ = th.run(h)
     assert block["ledger"][REFRESH_OWNER]["steps"] == 1 and block["u0b"]["checks"]["refresh_zero"] is False
@@ -169,7 +170,7 @@ def test_the_hand_refresh_is_inert_under_parity(tmp_path):
     """Every result of a PARITY episode is legacy: the providers' refresh_hands is never asked, the block says 0."""
     h = th.build(tmp_path, tape=True)
 
-    def never(world):
+    def never(world, after=None):
         raise AssertionError("refresh_hands was asked on a parity run")
 
     h.providers.refresh_hands = never
@@ -187,15 +188,17 @@ def test_a_native_hand_result_in_the_built_host_is_counted_in_the_block_at_zero_
     ledger = h.ledger
     seen = []
 
-    def refresh(world):
-        seen.append((ledger.current, world is h.host.svc.world))
+    def refresh(world, after=None):
+        seen.append((ledger.current, world is h.host.svc.world, after))
         return ["jar_of_honey_1"]
 
     h.providers.refresh_hands = refresh
+    n = int(h.sim.n_steps)
     h.host.refresh._after(result("pick_up", "tiptop@abc/pick-1", 12, cid="q1-8"))
     block, raised = th.run(h)
     assert raised is None and block["ok"], json.dumps(block["g3"]) + json.dumps(block["u0b"]["checks"])
-    assert seen == [(REFRESH_OWNER, True)], "under the refresh owner, over the host's world"
+    assert seen == [(REFRESH_OWNER, True, n - 12)], (
+        "under the refresh owner, over the host's world, after the step the 12-step run started at")
     hr = block["hand_refresh"]
     assert (hr["count"], hr["popped"], hr["popped_total"], hr["ok"]) == (1, ["jar_of_honey_1"], 1, True)
     assert block["ledger"][REFRESH_OWNER] == {**block["ledger"][REFRESH_OWNER], "steps": 0, "env_step_calls": 0}
@@ -204,7 +207,7 @@ def test_a_native_hand_result_in_the_built_host_is_counted_in_the_block_at_zero_
 
 def test_an_inside_owner_breach_fails_the_block(tmp_path):
     h = th.build(tmp_path, audit=False)
-    h.providers.refresh_hands = lambda world: []
+    h.providers.refresh_hands = lambda world, after=None: []
     with h.ledger.owner("ep.achieve"):
         h.host.refresh._after(result("place", "tiptop@abc/place-1", 40, cid="q1-9"))
     block, _ = th.run(h)
@@ -384,31 +387,68 @@ def test_runner_tape_rows_for_counters_come_from_the_runs_own_tape(tmp_path):
         ("q1-4", "place", "on", True), ("q1-5", "place", "in", False), ("q1-6", "close", None, None)]
 
 
-def test_the_prefix_verdict_forced_at_the_branch_early_within_the_floor_and_early_outside_it():
+def _prefix_tapes(tmp_path, monkeypatch, writes_before=2, equal=True):
+    """An L-rec Runner tape and a run's, identical, and tape_diff's per-write rows for the writes before the branch."""
+    t = tp.Tape({}, [{"kind": "write", "member": "pick", "args": ("a",), "kwargs": {}, "ret": True}] * 3)
+    lrec, mine = tmp_path / "lrec" / "episode" / "tapes" / "t.json", tmp_path / "run" / "episode" / "tapes" / "t.json"
+    for pth in (lrec, mine):
+        pth.parent.mkdir(parents=True, exist_ok=True)
+        t.save(pth)
+    per_write = [{"i": i, "delta_a": 5, "delta_b": 5 if equal else 6, "digest_before_equal": True, "digest_after_equal": True}
+                 for i in range(writes_before)]
+    monkeypatch.setattr(ladder, "tape_diff", lambda snap, a, b: {"runner": {"first_divergence": None, "records": [3, 3],
+                                                                          "per_write": per_write}})
+    return lrec, str(mine)
+
+
+def test_the_prefix_verdict_forced_at_the_branch_early_within_the_floor_and_early_outside_it(tmp_path, monkeypatch):
+    lrec, mine = _prefix_tapes(tmp_path, monkeypatch)
     replay = [{"i": 0, "op": "metadata", "matched": True, "diffs": []}, {"i": 1, "op": "plan", "matched": True, "diffs": []}]
-    run = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 forced live (--wstape-live-at 2)"}, "replay": replay}
-    pv = ladder.prefix_verdict(run, 2, None, 36, None, Path("/snap"))
+    run = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 forced live (--wstape-live-at 2)"}, "replay": replay,
+           "runner_tape": mine}
+    pv = ladder.prefix_verdict(run, 2, None, 3, lrec, Path("/snap"), 2)
     assert pv["ok"] and pv["switched_at_branch"] and pv["forced"] and not pv["pre_branch_divergence"] and pv["frames_before_branch"] == 2
     # the T arm: its native request at N differs from the tape at its op and goes live on that, at N all the same
-    native = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 (skill) differs at op: plan on the tape, skill in the replay"}, "replay": replay}
-    pv = ladder.prefix_verdict(native, 2, None, 36, None, Path("/snap"))
+    native = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 (skill) differs at op: plan on the tape, skill in the replay"},
+              "replay": replay, "runner_tape": mine}
+    pv = ladder.prefix_verdict(native, 2, None, 3, lrec, Path("/snap"), 2)
     assert pv["ok"] and pv["switched_at_branch"] and not pv["forced"] and not pv["pre_branch_divergence"]
-    early = {"wstape": {"switched_at": 3, "switch_reason": "frame 3 (plan) differs at depth: ..."},
+    early = {"wstape": {"switched_at": 3, "switch_reason": "frame 3 (plan) differs at depth: ..."}, "runner_tape": mine,
              "replay": replay + [{"i": 2, "op": "plan", "matched": True, "diffs": []}, {"i": 3, "op": "plan", "matched": False, "diffs": [{"path": "depth"}]}]}
-    within = ladder.prefix_verdict(early, 6, 3, 47, None, Path("/snap"))
+    within = ladder.prefix_verdict(early, 6, 3, 3, lrec, Path("/snap"), 2)
     assert within["pre_branch_divergence"] and within["within_floor"] and within["ok"] and not within["switched_at_branch"]
     assert within["mismatched_before_branch"] == [{"i": 3, "diffs": ["depth"]}]
-    outside = ladder.prefix_verdict(early, 6, None, 47, None, Path("/snap"))
+    outside = ladder.prefix_verdict(early, 6, None, 3, lrec, Path("/snap"), 2)
     assert outside["pre_branch_divergence"] and not outside["within_floor"] and not outside["ok"]
-    below = ladder.prefix_verdict(early, 6, 5, 47, None, Path("/snap"))
+    below = ladder.prefix_verdict(early, 6, 5, 3, lrec, Path("/snap"), 2)
     assert not below["within_floor"] and not below["ok"], "a divergence at frame 3 is not covered by a floor at 5"
+
+
+def test_the_prefix_verdict_needs_its_evidence_and_the_switch_at_the_branch(tmp_path, monkeypatch):
+    """(a) says every frame before N was served and matched, the switch happened at N, and the Runner tape matched
+    before the branch: a run with no Runner tape, one that never switched, one that switched late, or one with a
+    frame before N never served proves none of it."""
+    lrec, mine = _prefix_tapes(tmp_path, monkeypatch)
+    replay = [{"i": 0, "op": "metadata", "matched": True, "diffs": []}, {"i": 1, "op": "plan", "matched": True, "diffs": []}]
+    ok = {"wstape": {"switched_at": 2, "switch_reason": "forced"}, "replay": replay, "runner_tape": mine}
+    assert ladder.prefix_verdict(ok, 2, None, 3, lrec, Path("/snap"), 2)["ok"]
+    assert not ladder.prefix_verdict({**ok, "runner_tape": None}, 2, None, 3, lrec, Path("/snap"), 2)["ok"], "no Runner tape"
+    assert not ladder.prefix_verdict(ok, 2, None, 3, None, Path("/snap"), 2)["ok"], "no L-rec tape to compare against"
+    for switched in (None, 5):
+        run = {**ok, "wstape": {"switched_at": switched, "switch_reason": ""}}
+        assert not ladder.prefix_verdict(run, 2, None, 3, lrec, Path("/snap"), 2)["ok"], switched
+    assert not ladder.prefix_verdict({**ok, "replay": replay[:1]}, 2, None, 3, lrec, Path("/snap"), 2)["ok"], "frame 1 unserved"
+    assert not ladder.prefix_verdict(ok, 2, None, 3, lrec, Path("/snap"), 3)["ok"], "3 writes before the branch, 2 compared"
+    _prefix_tapes(tmp_path, monkeypatch, equal=False)
+    assert not ladder.prefix_verdict(ok, 2, None, 3, lrec, Path("/snap"), 2)["ok"], "a write's step delta differs"
 
 
 def _block(ok=True, **over):
     b = {"ok": ok, "step": 120, "idle_steps": 0, "charged": {"skill": 120, "go_to": 0}, "u0a": {"ok": ok, "L": 0, "X": 0},
          "u0b": {"ok": ok}, "u0c": {"ok": True}, "u0d": {"ok": True}, "build": {"ok": True},
          "rule2": {"ok": True, "rt": {"place_robot": 0, "capture": 0, "look_at": 0}, "d21_debt": {"place_robot": 2}},
-         "hand_refresh": {"ok": True, "count": 1, "popped_total": 1}, "reason": "success"}
+         "hand_refresh": {"ok": True, "count": 1, "popped_total": 1}, "reason": "success",
+         "g3": {"typed_literal_mismatches": 0, "runner_inputs_equal": True}, "shim": {"unconsumed": 0, "calls": 5}}
     b.update(over)
     return b
 
@@ -434,6 +474,59 @@ def test_the_hard_verdict_on_a_treatment_run():
     assert not ladder.hard_verdict(broken, "place.on", "T", {"success"})["ok"]
     refresh = dict(good, connector=_block(hand_refresh={"ok": False, "count": 1, "errors": ["x"]}))
     assert not ladder.hard_verdict(refresh, "place.on", "T", {"success"})["ok"]
+    for over in ({"g3": {"typed_literal_mismatches": 1, "runner_inputs_equal": True}},
+                 {"g3": {"typed_literal_mismatches": 0, "runner_inputs_equal": False}},
+                 {"shim": {"unconsumed": 1, "calls": 5}},  # a native write that never ran: no skill row, no (c) row
+                 {"ledger": {"unowned": {"capture": 1}}}):  # a native skill's code captured
+        assert not ladder.hard_verdict(dict(good, connector=_block(**over)), "place.on", "T", {"success"})["ok"], over
+    assert not ladder.hard_verdict(crash, None, "native", set())["ok"], "a carried run has no C to lack the crash"
+    live = dict(good, wstape={"switched_at": 2}, live_modules={"tiptop": "/elsewhere/tiptop/tiptop/__init__.py",
+                                                               "cutamp": "/elsewhere/tiptop/cutamp/cutamp/__init__.py"})
+    assert ladder.hard_verdict(live, "place.on", "T", {"success"}, Path("/snap"))["live_imports_ok"] is False
+    assert not ladder.hard_verdict(live, "place.on", "T", {"success"}, Path("/snap"))["ok"]
+    here = dict(live, live_modules={"tiptop": "/snap/tiptop/tiptop/__init__.py", "cutamp": "/snap/tiptop/cutamp/cutamp/__init__.py"})
+    assert ladder.hard_verdict(here, "place.on", "T", {"success"}, Path("/snap"))["ok"]
+    assert ladder.hard_verdict(dict(live, live_modules=None), "place.on", "T", {"success"}, Path("/snap"))["live_imports_ok"] is False
+
+
+def test_the_structural_shifts_count_repeats_and_name_the_absolute_write():
+    seq_c = [(f"q1-{i}", m, l, True, None) for i, (m, l) in enumerate([("pick", "pick_up"), ("stand_for", None),
+                                                                       ("put_down", "place.on")])]
+    seq_t = seq_c + [("q1-9", "walk_to_floor", None, True, None), ("q1-10", "put_down", "place.on", True, None)]
+    runs = {("C", 0): {"runner_tape": "c"}, ("T", 0): {"runner_tape": "t"}}
+    orig = ladder.write_sequence
+    ladder.write_sequence = lambda run: {"c": seq_c, "t": seq_t}[run["runner_tape"]]
+    try:
+        (s0,) = ladder.structural_shifts(runs, 1)
+    finally:
+        ladder.write_sequence = orig
+    assert s0["t_extra"] == [("put_down", "place.on"), ("walk_to_floor", None)] and s0["c_extra"] == [], (
+        "a second put_down is an extra even though C made one too")
+    assert s0["first_difference"] == 2 and s0["first_difference_write"] == 3
+
+
+def test_a_stage_with_no_branch_is_vacuous_not_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(ladder, "OUT", tmp_path)
+    (tmp_path / "S2").mkdir()
+    (tmp_path / "S2" / "plan.json").write_text(json.dumps({"tasks": {"store_honey": {"branch": None}}}))
+    g = ladder.gate_stage("S2", Path("/snap"))
+    assert g["verdict"]["vacuous"] and g["verdict"]["outcome"] == "VACUOUS" and not g["verdict"]["pass"]
+    assert "VACUOUS" in ladder.gate_md(g)
+
+
+def test_the_witness_needs_an_observe_before_every_native_press_and_no_crash(tmp_path, monkeypatch):
+    monkeypatch.setattr(ladder, "OUT", tmp_path)
+    d = ladder.run_dir("witness", ladder.WITNESS_TASK, "witness", 0)
+    press = {"call_id": "q1-1", "skill": "press", "backend": "tiptop@x/press-1", "status": "succeeded", "code": None,
+             "steps": 90, "effects": [], "verdicts": {"scorer": True}}
+    block = _block(charged={"skill": 90, "wait": 1200}, step=1290)
+    _bench_job(d, connector_block=block, rounds=[], gripper=[], calls=[press])
+    (d / "job_end.json").write_text('{"ended": 1}')
+    inst = sorted(p for p in (d / "episode").glob(f"*_{ladder.INSTANCE}_0") if p.is_dir())[0]
+    (inst / "audit.jsonl").write_text("")  # no audit rows at all: no evidence of an observe before the press
+    assert ladder.gate_witness(Path("/snap"))["ok"] is False
+    (inst / "audit.jsonl").write_text(json.dumps({"kind": "op", "op": "observe"}) + "\n" + json.dumps({"kind": "op", "op": "run"}) + "\n")
+    assert ladder.gate_witness(Path("/snap"))["ok"] is True
 
 
 def test_the_u0_reading_of_a_block_is_the_identity_and_the_hosts_verdicts():
@@ -726,6 +819,24 @@ def test_the_queue_launches_only_on_the_allowed_cards(monkeypatch):
             ladder.parse_gpus(bad)
     monkeypatch.setattr(ladder, "GPUS", (1, 3))
     monkeypatch.setattr(ladder.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "0, 90000\n1, 90000\n2, 90000\n3, 60000\n"})())
+    monkeypatch.setattr(ladder, "gpu_owners", lambda: {})
     assert ladder.pick_gpu() == 1
     monkeypatch.setattr(ladder, "GPUS", ladder.parse_gpus("3"))
     assert ladder.gpu_free() == {3: 60000} and ladder.pick_gpu() == 3, "a card left out is never picked, however free"
+    monkeypatch.setattr(ladder, "GPUS", (1, 3))
+    monkeypatch.setattr(ladder, "gpu_owners", lambda: {1: {"tcheng12"}, 3: {os.environ.get("USER", "wding8")}})
+    assert ladder.pick_gpu() == 3, "a card another user has a process on is never picked, however free"
+    monkeypatch.setattr(ladder, "gpu_owners", lambda: {1: {"tcheng12"}, 3: {"beijial2"}})
+    assert ladder.pick_gpu() is None
+
+
+def test_the_gpu_owners_are_read_off_the_compute_apps(monkeypatch):
+    out = {"--query-gpu=index,uuid": "1, GPU-aaa\n3, GPU-bbb\n", "--query-compute-apps=pid,gpu_uuid": "101, GPU-aaa\n202, GPU-bbb\n"}
+
+    def run(cmd, **k):
+        if cmd[0] == "ps":
+            return type("R", (), {"stdout": {"101": "tcheng12\n", "202": "wding8\n"}[cmd[-1]]})()
+        return type("R", (), {"stdout": out[cmd[1]]})()
+
+    monkeypatch.setattr(ladder.subprocess, "run", run)
+    assert ladder.gpu_owners() == {1: {"tcheng12"}, 3: {"wding8"}}

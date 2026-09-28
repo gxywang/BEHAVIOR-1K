@@ -11,7 +11,9 @@ touched, and ``skillrun.PASSTHROUGH = (EpisodeOver,)`` until ``close()``. The pr
   EpisodeWorld   is_open False iff ep.is_shut, else None; holding ("left",) iff ep.holding; held("left") the refs of
                  ep.held_names(), held("right") (); base_pose from ep.stance_key() (10 cm, 15 degrees), None when
                  absent; support_of, distance, edge_gap, switched_on and fixture_for forward to the Episode member of
-                 the same name, appeared() to after_transition (§4 row 11); objects() the scope's refs.
+                 the same name, with the production provider's conversions (OracleWorld: distance's KeyError, an
+                 object never perceived, is None); appeared() to after_transition (§4 row 11); objects() the scope's
+                 refs; box() unknown (no Runner member reads a box).
   EpisodeScorerOver  holds(fact) = ep.goal_already_holds(pred, *args); an exception or a missing member is None.
   task()         a TaskInfo built on every call: the floor re-read from ep.floor, the arms asked of ep.has_arm when
                  the Episode has it (else ("left",)), the scope the Runner was built with.
@@ -70,6 +72,8 @@ from omnigibson.tiptop.host.legacy_episode import EPISODE_SPECS, EpisodeLegacyBa
 from omnigibson.tiptop.host.routing_profiles import PARITY
 
 WRITES = tp.WRITES  # the Episode calls that move the robot or the clock: what the ExecLog records
+NO_CROSSING = ("stance_key",)  # extras peek never answers from an earlier segment: a write may have moved the base
+DIAGNOSTIC = ("step", "digest")  # the host's probe fields on a write (bench.py's TapeRecorder): never the Runner's
 SRC = "oracle"  # the providers' tag: the Episode's own answers, as the episode host's providers tag theirs
 
 
@@ -180,6 +184,7 @@ class Src:
         self.origin = Origin()
         self.extras: list = []
         self.misreads: list = []
+        self.stale: list = []  # extras over a tape that had no answer in their own segment (peek, NO_CROSSING)
         self._index = _segments(tape) if tape is not None else None
         self._head = tape.header if tape is not None else {}
 
@@ -217,7 +222,9 @@ class Src:
     def peek(self, member: str, args=(), kwargs=None):
         """The tape's answer to a read as of the current segment, consuming nothing: the segment's first record of
         that read, else (sim.n_steps) the last served write's step after it, else the latest earlier record, else
-        the header's floor / max_steps, else None. A recorded exception answers None."""
+        the header's floor / max_steps, else None. A recorded exception answers None. ``stance_key`` never falls
+        back across a write (any write may re-stance: a failed floor put_down's achieve did): with no record in
+        its own segment it answers None, listed in ``stale`` so a divergence it causes is named, not silent."""
         seg, k = self.ep.segment, _key(member, args, kwargs)
         recs = self._index[seg].get(k) if seg < len(self._index) else None
         if recs:
@@ -227,6 +234,9 @@ class Src:
                 step = w.get("step")
                 if step and step[1] is not None:
                     return step[1]
+        if member in NO_CROSSING:
+            self.stale.append({"member": member, "args": tuple(args), "segment": seg, "during": self.origin.during})
+            return None
         for s in range(min(seg, len(self._index)) - 1, -1, -1):
             recs = self._index[s].get(k)
             if recs:
@@ -287,7 +297,15 @@ class EpisodeWorld:
         return self._b(None if v is None else ref(v))
 
     def distance(self, a, b) -> Belief:
-        return self._b(self.src.read("distance", a.id, b.id))
+        """OracleWorld.distance's rule: the Episode's KeyError (never perceived) is an unknown distance, None; the
+        shim turns that back into the Episode's KeyError (shim.distance)."""
+        try:
+            return self._b(self.src.read("distance", a.id, b.id))
+        except KeyError:
+            return self._b(None)
+
+    def box(self, o) -> Belief:
+        return self._b(None)
 
     def edge_gap(self, item, support) -> Belief:
         return self._b(self.src.read("edge_gap", item.id, None if support is None else support.id))
@@ -578,6 +596,7 @@ class Harness(SimpleNamespace):
             "planner_reads": dict(rt.planner_oracle_reads),
             "extras": dict(Counter(f"{e['during']}>{e['member']}" for e in self.src.extras)),
             "misreads": [encode(m) for m in self.src.misreads],
+            "stale_extras": [encode(m) for m in self.src.stale],
             "shim": None if shim is None else counts(shim),
         }
 
@@ -714,17 +733,32 @@ def rebuild_runner(header: dict):
 
 
 def _exc_classes() -> tuple:
-    from b1k.bridge import strategies as st
+    """What a tape's endings may be, as the bench records them: the Runner's two, EpisodeOver, and TapeDiverged (a
+    BaseException, on tape because bench.py's TapeRecorder names it)."""
+    from b1k.planner.pseudo.errors import TransferBlocked, Unreachable
+    from omnigibson.tiptop.host.wstape import TapeDiverged
     from omnigibson.tiptop.scene import EpisodeOver
 
-    return st.Unreachable, st.TransferBlocked, EpisodeOver
+    return Unreachable, TransferBlocked, EpisodeOver, TapeDiverged
 
 
 def _ending(fn) -> tuple:
     try:
         return fn(), None
-    except Exception as e:  # noqa: BLE001 - the run's ending is what is compared
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001 - the run's ending is what is compared, TapeDiverged included
         return None, e
+
+
+def without_diagnostics(tape: tp.Tape) -> tp.Tape:
+    """The tape with the host's probe fields (DIAGNOSTIC: a write's step and digest) taken off every record: what
+    G2 compares, since a replay's recorder has no sim to probe. G4 compares the probes."""
+    return tp.Tape(tape.header, [{k: v for k, v in r.items() if k not in DIAGNOSTIC} for r in tape.records])
+
+
+def _probed(tape: tp.Tape) -> int:
+    return sum(1 for r in tape.records if any(k in r for k in DIAGNOSTIC))
 
 
 def _show(e) -> Optional[list]:
@@ -734,9 +768,11 @@ def _show(e) -> Optional[list]:
 def replay(tape: tp.Tape) -> dict:
     """G2 for one tape (WEEK4_PLAN §5.3): E0 (the rebuilt Runner against a TapeEpisode) and the connector replay
     (Runner -> TapeRecorder(shim) -> this stack -> ExecLog -> TapeEpisode). ``ok`` requires, for both: the recording
-    equals the tape, every write served in order, nothing unanswerable; for the connector, no typed/literal
-    mismatch and no violation, and the same ending as E0. Extra reads by the connector's own code are returned in
-    ``extras``, never failed on."""
+    equals the tape (the host's step and digest probes aside: ``without_diagnostics``; their count is reported),
+    every write served in order, nothing unanswerable; for the connector, no typed/literal mismatch and no
+    violation, and the same ending as E0 (a recorded TapeDiverged included: both recorders tape it, as the bench's
+    does). Extra reads by the connector's own code are returned in ``extras``, never failed on; an extra over the
+    tape that had no answer in its own segment is in ``stale_extras``."""
     from b1k.planner.pseudo.planner import PseudoPlanner
 
     text, exc = tape.dumps(), _exc_classes()
@@ -748,10 +784,12 @@ def replay(tape: tp.Tape) -> dict:
     except ValueError as e:  # a header without the construction inputs: this tape cannot be replayed
         return {**out, "ok": False, "error": str(e), "e0": {"ok": False}, "connector": {"ok": False, "extras": {}}}
     # E0
+    plain = without_diagnostics(tape)
+    out["probed_records"] = _probed(tape)
     te0 = tp.TapeEpisode(tp.Tape.loads(text), exc_classes=exc)
     rec0 = tp.Tape(dict(header))
-    ret0, e0 = _ending(lambda: rebuild_runner(header).run(tp.TapeRecorder(te0, rec0)))
-    d0 = tp.diff(tape, rec0)
+    ret0, e0 = _ending(lambda: rebuild_runner(header).run(tp.TapeRecorder(te0, rec0, exc_classes=exc)))
+    d0 = tp.diff(plain, rec0)
     out["e0"] = {"diff": None if d0 is None else [d0.index, d0.kind, encode(d0.a), encode(d0.b)],
                  "served": te0.segment, "unanswerable": encode(te0.unanswerable), "ending": _show(e0)}
     out["e0"]["ok"] = d0 is None and te0.segment == len(tape.writes) and not te0.unanswerable
@@ -764,15 +802,15 @@ def replay(tape: tp.Tape) -> dict:
     with build_episode_connector(TapeFake(te1, src), members, scope=scope, task=header.get("task") or "t",
                                  src=src) as h:
         planner = PseudoPlanner(runner=rebuild_runner(header), channel=h.channel, members=members,
-                                tape=lambda s: tp.TapeRecorder(h.runner_side(s), rec1))
+                                tape=lambda s: tp.TapeRecorder(h.runner_side(s), rec1, exc_classes=exc))
         ret1, e1 = _ending(lambda: planner.run(h.conn))
         diag = h.diagnostics(planner.shim)
-    d1 = tp.diff(tape, rec1)
+    d1 = tp.diff(plain, rec1)
     out["connector"] = {"diff": None if d1 is None else [d1.index, d1.kind, encode(d1.a), encode(d1.b)],
                         "served": te1.segment, "unanswerable": encode(te1.unanswerable), "ending": _show(e1),
                         "mismatches": diag["mismatches"], "violations": diag["violations"],
                         "extras": diag["extras"], "misreads": diag["misreads"], "advisory": diag["advisory"],
-                        "calls": diag["calls"]}
+                        "calls": diag["calls"], "stale_extras": diag["stale_extras"]}
     out["connector"]["ok"] = (d1 is None and te1.segment == len(tape.writes) and not te1.unanswerable
                               and not diag["mismatches"] and not diag["violations"]
                               and _show(e1) == _show(e0))

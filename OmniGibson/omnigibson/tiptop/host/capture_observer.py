@@ -39,16 +39,18 @@ class CaptureObserver:
             raise NotImplementedError(f"the bench captures {self.views}, framed on the targets; asked for "
                                       f"{tuple(req.views)} at {req.look_at}")
         t0, n0 = time.monotonic(), self.sim.n_steps
-        if req.aim:
-            self.sim.look_at(*(o.id for o in req.targets))
-            request, extras = self.sim.capture(self.task)
-        else:
-            request, extras = TiptopSim.capture(self.sim, self.task)  # the cameras where they are: nothing moves
-        seen = tuple(dict.fromkeys((*req.targets, *req.context)))  # the context is masked, never aimed at
-        labels = [self.sim.tracked_label(o.id) for o in seen]
-        masks = self.segmenter.masks(labels, request, extras)
-        self.wall_s += time.monotonic() - t0
-        self.steps += self.sim.n_steps - n0
+        try:  # counted however the capture ends: an EpisodeOver inside its settle ramp has stepped the sim already
+            if req.aim:
+                self.sim.look_at(*(o.id for o in req.targets))
+                request, extras = self.sim.capture(self.task)
+            else:
+                request, extras = TiptopSim.capture(self.sim, self.task)  # the cameras where they are: nothing moves
+            seen = tuple(dict.fromkeys((*req.targets, *req.context)))  # the context is masked, never aimed at
+            labels = [self.sim.tracked_label(o.id) for o in seen]
+            masks = self.segmenter.masks(labels, request, extras)
+        finally:
+            self.wall_s += time.monotonic() - t0
+            self.steps += self.sim.n_steps - n0
         after = self.host.observe_now()
         views = {name: CameraView(name, v["rgb"], v["depth"], v["intrinsics"], v["world_from_cam"])
                  for name, v, _ in capture_views(request, extras)}  # fmt: skip

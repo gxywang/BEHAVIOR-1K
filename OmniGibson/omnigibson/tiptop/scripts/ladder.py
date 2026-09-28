@@ -583,10 +583,40 @@ def gpu_free() -> dict:
     return free
 
 
+def gpu_owners() -> dict:
+    """GPU index -> the users with a compute process on it (nvidia-smi's apps, their pids' owners by ps)."""
+    idx = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], capture_output=True, text=True)
+    by_uuid = {u.strip(): int(i) for i, u in (line.split(",", 1) for line in idx.stdout.splitlines() if "," in line)}
+    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+                          capture_output=True, text=True)
+    out: dict = {}
+    for line in apps.stdout.splitlines():
+        if "," not in line:
+            continue
+        pid, uuid = (x.strip() for x in line.split(",", 1))
+        user = subprocess.run(["ps", "-o", "user=", "-p", pid], capture_output=True, text=True).stdout.strip() or "?"
+        out.setdefault(by_uuid.get(uuid), set()).add(user)
+    return out
+
+
 def pick_gpu() -> Optional[int]:
-    free = gpu_free()
+    """The allowed card with the most free memory that no other user has a process on (free memory alone is no
+    permission: a coworker's job may leave 30 GB free), and only when it has MIN_FREE_MIB."""
+    free, owners, me = gpu_free(), gpu_owners(), os.environ.get("USER", "wding8")
+    free = {g: f for g, f in free.items() if not (owners.get(g, set()) - {me})}
     best = max(free, key=free.get) if free else None
     return best if best is not None and free[best] >= MIN_FREE_MIB else None
+
+
+def m2t2_up(host: str = "127.0.0.1", port: int = 8123, timeout_s: float = 3.0) -> bool:
+    """The shared grasp server a live planner asks (WEEK4_PLAN 5.8 item 7): its port accepts a connection."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
 
 
 def ports_in_use() -> set:
@@ -670,6 +700,10 @@ def queue(specs: list[RunSpec], snap: Path, launch_log: Path, max_sims: int = MA
         planners = planners_live() + sum(1 for _, s in in_flight.values() if s.planner)
         gpu = pick_gpu()
         nxt = next((s for s in pending if s.label not in in_flight), None)
+        if nxt is not None and nxt.planner and not m2t2_up():
+            log(f"{nxt.label}: M2T2 (127.0.0.1:8123) does not answer; not launching a live planner this tick")
+            time.sleep(TICK)
+            continue
         if nxt is not None and sims < max_sims and (not nxt.planner or planners < max_planners) and gpu is not None:
             port = next_port(taken_ports)
             taken_ports.add(port)
@@ -760,6 +794,10 @@ def read_run(out: Path) -> dict:
     ep = out / "episode"
     inst = ep / f"{{task}}_{INSTANCE}_0"
     r = {"out": str(out), "ended": ended(out), "started": started(out), "result": None, "connector": None, "json": None}
+    try:  # the snapshot the run was launched from (its planner's modules must be under it, D25)
+        r["snap"] = json.loads((out / "spec.json").read_text()).get("snap")
+    except (OSError, ValueError):
+        r["snap"] = None
     lines = (out / "sim.log").read_text(errors="replace").splitlines() if (out / "sim.log").exists() else []
     r["result"] = parse_result(next((l for l in lines if "RESULT instance" in l), None))
     r["imports"] = next((l.split("INFO: ", 1)[1].strip() for l in lines if "INFO: imports:" in l), None)
@@ -786,6 +824,15 @@ def read_run(out: Path) -> dict:
     r["record_index"] = read_jsonl(ep / "wstape" / "index.jsonl")
     tapes = sorted((ep / "tapes").glob("*.json")) if (ep / "tapes").exists() else []
     r["runner_tape"] = str(tapes[0]) if tapes else None
+    # the live planner's own modules (D25): the first live frame's metadata, which the client received from the
+    # real server when the run switched (the served tape's metadata is the recording's, rerooted)
+    live = sorted((ep / "wstape_live" / "frames").glob("*.msgpack")) if (ep / "wstape_live" / "frames").exists() else []
+    r["live_modules"] = None
+    if live:
+        from b1k.bridge.protocol import unpackb
+
+        meta = unpackb(live[0].read_bytes()).get("metadata") or {}
+        r["live_modules"] = {n: (meta.get("modules") or {}).get(n) for n in ("tiptop", "cutamp")}
     r["planner_log"] = str(out / "planner" / "planner.log") if (out / "planner" / "planner.log").exists() else None
     if r["planner_log"]:
         plines = Path(r["planner_log"]).read_text(errors="replace").splitlines()
@@ -841,8 +888,27 @@ def u0_of(c: Optional[dict]) -> dict:
 
 
 def rule2_of(c: Optional[dict]) -> dict:
+    """The block's rule 2, and the verdict recomputed from its ledger over every owner but ep.*, observe and go_to
+    (a native skill's code runs unowned: a block from before the fix pass read ``rt`` alone)."""
     r2 = (c or {}).get("rule2") or {}
-    return {"ok": bool(r2.get("ok")), "rt": r2.get("rt"), "d21_debt": r2.get("d21_debt")}
+    outside = {o: {k: int(v.get(k) or 0) for k in RULE2_KEYS if int(v.get(k) or 0)}
+               for o, v in ((c or {}).get("ledger") or {}).items()
+               if not o.startswith("ep.") and o not in ("observe", "go_to")}
+    outside = {o: v for o, v in outside.items() if v}
+    return {"ok": bool(r2.get("ok")) and not outside, "rt": r2.get("rt"), "outside": outside,
+            "d21_debt": r2.get("d21_debt")}
+
+
+RULE2_KEYS = ("place_robot", "place_robot_calls", "capture", "look_at")
+
+
+def live_imports_ok(run: dict, snap: Path) -> Optional[bool]:
+    """D25 for a run that went live: the live planner's tiptop and cutamp under the snapshot. None: never live."""
+    if (run.get("wstape") or {}).get("switched_at") is None and run.get("live_modules") is None:
+        return None
+    mods = run.get("live_modules") or {}
+    root = str(Path(run.get("snap") or snap).resolve())  # the run's own snapshot (spec.json) when it names one
+    return bool(mods) and all(isinstance(p, str) and str(Path(p).resolve()).startswith(root + "/") for p in mods.values())
 
 
 NEUTRAL_READ = "distance"  # W4-F2 open item 1: the shim re-raises a KeyError with its own message where the Episode's
@@ -920,13 +986,25 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
                                 "writes_before_branch_equal": all(w["delta_a"] == w["delta_b"] and w["digest_before_equal"]
                                                                   and w["digest_after_equal"] for w in before_branch)}
     rp = out["runner_prefix"]
-    out["ok"] = out["within_floor"] and (rp is None or (rp["identical_before_branch"] and rp["writes_before_branch_equal"])) \
-        and not (out["pre_branch_divergence"] and floor_frame is None)
+    # the evidence must be there and say what (a) claims: every frame before N served and matched, the switch at N
+    # (or, a divergence before it, at or past the A/A floor), the Runner tape compared, and every write before the
+    # branch compared on both sides
+    served_all = frame is not None and len(before) == frame
+    out["served_all_before_branch"] = served_all
+    out["writes_before_branch_complete"] = rp is not None and branch_write is not None and rp["writes_before_branch"] == branch_write
+    out["ok"] = bool(out["within_floor"] and rp is not None and rp["identical_before_branch"] and rp["writes_before_branch_equal"]
+                     and out["writes_before_branch_complete"]
+                     and ((served_all and out["switched_at_branch"]) or (out["pre_branch_divergence"] and out["within_floor"]
+                                                                          and floor_frame is not None))
+                     and not (out["pre_branch_divergence"] and floor_frame is None))
     return out
 
 
-def hard_verdict(run: dict, switched: Optional[str], arm: str, c_reasons: set) -> dict:
-    """(b) on one run."""
+def hard_verdict(run: dict, switched: Optional[str], arm: str, c_reasons: set, snap: Path = SNAP) -> dict:
+    """(b) on one run. A C/T arm fails on a crash reason C lacks; a carried or witness run (no control) on any
+    crash. G3's own hard items ride along: no typed/literal mismatch, the Runner's inputs equal, no write the shim
+    put on the channel that never ran (a native route's NO_STANCE_HERE with no stance to reach: no skill row, so the
+    pooled test would never see it), and a live planner from the snapshot (D25)."""
     c = run.get("connector")
     u0, r2 = u0_of(c), rule2_of(c)
     reason = (run.get("json") or {}).get("reason") or ""
@@ -942,10 +1020,17 @@ def hard_verdict(run: dict, switched: Optional[str], arm: str, c_reasons: set) -
                 bad.append({"call_id": row.get("call_id"), "code": row.get("code"), "detail": row.get("detail")})
     on_air = [{k: r.get(k) for k in ("step", "arm", "owner", "call_id", "via", "is_grasping")}
               for r in run.get("gripper") or [] if r.get("event") == "close" and r.get("is_grasping") == -1]
+    g3 = (c or {}).get("g3") or {}
+    shim_counts = (c or {}).get("shim") or {}
     out = {"u0": u0, "rule2": r2, "reason": reason, "crash": crash, "crash_c_lacks": bool(crash and arm == "T" and reason not in c_reasons),
+           "crash_uncontrolled": bool(crash and arm not in ("C", "T")),
            "switched_unsupported": bad, "on_air": on_air, "on_air_explained": all(x["owner"] and (x["call_id"] or str(x["owner"]).startswith("ep.")) for x in on_air),
-           "hand_refresh": (c or {}).get("hand_refresh"), "epochs": (c or {}).get("epochs")}
-    out["ok"] = bool(u0["exact"] and r2["ok"] and u0["hand_refresh_ok"] and not out["crash_c_lacks"] and not bad and out["on_air_explained"])
+           "hand_refresh": (c or {}).get("hand_refresh"), "epochs": (c or {}).get("epochs"),
+           "typed_literal_mismatches": g3.get("typed_literal_mismatches"), "runner_inputs_equal": g3.get("runner_inputs_equal"),
+           "unconsumed": shim_counts.get("unconsumed"), "live_imports_ok": live_imports_ok(run, snap)}
+    out["ok"] = bool(u0["exact"] and r2["ok"] and u0["hand_refresh_ok"] and not out["crash_c_lacks"] and not out["crash_uncontrolled"]
+                     and not bad and out["on_air_explained"] and out["typed_literal_mismatches"] == 0
+                     and out["runner_inputs_equal"] is True and not out["unconsumed"] and out["live_imports_ok"] is not False)
     return out
 
 
@@ -1065,12 +1150,16 @@ def after_native(run: dict) -> list:
 
 
 def legacy_dependencies(run: dict) -> dict:
-    """What still ran on legacy in a run: skill rows by skill and qualifier."""
+    """What still ran on legacy in a run: skill rows by skill and qualifier, the qualifier the Runner tape's typed
+    call names (runner_tape.jsonl: a failed place has no effects), else the effects'."""
+    tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
     out = Counter()
     for r in run.get("skill_calls") or []:
         if r.get("backend") == "legacy":
-            quals = {counters.PLACE_PREDS[e["pred"]] for e in r.get("effects") or () if e.get("pred") in counters.PLACE_PREDS}
-            q = quals.pop() if len(quals) == 1 else ""
+            q = (tape.get(r.get("call_id")) or {}).get("qual")
+            if q is None:
+                quals = {counters.PLACE_PREDS[e["pred"]] for e in r.get("effects") or () if e.get("pred") in counters.PLACE_PREDS}
+                q = quals.pop() if len(quals) == 1 else ""
             out[r.get("skill") + (f".{q}" if q else "")] += 1
     return dict(out)
 
@@ -1094,8 +1183,10 @@ def structural_shifts(runs: dict, branch_write: int) -> list:
         sc, st = write_sequence(c)[branch_write:], write_sequence(t)[branch_write:]
         lc, lt = [(m, l) for _, m, l, _, _ in sc], [(m, l) for _, m, l, _, _ in st]
         first = next((i for i, (a, b) in enumerate(zip(lc, lt)) if a != b), None if len(lc) == len(lt) else min(len(lc), len(lt)))
+        ct, cc = Counter(lt), Counter(lc)  # a multiset: an extra repeat of a write both arms made is an extra too
         out.append({"rep": rep, "c_writes_after_branch": lc, "t_writes_after_branch": lt, "first_difference": first,
-                    "t_extra": [x for x in lt if x not in lc], "c_extra": [x for x in lc if x not in lt]})
+                    "first_difference_write": None if first is None else branch_write + first,
+                    "t_extra": sorted((ct - cc).elements()), "c_extra": sorted((cc - ct).elements())})
     return out
 
 
@@ -1108,6 +1199,12 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
     g = {"stage": stage, "line": STAGES[stage].line, "switched": switched, "snap": str(snap), "tasks": {}, "runs": {}}
     pairs, per_task = {}, {}
     stage_tasks = STAGES[stage].tasks
+    # a stage task whose L-rec calls the line but is carried forward (its branch lies past its A/A floor) is a
+    # deviation from plan 5.8, which runs arms on every task that calls the line: named, never silent
+    g["deviations"] = [{"task": t, "line_calls": p.get("line_calls"), "frame": p.get("frame"),
+                        "floor_frame": (p.get("floor") or {}).get("frame")}
+                       for t, p in plan["tasks"].items()
+                       if p.get("branch") is not None and stage_tasks and t not in stage_tasks and p.get("line_calls")]
     for task, p in plan["tasks"].items():
         if p.get("branch") is None:
             g["tasks"][task] = {"branch": None, "note": "no write routed differently: carried forward"}
@@ -1136,7 +1233,7 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
             key = f"{arm}{rep}"
             pv = prefix_verdict(run, p.get("frame"), floor.get("frame"), (p["branch"] or {}).get("record"), lrec_tape, snap,
                                 (p["branch"] or {}).get("write"))
-            hv = hard_verdict(run, switched, arm, c_reasons)
+            hv = hard_verdict(run, switched, arm, c_reasons, snap)
             t_entry["runs"][key] = {"out": run["out"], "ended": run["ended"], "result": run["result"], "prefix": pv, "hard": hv,
                                     "cut_off_delivery": cut_off_delivery(run, switched),
                                     "imports": run.get("imports"), "planner_imports": run.get("planner_imports"), "video": run.get("video"),
@@ -1176,7 +1273,7 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
         drop = (c_s / c_n - t_s / t_n) if c_n and t_n else 0.0
         g["compare_with_cut_off"] = {"cut_off_C": cut["C"], "cut_off_T": cut["T"], "c_n": c_n, "c_succ": c_s, "t_n": t_n, "t_succ": t_s,
                                      "c_rate": c_s / c_n if c_n else None, "t_rate": t_s / t_n if t_n else None, "p": p,
-                                     "mde": counters.minimum_detectable_effect(c_s, c_n, t_n, cmp.alpha),
+                                     "mde": counters.minimum_detectable_effect(c_s, c_n, t_n, cmp.alpha, cmp.delta),
                                      "fail": bool(c_n and t_n and drop >= cmp.delta and p < cmp.alpha)}
     # the causes of the flags, from the pairing: a T failure at a write C's run succeeded on
     flags_fail = []
@@ -1186,18 +1283,23 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
             flags_fail.append({"task": f.task, "counter": f.counter, "control": f.control, "treatment": f.treatment,
                                "switched_failed_where_c_succeeded": t_entry.get("switched_failed_where_c_succeeded") or []})
     g["flags"] = flags_fail
+    vacuous = not any(p.get("branch") is not None and (not stage_tasks or t in stage_tasks) for t, p in plan["tasks"].items())
     verdict = {
+        "vacuous": vacuous,  # no stage task routes any write differently between C and T: nothing to run or judge
         "a_prefix": all(r["prefix"]["ok"] for t in per_task.values() for r in t["runs"].values() if r["ended"]),
         "b_hard": all(r["hard"]["ok"] for t in per_task.values() for r in t["runs"].values() if r["ended"]),
-        "c_primary": None if cmp is None or cmp.pooled is None else not cmp.pooled.fail,
+        # an unjudged pooled test (a qualified line with unqualified rows, or an arm with no call) is never a pass
+        "c_primary": None if cmp is None or cmp.pooled is None else bool(cmp.pooled.judged and not cmp.pooled.fail),
+        "c_judged": None if cmp is None or cmp.pooled is None else cmp.pooled.judged,
         "d_flags_fail": any(x["switched_failed_where_c_succeeded"] for x in flags_fail),
         "runs_ended": sum(1 for t in per_task.values() for r in t["runs"].values() if r["ended"]),
         # two arms x the replicates on every task with a branch, whether or not its run dir exists yet
         "runs_expected": 2 * len(REPS) * sum(1 for t, p in plan["tasks"].items() if p.get("branch") is not None
                                              and (not stage_tasks or t in stage_tasks)),
     }
-    verdict["pass"] = bool(verdict["a_prefix"] and verdict["b_hard"] and verdict["c_primary"] is not False and not verdict["d_flags_fail"]
+    verdict["pass"] = bool(verdict["a_prefix"] and verdict["b_hard"] and verdict["c_primary"] is True and not verdict["d_flags_fail"]
                            and verdict["runs_ended"] == verdict["runs_expected"] and verdict["runs_ended"] > 0)
+    verdict["outcome"] = "VACUOUS" if vacuous else ("PASS" if verdict["pass"] else "FAIL")
     g["verdict"] = verdict
     return g
 
@@ -1211,7 +1313,7 @@ def gate_carried(snap: Path = SNAP) -> dict:
         write_runner_tape_rows(d)
         run = read_run(d)
         c = counters.extract(d) if run["ended"] else None
-        out["runs"][task] = {"out": str(d), "ended": run["ended"], "result": run["result"], "hard": hard_verdict(run, None, "native", set()),
+        out["runs"][task] = {"out": str(d), "ended": run["ended"], "result": run["result"], "hard": hard_verdict(run, None, "native", set(), snap),
                              "native_calls": None if c is None else c.native_calls, "native_by": None if c is None else c.native_by,
                              "legacy": legacy_dependencies(run), "calls": (run.get("connector") or {}).get("calls"),
                              "hand_refresh": (run.get("connector") or {}).get("hand_refresh"), "imports": run.get("imports"),
@@ -1283,8 +1385,11 @@ def gate_witness(snap: Path = SNAP) -> dict:
            "hand_refresh": c.get("hand_refresh"), "requests": c.get("requests"), "imports": run.get("imports"),
            "planner_imports": run.get("planner_imports"), "video": run.get("video"), "legacy": legacy_dependencies(run),
            "ledger": {k: {kk: v.get(kk) for kk in ("steps", "capture", "place_robot", "look_at")} for k, v in (c.get("ledger") or {}).items()}}
+    reason = ((run.get("json") or {}).get("reason") or "")
+    out["reason"] = reason
     out["ok"] = bool(out["u0"]["exact"] and out["rule2"]["ok"] and (out["charged"] or {}).get("wait", 0) > 0
-                     and press_rows and all(observe_before_press))
+                     and press_rows and len(observe_before_press) == len(press_rows) and all(observe_before_press)
+                     and not reason.startswith(("crash", "blocked")))
     return out
 
 
@@ -1302,13 +1407,16 @@ def gate_strict(snap: Path = SNAP) -> dict:
            "result_equal": bool(run["result"] and ref["result"] and all(run["result"][k] == ref["result"][k] for k in keys)),
            "rounds_equal": strip((run.get("json") or {}).get("rounds")) == strip((ref.get("json") or {}).get("rounds")),
            "runner_tape_vs_f2": (diff.get("runner") or {}).get("first_divergence"), "runner_records": (diff.get("runner") or {}).get("records"),
+           # both runs are replays of the same L-rec tape: each one's own log against that tape (tape_diff reads both)
            "stream_vs_f2": (diff.get("stream") or {}).get("first_divergence"),
+           "stream_replays": (diff.get("stream") or {}).get("replays"),
            "runner_tape_vs_lrec": (lrec.get("runner") or {}).get("first_divergence"), "stream_vs_lrec": (lrec.get("stream") or {}).get("first_divergence"),
            "replay": [(r.get("i"), r.get("op"), r.get("call_id"), r.get("matched")) for r in run.get("replay") or []],
            "u0": u0_of(run.get("connector")), "hand_refresh": (run.get("connector") or {}).get("hand_refresh"),
            "imports": run.get("imports"), "video": run.get("video")}
-    out["identical"] = bool(out["result_equal"] and out["rounds_equal"] and out["runner_tape_vs_f2"] is None and out["stream_vs_f2"] is None
-                            and out["u0"]["exact"] and all(m for _, _, _, m in out["replay"]))
+    out["identical"] = bool(out["result_equal"] and out["rounds_equal"] and out["runner_records"] and out["runner_tape_vs_f2"] is None
+                            and out["stream_vs_f2"] is None and out["stream_replays"] and out["u0"]["exact"]
+                            and all(m for _, _, _, m in out["replay"]))
     return out
 
 
@@ -1322,10 +1430,18 @@ def _f(v) -> str:
 
 
 def gate_md(g: dict) -> str:
+    v = g["verdict"]
     o = [f"# {g['stage']}: `{g['line']}` (W4-I switch ladder, WEEK4_PLAN 5.8)", "",
-         f"Snapshot `{g['snap']}`. Switched skill `{g['switched']}`. Verdict: **{'PASS' if g['verdict']['pass'] else 'FAIL'}** "
-         f"(a prefix {g['verdict']['a_prefix']}, b hard {g['verdict']['b_hard']}, c primary {g['verdict']['c_primary']}, "
-         f"d flag-caused-by-switch {g['verdict']['d_flags_fail']}, runs {g['verdict']['runs_ended']}/{g['verdict']['runs_expected']}).", ""]
+         f"Snapshot `{g['snap']}`. Switched skill `{g['switched']}`. Verdict: **{v.get('outcome') or ('PASS' if v['pass'] else 'FAIL')}** "
+         f"(a prefix {v['a_prefix']}, b hard {v['b_hard']}, c primary {v['c_primary']}, "
+         f"d flag-caused-by-switch {v['d_flags_fail']}, runs {v['runs_ended']}/{v['runs_expected']}).", ""]
+    if v.get("vacuous"):
+        o += ["VACUOUS: no stage task routes any Runner write differently between C and T, so there is no arm pair to "
+              "run and nothing to judge (not a pass, not a failure).", ""]
+    for d in g.get("deviations") or []:
+        o += [f"Deviation from WEEK4_PLAN 5.8 (arms on every task that calls the line): {d['task']} calls it "
+              f"{d['line_calls']} time(s) in its L-rec but is carried forward (branch frame {d['frame']}, A/A floor frame "
+              f"{d['floor_frame']}).", ""]
     causes = OUT / g["stage"] / "causes.md"
     if causes.exists():
         o += [causes.read_text().rstrip(), ""]
@@ -1345,14 +1461,14 @@ def gate_md(g: dict) -> str:
         b = t["branch"]
         o += [f"- branch: write {b['write']} `{b['member']}` ({b['line']}) call `{b['call_id']}`, C -> {b['backend_c']}, T -> {b['backend_t']}; "
               f"forced live at frame {t['frame']}; A/A floor frame {t['floor'].get('frame')} (F1 {t['floor'].get('f1_frame')}, extended {t['floor'].get('extended_frame')})", ""]
-        o += ["| run | ended | RESULT | prefix (a) | switched_at | hard (b) | U0 exact | rule2 | crash | on-air | hand refresh | legacy deps | score |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        o += ["| run | ended | RESULT | prefix (a) | switched_at | hard (b) | U0 exact | rule2 | live planner (D25) | crash | on-air | hand refresh | legacy deps | score |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for key, r in t["runs"].items():
             res, pv, hv = r["result"], r["prefix"], r["hard"]
             res_s = "" if not res else "{}/{} ({}) tp {}".format(res["steps"], res["max_steps"], res["reason"], res["teleports"])
             within = " (within floor)" if pv["pre_branch_divergence"] and pv["within_floor"] else ""
             hr = r.get("hand_refresh") or {}
             o.append(f"| {key} | {r['ended']} | {res_s} | {pv['ok']}{within} | {pv['switched_at']} | {hv['ok']} | "
-                     f"{hv['u0']['exact']} | {hv['rule2']['ok']} | {hv['reason'] if hv['crash'] else '-'} | {len(hv['on_air'])} | "
+                     f"{hv['u0']['exact']} | {hv['rule2']['ok']} | {hv.get('live_imports_ok')} | {hv['reason'] if hv['crash'] else '-'} | {len(hv['on_air'])} | "
                      f"{hr.get('count')} / {hr.get('popped_total')} | {r['legacy']} | {'' if not res else res['q_score']} |")
         on_air = [(key, x) for key, r in t["runs"].items() for x in r.get("on_air_causes") or []]
         o += ["", "On-air closes (b), each with its owning call from GripperWatch and that call's skill row:", ""]
@@ -1385,7 +1501,8 @@ def gate_md(g: dict) -> str:
         o += ["", f"Switched skill failed where a C run's succeeded (the cause that fails the stage): {t['switched_failed_where_c_succeeded'] or 'none'}"]
         o += ["", "Structural shifts (e), T against C after the branch, per replicate (ended pairs only):", ""]
         for s in t["structural"]:
-            o.append(f"- r{s['rep']}: first difference at write {s['first_difference']}; T extra {s['t_extra']}; C extra {s['c_extra']}")
+            o.append(f"- r{s['rep']}: first difference at write {s.get('first_difference_write')} ({s['first_difference']} after the "
+                     f"branch); T extra {s['t_extra']}; C extra {s['c_extra']}")
         o += ["", "Counters (raw; compare normalises per delivered atom):", ""]
         names_ = [c.name for c in counters.COUNTERS]
         keys_ = t.get("counters_keys") or {arm: [f"{arm}{i}" for i in range(len(t["counters"][arm]))] for arm in ("C", "T")}

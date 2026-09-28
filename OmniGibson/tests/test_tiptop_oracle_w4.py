@@ -50,6 +50,10 @@ def test_episode_mode_hands_are_the_robots_own_record_in_its_insertion_order():
     assert [o.id for o in left.value] == ["jar.n.01_1", "cup.n.01_1"], "the record's insertion order, BDDL names"
     assert [o.id for o in right.value] == ["lid.n.01_1"] and left.source == right.source == "oracle"
     assert sorted(o.id for a in ARMS for o in w.held(a).value) == sorted(Episode.held_names(ep))
+    # two holding hands: the same set, but the shim reads left then right (SPEC 7 row 2), not the record's cross-arm
+    # insertion order Episode.held_names follows; with one holding hand the orders are equal (below)
+    assert [o.id for a in ARMS for o in w.held(a).value] == ["jar.n.01_1", "cup.n.01_1", "lid.n.01_1"]
+    assert Episode.held_names(ep) == ["jar.n.01_1", "lid.n.01_1", "cup.n.01_1"]
     for bddl in ("jar.n.01_1", "lid.n.01_1", "cup.n.01_1", "bowl.n.01_1"):
         assert bool(w.holding(ObjRef(bddl, bddl.split(".")[0])).value) is Episode.holding(ep, bddl)
     assert w.holding(ObjRef("lid.n.01_1", "lid")).value == ("right",)
@@ -103,6 +107,31 @@ def test_apply_writes_the_record_and_a_repeat_changes_nothing():
     assert w.hands == {"left": set(), "right": set()}, "the sensor mode's ledger is untouched in episode mode"
 
 
+def test_a_label_that_changed_hands_stays_held_whatever_order_its_updates_come_in():
+    """A hand-to-hand move is released(old arm) and held(new arm). A release names the arm that let go, so it never
+    pops the label from the other hand: in either order the record ends with the new arm holding it."""
+    jar = ObjRef("jar.n.01_1", "jar")
+    for order in ((WorldUpdate("held", jar, "right"), WorldUpdate("released", jar, "left")),
+                  (WorldUpdate("released", jar, "left"), WorldUpdate("held", jar, "right"))):
+        sim = RecordSim([("jar_1", "left")])
+        w = episode_world(sim)
+        for u in order:
+            w.apply(u)
+        assert sim.held_objects == {"jar_1": "right"}, order
+
+
+def test_a_record_label_a_transition_removed_is_left_out_as_held_names_leaves_it():
+    class Gone(RecordSim):
+        def scene_object(self, name):
+            if name not in self.bddl_names.values():
+                raise ValueError(f"{name} is not in the scene")
+            return super().scene_object(name)
+
+    sim = Gone([("egg_1", "left"), ("jar_1", "left")])  # egg_1: cut into halves, no BDDL name any more
+    w, ep = episode_world(sim), SimpleNamespace(sim=sim)
+    assert [o.id for o in w.held("left").value] == ["jar.n.01_1"] == Episode.held_names(ep)
+
+
 def test_the_default_is_the_sensor_mode_and_a_wrong_mode_is_refused():
     grasp = SimpleNamespace(held=lambda arm, obs: Provided(True, "proprio", 0))
     w = OracleWorld(SimpleNamespace(sim=RecordSim([("jar_1", "left")])), grasp)
@@ -139,7 +168,12 @@ def test_is_open_takes_the_live_value_from_the_joint_state_estimator(monkeypatch
     q["j2"] = 0.4
     assert new.is_open(cab, "j2").value is True and new.open_fraction(cab).value == pytest.approx(1.0)
     est = SimpleNamespace(value=lambda o, joint: Provided(q[joint], "proprio", 7))  # a proprio estimator's source
-    assert OracleWorld(SimpleNamespace(sim=sim), None, joints=est).is_open(cab).source == "proprio"
+    assert OracleWorld(SimpleNamespace(sim=sim), None, joints=est).is_open(cab).source == "oracle", (
+        "the limits and the closed frame are openable_joints' (the simulator's): the answer is oracle")
+    blind = SimpleNamespace(value=lambda o, joint: Provided(None, "perceived", 7))  # cannot see the joint
+    b = OracleWorld(SimpleNamespace(sim=sim), None, joints=blind)
+    assert (b.is_open(cab).value, b.open_fraction(cab).value) == (None, None), "unknown, not a TypeError"
+    assert b.is_open(cab).source == "oracle"
     monkeypatch.setattr(oracle_world, "openable_joints", lambda o: [])
     assert new.is_open(cab).value is None and new.is_open(cab).source == "oracle", "nothing that opens: unknown"
 
@@ -180,14 +214,39 @@ def test_refresh_hands_pops_what_localization_says_left_the_hand_and_never_steps
 
     sim = RefreshSim([("jar_1", "left"), ("lid_1", "right")])
     w = episode_world(sim, knowledge=KNOWLEDGE)
-    assert w.refresh_hands() == ["jar_1"]
+    assert w._refresh_hands() == ["jar_1"]
     assert sim.held_objects == {"lid_1": "right"} and sim.n_steps == 0 and sim.checked == 1
-    assert w.refresh_hands() == [] and sim.held_objects == {"lid_1": "right"}
+    assert w._refresh_hands() == [] and sim.held_objects == {"lid_1": "right"}
     policy = ProvenancePolicy("pseudo")
     assert oracle.refresh_hands(guarded(w, policy, "world")) == [], "the module-level entry, through the guard"
     stepping = RefreshSim([("jar_1", "left")], step_on_check=True)
     with pytest.raises(RuntimeError, match="stepped the sim"):
-        episode_world(stepping, knowledge=KNOWLEDGE).refresh_hands()
+        episode_world(stepping, knowledge=KNOWLEDGE)._refresh_hands()
+
+
+def test_a_remembered_look_from_before_the_run_is_no_evidence_the_hand_let_go():
+    """``after``: the step the native run started at. A source that remembers its last look (onboard: the box
+    carries the step it was seen at) saw the jar where it WAS; from before the run it says nothing about the hand
+    now, so the record keeps it (the fingers still sense it). A look taken since counts."""
+    stale = {"jar.n.01_1": {"lo": (5.0, 5.0, 5.0), "hi": (6.0, 6.0, 6.0), "step": 40}}
+    knowledge = SimpleNamespace(localize=lambda *names: {n: stale[n] for n in names if n in stale})
+    sim = RefreshSim([("jar_1", "left")])
+    w = episode_world(sim, knowledge=knowledge)
+    assert w._refresh_hands(after=40) == [] and sim.held_objects == {"jar_1": "left"}, "seen at 40, the run from 40"
+    assert w._refresh_hands(after=39) == ["jar_1"], "a look taken after the run started counts"
+    sim = RefreshSim([("jar_1", "left")])
+    from omnigibson.tiptop import oracle
+
+    assert oracle.refresh_hands(guarded(episode_world(sim, knowledge=knowledge), ProvenancePolicy("pseudo"), "world"),
+                                after=100) == []
+
+
+def test_refresh_hands_is_not_on_the_worldview_a_planner_or_a_skill_reads():
+    """A write to the hand record is the host's (HandRefresh through oracle.refresh_hands), never a world read."""
+    from b1k.runtime.direct import WORLD_MEMBERS
+
+    assert "refresh_hands" not in WORLD_MEMBERS and "_refresh_hands" not in WORLD_MEMBERS
+    assert not hasattr(OracleWorld, "refresh_hands")
 
 
 # ------------------------------------------------------------------------------- pseudo_services: clock, hands, scorer
@@ -347,7 +406,8 @@ def test_a_capped_read_is_the_same_random0_sample_and_is_logged(caplog):
     assert ti.goal_options == tuple(tuple(taskinfo.atom_to_fact(a) for a in o) for o in task_goal_options(sim)), (
         "the function's own Random(0) sample: called, never re-sampled"
     )
-    assert list(ti.goal_options[0]) != [taskinfo.atom_to_fact(a) for a in task_goal_atoms(sim)]
+    assert list(ti.goal_options[0]) == [taskinfo.atom_to_fact(a) for a in task_goal_atoms(sim)], (
+        "the first ground option stays first: bench.main's goal is the pseudo planner's goal_options[0]")
     assert "capped at 20000" in caplog.text
 
 

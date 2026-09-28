@@ -246,8 +246,13 @@ class FakeWorld:
 
     def apply(self, u):
         """As OracleWorld(hands="episode") applies a held / released update: the sim's record, written idempotently
-        (a write-call the Runtime makes with no owner of its own)."""
+        (a write-call the Runtime makes with no owner of its own). ``fault``: "step_in_apply" steps the sim here,
+        "apply_writes" leaves a lasting entry in the record."""
         self.updates.append(u)
+        if self.fault == "step_in_apply":
+            self.sim.step(1)
+        if self.fault == "apply_writes":
+            self.sim.held_objects["ghost"] = "right"
         if u.arm is None:
             return
         if u.kind == "held" and u.obj is not None:
@@ -491,7 +496,8 @@ def fake_backends(ep, host, svc):
     return {"tiptop": NoNative(), "scripted": ScriptedBackend()}
 
 
-def build(tmp_path, *, fault=None, over_at=None, audit=True, routes=(), tape=False, host_attempts=2, ok=True):
+def build(tmp_path, *, fault=None, over_at=None, audit=True, routes=(), tape=False, host_attempts=2, ok=True,
+          wstape=None, tape_the_episode=False):
     sim = FakeSim(over_at=over_at)
     ep = FakeEpisode(sim, ok=ok, fault=fault)
     ledger = StepLedger(sim)
@@ -501,10 +507,12 @@ def build(tmp_path, *, fault=None, over_at=None, audit=True, routes=(), tape=Fal
     strategy = strategy_for("store_honey", GOAL, options=OPTIONS, attempts=host_attempts, scope=SCOPE)
     recorded = tp.Tape(tp.header("store_honey", 301, "connector", "parity", 0, strategy=strategy, floor=FLOOR))
     around = (lambda inner: tp.TapeRecorder(inner, recorded, exc_classes=(), step_probe=lambda: sim.n_steps)) if tape else None
+    if tape_the_episode:  # the wiring slip U0-c must see: the tape factory around the bench's Episode, not the shim
+        around = lambda inner: tp.TapeRecorder(ep, recorded)  # noqa: E731
     host = episode_host.build(
         ep, sim, PLANNERS, args, providers, strategy_for, strategy, ledger, watch, tape=around, inst_dir=tmp_path,
         max_steps=sim.max_steps, planner_client=NoPlanner(), bench_host=FakeHost(sim), observer=FakeObserver(sim),
-        teleport=FakeTeleport(), make_backends=fake_backends,
+        teleport=FakeTeleport(), make_backends=fake_backends, wstape=wstape,
     )
     return SimpleNamespace(host=host, sim=sim, ep=ep, ledger=ledger, providers=providers, strategy=strategy,
                            tape=recorded)
@@ -550,9 +558,10 @@ def test_a_clean_parity_episode_passes_every_verdict_and_streams_its_rows(tmp_pa
     assert block["u0b"]["totals"]["owned_steps"] == h.sim.n_steps == 6 + 20 + 40 + 30 + 30 + 20
     assert block["u0b"]["totals"]["unowned_writes"] == 0
     assert all(block["u0b"]["checks"].values()), block["u0b"]["checks"]
-    assert block["u0c"] == {"ok": True, "clock_view": "ClockView", "chain": ["TapeRecorder", "DualEpisode", "EpisodeOverConnector"]}
+    assert block["u0c"] == {"ok": True, "clock_view": "ClockView", "chain": ["TapeRecorder", "DualEpisode", "EpisodeOverConnector"],
+                            "ends_at_shim": True, "no_episode": True}
     assert block["u0d"]["ok"] and block["u0d"]["summary"]["ops"] > 20 and block["u0d"]["summary"]["first_sim_in"] == 0
-    assert block["rule2"] == {"ok": True, "rt": {"place_robot": 0, "capture": 0, "look_at": 0},
+    assert block["rule2"] == {"ok": True, "rt": {"place_robot": 0, "capture": 0, "look_at": 0}, "outside": {},
                               "d21_debt": {"place_robot": 3, "capture": 0, "look_at": 0}}
     assert block["collision"] == "map" and block["hands"] == "episode" and block["scorer_scope_only"] is True
     # the differential audit compared every pure read the Runner made, and the clocks after every write
@@ -644,10 +653,12 @@ def test_a_native_wait_that_finishes_is_charged_and_the_ledgers_rt_row_is_the_ru
         ("step_in_finish", ("u0b",)),  # Runtime._finish stepped: unowned
         ("step_in_build", ("u0b", "build")),  # host.build stepped
         ("closed_step", ("u0b",)),  # a step with episode_open False
+        ("step_in_apply", ("u0b",)),  # a step inside Runtime._finish's world.apply: owned by "apply", never 0
     ],
 )
 def test_each_planted_fault_fails_u0(tmp_path, monkeypatch, fault, failing):
-    h = build(tmp_path, fault=fault if fault in ("step_in_read", "step_in_build", "closed_step") else None)
+    h = build(tmp_path, fault=fault if fault in ("step_in_read", "step_in_build", "closed_step", "step_in_apply")
+              else None)
     if fault == "step_in_post_judge":
         judge = h.host.rt.svc.goals.judge  # the skills' panel: what EpisodeLegacyBackend judges with, not the planner's
 
@@ -673,11 +684,142 @@ def test_each_planted_fault_fails_u0(tmp_path, monkeypatch, fault, failing):
         assert block["ledger"]["host.build"]["steps"] == 1 and block["u0b"]["checks"]["host_build_zero"] is False
     elif fault == "closed_step":
         assert block["u0b"]["checks"]["closed_zero"] is False and block["u0b"]["totals"]["closed_env_step_calls"] == 1
+    elif fault == "step_in_apply":
+        assert block["ledger"]["apply"]["steps"] >= 1 and block["u0b"]["checks"]["apply_zero"] is False
+        assert block["u0b"]["checks"]["unowned_steps"] is True, "owned by apply: only apply_zero can see it"
     else:
         assert block["u0b"]["checks"]["unowned_steps"] is False and block["u0b"]["totals"]["unowned_steps"] >= 1
     if fault == "step_in_read":
         assert any("world.support_of" in v for v in block["u0d"]["violations"]), block["u0d"]
         assert block["purity"]["summary"]["digest_changes"] >= 1, "the digest moved across a read"
+
+
+def test_an_apply_that_changes_the_hand_record_on_a_parity_run_fails_g3(tmp_path):
+    """Under PARITY every result's hand updates repeat what the Episode already wrote: an apply that changes the
+    record is a write the connector added."""
+    h = build(tmp_path, fault="apply_writes")
+    block, raised = run(h)
+    assert raised is None and block["g3"]["apply_hand_changes"] >= 1 and not block["g3"]["pass"]
+    assert block["apply_hand_changes"][0]["after"].get("ghost") == "right"
+
+
+@pytest.mark.parametrize("owner", ["unowned", "rt", "apply", "refresh"])
+def test_a_capture_owned_by_anything_but_the_episode_or_the_planners_services_fails_rule2(tmp_path, owner):
+    """A native skill's own code runs unowned (DirectConnector starts and resumes it outside env_step's ``rt``):
+    rule 2 reads every owner but ep.*, observe and go_to."""
+    h = build(tmp_path, audit=False, routes=("wait=scripted",))
+    h.ledger.row(owner).capture = 1
+    block, _ = run(h)
+    assert block["rule2"]["ok"] is False and block["rule2"]["outside"] == {owner: {"capture": 1}}
+    assert not block["g3"]["pass"]
+    h = build(tmp_path, audit=False, routes=("wait=scripted",))
+    h.ledger.row("observe").capture, h.ledger.row("ep.pick").capture = 1, 1  # the planner's and legacy's own
+    block, _ = run(h)
+    assert block["rule2"]["ok"] is True and block["rule2"]["d21_debt"]["capture"] == 1
+
+
+def test_a_render_by_a_skills_code_fails_a_native_run_and_the_planners_capture_does_not(tmp_path):
+    h = build(tmp_path, audit=False, routes=("wait=scripted",))
+    h.ledger.row("observe").renders = 40  # the planner's capture: reported, never a failure
+    block, _ = run(h)
+    assert block["g3"]["parity_run"] is False and block["g3"]["renders_by_skills"] == 0 and block["ok"], block["g3"]
+    h = build(tmp_path, audit=False, routes=("wait=scripted",))
+    h.ledger.row("unowned").renders = 3  # a native skill grabbing a frame
+    block, _ = run(h)
+    assert block["g3"]["renders_by_skills"] == 3 and not block["ok"]
+
+
+def test_the_requests_are_this_episodes_frames_alone_and_a_plan_request_is_the_episodes(tmp_path):
+    frames = [{"op": "skill", "owner": "unowned"}, {"op": "metadata", "owner": "unowned"}]  # an earlier instance's
+    ws = SimpleNamespace(frames=frames, mode="log")
+    h = build(tmp_path, wstape=ws)
+    assert h.host.frames0 == 2
+    frames.append({"op": "plan", "owner": "ep.pick"})
+    block, _ = run(h)
+    assert block["requests"]["by_type_and_owner"] == {"plan/ep.pick": 1} and block["requests"]["ok"], block["requests"]
+    assert block["ok"], block["g3"]
+    for bad in ({"op": "skill", "owner": "unowned"}, {"op": "plan", "owner": "unowned"}):
+        frames = [{"op": "metadata", "owner": "unowned"}]
+        ws = SimpleNamespace(frames=frames, mode="log")
+        h = build(tmp_path, wstape=ws)
+        frames.append(bad)
+        block, _ = run(h)
+        assert not block["g3"]["pass"], bad
+    assert block["requests"]["plan_move_outside_ep"] == 1
+
+
+def test_a_runner_that_holds_the_episode_itself_fails_u0c_and_the_connector_floors(tmp_path):
+    """The tape factory wrapped around the bench's Episode (the legacy wiring) instead of what the host hands it:
+    the Runner never goes through the connector, which U0-c and the audited parity run's floors must see."""
+    h = build(tmp_path, tape=True, tape_the_episode=True)
+    block, raised = run(h)
+    assert raised is None
+    assert block["u0c"]["ok"] is False and block["u0c"]["ends_at_shim"] is False and block["u0c"]["no_episode"] is False
+    assert block["g3"]["shim_calls"] == 0 and not block["g3"]["pass"]
+
+
+def test_the_dual_episode_compares_an_exceptions_message_too():
+    class Raises:
+        def __init__(self, msg):
+            self.msg = msg
+
+        def distance(self, a, b):
+            raise KeyError(self.msg)
+
+    d = DualEpisode(Raises("floor.n.01_2"), Raises("no distance between floor.n.01_2 and x"))
+    with pytest.raises(KeyError):
+        d.distance("floor.n.01_2", "x")
+    assert len(d.mismatches) == 1, "the same type with another message is not the same answer"
+    d = DualEpisode(Raises("floor.n.01_2"), Raises("floor.n.01_2"))
+    with pytest.raises(KeyError):
+        d.distance("floor.n.01_2", "x")
+    assert d.mismatches == []
+
+
+def test_the_purity_audit_lets_appeared_and_fixture_for_track_what_they_name_and_nothing_else():
+    state = {"objects": 0, "robot": 0}
+
+    class World:
+        def appeared(self):
+            state["objects"] += 1
+            return []
+
+        def fixture_for(self, ability, near=None):
+            state["objects"] += 1
+            return None
+
+        def support_of(self, o):
+            state["objects"] += 1
+            return None
+
+    conn = SimpleNamespace(world=lambda: World())
+    audit = PurityAudit(conn, lambda: dict(state), lambda: 0)
+    audit.world().appeared()
+    audit.world().fixture_for("heatSource")
+    assert audit.violations == [] and [r.get("stateful") for r in audit.rows] == [True, True]
+    audit.world().support_of(None)
+    assert len(audit.violations) == 1 and "world.support_of" in audit.violations[0]
+
+
+def test_the_capture_observers_steps_are_counted_when_the_episode_ends_inside_its_capture():
+    from b1k.connector.observe import ObserveRequest
+    from omnigibson.tiptop.host.capture_observer import CaptureObserver
+
+    class Sim:
+        primary_view, extra_views, n_steps = "head", (), 100
+
+        def look_at(self, *names):
+            self.n_steps += 2
+
+        def capture(self, task):
+            self.n_steps += 5
+            raise EpisodeOver("timeout", self.n_steps)
+
+    sim = Sim()
+    obs = CaptureObserver(sim, None, None, "task")
+    with pytest.raises(EpisodeOver):
+        next(obs.observe(ObserveRequest((REFS[JAR],), views=("head",), aim=True), None))
+    assert obs.steps == 7, "the look and the capture's settle stepped the sim before EpisodeOver"
 
 
 def test_a_step_in_a_read_op_without_the_audit_still_fails_u0(tmp_path):
@@ -850,6 +992,8 @@ def test_bench_main_runs_the_pseudo_planner_over_the_connector_and_writes_the_co
     assert result["bench"]["reason"] == "strategy finished" and result["success"] is True
     block = result["bench"]["connector"]
     assert block["ok"] and block["g3"]["pass"], json.dumps(block["g3"]) + json.dumps(block["u0b"]["checks"])
+    assert block["u0c"]["chain"] == ["TapeRecorder", "DualEpisode", "EpisodeOverConnector"], block["u0c"]
+    assert block["calls"] and block["g3"]["shim_calls"] > 0 and block["g3"]["dual_compared"], "through the connector"
     assert block["u0b"]["n0"] == 3, "the posture's steps come before the host is built"
     assert block["ledger"]["host.build"]["steps"] == 0 and block["u0b"]["totals"]["closed_env_step_calls"] == 0
     assert set(result["bench"]) >= {"reason", "max_steps", "wall_time_s", "knowledge", "collision_map", "teleports",
