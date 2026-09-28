@@ -350,8 +350,10 @@ def test_the_arm_command_lines(tmp_path):
     assert r2[r2.index("--replicate") + 1] == "2" and r2[r2.index("--seed") + 1] == "2" and r2[r2.index("--wstape-path") + 1] == "/t/r2"
     s2 = ladder.stage_specs("S2", {"tasks": {"x": {"branch": {"write": 0}, "frame": 4, "tapes": {"0": "/t", "1": "/t", "2": "/t"}}}}, reps=(0,))
     assert s2[0].routes == ["place.on=tiptop"] and s2[1].routes == ["place.on=tiptop", "close.prismatic=tiptop"]
-    st = ladder.strict_spec().bench_args(8999)
-    assert st[st.index("--wstape") + 1] == "replay" and "--wstape-live-at" not in st and "--seed" not in st and not ladder.strict_spec().planner
+    strict = ladder.strict_spec(Path("/snap/w4ladder"), tape=Path("/t/strict_r0"))
+    st = strict.bench_args(8999)
+    assert st[st.index("--wstape") + 1] == "replay" and "--wstape-live-at" not in st and "--seed" not in st and not strict.planner
+    assert st[st.index("--wstape-path") + 1] == "/t/strict_r0"
     assert st[st.index("--routing-profile") + 1] == "parity" and st[st.index("--replicate") + 1] == "0"
     w = ladder.witness_spec().bench_args(8860)
     assert w[w.index("--task-name") + 1] == "cook_bacon" and w[w.index("--routing-profile") + 1] == "native"
@@ -361,7 +363,7 @@ def test_the_arm_command_lines(tmp_path):
     text = ladder.launcher_text(specs[1], 8851, 3, Path("/snap/w4ladder"))
     assert "S=/snap/w4ladder" in text and "tiptop-server" in text and "--wstape-live-at 2" in text and "kill -TERM $ppid" in text
     assert "setsid env" in text and "OMP_NUM_THREADS=8" in text and "PYTHONHASHSEED=2300" in text and "CUDA_VISIBLE_DEVICES=$gpu" in text
-    st_text = ladder.launcher_text(ladder.strict_spec(), 8999, 1, Path("/snap/w4ladder"))
+    st_text = ladder.launcher_text(strict, 8999, 1, Path("/snap/w4ladder"))
     assert "tiptop-server" not in st_text and "simslot.sh acquire" in st_text
 
 
@@ -477,3 +479,25 @@ def test_counters_names_the_owner_of_a_legacy_runs_on_air_close_from_its_gripper
     c = counters.extract(tmp_path)
     assert c.runner == "legacy" and (c.executed, c.cut_off, c.welds, c.on_air) == (1, 1, 1, 1)
     assert c.on_air_causes == [{"step": 600, "arm": "left", "owner": "ep.achieve", "call_id": "q1-2"}]
+
+
+def test_the_derived_tape_reroots_the_served_metadata_to_the_runs_snapshot(tmp_path):
+    """check_imports refuses a served metadata frame naming another checkout than the sim's: the derived tape moves
+    the recording planner's ``modules`` paths under the run's snapshot and changes nothing else."""
+    md = {"server": "tiptop", "robot_type": "r1pro_left", "modules": {"tiptop": "/snap/w4q1/tiptop/tiptop/__init__.py",
+                                                                        "cutamp": "/snap/w4q1/tiptop/cutamp/cutamp/__init__.py"}}
+    assert ladder.snapshot_root_of(md) == Path("/snap/w4q1") and ladder.snapshot_root_of({}) is None
+    out, changed = ladder.reroot_metadata(md, Path("/snap/w4q1"), Path("/snap/w4ladder"))
+    assert out["modules"] == {"tiptop": "/snap/w4ladder/tiptop/tiptop/__init__.py", "cutamp": "/snap/w4ladder/tiptop/cutamp/cutamp/__init__.py"}
+    assert [c[0] for c in changed] == ["tiptop", "cutamp"] and out["robot_type"] == "r1pro_left" and md["modules"]["tiptop"].startswith("/snap/w4q1")
+    assert ladder.reroot_metadata(md, Path("/elsewhere"), Path("/snap/w4ladder"))[1] == [], "another root is left alone"
+    src = TapeDir(tmp_path / "src")
+    src.append(Frame(0, "metadata", metadata=md), whole=True)
+    src.append(Frame(1, "plan", owner="ep.pick", server="127.0.0.1:8804", k=1, seed=2301, request=packb({"task": "put", "seed": 2301}),
+                     response='{"success": true}'), whole=True)
+    dst = ladder.derived_tape(tmp_path / "src", tmp_path / "r1", 1, Path("/snap/w4ladder"))
+    f0, f1 = TapeDir(dst).load(0), TapeDir(dst).load(1)
+    assert f0.metadata["modules"]["tiptop"] == "/snap/w4ladder/tiptop/tiptop/__init__.py" and f0.metadata["server"] == "tiptop"
+    assert f1.request_dict()["seed"] == seed_for(1, 1) == 3301 and f1.response == '{"success": true}'
+    assert ladder.derived_tape(tmp_path / "src", tmp_path / "r1", 1, Path("/snap/w4ladder")) == dst, "made once, reused after"
+    assert len(TapeDir(dst)) == 2

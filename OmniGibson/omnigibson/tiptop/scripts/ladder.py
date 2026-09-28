@@ -333,10 +333,32 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 # ------------------------------------------------------------------------------------------------- the re-stamped tape
-def restamp_tape(src: Path, dst: Path, replicate: int) -> int:
+def snapshot_root_of(metadata: dict) -> Optional[Path]:
+    """The checkout the recording planner ran from, off its metadata's ``modules.tiptop`` (<root>/tiptop/tiptop/
+    __init__.py): what run.check_imports compares with the sim's own root."""
+    p = ((metadata or {}).get("modules") or {}).get("tiptop")
+    return None if not p else Path(p).parents[2]
+
+
+def reroot_metadata(metadata: dict, root_from: Path, root_to: Path) -> tuple[dict, list]:
+    """The metadata with every ``modules`` path under ``root_from`` moved under ``root_to`` (the planner code at
+    both is the same commit: a served metadata frame must name the checkout the sim and the live planner run from,
+    or check_imports refuses the mix). (the new metadata, the paths changed)."""
+    out, changed = copy.deepcopy(metadata or {}), []
+    mods = out.get("modules")
+    if isinstance(mods, dict):
+        for name, p in list(mods.items()):
+            if isinstance(p, str) and Path(p).is_relative_to(root_from):
+                mods[name] = str(root_to / Path(p).relative_to(root_from))
+                changed.append((name, p, mods[name]))
+    return out, changed
+
+
+def restamp_tape(src: Path, dst: Path, replicate: int, reroot: Optional[tuple] = None) -> int:
     """A copy of the websocket tape at ``src`` with every plan request's ``seed`` re-stamped for ``replicate``
-    (wstape.seed_for(replicate, k), k the frame's own pipeline index), the frame's seed and the index row with it;
-    everything else, the responses above all, byte for byte the recorded value. The count of frames copied."""
+    (wstape.seed_for(replicate, k), k the frame's own pipeline index), the frame's seed and the index row with it,
+    and, with ``reroot=(root_from, root_to)``, the metadata frames' ``modules`` paths moved to the snapshot the run
+    comes from; everything else, the responses above all, byte for byte the recorded value. The count of frames."""
     from b1k.bridge.protocol import packb
     from omnigibson.tiptop.host.wstape import TapeDir, seed_for
 
@@ -355,9 +377,23 @@ def restamp_tape(src: Path, dst: Path, replicate: int) -> int:
                 seed = seed_for(replicate, frame.k)
                 req["seed"] = seed
                 frame.request, frame.seed = packb(req), seed
+        if reroot is not None and frame.metadata is not None:
+            frame.metadata, _ = reroot_metadata(frame.metadata, Path(reroot[0]), Path(reroot[1]))
         dst_dir.append(frame, whole=True)
         n += 1
     return n
+
+
+def derived_tape(src: Path, dst: Path, replicate: int, snap: Path) -> Path:
+    """The tape a ladder run is served: ``src`` re-stamped for the replicate and re-rooted from the recording
+    snapshot to ``snap``; made once, reused after."""
+    from omnigibson.tiptop.host.wstape import TapeDir
+
+    if not (dst / "index.jsonl").exists():
+        first = TapeDir(src).load(0)
+        root_from = snapshot_root_of(first.metadata if first is not None else None)
+        restamp_tape(src, dst, replicate, reroot=None if root_from is None else (root_from, snap))
+    return dst
 
 
 # ------------------------------------------------------------------------------------------------- runs
@@ -425,9 +461,13 @@ def witness_spec() -> RunSpec:
                    list(WITNESS_ROUTES), "record", None, None, True, seed=0)
 
 
-def strict_spec() -> RunSpec:
+def strict_spec(snap: Path = SNAP, tape: Optional[Path] = None) -> RunSpec:
+    """The strict E-rep: PARITY, a strict replay of the L-rec tape (re-rooted to ``snap``: the served metadata must
+    name the sim's own checkout, or check_imports refuses it), replicate 0, no planner."""
+    tape = derived_tape(LREC / STRICT_TASK / "episode" / "wstape", OUT / "strict" / "tapes" / f"{STRICT_TASK}_r0", 0, snap) \
+        if tape is None else tape
     return RunSpec("strict", STRICT_TASK, "strict", 0, run_dir("strict", STRICT_TASK, "strict", 0), "parity", [],
-                   "replay", LREC / STRICT_TASK / "episode" / "wstape", None, False)
+                   "replay", tape, None, False)
 
 
 LAUNCHER = """#!/bin/bash
@@ -531,8 +571,21 @@ def ports_in_use() -> set:
     return {int(m.group(1)) for m in re.finditer(r":(\d+)\s", out)}
 
 
+def ports_claimed() -> set:
+    """Ports named by every ladder run launched and not ended (another queue's planner may not listen yet)."""
+    out = set()
+    for spec in OUT.glob("*/*/spec.json") if OUT.exists() else ():
+        try:
+            d = json.loads(spec.read_text())
+        except ValueError:
+            continue
+        if d.get("planner") and not (spec.parent / "job_end.json").exists():
+            out.add(int(d.get("port", 0)))
+    return out
+
+
 def next_port(taken: set) -> int:
-    used = ports_in_use() | taken
+    used = ports_in_use() | ports_claimed() | taken
     p = PORT_BASE
     while p in used:
         p += 1
@@ -624,11 +677,11 @@ def floor_of(task: str) -> dict:
     return out
 
 
-def plan_stage(stage: str, tasks=TASKS, reps=REPS, tapes: bool = True) -> dict:
+def plan_stage(stage: str, tasks=TASKS, reps=REPS, tapes: bool = True, snap: Path = SNAP) -> dict:
     c_routes, t_routes = stage_routes(stage)
     pc, pt = profile_of(c_routes), profile_of(t_routes)
     plan = {"stage": stage, "line": STAGES[stage].line, "c_routes": c_routes, "t_routes": t_routes,
-            "profiles": {"C": pc, "T": pt}, "tasks": {}}
+            "profiles": {"C": pc, "T": pt}, "snap": str(snap), "tasks": {}}
     for task in tasks:
         rec = LREC / task / "episode"
         tape_path = rec / "tapes" / f"{task}_{INSTANCE}_0.json"
@@ -660,12 +713,12 @@ def plan_stage(stage: str, tasks=TASKS, reps=REPS, tapes: bool = True) -> dict:
             entry["frame"] = frame
             entry["frame_agrees"] = None if not n_erep or n_tape is None else all(n == n_tape for n in n_erep)
             if tapes and frame is not None:
-                entry["tapes"] = {}
-                for rep in reps:
-                    dst = OUT / stage / "tapes" / f"{task}_r{rep}"
-                    if not (dst / "index.jsonl").exists():
-                        restamp_tape(rec / "wstape", dst, rep)
-                    entry["tapes"][str(rep)] = str(dst)
+                entry["tapes"] = {str(rep): str(derived_tape(rec / "wstape", OUT / stage / "tapes" / f"{task}_r{rep}", rep, snap))
+                                  for rep in reps}
+                from omnigibson.tiptop.host.wstape import TapeDir
+
+                first = TapeDir(rec / "wstape").load(0)
+                entry["tape_reroot"] = [str(snapshot_root_of(first.metadata if first else None)), str(snap)]
         plan["tasks"][task] = entry
     return plan
 
@@ -1105,7 +1158,7 @@ def main(argv=None) -> int:
     reps = tuple(int(x) for x in a.reps.split(",") if x != "")
     arms = tuple(x for x in a.arms.split(",") if x)
     if a.mode == "plan":
-        plan = plan_stage(a.stage, tasks=a.tasks or TASKS, reps=reps)
+        plan = plan_stage(a.stage, tasks=a.tasks or TASKS, reps=reps, snap=a.snap)
         (OUT / a.stage).mkdir(parents=True, exist_ok=True)
         (OUT / a.stage / "plan.json").write_text(json.dumps(plan, indent=1, default=str))
         for task, p in plan["tasks"].items():
@@ -1125,7 +1178,7 @@ def main(argv=None) -> int:
         elif a.stage == "witness":
             specs = [witness_spec()]
         elif a.stage == "strict":
-            specs = [strict_spec()]
+            specs = [strict_spec(a.snap)]
         else:
             ap.error(f"unknown stage {a.stage}")
         return queue(specs, a.snap, OUT / a.stage / "launchers.log", a.max_sims, a.max_planners)
