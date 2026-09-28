@@ -64,8 +64,9 @@ def runner_report(a: Path, b: Path) -> dict:
                 "step_b": sb,
                 "delta_a": None if None in sa else sa[1] - sa[0],
                 "delta_b": None if None in sb else sb[1] - sb[0],
-                "digest_before_equal": tp.dumps(da[0]) == tp.dumps(db[0]),
-                "digest_after_equal": tp.dumps(da[1]) == tp.dumps(db[1]),
+                "digest_before_equal": _digests_equal(da[0], db[0]),
+                "digest_after_equal": _digests_equal(da[1], db[1]),
+                "digest_keys_one_side": _one_sided(da, db),
                 "outcome_equal": tp.dumps({k: wa.get(k) for k in ("ret", "exc")})
                 == tp.dumps({k: wb.get(k) for k in ("ret", "exc")}),
             }
@@ -82,6 +83,22 @@ def runner_report(a: Path, b: Path) -> dict:
         "headers_equal": tp.dumps({k: v for k, v in ta.header.items() if k != "provenance"})
         == tp.dumps({k: v for k, v in tb.header.items() if k != "provenance"}),
     }
+
+
+def _digests_equal(a, b) -> bool:
+    """Two state digests on the keys both carry: a tape recorded before a key was added (the joints, the fix pass)
+    compares with a newer one on what both measured; a key one side lacks is reported, not a divergence."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return all(tp.dumps(a[k]) == tp.dumps(b[k]) for k in set(a) & set(b))
+    return tp.dumps(a) == tp.dumps(b)
+
+
+def _one_sided(da, db) -> list:
+    keys = set()
+    for a, b in zip(da, db):
+        if isinstance(a, dict) and isinstance(b, dict):
+            keys |= set(a) ^ set(b)
+    return sorted(keys)
 
 
 # ------------------------------------------------------------------------------------------------- the request stream

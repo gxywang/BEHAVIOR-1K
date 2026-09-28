@@ -880,6 +880,14 @@ def test_the_digest_sees_a_joint_that_moves_no_root_pose():
     assert d0["objects"] == d1["objects"] and d0["joints"] != d1["joints"] and d1["joints"][0] == 1
 
 
+def test_tape_diff_compares_two_digests_on_the_keys_both_carry():
+    td = tape_diff()
+    old = {"n_steps": 3, "robot": "a", "objects": "b"}
+    assert td._digests_equal(old, {**old, "joints": (1, "c")}), "a key only the newer digest has is not a divergence"
+    assert not td._digests_equal(old, {**old, "robot": "x", "joints": (1, "c")})
+    assert td._one_sided([old, old], [{**old, "joints": (1, "c")}, old]) == ["joints"]
+
+
 # ------------------------------------------------------------------------------------------------- scripts/tape_diff.py
 def tape_diff():
     import importlib.util
