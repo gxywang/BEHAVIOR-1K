@@ -812,6 +812,18 @@ def test_the_carried_gate_lists_each_native_call_and_writes_its_table(tmp_path, 
     assert "native: `q1-4` place on tiptop@x/place-1 succeeded/None phase home steps 300" in md and "| demo | True |" in md
 
 
+def test_the_ladders_rule2_counts_a_refused_placement_by_its_call():
+    """The recompute over a run's own ledger (a block from before the fix pass read ``rt`` alone): a placement a
+    skill's code attempted and the landing check refused teleports nothing, and still fails rule 2."""
+    block = {"rule2": {"ok": True, "rt": {"place_robot": 0, "capture": 0, "look_at": 0}},
+             "ledger": {"unowned": {"steps": 0, "place_robot": 0, "place_robot_calls": 1},
+                        "ep.stand_for": {"place_robot": 1, "place_robot_calls": 1}, "go_to": {"place_robot_calls": 1}}}
+    r = ladder.rule2_of(block)
+    assert r["ok"] is False and r["outside"] == {"unowned": {"place_robot_calls": 1}}
+    block["ledger"]["unowned"]["place_robot_calls"] = 0
+    assert ladder.rule2_of(block)["ok"] is True, "the Episode's own teleport and the planner's go_to are not rule 2's"
+
+
 def test_out_moves_every_file_of_a_ladder_run_to_another_root(tmp_path, monkeypatch, capsys):
     """A re-run from a new snapshot writes its plan, tapes, runs and gate files under --out, never over the week's
     evidence in week4/ladder."""
@@ -838,6 +850,50 @@ def test_the_queue_launches_only_on_the_allowed_cards(monkeypatch):
     assert ladder.pick_gpu() == 3, "a card another user has a process on is never picked, however free"
     monkeypatch.setattr(ladder, "gpu_owners", lambda: {1: {"tcheng12"}, 3: {"beijial2"}})
     assert ladder.pick_gpu() is None
+
+
+def test_a_failed_legacy_place_is_named_by_its_runner_tape_qualifier(tmp_path):
+    """A failed place has no effects to read its relation from: the legacy dependencies take the qualifier of the
+    Runner tape's typed call (runner_tape.jsonl), as counters' _qual does, so a failed next_to or on is never a bare
+    ``place`` that reads like a place.on that fell back to legacy."""
+    (tmp_path / "runner_tape.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+        {"call_id": "q1-4", "skill": "place", "qual": "next_to"}, {"call_id": "q1-5", "skill": "place", "qual": "on"})))
+    run = {"inst": str(tmp_path), "skill_calls": [
+        {"call_id": "q1-4", "skill": "place", "backend": "legacy", "status": "failed", "effects": []},
+        {"call_id": "q1-5", "skill": "place", "backend": "legacy", "status": "succeeded",
+         "effects": [{"pred": "ontop", "value": True}]},
+        {"call_id": "q1-6", "skill": "pick_up", "backend": "legacy", "status": "succeeded", "effects": []},
+        {"call_id": "q1-7", "skill": "place", "backend": "tiptop@x/place-1", "status": "succeeded", "effects": []}]}
+    assert ladder.legacy_dependencies(run) == {"place.next_to": 1, "place.on": 1, "pick_up": 1}
+
+
+def test_the_queue_waits_for_m2t2_before_it_starts_a_live_planner(tmp_path, monkeypatch):
+    """A spec with a live planner is not launched while the shared grasp server (127.0.0.1:8123) does not answer: two
+    ticks of waiting, then the launch once it does (WEEK4_PLAN 5.8 item 7)."""
+    out = tmp_path / "t_T0"
+    spec = ladder.RunSpec("S1", "t", "T", 0, out, "parity", ["place.on=tiptop"], "replay-live", None, 2, True)
+    answers, launched, slept = iter([False, False, True]), [], []
+    monkeypatch.setattr(ladder, "m2t2_up", lambda *a, **k: next(answers))
+    monkeypatch.setattr(ladder, "pick_gpu", lambda: 3)
+    monkeypatch.setattr(ladder, "gpu_free", lambda: {3: 90000})
+    monkeypatch.setattr(ladder, "live_slots", lambda: 0)
+    monkeypatch.setattr(ladder, "planners_live", lambda: 0)
+    monkeypatch.setattr(ladder, "next_port", lambda taken: 8850)
+    monkeypatch.setattr(ladder.time, "sleep", lambda s: slept.append(s))
+
+    def launch(s, port, gpu, snap, log):
+        launched.append((s.label, gpu, port, len(slept)))
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "sim.pid").write_text("1")
+        return type("P", (), {"poll": lambda self: None})()
+
+    monkeypatch.setattr(ladder, "launch", launch)
+    monkeypatch.setattr(ladder, "started", lambda o: bool(launched))
+    monkeypatch.setattr(ladder, "ended", lambda o: bool(launched))
+    monkeypatch.setattr(ladder, "result_line", lambda o: "RESULT")
+    assert ladder.queue([spec], tmp_path, tmp_path / "launchers.log", max_sims=4, max_planners=4) == 0
+    assert launched == [(spec.label, 3, 8850, 2)], "launched after two ticks without M2T2, not before"
+    assert slept[:2] == [ladder.TICK, ladder.TICK]
 
 
 def test_the_gpu_owners_are_read_off_the_compute_apps(monkeypatch):

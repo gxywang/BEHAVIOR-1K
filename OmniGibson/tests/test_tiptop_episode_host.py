@@ -87,6 +87,8 @@ class FakeSim:
             self.step_env({"r": k})
 
     def place_robot(self, x, y, yaw, note=None):
+        if getattr(self, "refuse_placement", False):  # r1pro's landing check refusing a placement: no teleport
+            raise RuntimeError("base placement refused: the landing posture collides")
         self.teleports += 1
         self.step(2)
 
@@ -788,6 +790,23 @@ class FloorRunner(FakeRunner):
         self.seen.append(("put_down", ep.put_down(JAR, FLOOR)))
 
 
+class IdleRunner(FakeRunner):
+    """A Runner that asks its Episode nothing: an audited parity run through which no call went."""
+
+    def run(self, ep):
+        self.seen.append(("idle", True))
+
+
+def test_an_audited_parity_run_that_nothing_went_through_fails_its_floors(tmp_path):
+    """U0-c holds (the Runner holds the shim) and every other item is clean, yet the audit audited nothing: the
+    floors (shim calls, connector calls, DualEpisode comparisons) are what fail it."""
+    h = build(tmp_path, runner=IdleRunner)
+    block, raised = run(h)
+    assert raised is None and ("idle", True) in seen(h) and block["u0c"]["ok"]
+    assert (block["g3"]["shim_calls"], block["g3"]["connector_calls"], block["g3"]["dual_compared"]) == (0, 0, 0)
+    assert not block["g3"]["pass"] and not block["ok"]
+
+
 def test_the_dual_episode_compares_floor_failed_at_after_a_failed_floor_put_down(tmp_path):
     h = build(tmp_path, ok=False, runner=FloorRunner)
     block, raised = run(h)
@@ -824,6 +843,21 @@ def test_a_capture_owned_by_anything_but_the_episode_or_the_planners_services_fa
     h.ledger.row("observe").capture, h.ledger.row("ep.pick").capture = 1, 1  # the planner's and legacy's own
     block, _ = run(h)
     assert block["rule2"]["ok"] is True and block["rule2"]["d21_debt"]["capture"] == 1
+
+
+def test_a_refused_placement_by_a_skills_code_fails_rule2_by_its_call(tmp_path):
+    """A placement the landing check refuses teleports nothing (place_robot 0) but is still an attempt to move the
+    base from a skill's code: the ledger's place_robot_calls, which rule 2 reads beside the teleports."""
+    h = build(tmp_path, audit=False, routes=("wait=scripted",))
+    h.host.run()
+    h.sim.refuse_placement = True
+    with pytest.raises(RuntimeError, match="refused"):
+        h.sim.place_robot(1.0, 0.0, 0.0)  # a native skill's own code: no owner
+    block = h.host.close("strategy finished", None)
+    row = block["ledger"]["unowned"]
+    assert (row["place_robot"], row["place_robot_calls"], row["steps"]) == (0, 1, 0)
+    assert block["rule2"]["ok"] is False and block["rule2"]["outside"] == {"unowned": {"place_robot_calls": 1}}
+    assert not block["g3"]["pass"] and not block["ok"]
 
 
 def test_a_render_by_a_skills_code_fails_a_native_run_and_the_planners_capture_does_not(tmp_path):

@@ -279,3 +279,38 @@ def test_the_harness_world_turns_an_unperceived_distance_into_none_as_the_oracle
     with pytest.raises(KeyError) as legacy:
         ep.distance("plywood.n.01_1", "floor.n.01_2")
     assert e.value.args == legacy.value.args == ("floor.n.01_2",)
+
+
+def test_peek_never_answers_a_stance_key_across_a_write():
+    """A read the connector makes on its own over a tape (an extra) is answered from its own segment. A stance_key with
+    no record there reads None and is listed as stale, never the key from before a write that may have re-stanced
+    (a failed floor put_down's achieve does, and the shim's floor_failed_at would then take the old stance)."""
+
+    class Ep:
+        floor = "floor.n.01_1"
+
+        def __init__(self):
+            self.key = (10, -3, 5)
+
+        def stance_key(self):
+            return self.key
+
+        def holding(self, bddl):
+            return True
+
+        def put_down(self, bddl, support, floor=None):
+            self.key = (17, -5, 6)  # the achieve inside re-stanced
+            return False
+
+    tape = tp.Tape(tp.header("t", 301, "connector", "parity", 0))
+    rec = tp.TapeRecorder(Ep(), tape)
+    rec.stance_key()
+    rec.put_down("plywood.n.01_1", "floor.n.01_1")
+    rec.holding("plywood.n.01_1")
+    te = tp.TapeEpisode(tp.Tape.loads(tape.dumps()))
+    src = qh.Src(te, qh.members_of_tape(tape), tape=tape)
+    assert src.peek("stance_key") == (10, -3, 5), "its own segment answers"
+    assert te.put_down("plywood.n.01_1", "floor.n.01_1") is False  # the write: the next segment
+    assert src.peek("stance_key") is None, "the key from before the write is not this segment's"
+    assert [(s["member"], s["segment"]) for s in src.stale] == [("stance_key", 1)]
+    assert src.peek("holding", ("plywood.n.01_1",)) is True, "another member is answered from its segment"
