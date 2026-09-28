@@ -17,25 +17,30 @@ Legacy sources (``--runner legacy``, every historical job):
   own close is in); and the ``RESULT instance`` line.
 
 Connector sources (``--runner connector``), a schema this module defines; every file is optional and lives in the
-job dir (or under ``episode/``):
+job dir, under ``episode/`` (the bench's --out-dir) or one level below either (the bench's instance dir,
+``episode/<task>_<instance>_<rollout>/``, where episode_host streams its rows):
 - ``skill_calls.jsonl``: one ``to_dict(SkillResult)`` row per finished skill call, as the Runtime logs it, plus an
   optional ``trial``. A row is LEGACY when ``backend == "legacy"`` or ``requires_sim_clock`` is true; its
   ``evidence.records`` are the Episode records the call appended (round records with ``env_steps``/``error``, and
-  ``open``/``close`` records with ``opened``/``reached``), and they are counted exactly as ``bench.rounds`` are.
-  Any other row is NATIVE: it counts one executed motion when ``steps > 0``, plus ``evidence.resamples`` (an int,
+  ``open``/``close`` records with ``opened``/``reached``), and they are counted exactly as ``bench.rounds`` are;
+  when the result JSON carries ``bench.rounds`` (Episode.records, the same under either runner, holding the round
+  EpisodeOver cut off inside a legacy call, which never reaches a row) the legacy rounds are counted from there
+  instead. Any other row is NATIVE: it counts one executed motion when ``steps > 0``, plus ``evidence.resamples`` (an int,
   default 0, one per resample inside the call). The Runner-visible return is ``evidence.legacy_ok`` for a legacy row
   and ``status == "succeeded"`` for a native one; ``verdicts.scorer`` is the scorer's verdict right after.
 - ``ledger.jsonl``: one row per StepLedger owner: ``{"owner": str, "steps": int, "env_step_calls": int,
   "place_robot": int, "capture": int, "look_at": int, "writes": int}``. A ``place_robot`` is one teleport; the
   ``go_to`` owner's are the planner's, owners named ``ep.<member>`` are teleports inside a legacy call.
-- ``gripper.jsonl``: one GripperWatch row per gripper event: ``{"step": int, "arm": "left"|"right",
-  "event": "close"|"open", "is_grasping": 1|0|-1, "owner": str, "call_id": str|null}``. A close with
-  ``is_grasping == 1`` is a weld and one with ``-1`` an on-air close, whose cause is its ``owner`` and ``call_id``.
-  Without this file the executor lines in ``sim.log`` are used, and an on-air close has no owner to name.
+- ``gripper.jsonl`` (read for either runner whenever the bench wrote it): one GripperWatch row per gripper event:
+  ``{"step": int, "arm": "left"|"right", "event": "close"|"open", "is_grasping": 1|0|-1, "owner": str,
+  "call_id": str|null}``. A close with ``is_grasping == 1`` is a weld and one with ``-1`` an on-air close, whose
+  cause is its ``owner`` and ``call_id``. Without this file the executor lines in ``sim.log`` are used, and an
+  on-air close has no owner to name.
 - ``runner_tape.jsonl`` (optional): ``{"call_id": str, "skill": str, "qual": str|null, "returned": bool|null}``
   per Runner write, joining a skill row to the Runner's typed call; it qualifies ``place.on`` against ``place.in``.
   Without it the qualifier is read from the row's ``effects`` predicates, and a row with none stays unqualified.
-- the result JSON's ``connector`` block: ``step``, ``idle_steps``, ``charged`` (steps per run kind), ``ledger``
+- the result JSON's ``connector`` block (``bench.connector`` as bench.py writes it, or top-level): ``step``,
+  ``idle_steps``, ``charged`` (steps per run kind), ``ledger``
   (the same rows as ledger.jsonl, keyed by owner; the fallback when the file is missing) and ``live_at_end``
   (``{"call_id": str, "steps": int}`` when EpisodeOver ended a live native run: the cut-off round).
 
@@ -183,9 +188,14 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def _find(job: Path, name: str) -> Optional[Path]:
+    """A source file: in the job dir, under ``episode/``, or one level below either (the bench's instance dir)."""
     for p in (job / name, job / "episode" / name):
         if p.exists():
             return p
+    for pattern in (f"episode/*/{name}", f"*/{name}"):
+        found = sorted(job.glob(pattern))
+        if found:
+            return found[0]
     return None
 
 
@@ -274,12 +284,14 @@ def _qual(row: dict, tape: dict) -> Optional[str]:
     return quals.pop() if len(quals) == 1 else None
 
 
-def _count_skill_rows(c: Counters, rows: list[dict], tape: dict) -> None:
+def _count_skill_rows(c: Counters, rows: list[dict], tape: dict, records: bool = True) -> None:
+    """``records``: count each legacy row's evidence.records (off when bench.rounds was counted instead)."""
     for row in rows:
         legacy = row.get("backend") == "legacy" or bool(row.get("requires_sim_clock"))
         ev = row.get("evidence") or {}
         if legacy:
-            _count_records(c, ev.get("records") or [])
+            if records:
+                _count_records(c, ev.get("records") or [])
             if row.get("skill") in ("open", "close") and not any(
                     k in r for r in ev.get("records") or [] for k in ("open", "close")):
                 c.notes.append(f"{row.get('call_id')}: legacy {row['skill']} without an open/close record")
@@ -323,7 +335,8 @@ def extract(job: Path, instance: Optional[int] = None) -> Counters:
     c = Counters(job=str(job))
     rj = result_json(job, instance)
     data = json.loads(rj.read_text()) if rj else {}
-    bench, block = data.get("bench") or {}, data.get("connector")
+    bench = data.get("bench") or {}
+    block = data["connector"] if data.get("connector") is not None else bench.get("connector")
     calls_path = _find(job, "skill_calls.jsonl")
     c.runner = "connector" if (calls_path or block is not None) else "legacy"
     c.task = data.get("task") or (json.loads((job / "job.json").read_text()).get("task", "")
@@ -349,15 +362,22 @@ def extract(job: Path, instance: Optional[int] = None) -> Counters:
         tp = _find(job, "runner_tape.jsonl")
         if tp:
             tape = {r["call_id"]: r for r in _read_jsonl(tp)}
+        # the legacy rounds: bench.rounds is Episode.records under either runner and holds the round EpisodeOver
+        # cut off inside a legacy call, which never reaches a skill row (the Runtime never finishes that call); the
+        # rows' evidence.records are the same records and serve when the result JSON has none
+        from_rounds = bool(bench.get("rounds"))
+        if from_rounds:
+            _count_records(c, bench["rounds"])
         if calls_path:
-            _count_skill_rows(c, _read_jsonl(calls_path), tape)
+            _count_skill_rows(c, _read_jsonl(calls_path), tape, records=not from_rounds)
         else:
             c.notes.append("no skill_calls.jsonl")
         if block and block.get("live_at_end"):
             c.cut_off += 1
 
-    # welds and on-air closes
-    gp = _find(job, "gripper.jsonl") if c.runner == "connector" else None
+    # welds and on-air closes: the GripperWatch rows whichever runner wrote them (a legacy run under a week-4 flag
+    # has them too, and its on-air close then has an owner); the executor's lines otherwise
+    gp = _find(job, "gripper.jsonl")
     if gp:
         rows = [r for r in _read_jsonl(gp) if r.get("event") == "close"]
         _count_closes(c, [int(r.get("is_grasping")) for r in rows],

@@ -11,6 +11,10 @@ under ``--runner connector`` in the place of ``strategy.run(ep)``.
   with the sim clock stamp;
 - the Runtime with the providers' task_info, skillrun.PASSTHROUGH = (EpisodeOver,), DirectConnector with env_step
   under owner ``rt`` (an EpisodeOver raised inside it is counted: U0-a's X);
+- the HandRefresh proxy between ConnectorAudit and DirectConnector (W4-I): after a result whose backend is not legacy,
+  with steps > 0, for pick_up, place, release, hold or press, ``providers.refresh_hands(world)`` runs under owner
+  ``refresh`` (0 steps, U0-b), outside every skill's owner scope, and the popped labels are counted in the block;
+  inert under PARITY, where every result is legacy;
 - ConnectorAudit (U0-d) and, with --audit, PurityAudit around the connector and DualEpisode around the shim;
 - PseudoPlanner(factory=strategy_for, ...) whose Runner's construction inputs are compared with the strategy the
   bench built (the Runner-input equality; a mismatch is logged and flagged, never raised).
@@ -41,6 +45,7 @@ from b1k.runtime.core import Runtime
 from b1k.runtime.direct import DirectConnector
 from omnigibson.tiptop.host.bench_host import BenchHost
 from omnigibson.tiptop.host.capture_observer import CaptureObserver
+from omnigibson.tiptop.host.instruments import UNOWNED
 from omnigibson.tiptop.host.legacy_channel import LegacyChannel
 from omnigibson.tiptop.host.legacy_episode import EPISODE_SPECS, EpisodeLegacyBackend, EpisodeNavigator, EpisodeRegistry
 from omnigibson.tiptop.host.q1_audit import AuditedConnector, DualEpisode, PurityAudit
@@ -53,7 +58,9 @@ COLLISION = "map"  # pinned: the connector's native calls plan in the map, whate
 EP_PREFIX = "ep."
 REQUEST_OPS_ALLOWED = ("plan", "move")  # G3: a parity run's planner requests are the legacy Episode's alone
 PLANNER_FRAMES_IGNORED = ("metadata", "stream")  # the connect frame and the state stream are not requests
-HAND_SKILLS = ("pick_up", "place", "release", "hold", "press")  # W4-I's HandRefresh (not wired here: refresh == 0)
+HAND_SKILLS = ("pick_up", "place", "release", "hold", "press")  # the skills a HandRefresh follows (W4-I)
+LEGACY_BACKEND = "legacy"
+REFRESH_OWNER = "refresh"
 
 
 def _plain(x: Any) -> Any:
@@ -121,6 +128,66 @@ def planner_client_of(planners: dict):
     from b1k.bridge.client import ArmPlanners
 
     return ArmPlanners(client, right[0] if isinstance(right, tuple) else right)
+
+
+class HandRefresh:
+    """The HandRefresh proxy (WEEK4_PLAN 3.3, W4-I), between ConnectorAudit and DirectConnector. Every op passes
+    through; ``run`` and ``wait`` look at their results, and after one whose backend is not legacy, with steps > 0,
+    for a skill in HAND_SKILLS, ``refresh()`` (providers.refresh_hands over the host's world: it pops the hand
+    record's entries that localization says have left the hand and answers the popped labels) runs under the ledger
+    owner ``refresh``. It must take 0 steps (U0-b's refresh_zero; the provider raises if the sim moved) and it never
+    runs inside a skill's owner scope: the run has returned by then, so the ledger's innermost owner is UNOWNED, and
+    any other owner in flight is recorded in ``inside_owner``. A legacy result (PARITY: every one) never triggers it.
+    ``summary()`` is the connector block's ``hand_refresh``: the count, the popped labels, one row per refresh."""
+
+    def __init__(self, conn: Any, refresh: Callable[[], list], ledger):
+        self._conn, self._refresh, self._ledger = conn, refresh, ledger
+        self.calls: list = []  # {"call_id", "skill", "backend", "steps", "popped", "owner_before"}
+        self.inside_owner: list = []
+        self.errors: list = []
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._conn, name)
+
+    def run(self, call):
+        r = self._conn.run(call)
+        self._after(r)
+        return r
+
+    def wait(self, *handles):
+        results = self._conn.wait(*handles)
+        for r in results:
+            self._after(r)
+        return results
+
+    @staticmethod
+    def wants(r: Any) -> bool:
+        """A result the refresh follows: not legacy, moved (steps > 0), one of the hand skills."""
+        return (getattr(r, "backend", LEGACY_BACKEND) != LEGACY_BACKEND and int(getattr(r, "steps", 0) or 0) > 0
+                and getattr(r, "skill", None) in HAND_SKILLS)
+
+    def _after(self, r: Any) -> None:
+        if not self.wants(r):
+            return
+        before = self._ledger.current
+        if before != UNOWNED:
+            self.inside_owner.append({"call_id": r.call_id, "owner": before})
+        popped: list = []
+        with self._ledger.owner(REFRESH_OWNER):
+            try:
+                popped = list(self._refresh())
+            except Exception as e:  # noqa: BLE001 - a broken refresh is a block failure, never the instance's crash
+                self.errors.append(f"{r.call_id}: {type(e).__name__}: {e}")
+        self.calls.append({"call_id": r.call_id, "skill": r.skill, "backend": r.backend, "steps": int(r.steps),
+                           "popped": popped, "owner_before": before})
+
+    def summary(self) -> dict:
+        popped = [label for c in self.calls for label in c["popped"]]
+        return {"count": len(self.calls), "popped": popped, "popped_total": len(popped), "calls": list(self.calls),
+                "inside_owner": list(self.inside_owner), "errors": list(self.errors),
+                "ok": not self.inside_owner and not self.errors}
 
 
 def u0a(rt, live_steps: int, over_in_env_step: int, episode_over: bool) -> dict:
@@ -307,6 +374,7 @@ class EpisodeHost:
             inputs["equal"] = bool(inputs["equal"] and inputs["equal_at_run"])
         calls = Counter(f"{r.get('skill')}/{r.get('backend')}/{r.get('status')}/{r.get('code')}" for r in self.rt.log)
         live_native = [(cid, n) for cid, n in live.items() if n > 0]
+        hand_refresh = self.refresh.summary() if self.refresh is not None else HandRefresh(None, list, None).summary()
         g3 = {
             "dual_mismatches": None if dual is None else dual["summary"]["mismatches"],
             "purity_violations": None if purity is None else purity["summary"]["violations"],
@@ -315,9 +383,10 @@ class EpisodeHost:
             "requests_ok": None if req is None else req["ok"],
             "runner_inputs_equal": bool(inputs["equal"]),
             "u0a": a["ok"], "u0b": b["ok"], "u0c": c["ok"], "u0d": d["ok"], "rule2": r2["ok"], "build": build["ok"],
+            "hand_refresh_ok": hand_refresh["ok"],
         }
         hard = [g3["u0a"], g3["u0b"], g3["u0c"], g3["u0d"], g3["rule2"], g3["build"], g3["runner_inputs_equal"],
-                g3["typed_literal_mismatches"] == 0, g3["renders_outside_ep"] == 0]
+                g3["typed_literal_mismatches"] == 0, g3["renders_outside_ep"] == 0, g3["hand_refresh_ok"]]
         if dual is not None:
             hard.append(dual["ok"])
         if purity is not None:
@@ -352,7 +421,7 @@ class EpisodeHost:
             "advisory": dict(self.registry.advisory),
             "requests": req,
             "renders": renders,
-            "hand_refresh": {"count": 0, "popped": []},
+            "hand_refresh": hand_refresh,
             "runner_inputs": inputs,
             "shim": None if shim is None else shim_counts(shim),
             "world_disagreements": int(getattr(self.svc.world, "disagreements", 0) or 0),
@@ -446,10 +515,12 @@ def build(episode, sim, planners: dict, args, providers, strategy_for: Callable,
             digest0=digest0, svc=svc, segmenter=segmenter, bench_host=bench_host, observer=observer,
             teleport=teleport, channel=channel, legacy=legacy, backends=backends, registry=registry,
             navigator=navigator, rt=rt, calls=calls, saved_passthrough=saved, inst_dir=inst_dir, wstape=wstape,
-            max_steps=max_steps, purity=None, dual=None, runner_holds=None,
+            max_steps=max_steps, purity=None, dual=None, runner_holds=None, refresh=None,
         )
         direct = DirectConnector(rt, host.env_step, bench_host, bench_host.raw())
-        audit = AuditedConnector(direct, lambda: int(sim.n_steps))
+        # the HandRefresh between the audit and the connector: the audit's ``run`` row spans the refresh (0 steps)
+        refresh = HandRefresh(direct, lambda: providers.refresh_hands(svc.world), ledger)
+        audit = AuditedConnector(refresh, lambda: int(sim.n_steps))
         conn: Any = audit
         if getattr(args, "audit", False):
             host.purity = PurityAudit(audit, host.digest, host.writes)
@@ -464,7 +535,7 @@ def build(episode, sim, planners: dict, args, providers, strategy_for: Callable,
             host.runner_holds = ep
             return ep
 
-        host.direct, host.audit, host.conn = direct, audit, conn
+        host.direct, host.refresh, host.audit, host.conn = direct, refresh, audit, conn
         host.planner = PseudoPlanner(factory=host.factory, channel=channel, attempts=args.attempts_per_item,
                                      tape=runner_episode, views=tuple(getattr(args, "views", ("head",)) or ("head",)))
     digest1 = state_digest()
