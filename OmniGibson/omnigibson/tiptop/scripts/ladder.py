@@ -825,9 +825,11 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
     switched_at, reason = ws.get("switched_at"), ws.get("switch_reason") or ""
     before = [row for row in replay if frame is not None and int(row["i"]) < frame]
     mism = [row for row in before if not row.get("matched", True)]
+    # the switch lands at N either way: C's legacy request there is forced live, T's native request differs from the
+    # tape at its op (skill or reach against plan) and goes live on that
     out = {"frame": frame, "switched_at": switched_at, "switch_reason": reason, "frames_before_branch": len(before),
            "mismatched_before_branch": [{"i": r["i"], "diffs": [d.get("path") for d in r.get("diffs", [])][:5]} for r in mism],
-           "forced_at_branch": switched_at == frame and "forced" in reason, "floor_frame": floor_frame}
+           "switched_at_branch": switched_at == frame, "forced": "forced" in reason, "floor_frame": floor_frame}
     early = switched_at is not None and frame is not None and switched_at < frame
     out["pre_branch_divergence"] = early or bool(mism)
     out["within_floor"] = (not out["pre_branch_divergence"]) or (floor_frame is not None and switched_at is not None and switched_at >= floor_frame)

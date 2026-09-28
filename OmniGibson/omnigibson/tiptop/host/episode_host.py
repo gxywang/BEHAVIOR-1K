@@ -375,6 +375,10 @@ class EpisodeHost:
         calls = Counter(f"{r.get('skill')}/{r.get('backend')}/{r.get('status')}/{r.get('code')}" for r in self.rt.log)
         live_native = [(cid, n) for cid, n in live.items() if n > 0]
         hand_refresh = self.refresh.summary() if self.refresh is not None else HandRefresh(None, list, None).summary()
+        # G3's "no render outside ep.*" and "requests only plan/move, owned by ep.*" are the PARITY items (WEEK4_PLAN
+        # 5.4: a parity run is a legacy episode); a native route captures through the planner's observe and asks the
+        # planner for skills and reaches, so on a run with any route off legacy they are reported, not gated
+        parity_run = getattr(self.args, "routing_profile", "parity") == "parity" and not list(getattr(self.args, "route", ()) or ())
         g3 = {
             "dual_mismatches": None if dual is None else dual["summary"]["mismatches"],
             "purity_violations": None if purity is None else purity["summary"]["violations"],
@@ -383,15 +387,17 @@ class EpisodeHost:
             "requests_ok": None if req is None else req["ok"],
             "runner_inputs_equal": bool(inputs["equal"]),
             "u0a": a["ok"], "u0b": b["ok"], "u0c": c["ok"], "u0d": d["ok"], "rule2": r2["ok"], "build": build["ok"],
-            "hand_refresh_ok": hand_refresh["ok"],
+            "hand_refresh_ok": hand_refresh["ok"], "parity_run": parity_run,
         }
         hard = [g3["u0a"], g3["u0b"], g3["u0c"], g3["u0d"], g3["rule2"], g3["build"], g3["runner_inputs_equal"],
-                g3["typed_literal_mismatches"] == 0, g3["renders_outside_ep"] == 0, g3["hand_refresh_ok"]]
+                g3["typed_literal_mismatches"] == 0, g3["hand_refresh_ok"]]
+        if parity_run:
+            hard.append(g3["renders_outside_ep"] == 0)
         if dual is not None:
             hard.append(dual["ok"])
         if purity is not None:
             hard.append(purity["ok"])
-        if req is not None:
+        if req is not None and parity_run:
             hard.append(req["ok"])
         g3["pass"] = all(hard)
         shim = getattr(self.planner, "shim", None)

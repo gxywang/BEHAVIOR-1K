@@ -162,6 +162,7 @@ def test_the_host_wires_the_hand_refresh_between_the_audit_and_the_connector(tmp
     assert isinstance(host.refresh, episode_host.HandRefresh) and host.refresh._conn is host.direct
     assert host.audit.conn is host.refresh, "ConnectorAudit(HandRefresh(DirectConnector))"
     assert host.refresh._ledger is h.ledger
+    host.close("wired", None)  # restores skillrun.PASSTHROUGH for the tests after this one
 
 
 def test_the_hand_refresh_is_inert_under_parity(tmp_path):
@@ -384,11 +385,15 @@ def test_the_prefix_verdict_forced_at_the_branch_early_within_the_floor_and_earl
     replay = [{"i": 0, "op": "metadata", "matched": True, "diffs": []}, {"i": 1, "op": "plan", "matched": True, "diffs": []}]
     run = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 forced live (--wstape-live-at 2)"}, "replay": replay}
     pv = ladder.prefix_verdict(run, 2, None, 36, None, Path("/snap"))
-    assert pv["ok"] and pv["forced_at_branch"] and not pv["pre_branch_divergence"] and pv["frames_before_branch"] == 2
+    assert pv["ok"] and pv["switched_at_branch"] and pv["forced"] and not pv["pre_branch_divergence"] and pv["frames_before_branch"] == 2
+    # the T arm: its native request at N differs from the tape at its op and goes live on that, at N all the same
+    native = {"wstape": {"switched_at": 2, "switch_reason": "frame 2 (skill) differs at op: plan on the tape, skill in the replay"}, "replay": replay}
+    pv = ladder.prefix_verdict(native, 2, None, 36, None, Path("/snap"))
+    assert pv["ok"] and pv["switched_at_branch"] and not pv["forced"] and not pv["pre_branch_divergence"]
     early = {"wstape": {"switched_at": 3, "switch_reason": "frame 3 (plan) differs at depth: ..."},
              "replay": replay + [{"i": 2, "op": "plan", "matched": True, "diffs": []}, {"i": 3, "op": "plan", "matched": False, "diffs": [{"path": "depth"}]}]}
     within = ladder.prefix_verdict(early, 6, 3, 47, None, Path("/snap"))
-    assert within["pre_branch_divergence"] and within["within_floor"] and within["ok"] and not within["forced_at_branch"]
+    assert within["pre_branch_divergence"] and within["within_floor"] and within["ok"] and not within["switched_at_branch"]
     assert within["mismatched_before_branch"] == [{"i": 3, "diffs": ["depth"]}]
     outside = ladder.prefix_verdict(early, 6, None, 47, None, Path("/snap"))
     assert outside["pre_branch_divergence"] and not outside["within_floor"] and not outside["ok"]
@@ -501,3 +506,18 @@ def test_the_derived_tape_reroots_the_served_metadata_to_the_runs_snapshot(tmp_p
     assert f1.request_dict()["seed"] == seed_for(1, 1) == 3301 and f1.response == '{"success": true}'
     assert ladder.derived_tape(tmp_path / "src", tmp_path / "r1", 1, Path("/snap/w4ladder")) == dst, "made once, reused after"
     assert len(TapeDir(dst)) == 2
+
+
+# ------------------------------------------------------------------- the G3 items that are PARITY's alone
+def test_renders_outside_ep_and_native_requests_gate_a_parity_run_alone(tmp_path):
+    """A native route captures through the planner's observe and asks the planner for skills: those renders and
+    requests are reported on such a run, never gated (they are the parity items of G3, WEEK4_PLAN 5.4)."""
+    h = th.build(tmp_path, audit=False)
+    h.ledger.row("observe").renders = 3
+    block, _ = th.run(h)
+    assert block["g3"]["parity_run"] is True and block["g3"]["renders_outside_ep"] == 3 and not block["ok"]
+    h2 = th.build(tmp_path / "native", audit=False, routes=["wait=scripted"])
+    h2.ledger.row("observe").renders = 3
+    block2, _ = th.run(h2)
+    assert block2["g3"]["parity_run"] is False and block2["g3"]["renders_outside_ep"] == 3 and block2["ok"], json.dumps(block2["g3"])
+    assert block2["g3"]["u0a"] and block2["g3"]["u0b"] and block2["g3"]["rule2"], "the hard items still gate it"
