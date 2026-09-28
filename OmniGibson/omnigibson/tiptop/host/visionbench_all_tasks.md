@@ -133,5 +133,29 @@ Metadata-only tests (no simulator launch):
 ```bash
 OMNIGIBSON_HEADLESS=1 /path/to/sim/python -m pytest -q \
   OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks.py \
-  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_rebase.py
+  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_rebase.py \
+  OmniGibson/omnigibson/tiptop/host/test_visionbench_all_tasks_fidelity.py
 ```
+
+## Check replay fidelity against the final saved query
+
+The materialization receipt includes an early head-depth probe. A transient camera or
+render settling issue can make that probe disagree with the final saved query even when
+the final query converges. Preserve it as provenance, and compare the **saved input
+depth** directly with the recorded dataset frame before making fidelity claims:
+
+```bash
+/path/to/sim/python OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_fidelity.py \
+  --selection /path/to/new-run/selection_replay.json \
+  --captures /path/to/new-run/captures --dataset "$B1K_DEMOS" \
+  --output /path/to/new-run/replay_fidelity_summary.json --fresh
+```
+
+This is an independent diagnostic that can run after capture sealing. It preserves both
+`saved_depth_*` and `materialization_depth_*` statistics, per-case input hashes, decoded
+frame hashes, episode offsets and timestamps. It also reports joint and base-relative
+end-effector differences. It never replaces cases, tunes models, or excludes examples
+from the primary score. Base-versus-dead-reckoned differences are against integrated
+odometry, not measured world-pose ground truth. The raw replay-depth aggregates in the
+capture quality summary describe the preliminary probe; use the fidelity diagnostic's
+`saved_depth_*` fields for conclusions about the final model inputs.
