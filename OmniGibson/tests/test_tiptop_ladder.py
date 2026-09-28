@@ -521,3 +521,48 @@ def test_renders_outside_ep_and_native_requests_gate_a_parity_run_alone(tmp_path
     block2, _ = th.run(h2)
     assert block2["g3"]["parity_run"] is False and block2["g3"]["renders_outside_ep"] == 3 and block2["ok"], json.dumps(block2["g3"])
     assert block2["g3"]["u0a"] and block2["g3"]["u0b"] and block2["g3"]["rule2"], "the hard items still gate it"
+
+
+# ---------------------------------------------------------- the Runner prefix and the cut-off delivery
+def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_nothing_else():
+    """W4-F2's open item 1: the shim's KeyError message differs from the Episode's at every distance read the sim
+    cannot answer; Runner.gap maps both to inf, so the pair is neutral. Any other difference is a divergence."""
+    lrec = [{"kind": "read", "member": "holding", "args": ["a"], "kwargs": {}, "ret": False},
+            {"kind": "read", "member": "distance", "args": ["floor.n.01_2", "a"], "kwargs": {},
+             "exc": {"type": "KeyError", "module": "builtins", "message": "'floor.n.01_2'", "args": ["floor.n.01_2"]}},
+            {"kind": "write", "member": "pick", "args": ["a"], "kwargs": {}, "step": [0, 10], "ret": True},
+            {"kind": "read", "member": "support_of", "args": ["a"], "kwargs": {}, "ret": None},
+            {"kind": "write", "member": "put_down", "args": ["a", "f"], "kwargs": {"floor": True}, "step": [10, 20], "ret": True}]
+    run = [dict(r) for r in lrec]
+    run[1] = dict(run[1], exc={"type": "KeyError", "module": "builtins", "message": "'no distance between floor.n.01_2 and a'",
+                                "args": ["no distance between floor.n.01_2 and a"]})
+    cmp = ladder.runner_prefix_compare(lrec, run, 4)
+    assert cmp == {"compared": 4, "first_divergence": None, "neutral": [1], "identical_before_branch": True}
+    run[3] = dict(run[3], ret="table")
+    cmp = ladder.runner_prefix_compare(lrec, run, 4)
+    assert cmp["first_divergence"]["index"] == 3 and cmp["first_divergence"]["kind"] == "answer" and not cmp["identical_before_branch"]
+    assert cmp["neutral"] == [1]
+    # a distance read whose args differ, or that answered a value on one side, is not neutral
+    other = [dict(r) for r in lrec]
+    other[1] = dict(other[1], args=["floor.n.01_1", "a"])
+    assert ladder.runner_prefix_compare(lrec, other, 4)["first_divergence"]["index"] == 1
+    valued = [dict(r) for r in lrec]
+    valued[1] = {"kind": "read", "member": "distance", "args": ["floor.n.01_2", "a"], "kwargs": {}, "ret": 1.5}
+    assert ladder.runner_prefix_compare(lrec, valued, 4)["first_divergence"]["index"] == 1
+    # only the records before the branch count; a shorter run tape is a divergence
+    assert ladder.runner_prefix_compare(lrec, run[:2], 4)["first_divergence"] == {"index": 2, "why": "the run's tape is shorter"}
+    assert ladder.runner_prefix_compare(lrec, run[:2], 2)["identical_before_branch"]
+
+
+def test_a_switched_write_cut_off_at_success_is_a_cut_off_delivery(tmp_path):
+    ep = tmp_path / "episode"
+    (ep / "tapes").mkdir(parents=True)
+    records = [dict(r) for r in RECORDS]
+    records[-1] = _write("achieve", [[ONTOP]], {}, [3000, 3100], exc="EpisodeOver")  # the last write: place.on, cut off
+    tp.Tape({"task": "demo"}, records).save(ep / "tapes" / "demo_301_0.json")
+    run = {"runner_tape": str(ep / "tapes" / "demo_301_0.json"), "json": {"reason": "success"}}
+    assert ladder.cut_off_delivery(run, "place.on") == {"call_id": "q1-6", "member": "achieve", "args": [[ONTOP]]}
+    assert ladder.cut_off_delivery(run, "place.in") is None, "another line"
+    assert ladder.cut_off_delivery(dict(run, json={"reason": "episode over after 5000 steps: timeout"}), "place.on") is None
+    tp.Tape({"task": "demo"}, RECORDS).save(ep / "tapes" / "demo_301_0.json")  # the last write is a close
+    assert ladder.cut_off_delivery(run, "place.on") is None

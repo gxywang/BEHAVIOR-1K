@@ -817,6 +817,42 @@ def rule2_of(c: Optional[dict]) -> dict:
     return {"ok": bool(r2.get("ok")), "rt": r2.get("rt"), "d21_debt": r2.get("d21_debt")}
 
 
+NEUTRAL_READ = "distance"  # W4-F2 open item 1: the shim re-raises a KeyError with its own message where the Episode's
+#                              carries the name; Runner.gap maps both to inf, so the records differ in prose alone
+
+
+def neutral_pair(a: dict, b: dict) -> bool:
+    """Two Runner-tape records that differ only in a way no decision reads: the same distance read, both raising
+    KeyError, with different messages."""
+    if a.get("kind") != "read" or b.get("kind") != "read" or a.get("member") != NEUTRAL_READ or b.get("member") != NEUTRAL_READ:
+        return False
+    if a.get("args") != b.get("args") or a.get("kwargs") != b.get("kwargs"):
+        return False
+    ea, eb = (a.get("exc") or {}), (b.get("exc") or {})
+    return ea.get("type") == "KeyError" and eb.get("type") == "KeyError"
+
+
+def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: Optional[int]) -> dict:
+    """The run's Runner tape against the L-rec's before the branch write's record: the first record that differs
+    beyond a neutral pair, and the neutral pairs met on the way."""
+    n = len(lrec_records) if branch_record is None else min(branch_record, len(lrec_records))
+    neutral, first = [], None
+    for i in range(n):
+        if i >= len(run_records):
+            first = {"index": i, "why": "the run's tape is shorter"}
+            break
+        a, b = lrec_records[i], run_records[i]
+        if a == b:
+            continue
+        if neutral_pair(a, b):
+            neutral.append(i)
+            continue
+        first = {"index": i, "kind": "decision" if a.get("kind") == "write" or a.get("member") != b.get("member") or a.get("args") != b.get("args") else "answer",
+                 "member": a.get("member"), "a": json.dumps(a, default=str)[:300], "b": json.dumps(b, default=str)[:300]}
+        break
+    return {"compared": n, "first_divergence": first, "neutral": neutral, "identical_before_branch": first is None}
+
+
 def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], branch_record: Optional[int],
                    lrec_tape: Optional[Path], snap: Path, branch_write: Optional[int] = None) -> dict:
     """(a): the served frames before N matched and the switch happened at N (forced), else within the A/A floor;
@@ -841,9 +877,11 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
         idx = None if fd is None else fd.get("index")
         pw = runner.get("per_write") or []
         before_branch = [w for w in pw if branch_write is not None and w.get("i", 0) < branch_write]
-        out["runner_prefix"] = {"first_divergence": idx, "kind": None if fd is None else fd.get("kind"),
+        cmp = runner_prefix_compare(tp.Tape.load(lrec_tape).records, tp.Tape.load(run["runner_tape"]).records, branch_record)
+        out["runner_prefix"] = {"first_divergence_raw": idx, "kind_raw": None if fd is None else fd.get("kind"),
                                 "records": runner.get("records"), "branch_record": branch_record,
-                                "identical_before_branch": idx is None or (branch_record is not None and idx >= branch_record),
+                                "first_divergence": cmp["first_divergence"], "neutral_pairs": cmp["neutral"],
+                                "identical_before_branch": cmp["identical_before_branch"],
                                 "writes_before_branch": len(before_branch),
                                 "writes_before_branch_equal": all(w["delta_a"] == w["delta_b"] and w["digest_before_equal"]
                                                                   and w["digest_after_equal"] for w in before_branch)}
@@ -896,6 +934,19 @@ def pairing(plan_task: dict, runs: dict, switched: str) -> list:
                                       "same_write": r.get("skill") == name}
         rows.append(row)
     return rows
+
+
+def cut_off_delivery(run: dict, switched: str) -> Optional[dict]:
+    """A switched-skill write that EpisodeOver cut off at the task's success: it delivered the goal but never
+    returned to the Runner and never reached a skill row (the Runtime never finished it), on either arm alike. The
+    pre-registered per-call test leaves it out; the secondary line counts it as a success."""
+    if not run.get("runner_tape") or ((run.get("json") or {}).get("reason") != "success"):
+        return None
+    ws = writes_of(tp.Tape.load(run["runner_tape"]))
+    last = next((w for w in reversed(ws) if w.k is not None), None)
+    if last is None or last.line != switched or last.exc != "EpisodeOver":
+        return None
+    return {"call_id": last.call_id, "member": last.member, "args": last.args}
 
 
 def legacy_dependencies(run: dict) -> dict:
@@ -965,6 +1016,7 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
                                 (p["branch"] or {}).get("write"))
             hv = hard_verdict(run, switched, arm, c_reasons)
             t_entry["runs"][key] = {"out": run["out"], "ended": run["ended"], "result": run["result"], "prefix": pv, "hard": hv,
+                                    "cut_off_delivery": cut_off_delivery(run, switched),
                                     "imports": run.get("imports"), "planner_imports": run.get("planner_imports"), "video": run.get("video"),
                                     "legacy": legacy_dependencies(run), "hand_refresh": (run.get("connector") or {}).get("hand_refresh"),
                                     "d21_debt": rule2_of(run.get("connector")).get("d21_debt"), "calls": (run.get("connector") or {}).get("calls"),
@@ -981,6 +1033,22 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
     cmp = counters.compare(pairs, switched, backend=None) if pairs else None
     g["compare"] = None if cmp is None else counters._comparison_dict(cmp)
     g["compare_text"] = None if cmp is None else counters.format_comparison(cmp)
+    # the secondary line: the strict counts plus the cut-off deliveries (a success each)
+    if cmp is not None and cmp.pooled is not None:
+        cut = {"C": 0, "T": 0}
+        for task, t in per_task.items():
+            for key, r in t["runs"].items():
+                co = r.get("cut_off_delivery")
+                if co:
+                    cut[key[0]] += 1
+        pl = cmp.pooled
+        c_n, c_s, t_n, t_s = pl.c_n + cut["C"], pl.c_succ + cut["C"], pl.t_n + cut["T"], pl.t_succ + cut["T"]
+        p = counters.fisher_one_sided(c_s, c_n, t_s, t_n)
+        drop = (c_s / c_n - t_s / t_n) if c_n and t_n else 0.0
+        g["compare_with_cut_off"] = {"cut_off_C": cut["C"], "cut_off_T": cut["T"], "c_n": c_n, "c_succ": c_s, "t_n": t_n, "t_succ": t_s,
+                                     "c_rate": c_s / c_n if c_n else None, "t_rate": t_s / t_n if t_n else None, "p": p,
+                                     "mde": counters.minimum_detectable_effect(c_s, c_n, t_n, cmp.alpha),
+                                     "fail": bool(c_n and t_n and drop >= cmp.delta and p < cmp.alpha)}
     # the causes of the flags, from the pairing: a T failure at a write C's run succeeded on
     flags_fail = []
     if cmp is not None:
@@ -1098,10 +1166,16 @@ def gate_md(g: dict) -> str:
          f"d flag-caused-by-switch {g['verdict']['d_flags_fail']}, runs {g['verdict']['runs_ended']}/{g['verdict']['runs_expected']}).", ""]
     if g.get("compare_text"):
         o += ["## (c) primary and (d) counters (counters.py compare)", "", "```", g["compare_text"], "```", ""]
+        cc = g.get("compare_with_cut_off")
+        if cc:
+            o += [f"Secondary (the strict counts plus the switched-skill writes EpisodeOver cut off at success, one success each; "
+                  f"they never reach a skill row on either arm): C {cc['c_succ']}/{cc['c_n']} ({_f(cc['c_rate'])}), T {cc['t_succ']}/{cc['t_n']} "
+                  f"({_f(cc['t_rate'])}), one-sided Fisher p {cc['p']:.3f}, MDE {_f(cc['mde'])}, {'FAIL' if cc['fail'] else 'pass'}; "
+                  f"cut-off deliveries C {cc['cut_off_C']}, T {cc['cut_off_T']}.", ""]
     for task, t in g["tasks"].items():
         o.append(f"## {task}")
-        if t.get("branch") is None:
-            o += [f"- {t.get('note')}", ""]
+        if t.get("branch") is None or "runs" not in t:
+            o += [f"- {t.get('note')}" + ("" if t.get("branch") is None else f" (branch {t['branch']})"), ""]
             continue
         b = t["branch"]
         o += [f"- branch: write {b['write']} `{b['member']}` ({b['line']}) call `{b['call_id']}`, C -> {b['backend_c']}, T -> {b['backend_t']}; "
