@@ -620,6 +620,28 @@ def test_renders_outside_ep_and_native_requests_gate_a_parity_run_alone(tmp_path
 
 
 # ---------------------------------------------------------- the Runner prefix and the cut-off delivery
+def test_the_runner_prefix_compares_state_digests_on_the_keys_both_carry():
+    """The L-recs were recorded before the state digest gained the tracked objects' joints: a newer run's write
+    agrees with them on every key both carry and is not a divergence (it is listed); a shared key that differs is."""
+
+    def write(before, after):
+        return {"kind": "write", "member": "pick", "args": ("plywood.n.01_1",), "kwargs": {}, "ret": True,
+                "step": (90, 977), "digest": (before, after)}
+
+    old = write({"n_steps": 90, "objects": "a1"}, {"n_steps": 977, "objects": "b2"})
+    joints0, joints1 = (1, "j0"), (1, "j1")
+    new = write({"n_steps": 90, "objects": "a1", "joints": joints0},
+                {"n_steps": 977, "objects": "b2", "joints": joints1})
+    read = {"kind": "read", "member": "holding", "args": ("plywood.n.01_1",), "kwargs": {}, "ret": True}
+    r = ladder.runner_prefix_compare([read, old, read], [read, new, read], None)
+    assert r["identical_before_branch"] and r["digest_keys_one_side"] == [1] and r["first_divergence"] is None
+    moved = write({"n_steps": 90, "objects": "a1", "joints": joints0},
+                  {"n_steps": 977, "objects": "zz", "joints": joints1})
+    r = ladder.runner_prefix_compare([read, old, read], [read, moved, read], None)
+    assert (r["first_divergence"]["index"], r["first_divergence"]["kind"]) == (1, "decision")
+    assert r["digest_keys_one_side"] == []
+
+
 def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_nothing_else():
     """W4-F2's open item 1: the shim's KeyError message differs from the Episode's at every distance read the sim
     cannot answer; Runner.gap maps both to inf, so the pair is neutral. Any other difference is a divergence."""
@@ -633,7 +655,8 @@ def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_n
     run[1] = dict(run[1], exc={"type": "KeyError", "module": "builtins", "message": "'no distance between floor.n.01_2 and a'",
                                 "args": ["no distance between floor.n.01_2 and a"]})
     cmp = ladder.runner_prefix_compare(lrec, run, 4)
-    assert cmp == {"compared": 4, "first_divergence": None, "neutral": [1], "identical_before_branch": True}
+    assert cmp == {"compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [],
+                   "identical_before_branch": True}
     run[3] = dict(run[3], ret="table")
     cmp = ladder.runner_prefix_compare(lrec, run, 4)
     assert cmp["first_divergence"]["index"] == 3 and cmp["first_divergence"]["kind"] == "answer" and not cmp["identical_before_branch"]
@@ -650,7 +673,9 @@ def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_n
     assert ladder.exc_type(None) is None
     decoded_l = tp.Tape.loads(tp.Tape({}, lrec).dumps()).records
     decoded_r = tp.Tape.loads(tp.Tape({}, run[:2] + lrec[2:]).dumps()).records
-    assert ladder.runner_prefix_compare(decoded_l, decoded_r, 4) == {"compared": 4, "first_divergence": None, "neutral": [1], "identical_before_branch": True}
+    assert ladder.runner_prefix_compare(decoded_l, decoded_r, 4) == {
+        "compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [],
+        "identical_before_branch": True}
     as_exc_l = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in lrec]  # the form Tape.load gives a file's records
     as_exc_r = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in run[:2] + lrec[2:]]
     assert ladder.runner_prefix_compare(as_exc_l, as_exc_r, 4)["neutral"] == [1] and ladder.runner_prefix_compare(as_exc_l, as_exc_r, 4)["identical_before_branch"]

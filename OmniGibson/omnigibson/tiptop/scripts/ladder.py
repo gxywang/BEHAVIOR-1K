@@ -932,11 +932,29 @@ def exc_type(e) -> Optional[str]:
     return e.get("type") if isinstance(e, dict) else getattr(e, "type", None)
 
 
+def on_shared_digest_keys(a: dict, b: dict) -> tuple:
+    """Two records with each write's state digest (before, after) cut to the keys both carry, as scripts/tape_diff.py
+    compares digests: a tape recorded before a digest key existed (the tracked objects' joints, the fix pass) meets a
+    newer one on what both measured."""
+    da, db = a.get("digest"), b.get("digest")
+    if not (isinstance(da, (list, tuple)) and isinstance(db, (list, tuple)) and len(da) == len(db)):
+        return a, b
+    cut_a, cut_b = [], []
+    for x, y in zip(da, db):
+        if isinstance(x, dict) and isinstance(y, dict):
+            keys = set(x) & set(y)
+            x, y = {k: x[k] for k in keys}, {k: y[k] for k in keys}
+        cut_a.append(x)
+        cut_b.append(y)
+    return {**a, "digest": cut_a}, {**b, "digest": cut_b}
+
+
 def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: Optional[int]) -> dict:
     """The run's Runner tape against the L-rec's before the branch write's record: the first record that differs
-    beyond a neutral pair, and the neutral pairs met on the way."""
+    beyond a neutral pair, and the neutral pairs met on the way. A write's state digest is compared on the keys both
+    carry (``digest_keys_one_side``: the records where one side has a key the other lacks)."""
     n = len(lrec_records) if branch_record is None else min(branch_record, len(lrec_records))
-    neutral, first = [], None
+    neutral, one_sided, first = [], [], None
     for i in range(n):
         if i >= len(run_records):
             first = {"index": i, "why": "the run's tape is shorter"}
@@ -944,13 +962,18 @@ def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: 
         a, b = lrec_records[i], run_records[i]
         if a == b:
             continue
+        cut_a, cut_b = on_shared_digest_keys(a, b)
+        if cut_a == cut_b:
+            one_sided.append(i)
+            continue
         if neutral_pair(a, b):
             neutral.append(i)
             continue
         first = {"index": i, "kind": "decision" if a.get("kind") == "write" or a.get("member") != b.get("member") or a.get("args") != b.get("args") else "answer",
                  "member": a.get("member"), "a": json.dumps(a, default=str)[:300], "b": json.dumps(b, default=str)[:300]}
         break
-    return {"compared": n, "first_divergence": first, "neutral": neutral, "identical_before_branch": first is None}
+    return {"compared": n, "first_divergence": first, "neutral": neutral, "digest_keys_one_side": one_sided,
+            "identical_before_branch": first is None}
 
 
 def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], branch_record: Optional[int],
@@ -981,6 +1004,7 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
         out["runner_prefix"] = {"first_divergence_raw": idx, "kind_raw": None if fd is None else fd.get("kind"),
                                 "records": runner.get("records"), "branch_record": branch_record,
                                 "first_divergence": cmp["first_divergence"], "neutral_pairs": cmp["neutral"],
+                                "digest_keys_one_side": cmp["digest_keys_one_side"],
                                 "identical_before_branch": cmp["identical_before_branch"],
                                 "writes_before_branch": len(before_branch),
                                 "writes_before_branch_equal": all(w["delta_a"] == w["delta_b"] and w["digest_before_equal"]
