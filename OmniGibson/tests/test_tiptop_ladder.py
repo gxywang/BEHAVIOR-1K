@@ -360,7 +360,10 @@ def test_the_arm_command_lines(tmp_path):
     assert w[w.index("--task-name") + 1] == "cook_bacon" and w[w.index("--routing-profile") + 1] == "native"
     assert [w[i + 1] for i, x in enumerate(w) if x == "--route"] == ["press=tiptop", "place.on=tiptop"] and w[w.index("--wstape") + 1] == "record"
     cs = ladder.carried_specs(("dispose_of_batteries",))
-    assert cs[0].profile == "native" and cs[0].routes == [] and cs[0].planner and cs[0].wstape == "record"
+    assert cs[0].profile == "native" and cs[0].planner and cs[0].wstape == "record"
+    assert cs[0].routes == ["place.on=tiptop", "close.prismatic=tiptop"], "NATIVE plus every ladder line: the full native profile"
+    ca = cs[0].bench_args(8870)
+    assert [ca[i + 1] for i, x in enumerate(ca) if x == "--route"] == ["place.on=tiptop", "close.prismatic=tiptop"]
     text = ladder.launcher_text(specs[1], 8851, 3, Path("/snap/w4ladder"))
     assert "S=/snap/w4ladder" in text and "tiptop-server" in text and "--wstape-live-at 2" in text and "kill -TERM $ppid" in text
     assert "setsid env" in text and "OMP_NUM_THREADS=8" in text and "PYTHONHASHSEED=2300" in text and "CUDA_VISIBLE_DEVICES=$gpu" in text
@@ -609,3 +612,108 @@ def test_the_ordinal_pairing_names_the_same_write_once_the_sequences_part(tmp_pa
     table = ladder.ordinal_pairing(runs, "place.on")
     assert ladder.switched_failed_where_c_succeeded(table) == [{"ordinal": 2, "c_ok": [True], "t_failed": [("T0", "no_placement")]}]
     assert ladder.ordinal_pairing(runs, "place.in") == [], "no place.in in either run"
+
+
+# ------------------------------------------------------------- U0's amended identity and the expected run count
+def test_the_u0_reading_is_the_amended_identity_when_episode_over_cuts_a_live_run():
+    """WEEK4_PLAN 5.6: step - idle == sum(charged) + L + X with idle 0, and L and X 0 unless EpisodeOver ended the
+    episode. bringing_in_wood T1's block: 741 == 536 + 204 + 1, its native place q1-7 still live at the success."""
+    cut = _block(step=741, charged={"skill": 536, "go_to": 0, "observe": 0}, u0a={"ok": True, "L": 204, "X": 1, "episode_over": True})
+    u = ladder.u0_of(cut)
+    assert u["identity"] and u["exact"] and (u["L"], u["X"], u["episode_over"]) == (204, 1, True)
+    assert not ladder.u0_of(dict(cut, step=740))["identity"], "a step short of the amended sum"
+    assert not ladder.u0_of(dict(cut, u0a={"ok": True, "L": 204, "X": 1, "episode_over": False}))["identity"], \
+        "L and X count only when EpisodeOver ended the episode"
+    assert not ladder.u0_of(_block(step=125, idle_steps=5))["identity"], "idle_steps must be 0, not subtracted away"
+
+
+def test_a_stage_with_a_replicate_missing_does_not_pass(tmp_path, monkeypatch):
+    """runs_expected is two arms x the replicates on every task with a branch, not the run dirs that happen to
+    exist: rearrange_your_room T1 was moved aside after a stall, and 17 of 17 must not read as a complete stage."""
+    monkeypatch.setattr(ladder, "OUT", tmp_path)
+    monkeypatch.setitem(ladder.STAGES, "S1", ladder.Stage("S1", "place.on=tiptop", None, ("demo",)))
+    task = "demo"
+    plan = {"tasks": {task: {"branch": {"write": 1, "record": 5, "member": "put_down", "line": "place.on", "call_id": "q1-2",
+                                        "backend_c": "legacy", "backend_t": "tiptop"},
+                             "frame": 2, "floor": {}, "tape": str(tmp_path / "lrec" / "tapes" / "demo_301_0.json"), "writes": []},
+                      "other": {"branch": None}}}
+    (tmp_path / "S1").mkdir()
+    (tmp_path / "S1" / "plan.json").write_text(json.dumps(plan))
+    for arm in ("C", "T"):
+        d = ladder.run_dir("S1", task, arm, 0)
+        _bench_job(d, connector_block=_block(), rounds=ROUNDS_CUT[:1], gripper=[], calls=CALL_ROWS)
+        (d / "job_end.json").write_text('{"ended": 1}')
+    g = ladder.gate_stage("S1", Path("/snap"))
+    v = g["verdict"]
+    assert (v["runs_ended"], v["runs_expected"]) == (2, 6) and not v["pass"]
+
+
+# ------------------------------------------------------ a C cut-off is a success; on-air causes; after each native call
+def test_a_c_row_cut_off_at_success_counts_as_a_success_against_a_failed_treatment():
+    """rearrange T2: its fourth place.on failed placed_wrong where every C's fourth was the write EpisodeOver cut
+    off at the task's success. That C row delivered the goal, so T2's failure is listed as the switched skill
+    failing where C's succeeded."""
+    cut = {"call_id": "q1-8", "backend": "(cut off at success)", "status": "cut_off", "code": None, "steps": None, "scorer": True, "returned": None}
+    failed = {"call_id": "q1-8", "backend": "tiptop@x/place-1", "status": "failed", "code": "placed_wrong", "steps": 429, "scorer": False, "returned": False}
+    row = {"ordinal": 4, "C0": cut, "C1": dict(cut), "T0": dict(cut), "T2": failed}
+    assert ladder.switched_failed_where_c_succeeded([row]) == [{"ordinal": 4, "c_ok": [True, True], "t_failed": [("T2", "placed_wrong")]}]
+    assert ladder.switched_failed_where_c_succeeded([dict(row, T2=dict(cut))]) == [], "T cut off too: nothing failed"
+
+
+def test_on_air_causes_name_the_owning_calls_row_and_whether_the_call_held_later():
+    run = {"skill_calls": [{"call_id": "q1-6", "skill": "pick_up", "backend": "legacy", "status": "succeeded", "code": None},
+                           {"call_id": "q1-7", "skill": "place", "backend": "tiptop@x/place-1", "status": "failed", "code": "placed_wrong"}],
+           "gripper": [{"step": 5, "arm": "left", "event": "close", "is_grasping": -1, "owner": "ep.pick", "call_id": "q1-6"},
+                       {"step": 6, "arm": "left", "event": "open", "is_grasping": -1, "owner": "ep.pick", "call_id": "q1-6"},
+                       {"step": 9, "arm": "left", "event": "close", "is_grasping": 1, "owner": "ep.pick", "call_id": "q1-6"},
+                       {"step": 12, "arm": "left", "event": "close", "is_grasping": -1, "owner": "rt", "call_id": "q1-7"}]}
+    causes = ladder.on_air_causes(run)
+    assert [(c["call_id"], c["skill"], c["native"], c["held_later_in_the_call"]) for c in causes] == \
+        [("q1-6", "pick_up", False, True), ("q1-7", "place", True, False)], "an open on air is not a close"
+
+
+def test_after_native_lists_the_phase_and_the_legacy_calls_up_to_the_next_native_one():
+    """bringing_in_wood T2: a native place that ended in phase retreat, then four legacy picks refused with
+    no_stance_here at 0 steps."""
+    rows = [{"call_id": "q1-1", "skill": "pick_up", "backend": "legacy", "status": "succeeded", "code": None, "steps": 887},
+            {"call_id": "q1-2", "skill": "place", "backend": "tiptop@x/place-1", "status": "succeeded", "code": None, "phase": "retreat", "steps": 288}]
+    rows += [{"call_id": f"q1-{k}", "skill": "pick_up", "backend": "legacy", "status": "infeasible", "code": "no_stance_here", "steps": 0} for k in (3, 4)]
+    rows += [{"call_id": "q1-5", "skill": "place", "backend": "tiptop@x/place-1", "status": "succeeded", "code": None, "phase": "home", "steps": 220}]
+    out = ladder.after_native({"skill_calls": rows})
+    assert [(x["call_id"], x["phase"], [t[0] for t in x["then"]]) for x in out] == [("q1-2", "retreat", ["q1-3", "q1-4"]), ("q1-5", "home", [])]
+    assert out[0]["then"][0] == ("q1-3", "pick_up", "infeasible", "no_stance_here", 0)
+
+
+def test_a_branched_task_outside_the_stages_list_is_carried_with_its_reason(tmp_path, monkeypatch):
+    """attach and composting have a place.on branch in their L-rec (the floor put_down after a failed goal) past
+    their A/A floor: they are not S1's arms, the gate says why, and they do not count toward the expected runs."""
+    monkeypatch.setattr(ladder, "OUT", tmp_path)
+    assert ladder.STAGES["S1"].tasks == ("bringing_in_wood", "rearrange_your_room", "tidying_bedroom")
+    assert ladder.STAGES["S2"].tasks == ("store_honey",)
+    plan = {"tasks": {"attach_a_camera_to_a_tripod": {"branch": {"write": 5, "record": 47, "member": "put_down", "line": "place.on"},
+                                                      "frame": 6, "floor": {"frame": 3}},
+                      "dispose_of_batteries": {"branch": None}}}
+    (tmp_path / "S1").mkdir()
+    (tmp_path / "S1" / "plan.json").write_text(json.dumps(plan))
+    g = ladder.gate_stage("S1", Path("/snap"))
+    note = g["tasks"]["attach_a_camera_to_a_tripod"]["note"]
+    assert note.startswith("not a stage task: carried forward") and "past the floor" in note
+    assert g["verdict"]["runs_expected"] == 0 and not g["verdict"]["pass"]
+    assert [s.task for s in ladder.stage_specs("S1", {"tasks": {**plan["tasks"], "bringing_in_wood": {"branch": {"write": 2}, "frame": 2, "tapes": {"0": "/t"}}}},
+                                                tasks=ladder.STAGES["S1"].tasks, reps=(0,))] == ["bringing_in_wood", "bringing_in_wood"]
+
+
+def test_the_carried_gate_lists_each_native_call_and_writes_its_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(ladder, "OUT", tmp_path)
+    monkeypatch.setattr(ladder, "CARRIED", ("demo",))
+    d = ladder.run_dir("carried", "demo", "native", 0)
+    native_row = {"call_id": "q1-4", "skill": "place", "backend": "tiptop@x/place-1", "status": "succeeded", "code": None, "phase": "home",
+                  "steps": 300, "effects": [{"pred": "ontop", "args": ["a", "floor"], "value": True}], "verdicts": {"scorer": True}}
+    _bench_job(d, connector_block=_block(), rounds=ROUNDS_CUT[:1], gripper=[], calls=CALL_ROWS + [native_row])
+    (d / "job_end.json").write_text('{"ended": 1}')
+    g = ladder.gate_carried(Path("/snap"))
+    r = g["runs"]["demo"]
+    assert [x["call_id"] for x in r["native_rows"]] == ["q1-4"] and g["verdict"]["native_calls"] == {"demo": 1}
+    assert g["verdict"]["runs_ended"] == 1 and g["verdict"]["hard_ok"]
+    md = ladder.carried_md(g)
+    assert "native: `q1-4` place on tiptop@x/place-1 succeeded/None phase home steps 300" in md and "| demo | True |" in md

@@ -108,9 +108,16 @@ class Stage:
     name: str
     line: Optional[str]  # the --route this stage adds; None for the non-ladder stages
     prev: Optional[str]
+    tasks: tuple = ()  # the tasks whose arms the stage runs (WEEK4_PLAN 5.8, BASE.md 5)
 
 
-STAGES = {"S1": Stage("S1", "place.on=tiptop", None), "S2": Stage("S2", "close.prismatic=tiptop", "S1")}
+# attach_a_camera_to_a_tripod and composting_waste call place.on once in their L-rec (a floor put_down after the goal
+# failed twice; legacy_ref/calls_table.md), which BASE.md's count from the historical jobs does not have. Their branch
+# frames (6 and 9) lie past their A/A floor (frame 3, where every W4-F2 E-rep of either diverged), so an arm pair
+# would go live on both arms before the branch and meet the put_down only if the live run repeats the failures: not
+# the plan's arms. They are carried forward; the carried run routes the line natively and reports the call if reached.
+STAGES = {"S1": Stage("S1", "place.on=tiptop", None, ("bringing_in_wood", "rearrange_your_room", "tidying_bedroom")),
+          "S2": Stage("S2", "close.prismatic=tiptop", "S1", ("store_honey",))}
 CARRIED = ("attach_a_camera_to_a_tripod", "composting_waste", "dispose_of_batteries", "store_honey")
 
 
@@ -451,9 +458,15 @@ def stage_specs(stage: str, plan: dict, tasks=None, reps=REPS, arms=("C", "T")) 
     return specs
 
 
+def carried_routes() -> list:
+    """The ladder's lines on top of NATIVE (the full native profile once every stage is in): routing.yaml does not
+    route place.on yet, and close.prismatic is already its line."""
+    return stage_routes(list(STAGES)[-1])[1]
+
+
 def carried_specs(tasks=CARRIED) -> list[RunSpec]:
-    return [RunSpec("carried", t, "native", 0, run_dir("carried", t, "native", 0), "native", [], "record", None, None,
-                    True, seed=0) for t in tasks]
+    return [RunSpec("carried", t, "native", 0, run_dir("carried", t, "native", 0), "native", carried_routes(), "record", None,
+                    None, True, seed=0) for t in tasks]
 
 
 def witness_spec() -> RunSpec:
@@ -803,11 +816,16 @@ def u0_of(c: Optional[dict]) -> dict:
         return {"exact": False, "note": "no connector block"}
     charged = c.get("charged") or {}
     ok = lambda k: bool((c.get(k) or {}).get("ok"))  # noqa: E731
+    a = c.get("u0a") or {}
+    # WEEK4_PLAN 5.6's amended identity: step - idle == sum(charged) + L + X, idle 0, and L and X both 0 unless the
+    # episode ended in EpisodeOver (L: the steps of a run still live at the end; X: 1 iff it was raised in env_step)
+    live, over, episode_over = int(a.get("L") or 0), int(a.get("X") or 0), bool(a.get("episode_over"))
     out = {"step": c.get("step"), "idle_steps": c.get("idle_steps"), "charged": charged,
-           "identity": c.get("step") is not None and c.get("step") - (c.get("idle_steps") or 0) == sum(charged.values()),
+           "identity": c.get("step") is not None and c.get("step") - (c.get("idle_steps") or 0) == sum(charged.values()) + live + over
+           and not c.get("idle_steps") and (episode_over or (live == 0 and over == 0)),
            "u0a": ok("u0a"), "u0b": ok("u0b"), "u0c": ok("u0c"), "u0d": ok("u0d"), "rule2": ok("rule2"), "build": ok("build"),
            "hand_refresh_ok": bool((c.get("hand_refresh") or {}).get("ok", True)), "block_ok": bool(c.get("ok")),
-           "L": (c.get("u0a") or {}).get("L"), "X": (c.get("u0a") or {}).get("X"), "reason": c.get("reason")}
+           "L": a.get("L"), "X": a.get("X"), "episode_over": episode_over, "reason": c.get("reason")}
     out["exact"] = out["identity"] and out["u0a"] and out["u0b"] and out["u0c"] and out["u0d"] and out["build"]
     return out
 
@@ -987,14 +1005,52 @@ def ordinal_pairing(runs: dict, switched: str) -> list:
 
 
 def switched_failed_where_c_succeeded(ordinal: list) -> list:
-    """The cause the stage fails on: at an ordinal where a C run's switched call succeeded, a T run's failed."""
+    """The cause the stage fails on: at an ordinal where a C run's switched call succeeded, a T run's failed. A C row
+    EpisodeOver cut off at the task's success delivered its goal, so it counts as a success."""
     out = []
     for row in ordinal:
-        c_ok = [v["returned"] is True and v["scorer"] is True for k, v in row.items() if k[:1] == "C" and isinstance(v, dict)]
+        c_ok = [(v["returned"] is True and v["scorer"] is True) or v["status"] == "cut_off"
+                for k, v in row.items() if k[:1] == "C" and isinstance(v, dict)]
         t = [(k, v) for k, v in row.items() if k[:1] == "T" and isinstance(v, dict)]
         t_bad = [(k, v["code"]) for k, v in t if not (v["returned"] is True and v["scorer"] is True) and v["status"] != "cut_off"]
         if c_ok and any(c_ok) and t_bad:
             out.append({"ordinal": row["ordinal"], "c_ok": c_ok, "t_failed": t_bad})
+    return out
+
+
+def on_air_causes(run: dict) -> list:
+    """(b)'s on-air closes (GripperWatch, is_grasping -1), each with its owning call's skill row (skill, backend,
+    status/code) and whether a later close inside the same call held (the call's own next round)."""
+    rows = {r.get("call_id"): r for r in run.get("skill_calls") or []}
+    grip = run.get("gripper") or []
+    out = []
+    for i, g in enumerate(grip):
+        if g.get("event") != "close" or g.get("is_grasping") != -1:
+            continue
+        r = rows.get(g.get("call_id")) or {}
+        out.append({"step": g.get("step"), "arm": g.get("arm"), "owner": g.get("owner"), "call_id": g.get("call_id"),
+                    "skill": r.get("skill"), "backend": r.get("backend"), "status": r.get("status"), "code": r.get("code"),
+                    "native": bool(r) and r.get("backend") != "legacy",
+                    "held_later_in_the_call": any(x.get("event") == "close" and x.get("is_grasping") == 1
+                                                  and x.get("call_id") == g.get("call_id") for x in grip[i + 1:])})
+    return out
+
+
+def after_native(run: dict) -> list:
+    """Each native skill row with the phase it ended in, then the legacy rows up to the next native one: a posture a
+    native run leaves behind shows where the next legacy call pays for it."""
+    rows = run.get("skill_calls") or []
+    out = []
+    for i, r in enumerate(rows):
+        if r.get("backend") == "legacy":
+            continue
+        following = []
+        for x in rows[i + 1:]:
+            if x.get("backend") != "legacy":
+                break
+            following.append((x.get("call_id"), x.get("skill"), x.get("status"), x.get("code"), x.get("steps")))
+        out.append({"call_id": r.get("call_id"), "skill": r.get("skill"), "status": r.get("status"), "code": r.get("code"),
+                    "phase": r.get("phase"), "steps": r.get("steps"), "then": following})
     return out
 
 
@@ -1041,9 +1097,16 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
     backend = STAGES[stage].line.split("=")[1]
     g = {"stage": stage, "line": STAGES[stage].line, "switched": switched, "snap": str(snap), "tasks": {}, "runs": {}}
     pairs, per_task = {}, {}
+    stage_tasks = STAGES[stage].tasks
     for task, p in plan["tasks"].items():
         if p.get("branch") is None:
             g["tasks"][task] = {"branch": None, "note": "no write routed differently: carried forward"}
+            continue
+        if stage_tasks and task not in stage_tasks:
+            fl = (p.get("floor") or {}).get("frame")
+            g["tasks"][task] = {"branch": p["branch"], "frame": p.get("frame"), "note":
+                                f"not a stage task: carried forward (branch frame {p.get('frame')}, A/A floor frame {fl}"
+                                + (": the branch lies past the floor, so both arms would go live before it)" if fl is not None and p.get("frame") is not None and p["frame"] > fl else ")")}
             continue
         runs = {}
         for rep in REPS:
@@ -1069,7 +1132,8 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
                                     "imports": run.get("imports"), "planner_imports": run.get("planner_imports"), "video": run.get("video"),
                                     "legacy": legacy_dependencies(run), "hand_refresh": (run.get("connector") or {}).get("hand_refresh"),
                                     "d21_debt": rule2_of(run.get("connector")).get("d21_debt"), "calls": (run.get("connector") or {}).get("calls"),
-                                    "charged": (run.get("connector") or {}).get("charged"), "live_index": [(x.get("i"), x.get("op"), x.get("owner"), x.get("call_id")) for x in run.get("live_index") or []][:40]}
+                                    "charged": (run.get("connector") or {}).get("charged"), "live_index": [(x.get("i"), x.get("op"), x.get("owner"), x.get("call_id")) for x in run.get("live_index") or []][:40],
+                                    "on_air_causes": on_air_causes(run), "after_native": after_native(run)}
             g["runs"][f"{task}/{key}"] = t_entry["runs"][key]
         for (arm, rep), run in runs.items():
             run["cut_off_delivery"] = cut_off_delivery(run, switched)
@@ -1077,10 +1141,12 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
         t_entry["ordinal"] = ordinal_pairing(runs, switched)
         t_entry["switched_failed_where_c_succeeded"] = switched_failed_where_c_succeeded(t_entry["ordinal"])
         t_entry["structural"] = structural_shifts({k: r for k, r in runs.items() if r["ended"]}, (p["branch"] or {}).get("write", 0))
-        C = [counters.extract(Path(run["out"])) for (a, _), run in sorted(runs.items()) if a == "C" and run["ended"]]
-        T = [counters.extract(Path(run["out"])) for (a, _), run in sorted(runs.items()) if a == "T" and run["ended"]]
+        ended_ = [(a, rep, run) for (a, rep), run in sorted(runs.items()) if run["ended"]]
+        C = [counters.extract(Path(run["out"])) for a, _, run in ended_ if a == "C"]
+        T = [counters.extract(Path(run["out"])) for a, _, run in ended_ if a == "T"]
         pairs[task] = (C, T)
         t_entry["counters"] = {"C": [c.as_dict() for c in C], "T": [t.as_dict() for t in T]}
+        t_entry["counters_keys"] = {arm: [f"{a}{rep}" for a, rep, _ in ended_ if a == arm] for arm in ("C", "T")}
         per_task[task] = t_entry
         g["tasks"][task] = t_entry
     cmp = counters.compare(pairs, switched, backend=None) if pairs else None
@@ -1116,7 +1182,9 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
         "c_primary": None if cmp is None or cmp.pooled is None else not cmp.pooled.fail,
         "d_flags_fail": any(x["switched_failed_where_c_succeeded"] for x in flags_fail),
         "runs_ended": sum(1 for t in per_task.values() for r in t["runs"].values() if r["ended"]),
-        "runs_expected": sum(len(t["runs"]) for t in per_task.values()),
+        # two arms x the replicates on every task with a branch, whether or not its run dir exists yet
+        "runs_expected": 2 * len(REPS) * sum(1 for t, p in plan["tasks"].items() if p.get("branch") is not None
+                                             and (not stage_tasks or t in stage_tasks)),
     }
     verdict["pass"] = bool(verdict["a_prefix"] and verdict["b_hard"] and verdict["c_primary"] is not False and not verdict["d_flags_fail"]
                            and verdict["runs_ended"] == verdict["runs_expected"] and verdict["runs_ended"] > 0)
@@ -1138,8 +1206,45 @@ def gate_carried(snap: Path = SNAP) -> dict:
                              "legacy": legacy_dependencies(run), "calls": (run.get("connector") or {}).get("calls"),
                              "hand_refresh": (run.get("connector") or {}).get("hand_refresh"), "imports": run.get("imports"),
                              "planner_imports": run.get("planner_imports"), "video": run.get("video"),
-                             "routing_profile": (run.get("connector") or {}).get("routing_profile"), "routes": (run.get("connector") or {}).get("routes")}
+                             "routing_profile": (run.get("connector") or {}).get("routing_profile"), "routes": (run.get("connector") or {}).get("routes"),
+                             "native_rows": [{k: r.get(k) for k in ("call_id", "skill", "backend", "status", "code", "phase", "steps")}
+                                             for r in run.get("skill_calls") or [] if r.get("backend") != "legacy"],
+                             "after_native": after_native(run), "on_air_causes": on_air_causes(run),
+                             "d21_debt": rule2_of(run.get("connector")).get("d21_debt")}
+    runs = out["runs"].values()
+    out["verdict"] = {"runs_ended": sum(1 for r in runs if r["ended"]), "runs_expected": len(CARRIED),
+                      "hard_ok": all(r["hard"]["ok"] for r in runs if r["ended"]),
+                      "native_calls": {t: len(r["native_rows"]) for t, r in out["runs"].items() if r["ended"]}}
     return out
+
+
+def carried_md(g: dict) -> str:
+    v = g["verdict"]
+    o = ["# Carried-forward tasks (W4-I, WEEK4_PLAN 5.8): one NATIVE full-profile run each, replicate 0", "",
+         f"Profile: NATIVE (routing.yaml) plus the ladder's lines `{' '.join(carried_routes())}`, live, from the snapshot. "
+         f"Runs ended {v['runs_ended']}/{v['runs_expected']}; hard items on every ended run {v['hard_ok']}; "
+         f"native calls per task {v['native_calls']} (each reported below).", ""]
+    causes = OUT / "carried" / "causes.md"
+    if causes.exists():
+        o += [causes.read_text().rstrip(), ""]
+    o += ["| task | ended | RESULT | U0 exact | rule2 | hand refresh | on-air | native calls | legacy deps | score |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
+    for task, r in g["runs"].items():
+        res, hv, hr = r["result"], r["hard"], r.get("hand_refresh") or {}
+        res_s = "" if not res else "{}/{} ({}) tp {}".format(res["steps"], res["max_steps"], res["reason"], res["teleports"])
+        o.append(f"| {task} | {r['ended']} | {res_s} | {hv['u0']['exact']} | {hv['rule2']['ok']} | {hr.get('count')} / {hr.get('popped_total')} | "
+                 f"{len(hv['on_air'])} | {len(r['native_rows'])} | {r['legacy']} | {'' if not res else res['q_score']} |")
+    o.append("")
+    for task, r in g["runs"].items():
+        o += [f"## {task}", "", f"- run `{r['out']}`; routes {r.get('routes')}; profile {r.get('routing_profile')}",
+              f"- imports: `{r.get('imports')}`", f"- video: `{r.get('video')}`", f"- D21 debt: {r.get('d21_debt')}"]
+        o += [f"- native: `{x['call_id']}` {x['skill']} on {x['backend']} {x['status']}/{x['code']} phase {x['phase']} steps {x['steps']}"
+              for x in r["native_rows"]] or ["- native calls: none"]
+        o += [f"- after `{x['call_id']}` (phase {x['phase']}): {x['then'] or 'nothing'}" for x in r["after_native"]]
+        o += [f"- on-air close step {x['step']}: `{x['owner']}` `{x['call_id']}` = {x['skill']} on {x['backend']} ({x['status']}/{x['code']})"
+              for x in r["on_air_causes"]]
+        o.append("")
+    return "\n".join(o)
 
 
 def gate_witness(snap: Path = SNAP) -> dict:
@@ -1211,6 +1316,9 @@ def gate_md(g: dict) -> str:
          f"Snapshot `{g['snap']}`. Switched skill `{g['switched']}`. Verdict: **{'PASS' if g['verdict']['pass'] else 'FAIL'}** "
          f"(a prefix {g['verdict']['a_prefix']}, b hard {g['verdict']['b_hard']}, c primary {g['verdict']['c_primary']}, "
          f"d flag-caused-by-switch {g['verdict']['d_flags_fail']}, runs {g['verdict']['runs_ended']}/{g['verdict']['runs_expected']}).", ""]
+    causes = OUT / g["stage"] / "causes.md"
+    if causes.exists():
+        o += [causes.read_text().rstrip(), ""]
     if g.get("compare_text"):
         o += ["## (c) primary and (d) counters (counters.py compare)", "", "```", g["compare_text"], "```", ""]
         cc = g.get("compare_with_cut_off")
@@ -1236,6 +1344,15 @@ def gate_md(g: dict) -> str:
             o.append(f"| {key} | {r['ended']} | {res_s} | {pv['ok']}{within} | {pv['switched_at']} | {hv['ok']} | "
                      f"{hv['u0']['exact']} | {hv['rule2']['ok']} | {hv['reason'] if hv['crash'] else '-'} | {len(hv['on_air'])} | "
                      f"{hr.get('count')} / {hr.get('popped_total')} | {r['legacy']} | {'' if not res else res['q_score']} |")
+        on_air = [(key, x) for key, r in t["runs"].items() for x in r.get("on_air_causes") or []]
+        o += ["", "On-air closes (b), each with its owning call from GripperWatch and that call's skill row:", ""]
+        o += [f"- {key} step {x['step']} {x['arm']}: owner `{x['owner']}` call `{x['call_id']}` = {x['skill']} on {x['backend']} "
+              f"({x['status']}/{x['code']}); {'native' if x['native'] else 'not a native run'}; "
+              f"{'a later close in the same call held' if x['held_later_in_the_call'] else 'no later close in the call held'}"
+              for key, x in on_air] or ["- none"]
+        o += ["", "After each native call: the phase it ended in, then the legacy calls up to the next native one (call, skill, status/code, steps):", ""]
+        o += [f"- {key} `{x['call_id']}` {x['skill']} {x['status']}/{x['code']} phase {x['phase']} steps {x['steps']} -> {x['then'] or 'nothing'}"
+              for key, r in t["runs"].items() for x in r.get("after_native") or []] or ["- no native call"]
         o += ["", "Per-call table (the switched skill at the same Runner write; each cell: backend, status/code, steps, scorer, returned):", ""]
         cols = sorted(k for row in t["pairing"] for k in row if k[:1] in "CT" and k[1:].isdigit())
         cols = sorted(set(cols))
@@ -1261,7 +1378,8 @@ def gate_md(g: dict) -> str:
             o.append(f"- r{s['rep']}: first difference at write {s['first_difference']}; T extra {s['t_extra']}; C extra {s['c_extra']}")
         o += ["", "Counters (raw; compare normalises per delivered atom):", ""]
         names_ = [c.name for c in counters.COUNTERS]
-        o += ["| counter | " + " | ".join(f"C{i}" for i in range(len(t['counters']['C']))) + " | " + " | ".join(f"T{i}" for i in range(len(t['counters']['T']))) + " |",
+        keys_ = t.get("counters_keys") or {arm: [f"{arm}{i}" for i in range(len(t["counters"][arm]))] for arm in ("C", "T")}
+        o += ["| counter | " + " | ".join(keys_["C"]) + " | " + " | ".join(keys_["T"]) + " |",
               "|---|" + "---|" * (len(t['counters']['C']) + len(t['counters']['T']))]
         for n in names_:
             o.append(f"| {n} | " + " | ".join(_f(c.get(n)) for c in t['counters']['C']) + " | " + " | ".join(_f(c.get(n)) for c in t['counters']['T']) + " |")
@@ -1305,7 +1423,7 @@ def main(argv=None) -> int:
         (OUT / a.stage).mkdir(parents=True, exist_ok=True)
         if a.stage in STAGES:
             plan = json.loads((OUT / a.stage / "plan.json").read_text())
-            specs = stage_specs(a.stage, plan, tasks=a.tasks, reps=reps, arms=arms)
+            specs = stage_specs(a.stage, plan, tasks=a.tasks or STAGES[a.stage].tasks, reps=reps, arms=arms)
         elif a.stage == "carried":
             specs = carried_specs(tuple(a.tasks) if a.tasks else CARRIED)
         elif a.stage == "witness":
@@ -1324,6 +1442,8 @@ def main(argv=None) -> int:
             print(json.dumps(g["verdict"], indent=1))
         elif a.stage == "carried":
             g = gate_carried(a.snap)
+            (OUT / "carried").mkdir(parents=True, exist_ok=True)
+            (OUT / "carried" / "GATE.md").write_text(carried_md(g))
         elif a.stage == "witness":
             g = gate_witness(a.snap)
         elif a.stage == "strict":
