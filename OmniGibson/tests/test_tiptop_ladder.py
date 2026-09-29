@@ -655,7 +655,7 @@ def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_n
     run[1] = dict(run[1], exc={"type": "KeyError", "module": "builtins", "message": "'no distance between floor.n.01_2 and a'",
                                 "args": ["no distance between floor.n.01_2 and a"]})
     cmp = ladder.runner_prefix_compare(lrec, run, 4)
-    assert cmp == {"compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [],
+    assert cmp == {"compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [], "ignored_key_only": [],
                    "identical_before_branch": True}
     run[3] = dict(run[3], ret="table")
     cmp = ladder.runner_prefix_compare(lrec, run, 4)
@@ -674,7 +674,7 @@ def test_the_runner_prefix_treats_the_distance_keyerror_message_as_neutral_and_n
     decoded_l = tp.Tape.loads(tp.Tape({}, lrec).dumps()).records
     decoded_r = tp.Tape.loads(tp.Tape({}, run[:2] + lrec[2:]).dumps()).records
     assert ladder.runner_prefix_compare(decoded_l, decoded_r, 4) == {
-        "compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [],
+        "compared": 4, "first_divergence": None, "neutral": [1], "digest_keys_one_side": [], "ignored_key_only": [],
         "identical_before_branch": True}
     as_exc_l = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in lrec]  # the form Tape.load gives a file's records
     as_exc_r = [dict(r, exc=tp.Exc(**r["exc"])) if "exc" in r else r for r in run[:2] + lrec[2:]]
@@ -1002,6 +1002,12 @@ def test_a_success_on_air_is_not_explained_by_its_owner_and_a_fist_close_is_no_o
     assert not ladder.on_air_causes(regrasp)[0]["false_success"] and ladder.hard_verdict(regrasp, None, "native", set(), Path("/snap"))["on_air_explained"]
     refused = {**run, "skill_calls": [{**pick, "evidence": {"legacy_ok": False}}]}
     assert not ladder.on_air_causes(refused)[0]["false_success"], "a call that returned False reported what happened"
+    # a place whose plan re-picked and closed on air (the fix pass's tidying T1 q1-7) ends empty-handed by design
+    place = {"call_id": "q1-7", "skill": "place", "backend": "legacy", "status": "failed", "code": "placed_wrong",
+             "evidence": {"legacy_ok": True}, "verdicts": {"scorer": False}}
+    in_place = {"skill_calls": [place], "gripper": [{**air, "owner": "ep.achieve", "call_id": "q1-7"}]}
+    (y,) = ladder.on_air_causes(in_place)
+    assert y["returned"] is True and not y["false_success"] and ladder.hard_verdict(in_place, None, "native", set(), Path("/snap"))["on_air_explained"]
     fist = {"skill_calls": [{"call_id": "q1-1", "skill": "open", "backend": "legacy", "status": "succeeded", "evidence": {"legacy_ok": True}}],
             "gripper": [{**air, "owner": "ep.open_up", "via": "sim"}]}
     assert ladder.on_air_causes(fist) == [] and ladder.hard_verdict(fist, None, "native", set(), Path("/snap"))["on_air"] == []
@@ -1034,3 +1040,36 @@ def test_downstream_calls_and_the_refusals_after_a_switched_call():
     md = ladder.gate_md(g)
     assert "c2 downstream False" in md and "(c2) Downstream" in md and "T 5/10" in md and "FAIL" in md
     assert "pair calls by ordinal within each run, not at the same Runner write" in md
+
+
+def test_a_tolerated_capture_sets_the_capture_derived_digest_key_aside_and_nothing_else(tmp_path, monkeypatch):
+    """S1x's attach T0: the attach round's capture took the other render variant (frame 5, depth alone, tolerated),
+    and from that write on the digest's knowledge ``memory`` (built from the captures) differed while every physical
+    key matched. With a tolerated frame the prefix sets ``memory`` aside; any other key, or a step, still fails it;
+    without one, a memory difference fails it as before."""
+    def w(member, s0, s1, mem, objs="o1"):
+        d = lambda n, m: {"n_steps": n, "objects": objs, "memory": m, "robot": "r"}  # noqa: E731
+        return {"kind": "write", "member": member, "args": ("x",), "kwargs": {}, "ret": True, "step": [s0, s1],
+                "digest": [d(s0, "m0"), d(s1, mem)]}
+    lrec_recs = [w("pick", 0, 5, "m0"), w("achieve", 5, 9, "m1"), w("put_down", 9, 12, "m2")]
+    run_recs = [w("pick", 0, 5, "m0"), w("achieve", 5, 9, "mX"), w("put_down", 9, 15, "mY")]
+    lrec, mine = tmp_path / "lrec" / "episode" / "tapes" / "t.json", tmp_path / "run" / "episode" / "tapes" / "t.json"
+    for pth, recs in ((lrec, lrec_recs), (mine, run_recs)):
+        pth.parent.mkdir(parents=True, exist_ok=True)
+        tp.Tape({}, recs).save(pth)
+    per_write = [{"i": 0, "delta_a": 5, "delta_b": 5, "digest_before_equal": True, "digest_after_equal": True},
+                 {"i": 1, "delta_a": 4, "delta_b": 4, "digest_before_equal": True, "digest_after_equal": False}]
+    monkeypatch.setattr(ladder, "tape_diff", lambda snap, a, b: {"runner": {"first_divergence": {"index": 1}, "records": [3, 3],
+                                                                          "per_write": per_write}})
+    replay = [{"i": 0, "op": "metadata", "matched": True, "diffs": []}, {"i": 1, "op": "plan", "matched": True, "diffs": []},
+              {"i": 2, "op": "plan", "matched": False, "tolerated": True, "diffs": [{"path": "depth"}]}]
+    run = {"wstape": {"switched_at": 3, "switch_reason": "frame 3 forced live"}, "replay": replay, "runner_tape": str(mine)}
+    pv = ladder.prefix_verdict(run, 3, 2, 2, lrec, Path("/snap"), 2)
+    rp = pv["runner_prefix"]
+    assert pv["ok"] and rp["identical_before_branch"] and rp["capture_derived_only"] == [1] and rp["writes_before_branch_equal"]
+    assert rp["digest_keys_set_aside"] == ["memory"]
+    untolerated = {**run, "replay": [dict(r, tolerated=False) for r in replay[:2]] + [{"i": 2, "op": "plan", "matched": True, "diffs": []}]}
+    assert not ladder.prefix_verdict(untolerated, 3, 2, 2, lrec, Path("/snap"), 2)["ok"], "memory counts without a tolerated capture"
+    run_recs[1] = w("achieve", 5, 9, "mX", objs="o2")  # a physical key differs too
+    tp.Tape({}, run_recs).save(mine)
+    assert not ladder.prefix_verdict(run, 3, 2, 2, lrec, Path("/snap"), 2)["ok"]

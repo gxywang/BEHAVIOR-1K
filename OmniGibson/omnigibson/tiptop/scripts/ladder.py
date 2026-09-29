@@ -945,29 +945,35 @@ def exc_type(e) -> Optional[str]:
     return e.get("type") if isinstance(e, dict) else getattr(e, "type", None)
 
 
-def on_shared_digest_keys(a: dict, b: dict) -> tuple:
+# the state digest's capture-derived key: what the knowledge source has seen, built from the captures' renders. A
+# capture that took the other render variant (the A/A floor's kind) changes it and nothing physical
+CAPTURE_DERIVED = ("memory",)
+
+
+def on_shared_digest_keys(a: dict, b: dict, ignore: tuple = ()) -> tuple:
     """Two records with each write's state digest (before, after) cut to the keys both carry, as scripts/tape_diff.py
     compares digests: a tape recorded before a digest key existed (the tracked objects' joints, the fix pass) meets a
-    newer one on what both measured."""
+    newer one on what both measured. ``ignore``: keys left out as well (CAPTURE_DERIVED after a tolerated capture)."""
     da, db = a.get("digest"), b.get("digest")
     if not (isinstance(da, (list, tuple)) and isinstance(db, (list, tuple)) and len(da) == len(db)):
         return a, b
     cut_a, cut_b = [], []
     for x, y in zip(da, db):
         if isinstance(x, dict) and isinstance(y, dict):
-            keys = set(x) & set(y)
+            keys = (set(x) & set(y)) - set(ignore)
             x, y = {k: x[k] for k in keys}, {k: y[k] for k in keys}
         cut_a.append(x)
         cut_b.append(y)
     return {**a, "digest": cut_a}, {**b, "digest": cut_b}
 
 
-def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: Optional[int]) -> dict:
+def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: Optional[int], ignore: tuple = ()) -> dict:
     """The run's Runner tape against the L-rec's before the branch write's record: the first record that differs
     beyond a neutral pair, and the neutral pairs met on the way. A write's state digest is compared on the keys both
-    carry (``digest_keys_one_side``: the records where one side has a key the other lacks)."""
+    carry (``digest_keys_one_side``: the records where one side has a key the other lacks), minus ``ignore``
+    (``ignored_key_only``: the records that differed in those keys alone)."""
     n = len(lrec_records) if branch_record is None else min(branch_record, len(lrec_records))
-    neutral, one_sided, first = [], [], None
+    neutral, one_sided, ignored, first = [], [], [], None
     for i in range(n):
         if i >= len(run_records):
             first = {"index": i, "why": "the run's tape is shorter"}
@@ -979,6 +985,9 @@ def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: 
         if cut_a == cut_b:
             one_sided.append(i)
             continue
+        if ignore and on_shared_digest_keys(a, b, ignore)[0] == on_shared_digest_keys(a, b, ignore)[1]:
+            ignored.append(i)
+            continue
         if neutral_pair(a, b):
             neutral.append(i)
             continue
@@ -986,7 +995,26 @@ def runner_prefix_compare(lrec_records: list, run_records: list, branch_record: 
                  "member": a.get("member"), "a": json.dumps(a, default=str)[:300], "b": json.dumps(b, default=str)[:300]}
         break
     return {"compared": n, "first_divergence": first, "neutral": neutral, "digest_keys_one_side": one_sided,
-            "identical_before_branch": first is None}
+            "ignored_key_only": ignored, "identical_before_branch": first is None}
+
+
+def writes_equal_before(lrec_records: list, run_records: list, branch_write: Optional[int], ignore: tuple = ()) -> Optional[bool]:
+    """Every write before the branch write: the same step delta and the same state digest before and after, on the
+    keys both tapes carry minus ``ignore`` (tape_diff's per-write test, recomputed when a key is set aside)."""
+    wa = [r for r in lrec_records if r.get("kind") == "write"]
+    wb = [r for r in run_records if r.get("kind") == "write"]
+    if branch_write is None or len(wa) < branch_write or len(wb) < branch_write:
+        return None
+    for x, y in zip(wa[:branch_write], wb[:branch_write]):
+        sx, sy = x.get("step"), y.get("step")
+        sx = sx.get("$t") if isinstance(sx, dict) else sx
+        sy = sy.get("$t") if isinstance(sy, dict) else sy
+        if (sx is None) != (sy is None) or (sx and sy and (sx[1] - sx[0]) != (sy[1] - sy[0])):
+            return False  # a step probe on one side only, or another step delta
+        cx, cy = on_shared_digest_keys(x, y, ignore)
+        if cx.get("digest") != cy.get("digest"):
+            return False
+    return True
 
 
 def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], branch_record: Optional[int],
@@ -1018,15 +1046,23 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
         idx = None if fd is None else fd.get("index")
         pw = runner.get("per_write") or []
         before_branch = [w for w in pw if branch_write is not None and w.get("i", 0) < branch_write]
-        cmp = runner_prefix_compare(tp.Tape.load(lrec_tape).records, tp.Tape.load(run["runner_tape"]).records, branch_record)
+        # a capture served on the tolerance (a render variant, the A/A floor's kind) changes what the knowledge source
+        # has seen and nothing physical: the digest's CAPTURE_DERIVED key is set aside then, every other key compared
+        ignore = CAPTURE_DERIVED if tolerated else ()
+        ra, rb = tp.Tape.load(lrec_tape).records, tp.Tape.load(run["runner_tape"]).records
+        cmp = runner_prefix_compare(ra, rb, branch_record, ignore)
+        per_write_equal = all(w["delta_a"] == w["delta_b"] and w["digest_before_equal"] and w["digest_after_equal"]
+                              for w in before_branch)
         out["runner_prefix"] = {"first_divergence_raw": idx, "kind_raw": None if fd is None else fd.get("kind"),
                                 "records": runner.get("records"), "branch_record": branch_record,
                                 "first_divergence": cmp["first_divergence"], "neutral_pairs": cmp["neutral"],
                                 "digest_keys_one_side": cmp["digest_keys_one_side"],
+                                "capture_derived_only": cmp["ignored_key_only"], "digest_keys_set_aside": list(ignore),
                                 "identical_before_branch": cmp["identical_before_branch"],
                                 "writes_before_branch": len(before_branch),
-                                "writes_before_branch_equal": all(w["delta_a"] == w["delta_b"] and w["digest_before_equal"]
-                                                                  and w["digest_after_equal"] for w in before_branch)}
+                                "writes_before_branch_equal": per_write_equal if not ignore
+                                else bool(all(w["delta_a"] == w["delta_b"] for w in before_branch)
+                                          and writes_equal_before(ra, rb, branch_write, ignore))}
     rp = out["runner_prefix"]
     # the evidence must be there and say what (a) claims: every frame before N served and matched, the switch at N
     # (or, a divergence before it, at or past the A/A floor), the Runner tape compared, and every write before the
@@ -1182,7 +1218,7 @@ def _on_air(g: dict) -> bool:
 def on_air_causes(run: dict) -> list:
     """(b)'s on-air closes (GripperWatch, is_grasping -1), each with its owning call's skill row (skill, backend,
     status/code), whether a later close inside the same call held (the call's own next round), and what the call
-    returned to the Runner. ``false_success``: the call returned True and nothing in it held after the close: a
+    returned to the Runner. ``false_success``: a pick that returned True with nothing in it holding after the close: a
     success on air (HEAD's carried attach run: legacy's pick closed at step 883 on air and returned True), which the
     owning call names but does not explain (the gap closure after the week-4 critic)."""
     rows = {r.get("call_id"): r for r in run.get("skill_calls") or []}
@@ -1199,10 +1235,13 @@ def on_air_causes(run: dict) -> list:
             (r.get("status") == "succeeded" if r else None))
         held_later = any(x.get("event") == "close" and x.get("is_grasping") == 1 and x.get("call_id") == g.get("call_id")
                          for x in grip[i + 1:])
+        # a grasp's success means the hand holds: only a pick can succeed on air. A place whose plan re-picked and closed
+        # on air (tidying's final nextto, plan 5.8 (e)) ends empty-handed by design; its verdict is the scorer's
+        grasp = r.get("skill") == "pick_up" or (not r and str(g.get("owner")) == "ep.pick")
         out.append({"step": g.get("step"), "arm": g.get("arm"), "owner": g.get("owner"), "call_id": g.get("call_id"),
                     "skill": r.get("skill"), "backend": r.get("backend"), "status": r.get("status"), "code": r.get("code"),
                     "native": bool(r) and r.get("backend") != "legacy", "held_later_in_the_call": held_later,
-                    "returned": returned, "false_success": returned is True and not held_later})
+                    "returned": returned, "false_success": bool(grasp and returned is True and not held_later)})
     return out
 
 
@@ -1607,7 +1646,7 @@ def gate_md(g: dict) -> str:
          f"c2 downstream {v.get('c2_downstream')}, "
          f"d flag-caused-by-switch {v['d_flags_fail']}, runs {v['runs_ended']}/{v['runs_expected']}).", "",
          "Gate as amended after the week-4 critic (the pre-registered items are unchanged otherwise): (b) an on-air "
-         "close inside a call that returned True with nothing held after it is a success on air, not explained by "
+         "close inside a pick that returned True with nothing held after it is a success on air, not explained by "
          "its owner; (c) a place that started with nothing in its hand is left out of the pooled test and listed; "
          "(c2) the other skills' per-call success after the branch, pooled, fails the stage under (c)'s rule. The "
          "pooled tests pair calls by ordinal within each run, not at the same Runner write: every call of the "
