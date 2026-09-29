@@ -1,9 +1,11 @@
 # All-task vision benchmark capture
 
-The `vision-bench` branch in BEHAVIOR-1K provides deterministic simulator queries and
+The `vision-bench` branch in BEHAVIOR-1K provides frozen simulator queries and
 approximate evaluation masks. Inference, reference prompting, calibration, scoring,
 and the comparison website live in the **separate** `b1k-submission` repository's
 `vision-bench` branch. Equal branch names do not mean equal contents.
+
+For an offline checkout, follow the release's START_HERE.md: clone `BEHAVIOR-1K-vision-bench.bundle` on branch `vision-bench`, initialize its `tiptop` directory, fetch HEAD from `tiptop-b2968b7.bundle`, and check out `b2968b7182740487e5276b17b0bed82c4da09fb4` detached. Confirm that TiPToP HEAD equals the simulator checkout's `HEAD:tiptop` gitlink. These source bundles do not include the installed simulator environment or licensed assets/demonstrations.
 
 Use an existing BEHAVIOR-1K/Isaac Sim environment with dataset access and the matching
 TiPToP submodule. The original host uses the approved UV environment; another host can
@@ -42,13 +44,16 @@ The main inference data archive contains `plan.json` and the eight native files 
 `vision-bench-comprehensive-capture-provenance.tar`. Extract them into separate roots:
 
 ```bash
-export VISION_RUN=/path/to/comprehensive_v1
-export VISION_RELEASE_RUN="$VISION_RUN"  # Keep bound to the complete main artifact.
-export VISION_CAPTURE_PROVENANCE=/path/to/capture-provenance
-export SIM_PY=/path/to/sim/python
-mkdir -p "$VISION_RUN" "$VISION_CAPTURE_PROVENANCE"
-# Extract the main inference data archive into "$VISION_RUN" using its handoff guide.
-tar -xf vision-bench-comprehensive-capture-provenance.tar -C "$VISION_CAPTURE_PROVENANCE"
+export VISION_RELEASE=/absolute/path/to/vision-bench-release
+export VISION_CAPTURE_CHECKOUT=/path/to/BEHAVIOR-1K
+export VISION_RUN=/path/to/unpacked/comprehensive_v1
+export VISION_RELEASE_RUN="$VISION_RUN"
+export VISION_CAPTURE_PROVENANCE=/path/to/new/capture-provenance
+export SIM_PY=/path/to/existing/simulator/environment/bin/python
+cd "$VISION_CAPTURE_CHECKOUT"
+test -f "$VISION_RELEASE_RUN/plan.json"
+mkdir "$VISION_CAPTURE_PROVENANCE"
+tar -xf "$VISION_RELEASE/vision-bench-comprehensive-capture-provenance.tar" -C "$VISION_CAPTURE_PROVENANCE"
 
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py verify \
   --provenance "$VISION_CAPTURE_PROVENANCE"
@@ -187,14 +192,14 @@ initialization SIGSEGV (`returncode: -11`) occurred before any snapshots, task-s
 receipt or per-case failure files. One identical frozen task attempt from frame zero
 captured the same five selected snapshots, without case replacement or source changes.
 Its publication audited 358/365 captures and preserved 8,697 protected files unchanged.
-The remaining seven cases are the driveway-binding failures below.
+The remaining seven failures were subsequently recovered as described below.
 
 Preserve the original task-level crash/execution, exact launch/completion, successful
 outputs, five snapshots and publication evidence under
 `driveway_recovery/prior_task_retry`, with its explicit portable path map and tools.
 Do not synthesize per-case failures. The viewer's seven recovered flags correspond to
 real driveway per-case failure files; disclose the five task-retry snapshots separately.
-The final completion account is 353 + five + seven = 365, subject to the final audit.
+The final sealed audit confirms 353 + five + seven = 365 captured snapshots.
 
 ## Recover the declared driveway binding failures
 
@@ -208,16 +213,16 @@ replay actions, substitute a frame, or take physics steps after snapshot restora
 Environment setup/reset occurs before restoration. Annotation targets include support
 surfaces; the driveway-only `chopping_wood` case retains its original target scope.
 
-On the capture host, `runs/vision/comprehensive_v1/driveway_recovery_v3/` is the active
-fresh preparation, preserving the earlier failed v2 attempt and the exact-task retry.
-Read `status.json` for its phase; starting the process does not mean recovery or TEST
-results have finished. The reviewed `tools/visionbench_shared_capture.py` wrapper runs
-the unchanged continuation with the scheduling-only amendment `schedule_amendment.json`,
+On the capture host, `runs/vision/comprehensive_v1/driveway_recovery_v3/` records the
+completed recovery, preserving the earlier failed v2 attempt and the exact-task retry.
+Its `status.json` reports `phase: complete`. The reviewed
+`tools/visionbench_shared_capture.py` wrapper ran the unchanged continuation with the
+scheduling-only amendment `schedule_amendment.json`,
 SHA256 `6124f02a403b336b6c72314dc78a054950a499b2969d3f77272a58b4edc01cf2`.
-It runs one recovery worker at a time on GPU1 with checked shared occupancy and at least
-40,000 MiB free. It does not require GPUs1/3 to be empty or terminate other work. Frozen
-capture/label/model sources, selection and DEV lock remain unchanged. Do not launch a
-duplicate continuation or describe shared capture wall times as controlled latency.
+It ran one recovery worker at a time on GPU1 with checked shared occupancy and at least
+40,000 MiB free. GPUs1/3 were not required to be empty, and other work was not terminated.
+Frozen capture/label/model sources, selection and DEV lock remained unchanged. Do not
+rerun the completed continuation or describe shared capture wall times as controlled latency.
 
 Recovery writes into a separate directory and preserves original failed task receipts
 and the original `execution.json` with status `incomplete`. A CPU verifier checks the
@@ -227,26 +232,34 @@ The published outputs are verified again **before** task receipts and execution 
 are reconciled to complete. The original failed attempt history remains in the reconciled
 execution receipt; it is not a claim that every original attempt succeeded.
 
-This continuation owns the remaining sequence: verified recovery, V3 capture seal,
-fresh saved-query fidelity diagnostic, recovery-aware metadata staging, companion
-finalization, extraction, portable recovery verification, and independent overlay audit.
-The original monitor/finalizer exits on incomplete execution; it does not handle this
-recovery chain. Successful publication is recorded in `publication.json`, and the final
-continuation phase is `complete`. A failure stops the continuation with preserved evidence.
-The reviewed shared wrapper then writes `shared_schedule_completion.json` (schema
+The continuation completed verified recovery, the V3 capture seal, the fresh saved-query
+fidelity diagnostic, recovery-aware metadata staging, companion finalization, extraction,
+portable recovery verification, and the independent overlay audit. The original
+monitor/finalizer stopped at incomplete execution; this additive continuation completed
+the recovery chain. Successful publication is recorded in `publication.json`.
+
+The finalized companion covers capture provenance for all 365 cases across 100 tasks. Its SHA256 is
+`ecf14e0184bc270d00318d0875182a28dd880796f05cce147d86b7cbab1a5516`
+(275,466,240 bytes). The portable recovery and independent overlay audits both report
+`ok: true`; the latter verified all 2,920 native main capture files.
+
+The reviewed shared wrapper wrote `shared_schedule_completion.json` (schema
 `visionbench-shared-capture-completion/1`) binding unchanged frozen sources and the final
-`status.json`. These final receipts are produced after companion archive creation;
+`status.json`. These final receipts were produced after companion archive creation;
 preserve their bytes and hashes separately in the release validation inventory. They
 must not be assumed present inside that immutable companion.
 
-The main benchmark's active controller state is `continuation_shared_v1/status.json`
-(schema remains `visionbench-continuation/3`); require `state: complete` before release.
+Capture completion is separate from the main benchmark's timing and release validation.
+Its controller state is `continuation_shared_v1/status.json` (schema remains
+`visionbench-continuation/3`); require `state: complete` before release.
 Its scheduling amendment SHA256 is
 `aa8b2a39f4ab01db7ec84548910d211982c7f4e1726599d3472490bd87331bf9`.
 Capture acceptance and bulk inference allow checked shared GPUs1/3 with at least 40,000
 MiB free at launch, not a per-arm reservation. Bulk timings are not controlled runtime.
-The original GPU1 exclusive latency checks and 30-second monitoring remain unchanged;
-results and model recommendations are pending until all phases and release checks pass.
+The original GPU1 exclusive latency checks and 30-second monitoring remain unchanged.
+This capture handoff does not assert completion of those timing or release checks;
+consult their separate final receipts before presenting controlled runtime or a final
+model recommendation.
 
 This recovery wrapper is bound to the original selection SHA and seven case IDs; it is
 not a general retry command for a rebased or newly selected run.
@@ -287,7 +300,10 @@ Masks are **geometry-proximity proxies** at 8mm, with a 4mm tolerance sensitivit
 they are not renderer instance ground truth. Saved-query render convergence flags live
 in `labels.json["render_convergence"][view]`. Nonconverged views remain in the main
 cohort and are explicitly marked for the fixed-threshold quality sensitivity. Recorded
-head-depth replay fidelity is reported separately from integrity. `aabb_base` is an
+head-depth replay fidelity is reported separately from integrity. The completed cohort
+has 1,095 saved views, including 41 nonconverged views in 34 snapshots; all were retained,
+with zero case replacements. Passing integrity checks does not establish exact masks or
+faithful replay of every recorded viewpoint. `aabb_base` is an
 orientation-dependent, base-frame axis-aligned box, not an orientation-invariant native
 asset dimension or proof an object is graspable.
 
@@ -316,6 +332,8 @@ render settling issue can make that probe disagree with the final saved query ev
 the final query converges. Preserve it as provenance, and compare the **saved input
 depth** directly with the recorded dataset frame before making fidelity claims:
 
+Rerunning this recorded-video diagnostic additionally requires the existing simulator environment to provide PyAV (`av`) and PyArrow (`pyarrow.parquet`), together with the original demonstration video/parquet shards. Reading its archived JSON summary does not require decoding videos. These are separate from cached inference rescoring dependencies.
+
 ```bash
 /path/to/sim/python OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_fidelity.py \
   --selection /path/to/new-run/selection_replay.json \
@@ -331,6 +349,11 @@ from the primary score. Base-versus-dead-reckoned differences are against integr
 odometry, not measured world-pose ground truth. The raw replay-depth aggregates in the
 capture quality summary describe the preliminary probe; use the fidelity diagnostic's
 `saved_depth_*` fields for conclusions about the final model inputs.
+
+All 365 final saved queries have fresh recorded-depth comparisons. Across cases, the
+median of the per-case median absolute depth differences is 3.24mm, the 95th percentile
+is 15.01mm, and the maximum is 889.38mm. No cases were excluded on fidelity grounds.
+These aggregate diagnostics do not identify the cause of every replay mismatch.
 
 One preserved outlier, `comprehensive.sorting_household_items.e5484.f5179`, has a
 723.7mm median saved head-depth difference and a robot base tilted 123.91 degrees: the saved
@@ -359,9 +382,10 @@ fresh saved-query comparisons; it will not publish a partial capture as complete
   --archive /path/to/comprehensive_v1/vision-bench-comprehensive-capture-provenance.tar
 ```
 
-The active comprehensive run uses recovery-aware staging instead of the plain `stage`
-command above. Its running continuation performs this automatically after verification;
-for a completed recovery, the equivalent manual staging command is:
+This completed comprehensive run used recovery-aware staging instead of the plain
+`stage` command above. Its continuation performed this after verification. To create a
+new artifact from a completed recovery, the equivalent manual staging command is below;
+use a fresh staging path, and do not rerun finalization over the published companion:
 
 ```bash
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_driveway_recovery_verify.py stage \
@@ -374,8 +398,9 @@ for a completed recovery, the equivalent manual staging command is:
 Before finalization, verify that the stage includes the `prior_task_retry` path map,
 publication receipt, portable verifier and every mapped dependency. Pass that stage to
 the unchanged V3 `finalize` command. It includes both recovery chains, the scheduling
-amendment/wrapper and fidelity diagnosis. Final `shared_schedule_completion.json` and
-`status.json` become separate hashed release receipts after archive creation.
+amendment/wrapper and fidelity diagnosis. For this completed run, final
+`shared_schedule_completion.json` and `status.json` were generated after archive creation
+and must be preserved as separate hashed release receipts.
 
 Staging and finalization copy original file bytes and record SHA-256 receipts. They
 never edit the frozen selection or active capture sources. A staging directory is not
