@@ -1061,12 +1061,17 @@ def hard_verdict(run: dict, switched: Optional[str], arm: str, c_reasons: set, s
             if str(row.get("code") or "").lower() in UNSUPPORTED_CODES:
                 bad.append({"call_id": row.get("call_id"), "code": row.get("code"), "detail": row.get("detail")})
     on_air = [{k: r.get(k) for k in ("step", "arm", "owner", "call_id", "via", "is_grasping")}
-              for r in run.get("gripper") or [] if r.get("event") == "close" and r.get("is_grasping") == -1]
+              for r in run.get("gripper") or [] if _on_air(r)]
+    # an on-air close is explained by its owning call unless that call returned True with nothing held after it
+    false_success = [{k: x.get(k) for k in ("step", "arm", "owner", "call_id", "skill", "backend", "returned")}
+                     for x in on_air_causes(run) if x.get("false_success")]
     g3 = (c or {}).get("g3") or {}
     shim_counts = (c or {}).get("shim") or {}
     out = {"u0": u0, "rule2": r2, "reason": reason, "crash": crash, "crash_c_lacks": bool(crash and arm == "T" and reason not in c_reasons),
            "crash_uncontrolled": bool(crash and arm not in ("C", "T")),
-           "switched_unsupported": bad, "on_air": on_air, "on_air_explained": all(x["owner"] and (x["call_id"] or str(x["owner"]).startswith("ep.")) for x in on_air),
+           "switched_unsupported": bad, "on_air": on_air, "false_success_on_air": false_success,
+           "on_air_explained": all(x["owner"] and (x["call_id"] or str(x["owner"]).startswith("ep.")) for x in on_air)
+           and not false_success,
            "hand_refresh": (c or {}).get("hand_refresh"), "epochs": (c or {}).get("epochs"),
            "typed_literal_mismatches": g3.get("typed_literal_mismatches"), "runner_inputs_equal": g3.get("runner_inputs_equal"),
            "unconsumed": shim_counts.get("unconsumed"), "live_imports_ok": live_imports_ok(run, snap)}
@@ -1119,6 +1124,7 @@ def ordinal_pairing(runs: dict, switched: str) -> list:
     for (arm, rep), run in sorted(runs.items()):
         rows = []
         tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
+        held = held_at_start_by_call(run)
         for r in run.get("skill_calls") or []:
             if r.get("skill") != name:
                 continue
@@ -1131,7 +1137,8 @@ def ordinal_pairing(runs: dict, switched: str) -> list:
             rows.append({"call_id": r.get("call_id"), "backend": r.get("backend"), "status": r.get("status"), "code": r.get("code"),
                          "steps": r.get("steps"), "scorer": (r.get("verdicts") or {}).get("scorer"),
                          "returned": (r.get("evidence") or {}).get("legacy_ok") if r.get("backend") == "legacy" else r.get("status") == "succeeded",
-                         "target": (tape.get(r.get("call_id")) or {}).get("args")})
+                         "target": (tape.get(r.get("call_id")) or {}).get("args"),
+                         "held_at_start": held.get(r.get("call_id")) if r.get("skill") == "place" else None})
         co = run.get("cut_off_delivery")
         if co and co.get("line") == switched:
             rows.append({"call_id": co["call_id"], "backend": "(cut off at success)", "status": "cut_off", "code": None, "steps": None,
@@ -1141,11 +1148,21 @@ def ordinal_pairing(runs: dict, switched: str) -> list:
     return [{"ordinal": j + 1, **{k: (v[j] if j < len(v) else None) for k, v in per_run.items()}} for j in range(n)]
 
 
+def held_at_start_by_call(run: dict) -> dict:
+    """call_id -> whether the call's arm held something when it started (counters.hands_at_start: the audit's run
+    op and the last GripperWatch event before it); {} when the run ops and the skill rows do not pair."""
+    rows = run.get("skill_calls") or []
+    held = counters.hands_at_start(rows, run.get("audit_ops") or [], run.get("gripper") or [])
+    return {} if held is None else {r.get("call_id"): h for r, h in zip(rows, held)}
+
+
 def switched_failed_where_c_succeeded(ordinal: list) -> list:
     """The cause the stage fails on: at an ordinal where a C run's switched call succeeded, a T run's failed. A C row
-    EpisodeOver cut off at the task's success delivered its goal, so it counts as a success."""
+    EpisodeOver cut off at the task's success delivered its goal, so it counts as a success. A place that started
+    with nothing in its hand is neither (counters.CallOutcome.empty_hand)."""
     out = []
     for row in ordinal:
+        row = {k: v for k, v in row.items() if not (isinstance(v, dict) and v.get("held_at_start") is False)}
         c_ok = [(v["returned"] is True and v["scorer"] is True) or v["status"] == "cut_off"
                 for k, v in row.items() if k[:1] == "C" and isinstance(v, dict)]
         t = [(k, v) for k, v in row.items() if k[:1] == "T" and isinstance(v, dict)]
@@ -1155,21 +1172,37 @@ def switched_failed_where_c_succeeded(ordinal: list) -> list:
     return out
 
 
+def _on_air(g: dict) -> bool:
+    """An on-air close as counters.py defines it: a close the EXECUTOR issued (``via`` executor or none) that read
+    is_grasping -1. A closed-fist drawer pull or push (``via`` sim: store_honey's open and close) and a
+    start_gripper (``via`` executor.start) close on nothing by design and are never on-air closes."""
+    return g.get("event") == "close" and g.get("is_grasping") == -1 and g.get("via") in (None, "executor")
+
+
 def on_air_causes(run: dict) -> list:
     """(b)'s on-air closes (GripperWatch, is_grasping -1), each with its owning call's skill row (skill, backend,
-    status/code) and whether a later close inside the same call held (the call's own next round)."""
+    status/code), whether a later close inside the same call held (the call's own next round), and what the call
+    returned to the Runner. ``false_success``: the call returned True and nothing in it held after the close: a
+    success on air (HEAD's carried attach run: legacy's pick closed at step 883 on air and returned True), which the
+    owning call names but does not explain (the gap closure after the week-4 critic)."""
     rows = {r.get("call_id"): r for r in run.get("skill_calls") or []}
+    tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
     grip = run.get("gripper") or []
     out = []
     for i, g in enumerate(grip):
-        if g.get("event") != "close" or g.get("is_grasping") != -1:
+        if not _on_air(g):
             continue
         r = rows.get(g.get("call_id")) or {}
+        t = tape.get(g.get("call_id")) or {}
+        returned = t.get("returned") if t.get("returned") is not None else (
+            (r.get("evidence") or {}).get("legacy_ok") if r.get("backend") == "legacy" else
+            (r.get("status") == "succeeded" if r else None))
+        held_later = any(x.get("event") == "close" and x.get("is_grasping") == 1 and x.get("call_id") == g.get("call_id")
+                         for x in grip[i + 1:])
         out.append({"step": g.get("step"), "arm": g.get("arm"), "owner": g.get("owner"), "call_id": g.get("call_id"),
                     "skill": r.get("skill"), "backend": r.get("backend"), "status": r.get("status"), "code": r.get("code"),
-                    "native": bool(r) and r.get("backend") != "legacy",
-                    "held_later_in_the_call": any(x.get("event") == "close" and x.get("is_grasping") == 1
-                                                  and x.get("call_id") == g.get("call_id") for x in grip[i + 1:])})
+                    "native": bool(r) and r.get("backend") != "legacy", "held_later_in_the_call": held_later,
+                    "returned": returned, "false_success": returned is True and not held_later})
     return out
 
 
@@ -1188,6 +1221,59 @@ def after_native(run: dict) -> list:
             following.append((x.get("call_id"), x.get("skill"), x.get("status"), x.get("code"), x.get("steps")))
         out.append({"call_id": r.get("call_id"), "skill": r.get("skill"), "status": r.get("status"), "code": r.get("code"),
                     "phase": r.get("phase"), "steps": r.get("steps"), "then": following})
+    return out
+
+
+def _returned(row: dict, tape_row: dict):
+    """The Runner-visible return of a skill row: the Runner tape's, else the literal (legacy) or the status (native)."""
+    if tape_row.get("returned") is not None:
+        return tape_row["returned"]
+    return (row.get("evidence") or {}).get("legacy_ok") if row.get("backend") == "legacy" else row.get("status") == "succeeded"
+
+
+def downstream_calls(run: dict, switched: str, branch_call_id: Optional[str]) -> list:
+    """(c2, added after the week-4 critic): every call after the branch call that is not the switched skill, each
+    with the pooled test's success (returned True and the scorer true right after). A native call's cost to the
+    calls after it (the retreat posture that left wood's next legacy picks refused at 0 steps) shows here and in no
+    per-call number of the switched skill. A call with no scorer verdict is listed and not counted."""
+    name, _, qual = switched.partition(".")
+    rows = run.get("skill_calls") or []
+    tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
+    start = next((i for i, r in enumerate(rows) if r.get("call_id") == branch_call_id), None)
+    if start is None:
+        return []
+    out = []
+    for r in rows[start + 1:]:
+        t = tape.get(r.get("call_id")) or {}
+        if r.get("skill") == name and (not qual or t.get("qual") in (qual, None)):
+            continue  # the switched skill (a place with no qualifier on the tape is left out, not guessed)
+        returned, scorer = _returned(r, t), (r.get("verdicts") or {}).get("scorer")
+        out.append({"call_id": r.get("call_id"), "skill": r.get("skill"), "qual": t.get("qual"), "backend": r.get("backend"),
+                    "status": r.get("status"), "code": r.get("code"), "steps": r.get("steps"), "returned": returned,
+                    "scorer": scorer, "counted": scorer is not None, "ok": returned is True and scorer is True})
+    return out
+
+
+def refused_after_switched(run: dict, switched: str) -> list:
+    """The calls refused NO_STANCE_HERE at 0 steps right after a switched-skill call (up to the next one), on
+    either arm: the collateral the retreat posture left on wood (T2's picks after its native place)."""
+    name, _, qual = switched.partition(".")
+    rows = run.get("skill_calls") or []
+    tape = {r["call_id"]: r for r in read_jsonl(Path(run["inst"]) / "runner_tape.jsonl")} if run.get("inst") else {}
+    # as downstream_calls reads it: a row of the skill whose Runner-tape qualifier is the line's, or unknown
+    is_switched = [r.get("skill") == name and (not qual or (tape.get(r.get("call_id")) or {}).get("qual") in (qual, None))
+                   for r in rows]
+    out = []
+    for i, r in enumerate(rows):
+        if not is_switched[i]:
+            continue
+        for j in range(i + 1, len(rows)):
+            if is_switched[j]:
+                break
+            x = rows[j]
+            if str(x.get("code") or "").lower() == "no_stance_here" and not x.get("steps"):
+                out.append({"after": r.get("call_id"), "call_id": x.get("call_id"), "skill": x.get("skill"),
+                            "backend": x.get("backend")})
     return out
 
 
@@ -1292,7 +1378,9 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
                                     "legacy": legacy_dependencies(run), "hand_refresh": (run.get("connector") or {}).get("hand_refresh"),
                                     "d21_debt": rule2_of(run.get("connector")).get("d21_debt"), "calls": (run.get("connector") or {}).get("calls"),
                                     "charged": (run.get("connector") or {}).get("charged"), "live_index": [(x.get("i"), x.get("op"), x.get("owner"), x.get("call_id")) for x in run.get("live_index") or []][:40],
-                                    "on_air_causes": on_air_causes(run), "after_native": after_native(run)}
+                                    "on_air_causes": on_air_causes(run), "after_native": after_native(run),
+                                    "downstream": downstream_calls(run, switched, (p["branch"] or {}).get("call_id")),
+                                    "refused_after_switched": refused_after_switched(run, switched)}
             g["runs"][f"{task}/{key}"] = t_entry["runs"][key]
         for (arm, rep), run in runs.items():
             run["cut_off_delivery"] = cut_off_delivery(run, switched)
@@ -1335,6 +1423,27 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
             flags_fail.append({"task": f.task, "counter": f.counter, "control": f.control, "treatment": f.treatment,
                                "switched_failed_where_c_succeeded": t_entry.get("switched_failed_where_c_succeeded") or []})
     g["flags"] = flags_fail
+    # (c2) the other skills after the branch, pooled over tasks and replicates, the same rule as (c): what a native
+    # call costs the calls after it (added after the week-4 critic; gated from then on, reported beside the
+    # pre-registered items)
+    alpha, delta = (cmp.alpha, cmp.delta) if cmp is not None else (0.10, 0.25)
+    ds = {"C": [0, 0], "T": [0, 0]}
+    refused = {"C": 0, "T": 0}
+    for t in per_task.values():
+        for key, r in t["runs"].items():
+            if not r["ended"]:
+                continue
+            counted = [x for x in r["downstream"] if x["counted"]]
+            ds[key[0]][0] += len(counted)
+            ds[key[0]][1] += sum(1 for x in counted if x["ok"])
+            refused[key[0]] += len(r["refused_after_switched"])
+    (c_n, c_s), (t_n, t_s) = ds["C"], ds["T"]
+    p2 = counters.fisher_one_sided(c_s, c_n, t_s, t_n)
+    drop2 = (c_s / c_n - t_s / t_n) if c_n and t_n else 0.0
+    g["downstream"] = {"c_n": c_n, "c_succ": c_s, "t_n": t_n, "t_succ": t_s, "c_rate": c_s / c_n if c_n else None,
+                       "t_rate": t_s / t_n if t_n else None, "p": p2, "judged": bool(c_n and t_n),
+                       "mde": counters.minimum_detectable_effect(c_s, c_n, t_n, alpha, delta),
+                       "fail": bool(c_n and t_n and drop2 >= delta and p2 < alpha), "refused_after_switched": refused}
     vacuous = not any(p.get("branch") is not None and (not stage_tasks or t in stage_tasks) for t, p in plan["tasks"].items())
     verdict = {
         "vacuous": vacuous,  # no stage task routes any write differently between C and T: nothing to run or judge
@@ -1343,6 +1452,8 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
         # an unjudged pooled test (a qualified line with unqualified rows, or an arm with no call) is never a pass
         "c_primary": None if cmp is None or cmp.pooled is None else bool(cmp.pooled.judged and not cmp.pooled.fail),
         "c_judged": None if cmp is None or cmp.pooled is None else cmp.pooled.judged,
+        # (c2): None when an arm has no downstream call with a verdict (nothing to judge, not a failure)
+        "c2_downstream": None if not g["downstream"]["judged"] else not g["downstream"]["fail"],
         "d_flags_fail": any(x["switched_failed_where_c_succeeded"] for x in flags_fail),
         "runs_ended": sum(1 for t in per_task.values() for r in t["runs"].values() if r["ended"]),
         # two arms x the replicates on every task with a branch, whether or not its run dir exists yet
@@ -1350,6 +1461,7 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
                                              and (not stage_tasks or t in stage_tasks)),
     }
     verdict["pass"] = bool(verdict["a_prefix"] and verdict["b_hard"] and verdict["c_primary"] is True and not verdict["d_flags_fail"]
+                           and verdict["c2_downstream"] is not False
                            and verdict["runs_ended"] == verdict["runs_expected"] and verdict["runs_ended"] > 0)
     verdict["outcome"] = "VACUOUS" if vacuous else ("PASS" if verdict["pass"] else "FAIL")
     g["verdict"] = verdict
@@ -1365,13 +1477,16 @@ def gate_carried(snap: Path = SNAP) -> dict:
         write_runner_tape_rows(d)
         run = read_run(d)
         c = counters.extract(d) if run["ended"] else None
+        held = held_at_start_by_call(run)
         out["runs"][task] = {"out": str(d), "ended": run["ended"], "result": run["result"], "hard": hard_verdict(run, None, "native", set(), snap),
                              "native_calls": None if c is None else c.native_calls, "native_by": None if c is None else c.native_by,
                              "legacy": legacy_dependencies(run), "calls": (run.get("connector") or {}).get("calls"),
                              "hand_refresh": (run.get("connector") or {}).get("hand_refresh"), "imports": run.get("imports"),
                              "planner_imports": run.get("planner_imports"), "video": run.get("video"),
                              "routing_profile": (run.get("connector") or {}).get("routing_profile"), "routes": (run.get("connector") or {}).get("routes"),
-                             "native_rows": [{k: r.get(k) for k in ("call_id", "skill", "backend", "status", "code", "phase", "steps")}
+                             "native_rows": [{**{k: r.get(k) for k in ("call_id", "skill", "backend", "status", "code", "phase", "steps")},
+                                              "scorer": (r.get("verdicts") or {}).get("scorer"),
+                                              "held_at_start": held.get(r.get("call_id")) if r.get("skill") == "place" else None}
                                              for r in run.get("skill_calls") or [] if r.get("backend") != "legacy"],
                              "after_native": after_native(run), "on_air_causes": on_air_causes(run),
                              "d21_debt": rule2_of(run.get("connector")).get("d21_debt")}
@@ -1403,9 +1518,12 @@ def carried_md(g: dict) -> str:
         o += [f"## {task}", "", f"- run `{r['out']}`; routes {r.get('routes')}; profile {r.get('routing_profile')}",
               f"- imports: `{r.get('imports')}`", f"- video: `{r.get('video')}`", f"- D21 debt: {r.get('d21_debt')}"]
         o += [f"- native: `{x['call_id']}` {x['skill']} on {x['backend']} {x['status']}/{x['code']} phase {x['phase']} steps {x['steps']}"
+              + (f" scorer {x.get('scorer')}" if "scorer" in x else "")
+              + ("; started with NOTHING in the hand (a place's success here is vacuous)" if x.get("held_at_start") is False else "")
               for x in r["native_rows"]] or ["- native calls: none"]
         o += [f"- after `{x['call_id']}` (phase {x['phase']}): {x['then'] or 'nothing'}" for x in r["after_native"]]
         o += [f"- on-air close step {x['step']}: `{x['owner']}` `{x['call_id']}` = {x['skill']} on {x['backend']} ({x['status']}/{x['code']})"
+              + ("; the call returned True with nothing held: a success on air, NOT explained" if x.get("false_success") else "")
               for x in r["on_air_causes"]]
         o.append("")
     return "\n".join(o)
@@ -1486,7 +1604,14 @@ def gate_md(g: dict) -> str:
     o = [f"# {g['stage']}: `{g['line']}` (W4-I switch ladder, WEEK4_PLAN 5.8)", "",
          f"Snapshot `{g['snap']}`. Switched skill `{g['switched']}`. Verdict: **{v.get('outcome') or ('PASS' if v['pass'] else 'FAIL')}** "
          f"(a prefix {v['a_prefix']}, b hard {v['b_hard']}, c primary {v['c_primary']}, "
-         f"d flag-caused-by-switch {v['d_flags_fail']}, runs {v['runs_ended']}/{v['runs_expected']}).", ""]
+         f"c2 downstream {v.get('c2_downstream')}, "
+         f"d flag-caused-by-switch {v['d_flags_fail']}, runs {v['runs_ended']}/{v['runs_expected']}).", "",
+         "Gate as amended after the week-4 critic (the pre-registered items are unchanged otherwise): (b) an on-air "
+         "close inside a call that returned True with nothing held after it is a success on air, not explained by "
+         "its owner; (c) a place that started with nothing in its hand is left out of the pooled test and listed; "
+         "(c2) the other skills' per-call success after the branch, pooled, fails the stage under (c)'s rule. The "
+         "pooled tests pair calls by ordinal within each run, not at the same Runner write: every call of the "
+         "switched skill counts, a retry after a refusal included.", ""]
     if v.get("vacuous"):
         o += ["VACUOUS: no stage task routes any Runner write differently between C and T, so there is no arm pair to "
               "run and nothing to judge (not a pass, not a failure).", ""]
@@ -1508,6 +1633,14 @@ def gate_md(g: dict) -> str:
                   f"they never reach a skill row on either arm): C {cc['c_succ']}/{cc['c_n']} ({_f(cc['c_rate'])}), T {cc['t_succ']}/{cc['t_n']} "
                   f"({_f(cc['t_rate'])}), one-sided Fisher p {cc['p']:.3f}, MDE {_f(cc['mde'])}, {'FAIL' if cc['fail'] else 'pass'}; "
                   f"cut-off deliveries C {cc['cut_off_C']}, T {cc['cut_off_T']}.", ""]
+    ds = g.get("downstream")
+    if ds:
+        o += [f"(c2) Downstream, the other skills' calls after the branch (returned True and the scorer true right after; "
+              f"calls with no scorer verdict left out): C {ds['c_succ']}/{ds['c_n']} ({_f(ds['c_rate'])}), T {ds['t_succ']}/{ds['t_n']} "
+              f"({_f(ds['t_rate'])}), one-sided Fisher p {ds['p']:.3f}, MDE {_f(ds['mde'])}, "
+              f"{('FAIL' if ds['fail'] else 'pass') if ds['judged'] else 'UNJUDGED (an arm has no such call)'}. Calls refused "
+              f"no_stance_here at 0 steps right after a switched-skill call: C {ds['refused_after_switched']['C']}, "
+              f"T {ds['refused_after_switched']['T']}.", ""]
     for task, t in g["tasks"].items():
         o.append(f"## {task}")
         if t.get("branch") is None or "runs" not in t:
@@ -1534,7 +1667,16 @@ def gate_md(g: dict) -> str:
         o += [f"- {key} step {x['step']} {x['arm']}: owner `{x['owner']}` call `{x['call_id']}` = {x['skill']} on {x['backend']} "
               f"({x['status']}/{x['code']}); {'native' if x['native'] else 'not a native run'}; "
               f"{'a later close in the same call held' if x['held_later_in_the_call'] else 'no later close in the call held'}"
+              + ("; the call returned True with nothing held: a success on air, NOT explained" if x.get("false_success") else "")
               for key, x in on_air] or ["- none"]
+        down = [(key, x) for key, r in t["runs"].items() for x in r.get("downstream") or [] if x["counted"] and not x["ok"]]
+        o += ["", "(c2) Downstream calls after the branch that failed (call, skill, backend, status/code, steps):", ""]
+        o += [f"- {key} `{x['call_id']}` {x['skill']}{'.' + x['qual'] if x.get('qual') else ''} on {x['backend']} "
+              f"{x['status']}/{x['code']} {x['steps']}" for key, x in down] or ["- none"]
+        empty = [(key, v) for row in t["ordinal"] for key, v in row.items() if isinstance(v, dict) and v.get("held_at_start") is False]
+        if empty:
+            o += ["", "Switched-skill places that started with nothing in the hand (left out of the pooled test):", ""]
+            o += [f"- {key} `{v['call_id']}` on {v['backend']}: returned {v['returned']}, scorer {v['scorer']}" for key, v in empty]
         o += ["", "After each native call: the phase it ended in, then the legacy calls up to the next native one (call, skill, status/code, steps):", ""]
         o += [f"- {key} `{x['call_id']}` {x['skill']} {x['status']}/{x['code']} phase {x['phase']} steps {x['steps']} -> {x['then'] or 'nothing'}"
               for key, r in t["runs"].items() for x in r.get("after_native") or []] or ["- no native call"]

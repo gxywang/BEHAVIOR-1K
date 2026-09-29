@@ -27,7 +27,10 @@ job dir, under ``episode/`` (the bench's --out-dir) or one level below either (t
   EpisodeOver cut off inside a legacy call, which never reaches a row) the legacy rounds are counted from there
   instead. Any other row is NATIVE: it counts one executed motion when ``steps > 0``, plus ``evidence.resamples`` (an int,
   default 0, one per resample inside the call). The Runner-visible return is ``evidence.legacy_ok`` for a legacy row
-  and ``status == "succeeded"`` for a native one; ``verdicts.scorer`` is the scorer's verdict right after.
+  and ``status == "succeeded"`` for a native one; ``verdicts.scorer`` is the scorer's verdict right after. A place
+  row's ``held_at_start`` comes from ``audit.jsonl`` (its run op's ``sim_in``) and ``gripper.jsonl`` (the last event
+  on its arm before then); a place that started with nothing in its hand is left out of the pooled per-call test and
+  listed (gap closure after the week-4 critic: a vacuous success is not a place's success).
 - ``ledger.jsonl``: one row per StepLedger owner: ``{"owner": str, "steps": int, "env_step_calls": int,
   "place_robot": int, "capture": int, "look_at": int, "writes": int}``. A ``place_robot`` is one teleport; the
   ``go_to`` owner's are the planner's, owners named ``ep.<member>`` are teleports inside a legacy call.
@@ -124,10 +127,20 @@ class CallOutcome:
     returned: Optional[bool]  # the Runner-visible return
     scorer: Optional[bool]  # the scorer's verdict right after
     trial: Optional[str] = None
+    # a place: whether its arm held something when the call started, by GripperWatch (the last executor close
+    # before the call's first step held, is_grasping 1; an on-air close or an open since: False; no reading: None)
+    held_at_start: Optional[bool] = None
 
     @property
     def ok(self) -> bool:
         return self.returned is True and self.scorer is True
+
+    @property
+    def empty_hand(self) -> bool:
+        """A place called with nothing in its hand: its premise failed before it ran, so its verdict says nothing
+        about the place (HEAD's carried attach run: a legacy pick closed on air and returned True, and the native
+        floor place after it was scored true on an ontop that held before the call). Left out of the pooled test."""
+        return self.skill == "place" and self.held_at_start is False
 
 
 @dataclass
@@ -337,6 +350,48 @@ def _count_skill_rows(c: Counters, rows: list[dict], tape: dict, records: bool =
                                    row.get("trial")))
 
 
+def _mark_hands(c: Counters, rows: list[dict], audit_path: Optional[Path], gripper_path: Optional[Path]) -> None:
+    """CallOutcome.held_at_start for every place row. The i-th ``run`` op of audit.jsonl (ConnectorAudit) is the
+    i-th skill row (one row per finished run), and its ``sim_in`` is the call's first step; the last GripperWatch
+    event on the row's arm before that step says whether the hand held something: an executor close that held
+    (is_grasping 1) True, an on-air close (-1) or an open False. Without both files, or with the counts apart, the
+    calls keep None and a note says why."""
+    if audit_path is None or gripper_path is None:
+        return
+    held = hands_at_start(rows, _read_jsonl(audit_path), _read_jsonl(gripper_path))
+    if held is None or len(c.calls) < len(rows):
+        c.notes.append(f"held_at_start not read: the run ops and the {len(rows)} skill rows do not pair")
+        return
+    offset = len(c.calls) - len(rows)
+    for i, (row, h) in enumerate(zip(rows, held)):
+        if row.get("skill") == "place":
+            c.calls[offset + i].held_at_start = h
+
+
+def hands_at_start(rows: list[dict], audit_rows: list[dict], gripper_rows: list[dict]) -> Optional[list]:
+    """Per skill row, whether its arm held something when the call started (None: no reading), or None when the
+    audit's run ops and the rows do not pair one to one. See _mark_hands. The run EpisodeOver cut off is a run op
+    with no row (the Runtime never finished it): one extra run op at the end still pairs."""
+    runs = [r for r in audit_rows if r.get("kind", "op") == "op" and r.get("op") == "run"]
+    if len(runs) not in (len(rows), len(rows) + 1):
+        return None
+    runs = runs[:len(rows)]
+    events = [g for g in gripper_rows
+              if g.get("event") == "open" or (g.get("event") == "close" and g.get("via") in (None, "executor"))]
+    out = []
+    for row, op in zip(rows, runs):
+        arm = next((u.get("arm") for u in row.get("world_updates") or () if isinstance(u, dict) and u.get("arm")),
+                   None) or "left"
+        start = int(op.get("sim_in") or 0)
+        before = [g for g in events if g.get("arm") == arm and int(g.get("step") or 0) < start]
+        held = None
+        if before:
+            last = before[-1]
+            held = False if last.get("event") == "open" else {1: True, -1: False}.get(last.get("is_grasping"))
+        out.append(held)
+    return out
+
+
 def _count_ledger(c: Counters, owners: dict) -> None:
     for owner, row in owners.items():
         n = int(row.get("place_robot") or 0)
@@ -389,7 +444,9 @@ def extract(job: Path, instance: Optional[int] = None) -> Counters:
         if from_rounds:
             _count_records(c, bench["rounds"])
         if calls_path:
-            _count_skill_rows(c, _read_jsonl(calls_path), tape, records=not from_rounds)
+            rows = _read_jsonl(calls_path)
+            _count_skill_rows(c, rows, tape, records=not from_rounds)
+            _mark_hands(c, rows, _find(job, "audit.jsonl"), _find(job, "gripper.jsonl"))
         else:
             c.notes.append("no skill_calls.jsonl")
         live = (block or {}).get("live_at_end")
@@ -532,6 +589,8 @@ class Comparison:
     raw_tasks: list = field(default_factory=list)  # tasks compared raw (a run delivered no atom)
     pooled: Optional[Pooled] = None
     carried: list = field(default_factory=list)  # {"task", "job", "native_calls", "native_by"}
+    # switched-skill place calls left out of the pooled test because nothing was in the hand when they started
+    empty_hand: list = field(default_factory=list)  # {"task", "arm", "job", "call_id", "backend", "returned", "scorer"}
 
     @property
     def n_tests(self) -> int:
@@ -611,6 +670,10 @@ def compare(pairs: dict, skill: str, *, backend: Optional[str] = None, alpha: fl
                         unq += 1
                     if not m:
                         continue
+                    if call.empty_hand:  # the place's premise failed before it ran: neither a success nor a failure
+                        cmp.empty_hand.append({"task": task, "arm": arm, "job": x.job, "call_id": call.call_id,
+                                               "backend": call.backend, "returned": call.returned, "scorer": call.scorer})
+                        continue
                     if arm == "C":
                         c_n, c_s = c_n + 1, c_s + call.ok
                     else:
@@ -670,6 +733,10 @@ def format_comparison(cmp: Comparison) -> str:
         out.append(f"compared raw (a run delivered no atom): {', '.join(cmp.raw_tasks)}")
     for row in cmp.on_air:
         out.append(f"  on-air {row['task']} {row['arm']} {Path(row['job']).name}: needs a cause: {row['causes']}")
+    for row in cmp.empty_hand:
+        out.append(f"  left out (nothing in the hand at the call's start) {row['task']} {row['arm']} "
+                   f"{Path(row['job']).name} {row['call_id']} on {row['backend']}: returned {row['returned']}, "
+                   f"scorer {row['scorer']}")
     for row in cmp.carried:
         verdict = "0 native calls" if not row["native_calls"] else f"{row['native_calls']} native calls " \
                                                                     f"{row['native_by']} (REPORT)"

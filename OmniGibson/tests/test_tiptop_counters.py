@@ -496,3 +496,43 @@ def test_an_e_rep_reads_every_counter_its_l_rec_reads(task, erep):
     strip = lambda causes: [{k: v for k, v in x.items() if k != "call_id"} for x in causes]  # noqa: E731
     assert strip(a.on_air_causes) == strip(b.on_air_causes)
     assert a.cut_off == 1 and a.notes == b.notes == []
+
+
+# ------------------------------------------------------------------------------------------ a place with an empty hand
+def test_a_place_that_started_with_an_empty_hand_is_left_out_of_the_pooled_test(tmp_path):
+    """Gap closure after the week-4 critic: HEAD's carried attach run closed a legacy pick on air (is_grasping -1)
+    that returned True, and the native floor place after it was scored true on an ontop that held before the call.
+    A place whose arm held nothing when it started (the last executor close before its first step on air, or an
+    open since) is left out of the pooled test and listed; one that started holding is counted as before."""
+    rows = [_row("q1-1", "pick_up", "legacy", "infeasible", 836, scorer=False, sim_clock=True,
+                 evidence={"legacy_ok": True, "records": []}),
+            _row("q1-2", "place", "tiptop", "succeeded", 227, scorer=True, effects=(("ontop", ("cam", "floor")),))]
+    audit = [{"kind": "op", "op": "task", "sim_in": 90, "sim_out": 90},
+             {"kind": "op", "op": "run", "sim_in": 90, "sim_out": 926},
+             {"kind": "op", "op": "observe", "sim_in": 926, "sim_out": 926},
+             {"kind": "op", "op": "run", "sim_in": 926, "sim_out": 1153}]
+    air = [{"step": 883, "arm": "left", "event": "close", "is_grasping": -1, "owner": "ep.pick", "call_id": "q1-1",
+            "via": "executor"},
+           {"step": 1048, "arm": "left", "event": "open", "is_grasping": -1, "owner": "rt", "call_id": "q1-2"}]
+    held = [dict(air[0], is_grasping=1), air[1]]
+    out = {}
+    for name, grip in (("air", air), ("held", held)):
+        d = tmp_path / name
+        _job(d, calls=rows, steps=1153, gripper=grip, tape=[{"call_id": "q1-2", "skill": "place", "qual": "on", "returned": True}])
+        (d / "audit.jsonl").write_text("".join(json.dumps(r) + "\n" for r in audit))
+        out[name] = counters.extract(d)
+    place_air = next(c for c in out["air"].calls if c.call_id == "q1-2")
+    place_held = next(c for c in out["held"].calls if c.call_id == "q1-2")
+    assert place_air.held_at_start is False and place_air.empty_hand and place_air.ok, "scored true, premise failed"
+    assert place_held.held_at_start is True and not place_held.empty_hand
+    C = [Counters(job=f"c{i}", task="t", delivered_atoms=1, calls=[CallOutcome(f"c{i}", "place", "on", "legacy", True, True)])
+         for i in range(3)]
+    cmp = counters.compare({"t": (C, [out["air"], out["held"]])}, "place.on")
+    assert (cmp.pooled.t_n, cmp.pooled.t_succ) == (1, 1), "the empty-hand place is neither a success nor a failure"
+    assert [(r["call_id"], r["arm"], r["returned"]) for r in cmp.empty_hand] == [("q1-2", "T", True)]
+    assert "nothing in the hand at the call's start" in counters.format_comparison(cmp)
+    # the run EpisodeOver cut off is a run op with no row: the rows still pair; two extra ops do not
+    assert counters.hands_at_start(rows, audit + [{"kind": "op", "op": "run", "sim_in": 1153, "sim_out": 1200}], air) == [None, False]
+    assert counters.hands_at_start(rows, audit + [{"op": "run", "sim_in": 1}, {"op": "run", "sim_in": 2}], air) is None
+    fist = [{"step": 125, "arm": "left", "event": "close", "is_grasping": -1, "via": "sim"}]
+    assert counters.hands_at_start(rows, audit, fist) == [None, None], "a closed-fist pull is no grasp reading"

@@ -984,3 +984,53 @@ def test_the_gpu_owners_are_read_off_the_compute_apps(monkeypatch):
 
     monkeypatch.setattr(ladder.subprocess, "run", run)
     assert ladder.gpu_owners() == {1: {"tcheng12"}, 3: {"wding8"}}
+
+
+def test_a_success_on_air_is_not_explained_by_its_owner_and_a_fist_close_is_no_on_air_close():
+    """Gap closure after the week-4 critic: an executor close on air inside a call that returned True, with no later
+    close in the call holding, is a success on air; (b) no longer reads it as explained by its owning call. A later
+    close that held (a regrasp inside the call) explains it; a closed-fist drawer pull (via sim) is no on-air close."""
+    pick = {"call_id": "q1-1", "skill": "pick_up", "backend": "legacy", "status": "infeasible", "code": "exec_refused",
+            "evidence": {"legacy_ok": True}, "verdicts": {"scorer": False}}
+    air = {"step": 883, "arm": "left", "event": "close", "is_grasping": -1, "owner": "ep.pick", "call_id": "q1-1", "via": "executor"}
+    run = {"skill_calls": [pick], "gripper": [air]}
+    (x,) = ladder.on_air_causes(run)
+    assert x["returned"] is True and not x["held_later_in_the_call"] and x["false_success"]
+    hv = ladder.hard_verdict(run, None, "native", set(), Path("/snap"))
+    assert hv["false_success_on_air"] and hv["on_air_explained"] is False and hv["ok"] is False
+    regrasp = {**run, "gripper": [air, {**air, "step": 950, "is_grasping": 1}]}
+    assert not ladder.on_air_causes(regrasp)[0]["false_success"] and ladder.hard_verdict(regrasp, None, "native", set(), Path("/snap"))["on_air_explained"]
+    refused = {**run, "skill_calls": [{**pick, "evidence": {"legacy_ok": False}}]}
+    assert not ladder.on_air_causes(refused)[0]["false_success"], "a call that returned False reported what happened"
+    fist = {"skill_calls": [{"call_id": "q1-1", "skill": "open", "backend": "legacy", "status": "succeeded", "evidence": {"legacy_ok": True}}],
+            "gripper": [{**air, "owner": "ep.open_up", "via": "sim"}]}
+    assert ladder.on_air_causes(fist) == [] and ladder.hard_verdict(fist, None, "native", set(), Path("/snap"))["on_air"] == []
+
+
+def test_downstream_calls_and_the_refusals_after_a_switched_call():
+    """(c2): the calls after the branch that are not the switched skill, each with the pooled test's success; and
+    the NO_STANCE_HERE refusals at 0 steps right after a switched call (wood T2 after its native place ended in
+    retreat)."""
+    rows = [{"call_id": "q1-1", "skill": "pick_up", "backend": "legacy", "status": "succeeded", "steps": 800,
+             "evidence": {"legacy_ok": True}, "verdicts": {"scorer": True}},
+            {"call_id": "q1-2", "skill": "place", "backend": "tiptop", "status": "succeeded", "steps": 228, "verdicts": {"scorer": True}},
+            {"call_id": "q1-3", "skill": "pick_up", "backend": "legacy", "status": "infeasible", "code": "no_stance_here", "steps": 0,
+             "evidence": {"legacy_ok": False}, "verdicts": {"scorer": False}},
+            {"call_id": "q1-4", "skill": "wait", "backend": "legacy", "status": "succeeded", "steps": 30, "verdicts": {}},
+            {"call_id": "q1-5", "skill": "place", "backend": "tiptop", "status": "failed", "code": "placed_wrong", "steps": 300,
+             "verdicts": {"scorer": False}},
+            {"call_id": "q1-6", "skill": "pick_up", "backend": "legacy", "status": "succeeded", "steps": 900,
+             "evidence": {"legacy_ok": True}, "verdicts": {"scorer": True}}]
+    run = {"skill_calls": rows}
+    down = ladder.downstream_calls(run, "place.on", "q1-2")
+    assert [(x["call_id"], x["counted"], x["ok"]) for x in down] == [("q1-3", True, False), ("q1-4", False, False), ("q1-6", True, True)]
+    assert ladder.downstream_calls(run, "place.on", "q9-9") == [], "no branch call in the run: nothing downstream"
+    assert [(x["after"], x["call_id"]) for x in ladder.refused_after_switched(run, "place.on")] == [("q1-2", "q1-3")]
+    g = {"stage": "S1", "line": "place.on=tiptop", "switched": "place.on", "snap": "/s", "tasks": {},
+         "verdict": {"a_prefix": True, "b_hard": True, "c_primary": True, "c2_downstream": False, "d_flags_fail": False,
+                     "runs_ended": 6, "runs_expected": 6, "pass": False, "outcome": "FAIL"},
+         "downstream": {"c_n": 10, "c_succ": 10, "t_n": 10, "t_succ": 5, "c_rate": 1.0, "t_rate": 0.5, "p": 0.016,
+                        "mde": 0.3, "fail": True, "judged": True, "refused_after_switched": {"C": 0, "T": 2}}}
+    md = ladder.gate_md(g)
+    assert "c2 downstream False" in md and "(c2) Downstream" in md and "T 5/10" in md and "FAIL" in md
+    assert "pair calls by ordinal within each run, not at the same Runner write" in md
