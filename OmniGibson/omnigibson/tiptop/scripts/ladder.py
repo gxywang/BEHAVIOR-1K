@@ -119,15 +119,24 @@ class Stage:
     line: Optional[str]  # the --route this stage adds; None for the non-ladder stages
     prev: Optional[str]
     tasks: tuple = ()  # the tasks whose arms the stage runs (WEEK4_PLAN 5.8, BASE.md 5)
+    # the arms' prefix serves a capture-only request difference before the branch from the tape (bench's
+    # --wstape-tolerate-capture), so a task whose branch lies past its A/A floor still reaches the branch on both arms
+    tolerate_capture: bool = False
+    part_of: Optional[str] = None  # the stage whose line this one runs on the rest of the line's tasks
 
 
 # attach_a_camera_to_a_tripod and composting_waste call place.on once in their L-rec (a floor put_down after the goal
 # failed twice; legacy_ref/calls_table.md), which BASE.md's count from the historical jobs does not have. Their branch
-# frames (6 and 9) lie past their A/A floor (frame 3, where every W4-F2 E-rep of either diverged), so an arm pair
-# would go live on both arms before the branch and meet the put_down only if the live run repeats the failures: not
-# the plan's arms. They are carried forward; the carried run routes the line natively and reports the call if reached.
+# frames (6 and 9) lie past their A/A floor (frame 3, where every W4-F2 E-rep of either diverged), so a strict
+# replay-live pair would go live on both arms before the branch and meet the put_down only if the live run repeats the
+# failures: not the plan's arms. S1x runs them (the gap closure after the week-4 critic): its arms serve every frame
+# before the branch from the tape, a head capture's render difference included (the A/A floor's kind; any other
+# request difference still switches live, and the Runner tape must be identical before the branch), so both arms meet
+# a fresh planner at the put_down itself.
 STAGES = {"S1": Stage("S1", "place.on=tiptop", None, ("bringing_in_wood", "rearrange_your_room", "tidying_bedroom")),
-          "S2": Stage("S2", "close.prismatic=tiptop", "S1", ("store_honey",))}
+          "S1x": Stage("S1x", "place.on=tiptop", None, ("attach_a_camera_to_a_tripod", "composting_waste"),
+                       tolerate_capture=True, part_of="S1"),
+          "S2": Stage("S2", "close.prismatic=tiptop", "S1", ("store_honey",))}  # S2 stays last: carried_routes reads it
 CARRIED = ("attach_a_camera_to_a_tripod", "composting_waste", "dispose_of_batteries", "store_honey")
 
 
@@ -428,6 +437,7 @@ class RunSpec:
     live_at: Optional[int]
     planner: bool  # a live tiptop-server is started for it
     seed: Optional[int] = None
+    tolerate: bool = False  # --wstape-tolerate-capture (a Stage's tolerate_capture): with a forced frame only
 
     @property
     def label(self) -> str:
@@ -443,6 +453,8 @@ class RunSpec:
             a += ["--wstape-path", str(self.tape)]
         if self.live_at is not None:
             a += ["--wstape-live-at", str(self.live_at)]
+            if self.tolerate:
+                a += ["--wstape-tolerate-capture"]
         if self.seed is not None:
             a += ["--seed", str(self.seed)]
         return a
@@ -464,7 +476,8 @@ def stage_specs(stage: str, plan: dict, tasks=None, reps=REPS, arms=("C", "T")) 
             for arm in arms:
                 specs.append(RunSpec(stage, task, arm, rep, run_dir(stage, task, arm, rep), "parity",
                                      c_routes if arm == "C" else t_routes, "replay-live",
-                                     Path(p["tapes"][str(rep)]), int(p["frame"]), True, seed=rep))
+                                     Path(p["tapes"][str(rep)]), int(p["frame"]), True, seed=rep,
+                                     tolerate=STAGES[stage].tolerate_capture))
     return specs
 
 
@@ -983,12 +996,17 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
     ws, replay = run.get("wstape") or {}, run.get("replay") or []
     switched_at, reason = ws.get("switched_at"), ws.get("switch_reason") or ""
     before = [row for row in replay if frame is not None and int(row["i"]) < frame]
-    mism = [row for row in before if not row.get("matched", True)]
+    # a frame the tape served despite a capture-only difference (--wstape-tolerate-capture, stage S1x): the A/A
+    # floor's kind of difference, allowed at or past the floor frame alone; every other difference is a mismatch
+    tolerated = [row for row in before if not row.get("matched", True) and row.get("tolerated")]
+    mism = [row for row in before if not row.get("matched", True) and not row.get("tolerated")]
     # the switch lands at N either way: C's legacy request there is forced live, T's native request differs from the
     # tape at its op (skill or reach against plan) and goes live on that
     out = {"frame": frame, "switched_at": switched_at, "switch_reason": reason, "frames_before_branch": len(before),
            "mismatched_before_branch": [{"i": r["i"], "diffs": [d.get("path") for d in r.get("diffs", [])][:5]} for r in mism],
+           "tolerated_before_branch": [{"i": r["i"], "diffs": [d.get("path") for d in r.get("diffs", [])][:6]} for r in tolerated],
            "switched_at_branch": switched_at == frame, "forced": "forced" in reason, "floor_frame": floor_frame}
+    out["tolerated_within_floor"] = all(floor_frame is not None and int(r["i"]) >= floor_frame for r in tolerated)
     early = switched_at is not None and frame is not None and switched_at < frame
     out["pre_branch_divergence"] = early or bool(mism)
     out["within_floor"] = (not out["pre_branch_divergence"]) or (floor_frame is not None and switched_at is not None and switched_at >= floor_frame)
@@ -1017,7 +1035,7 @@ def prefix_verdict(run: dict, frame: Optional[int], floor_frame: Optional[int], 
     out["served_all_before_branch"] = served_all
     out["writes_before_branch_complete"] = rp is not None and branch_write is not None and rp["writes_before_branch"] == branch_write
     out["ok"] = bool(out["within_floor"] and rp is not None and rp["identical_before_branch"] and rp["writes_before_branch_equal"]
-                     and out["writes_before_branch_complete"]
+                     and out["writes_before_branch_complete"] and out["tolerated_within_floor"]
                      and ((served_all and out["switched_at_branch"]) or (out["pre_branch_divergence"] and out["within_floor"]
                                                                           and floor_frame is not None))
                      and not (out["pre_branch_divergence"] and floor_frame is None))
@@ -1223,21 +1241,31 @@ def gate_stage(stage: str, snap: Path = SNAP) -> dict:
     g = {"stage": stage, "line": STAGES[stage].line, "switched": switched, "snap": str(snap), "tasks": {}, "runs": {}}
     pairs, per_task = {}, {}
     stage_tasks = STAGES[stage].tasks
+    # the stages that run the same line on the line's other tasks (S1x runs S1's line where the branch lies past the
+    # A/A floor): a task one of them runs is covered, not a deviation
+    sibling = {t: s.name for s in STAGES.values() if s.name != stage and s.line == STAGES[stage].line
+               and (s.part_of == stage or STAGES[stage].part_of == s.name) for t in s.tasks}
     # a stage task whose L-rec calls the line but is carried forward (its branch lies past its A/A floor) is a
     # deviation from plan 5.8, which runs arms on every task that calls the line: named, never silent
     g["deviations"] = [{"task": t, "line_calls": p.get("line_calls"), "frame": p.get("frame"),
                         "floor_frame": (p.get("floor") or {}).get("frame")}
                        for t, p in plan["tasks"].items()
-                       if p.get("branch") is not None and stage_tasks and t not in stage_tasks and p.get("line_calls")]
+                       if p.get("branch") is not None and stage_tasks and t not in stage_tasks and p.get("line_calls")
+                       and t not in sibling]
+    g["covered_by"] = {t: s for t, s in sibling.items() if t in plan["tasks"]}
     for task, p in plan["tasks"].items():
         if p.get("branch") is None:
             g["tasks"][task] = {"branch": None, "note": "no write routed differently: carried forward"}
             continue
         if stage_tasks and task not in stage_tasks:
             fl = (p.get("floor") or {}).get("frame")
+            past = fl is not None and p.get("frame") is not None and p["frame"] > fl
             g["tasks"][task] = {"branch": p["branch"], "frame": p.get("frame"), "note":
+                                (f"its arms are stage {sibling[task]}'s (branch frame {p.get('frame')}, A/A floor frame "
+                                 f"{fl}: the prefix serves the floor's capture difference from the tape)")
+                                if task in sibling else
                                 f"not a stage task: carried forward (branch frame {p.get('frame')}, A/A floor frame {fl}"
-                                + (": the branch lies past the floor, so both arms would go live before it)" if fl is not None and p.get("frame") is not None and p["frame"] > fl else ")")}
+                                + (": the branch lies past the floor, so both arms would go live before it)" if past else ")")}
             continue
         runs = {}
         for rep in REPS:
@@ -1466,6 +1494,9 @@ def gate_md(g: dict) -> str:
         o += [f"Deviation from WEEK4_PLAN 5.8 (arms on every task that calls the line): {d['task']} calls it "
               f"{d['line_calls']} time(s) in its L-rec but is carried forward (branch frame {d['frame']}, A/A floor frame "
               f"{d['floor_frame']}).", ""]
+    for task, s in (g.get("covered_by") or {}).items():
+        o += [f"{task} calls the line; its arms are stage {s}'s (its branch lies past its A/A floor, and {s}'s prefix "
+              f"serves the floor's capture difference from the tape).", ""]
     causes = OUT / g["stage"] / "causes.md"
     if causes.exists():
         o += [causes.read_text().rstrip(), ""]
@@ -1494,6 +1525,10 @@ def gate_md(g: dict) -> str:
             o.append(f"| {key} | {r['ended']} | {res_s} | {pv['ok']}{within} | {pv['switched_at']} | {hv['ok']} | "
                      f"{hv['u0']['exact']} | {hv['rule2']['ok']} | {hv.get('live_imports_ok')} | {hv['reason'] if hv['crash'] else '-'} | {len(hv['on_air'])} | "
                      f"{hr.get('count')} / {hr.get('popped_total')} | {r['legacy']} | {'' if not res else res['q_score']} |")
+        tol = {key: [x["i"] for x in r["prefix"].get("tolerated_before_branch") or []] for key, r in t["runs"].items()}
+        if any(tol.values()):
+            o += ["", "Frames before the branch served on the capture tolerance (a capture-only request difference, at or "
+                  f"past the A/A floor frame {t['floor'].get('frame')}): " + "; ".join(f"{k} {v}" for k, v in tol.items())]
         on_air = [(key, x) for key, r in t["runs"].items() for x in r.get("on_air_causes") or []]
         o += ["", "On-air closes (b), each with its owning call from GripperWatch and that call's skill row:", ""]
         o += [f"- {key} step {x['step']} {x['arm']}: owner `{x['owner']}` call `{x['call_id']}` = {x['skill']} on {x['backend']} "

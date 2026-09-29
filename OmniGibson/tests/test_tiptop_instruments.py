@@ -25,7 +25,10 @@ def test_the_defaults_are_todays_run_and_install_nothing():
     assert (args.runner, args.routing_profile, args.route, args.audit) == ("legacy", "parity", [], False)
     assert (args.runner_tape, args.wstape, args.wstape_path, args.wstape_live_at) == (None, "off", None, None)
     assert (args.replicate, args.seed, args.shadow, args.providers) == (0, None, False, "omnigibson.tiptop.oracle")
+    assert args.wstape_tolerate_capture is False
     assert bench.instrumented(args) is False
+    ok = bench.parse_args(MINIMAL + ["--wstape", "replay-live", "--wstape-live-at", "6", "--wstape-tolerate-capture"])
+    assert ok.wstape_tolerate_capture is True and ok.wstape_live_at == 6
 
 
 @pytest.mark.parametrize(
@@ -83,6 +86,9 @@ def test_the_connector_runner_is_accepted_now_that_its_host_has_landed():
         (["--wstape", "replay", "--wstape-live-at", "2"], "--wstape-live-at goes with --wstape replay-live"),
         (["--wstape", "replay-live", "--wstape-live-at", "-1"], "N is a frame index"),
         (["--replicate", "-1"], "R is 0 or more"),
+        (["--wstape-tolerate-capture"], "--wstape-tolerate-capture goes with --wstape replay-live and --wstape-live-at"),
+        (["--wstape", "replay-live", "--wstape-tolerate-capture"], "--wstape-tolerate-capture goes with"),
+        (["--wstape", "replay-log", "--wstape-tolerate-capture"], "--wstape-tolerate-capture goes with"),
     ],
 )
 def test_a_malformed_week4_flag_is_refused_with_its_reason(flags, why, capsys):

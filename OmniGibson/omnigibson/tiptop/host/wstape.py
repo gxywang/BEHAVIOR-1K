@@ -16,7 +16,12 @@ Modes (``--wstape``):
   round (bench.py:426) and a diverged replay must stop the instance, not the round;
 - ``replay-log``: served by index, every diff logged (``wstape_replay.jsonl`` in the run's out dir), never stops;
 - ``replay-live``: served by index until the first mismatch, or until frame ``live_at``, then real connections; the
-  frames after the switch are recorded whole under ``<log_dir>/wstape_live``.
+  frames after the switch are recorded whole under ``<log_dir>/wstape_live``. With ``tolerate_capture`` (and a
+  ``live_at``), a request before ``live_at`` that differs from the tape only in CAPTURE_FIELDS (the renders of the
+  head and wrist captures: depth, robot_mask, gt_masks) is served from the tape and logged, as replay-log serves
+  it, and the run goes live at ``live_at``; any other difference still switches at once. This is the ladder's
+  prefix for a task whose branch lies past its A/A floor, whose floor is a capture variant (G0: a stale render
+  that "converged" after 4 renders; the physics, and every non-render field, identical).
 
 The seed stamp: every legacy plan request gets ``request["seed"] = 2300 + 1000 * replicate + k``, where k is the
 index the server's own counter would give it: ``_run_pipeline`` increments ``_request_n`` once per plan request and
@@ -50,6 +55,10 @@ log = logging.getLogger("omnigibson.tiptop.wstape")
 MODES = ("off", "log", "record", "replay", "replay-log", "replay-live")
 REPLAY_MODES = ("replay", "replay-log", "replay-live")
 VOLATILE = frozenset({"rgb", "views[*].rgb"})  # fixed; never extended (WEEK4_PLAN 5.1)
+# the other render outputs of a capture (the A/A floors' fields: W4-F2's E-rep divergences and their legacy twins
+# differ in these alone); tolerated only before a replay-live run's forced frame, never by replay or replay-log
+CAPTURE_FIELDS = frozenset({"depth", "robot_mask", "gt_masks", "views[*].depth", "views[*].robot_mask",
+                            "views[*].gt_masks"})
 SEED_BASE, SEED_STRIDE = 2300, 1000
 STREAM_TYPES = ("sim_scene", "sim_state")
 PIPELINE_OPS = ("plan", "skill")  # what the server's _request_n counts
@@ -552,7 +561,8 @@ class _Replaying:
         else:
             self.diffs = diff_fields(want.request_dict(), request)
         forced = tape.live_at is not None and i >= tape.live_at
-        if tape.mode == "replay-live" and (self.diffs or forced):
+        tolerated = not forced and tape.tolerates(self.diffs, i)
+        if tape.mode == "replay-live" and ((self.diffs and not tolerated) or forced):
             tape.mismatches += bool(self.diffs)
             return self._go_live(payload, probe, i, self.diffs)
         if self.diffs:
@@ -560,9 +570,12 @@ class _Replaying:
             if tape.mode == "replay":
                 path, detail = self.diffs[0]
                 raise TapeDiverged(path, i, detail, self.op)
+            if tolerated:  # replay-live before its forced frame: a capture-only difference, served as replay-log does
+                tape.tolerated.append(i)
             log.warning(
                 f"wstape frame {i} ({self.op}): {len(self.diffs)} field(s) differ from the tape; first {self.diffs[0][0]}: "
-                f"{self.diffs[0][1]}"
+                f"{self.diffs[0][1]}" + ("; capture fields only, served from the tape (tolerated before the forced "
+                                         f"frame {tape.live_at})" if tolerated else "")
             )
         if want.send_error is not None:  # the recorded send failed: the server never saw it, so neither does the k
             tape._unstamp(probe)
@@ -646,10 +659,16 @@ class WsTape:
     """See the module docstring. ``path``: the tape directory (written by record and log, read by the replays);
     ``log_dir``: where a replay's own log goes (``wstape_replay.jsonl``) and the live tail (``wstape_live``)."""
 
-    def __init__(self, mode: str, path, replicate: int = 0, live_at: int | None = None, ledger=None, log_dir=None):
+    def __init__(self, mode: str, path, replicate: int = 0, live_at: int | None = None, ledger=None, log_dir=None,
+                 tolerate_capture: bool = False):
         if mode not in MODES or mode == "off":
             raise ValueError(f"--wstape {mode!r}: one of {MODES[1:]}")
+        if tolerate_capture and (mode != "replay-live" or live_at is None):
+            raise ValueError("tolerate_capture goes with replay-live and a forced frame (live_at): it serves a "
+                             "capture-only difference before the frame the run goes live at")
         self.mode, self.replicate, self.live_at = mode, int(replicate), live_at
+        self.tolerate_capture = bool(tolerate_capture)
+        self.tolerated: list = []  # replay-live with tolerate_capture: the frames served despite capture-only diffs
         self.dir = TapeDir(path)
         self.log_dir = Path(log_dir) if log_dir is not None else self.dir.path.parent
         self.ledger = ledger
@@ -678,6 +697,14 @@ class WsTape:
                 )
         elif self.dir.index.exists():
             raise FileExistsError(f"--wstape {mode}: {self.dir.index} exists; a tape is never overwritten")
+
+    def tolerates(self, diffs: list, i: int) -> bool:
+        """A replay-live request at frame ``i`` before the forced frame whose every difference from the tape is a
+        render output of a capture (CAPTURE_FIELDS), when the tape tolerates those (``tolerate_capture``)."""
+        return bool(
+            self.tolerate_capture and self.live_at is not None and i < self.live_at and diffs
+            and all(_star(path) in CAPTURE_FIELDS for path, _ in diffs)
+        )
 
     # ---------------------------------------------------------------- the patch
     @property
@@ -861,6 +888,8 @@ class WsTape:
                 "diffs": [{"path": p, "detail": d} for p, d in conn.diffs],
                 "live": False,
             }
+            if self.tolerate_capture:  # replay-live with the capture tolerance: whether this frame was served on it
+                row["tolerated"] = i in self.tolerated
             if frame is not None:
                 self._count_skill(frame, server_of(conn.uri))
             self.frames.append(row)
@@ -909,4 +938,5 @@ class WsTape:
             "rerooted": self.rerooted,
             "live_imports": list(self.live_imports),
             "replay_log": str(self.replay_log) if self.mode in REPLAY_MODES else None,
+            **({"tolerate_capture": True, "tolerated": list(self.tolerated)} if self.tolerate_capture else {}),
         }

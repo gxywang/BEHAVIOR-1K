@@ -809,16 +809,69 @@ def test_a_branched_task_outside_the_stages_list_is_carried_with_its_reason(tmp_
     assert ladder.STAGES["S1"].tasks == ("bringing_in_wood", "rearrange_your_room", "tidying_bedroom")
     assert ladder.STAGES["S2"].tasks == ("store_honey",)
     plan = {"tasks": {"attach_a_camera_to_a_tripod": {"branch": {"write": 5, "record": 47, "member": "put_down", "line": "place.on"},
-                                                      "frame": 6, "floor": {"frame": 3}},
+                                                      "frame": 6, "floor": {"frame": 3}, "line_calls": 1},
+                      "some_other_task": {"branch": {"write": 3, "record": 20, "member": "put_down", "line": "place.on"},
+                                          "frame": 5, "floor": {"frame": 2}, "line_calls": 1},
                       "dispose_of_batteries": {"branch": None}}}
     (tmp_path / "S1").mkdir()
     (tmp_path / "S1" / "plan.json").write_text(json.dumps(plan))
     g = ladder.gate_stage("S1", Path("/snap"))
+    # since the gap closure, S1x runs S1's line on attach and composting: S1's gate names that, not a deviation
     note = g["tasks"]["attach_a_camera_to_a_tripod"]["note"]
-    assert note.startswith("not a stage task: carried forward") and "past the floor" in note
+    assert note.startswith("its arms are stage S1x's") and g["covered_by"] == {"attach_a_camera_to_a_tripod": "S1x"}
+    other = g["tasks"]["some_other_task"]["note"]
+    assert other.startswith("not a stage task: carried forward") and "past the floor" in other
+    assert [d["task"] for d in g["deviations"]] == ["some_other_task"], "a task no sibling stage runs is still a deviation"
     assert g["verdict"]["runs_expected"] == 0 and not g["verdict"]["pass"]
+    md = ladder.gate_md(g)
+    assert "its arms are stage S1x's" in md and "some_other_task calls it 1 time(s)" in md
     assert [s.task for s in ladder.stage_specs("S1", {"tasks": {**plan["tasks"], "bringing_in_wood": {"branch": {"write": 2}, "frame": 2, "tapes": {"0": "/t"}}}},
                                                 tasks=ladder.STAGES["S1"].tasks, reps=(0,))] == ["bringing_in_wood", "bringing_in_wood"]
+
+
+def test_s1x_runs_s1s_line_on_the_tasks_past_their_floor_with_the_capture_tolerance():
+    """Gap closure: attach and composting call place.on past their A/A floor; S1x runs their arms with the prefix
+    serving the floor's capture difference (--wstape-tolerate-capture after --wstape-live-at); S1's own arms and the
+    carried routes are unchanged."""
+    s1, s1x = ladder.STAGES["S1"], ladder.STAGES["S1x"]
+    assert s1x.line == s1.line and s1x.prev is None and s1x.part_of == "S1" and s1x.tolerate_capture and not s1.tolerate_capture
+    assert s1x.tasks == ("attach_a_camera_to_a_tripod", "composting_waste")
+    assert ladder.stage_routes("S1x") == ([], ["place.on=tiptop"]) and list(ladder.STAGES)[-1] == "S2"
+    assert ladder.carried_routes() == ["place.on=tiptop", "close.prismatic=tiptop"]
+    plan = {"tasks": {"attach_a_camera_to_a_tripod": {"branch": {"write": 5}, "frame": 6, "tapes": {"0": "/t/a0", "1": "/t/a1", "2": "/t/a2"}}}}
+    specs = ladder.stage_specs("S1x", plan)
+    assert [(s.arm, s.rep, s.tolerate) for s in specs] == [(a, r, True) for r in (0, 1, 2) for a in ("C", "T")]
+    for s in specs:
+        a = s.bench_args(8850)
+        assert a[a.index("--wstape-live-at") + 1] == "6" and "--wstape-tolerate-capture" in a
+        assert a[a.index("--wstape") + 1] == "replay-live"
+    s1_specs = ladder.stage_specs("S1", {"tasks": {"bringing_in_wood": {"branch": {"write": 2}, "frame": 2, "tapes": {"0": "/t"}}}}, reps=(0,))
+    assert all("--wstape-tolerate-capture" not in s.bench_args(8850) for s in s1_specs)
+    assert "--wstape-tolerate-capture" in ladder.launcher_text(specs[1], 8851, 1, Path("/snap/x"))
+
+
+def test_the_prefix_verdict_takes_a_tolerated_capture_frame_at_or_past_the_floor_and_no_other(tmp_path, monkeypatch):
+    lrec, mine = _prefix_tapes(tmp_path, monkeypatch)
+    replay = [{"i": 0, "op": "metadata", "matched": True, "diffs": []}, {"i": 1, "op": "plan", "matched": True, "diffs": []},
+              {"i": 2, "op": "plan", "matched": True, "diffs": []},
+              {"i": 3, "op": "plan", "matched": False, "tolerated": True, "diffs": [{"path": "depth"}, {"path": "gt_masks"}]},
+              {"i": 4, "op": "plan", "matched": True, "tolerated": False, "diffs": []},
+              {"i": 5, "op": "plan", "matched": False, "tolerated": True, "diffs": [{"path": "depth"}]}]
+    run = {"wstape": {"switched_at": 6, "switch_reason": "frame 6 forced live (--wstape-live-at 6)"}, "replay": replay,
+           "runner_tape": mine}
+    pv = ladder.prefix_verdict(run, 6, 3, 3, lrec, Path("/snap"), 2)
+    assert pv["ok"] and pv["switched_at_branch"] and not pv["pre_branch_divergence"] and pv["served_all_before_branch"]
+    assert pv["tolerated_before_branch"] == [{"i": 3, "diffs": ["depth", "gt_masks"]}, {"i": 5, "diffs": ["depth"]}]
+    assert pv["mismatched_before_branch"] == [] and pv["tolerated_within_floor"]
+    below = ladder.prefix_verdict(run, 6, 4, 3, lrec, Path("/snap"), 2)
+    assert not below["tolerated_within_floor"] and not below["ok"], "a tolerated frame before the A/A floor frame"
+    no_floor = ladder.prefix_verdict(run, 6, None, 3, lrec, Path("/snap"), 2)
+    assert not no_floor["ok"], "a task with no A/A floor has no capture difference to tolerate"
+    plain = [dict(r, tolerated=False) if r["i"] == 3 else r for r in replay]
+    mism = ladder.prefix_verdict({**run, "replay": plain}, 6, 3, 3, lrec, Path("/snap"), 2)
+    assert mism["mismatched_before_branch"][0]["i"] == 3 and mism["pre_branch_divergence"], "an untolerated mismatch"
+    _prefix_tapes(tmp_path, monkeypatch, equal=False)
+    assert not ladder.prefix_verdict(run, 6, 3, 3, lrec, Path("/snap"), 2)["ok"], "the Runner prefix must still match"
 
 
 def test_the_carried_gate_lists_each_native_call_and_writes_its_table(tmp_path, monkeypatch):

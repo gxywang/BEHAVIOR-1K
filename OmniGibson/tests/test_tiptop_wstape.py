@@ -354,6 +354,60 @@ def test_replay_live_switches_at_the_forced_index_when_everything_matches(tmp_pa
     assert [r["op"] for r in t.live_dir.rows()] == ["plan", "move"]
 
 
+def test_the_capture_tolerance_serves_a_render_only_difference_before_the_forced_frame(tmp_path, fake):
+    """Gap closure (the ladder's prefix past an A/A floor): with tolerate_capture a request before the forced frame
+    that differs only in the capture's renders (the head depth here, gt_masks and the wrist depths) is served from
+    the tape and logged as tolerated; the run goes live at the forced frame and not before."""
+    here(fake)
+    tape_dir = recorded(tmp_path, fake)
+    fake.connections = 0
+    with WsTape("replay-live", tape_dir, live_at=3, log_dir=tmp_path / "rep", tolerate_capture=True) as t:
+        c = client()
+        c.fetch_metadata()
+        r = request(depth=3.0)  # depth, views[0].depth, views[1].depth differ; nothing else
+        r["gt_masks"] = np.ones((1, 4, 4), dtype=bool)
+        s1 = c.plan(r)
+        assert fake.connections == 0 and t.live is False and s1["save_dir"] == "/out/1", "served from the tape"
+        s2 = c.plan(request(task="place the jar"))
+        assert fake.connections == 0 and t.live is False and s2["save_dir"] == "/out/2"
+        move(c, {"type": "move", "q_init": np.zeros(8, dtype=np.float32), "locked_joints": {}, "room": {},
+                 "goal_link": "left_eef", "goal_pose": [1.0, 2.0, 3.0]})
+    assert t.tolerated == [1] and t.mismatches == 1 and t.switched_at == 3 and "forced live" in t.switch_reason
+    assert fake.connections == 1, "only the forced frame went to the server"
+    log = [json.loads(l) for l in (tmp_path / "rep" / "wstape_replay.jsonl").read_text().splitlines()]
+    assert [(r["i"], r["matched"], r.get("tolerated"), r["live"]) for r in log] == [
+        (0, True, False, False), (1, False, True, False), (2, True, False, False), (3, True, None, True)]
+    assert {d["path"] for d in log[1]["diffs"]} == {"depth", "gt_masks", "views[0].depth", "views[1].depth"}
+    s = t.summary()
+    assert s["tolerate_capture"] is True and s["tolerated"] == [1]
+
+
+def test_the_capture_tolerance_still_switches_on_any_other_difference_and_never_past_the_forced_frame(tmp_path, fake):
+    here(fake)
+    tape_dir = recorded(tmp_path, fake)
+    fake.connections = 0
+    with WsTape("replay-live", tape_dir, live_at=3, log_dir=tmp_path / "rep", tolerate_capture=True) as t:
+        c = client()
+        c.fetch_metadata()
+        c.plan(request(q=0.25, depth=3.0))  # q_init differs too: not a render; live here
+    assert t.switched_at == 1 and t.live is True and t.tolerated == [] and "depth" in t.switch_reason
+    assert fake.connections == 1
+    log = [json.loads(l) for l in (tmp_path / "rep" / "wstape_replay.jsonl").read_text().splitlines()]
+    assert log[-1]["i"] == 1 and log[-1]["live"] and "q_init" in [d["path"] for d in log[-1]["diffs"]]
+    with pytest.raises(ValueError, match="replay-live and a forced frame"):
+        WsTape("replay-live", tape_dir, log_dir=tmp_path / "x", tolerate_capture=True)
+    with pytest.raises(ValueError, match="replay-live and a forced frame"):
+        WsTape("replay-log", tape_dir, live_at=2, log_dir=tmp_path / "y", tolerate_capture=True)
+    plain = WsTape("replay-live", tape_dir, live_at=3, log_dir=tmp_path / "z")
+    assert not plain.tolerates([("depth", "x")], 1), "off by default: a capture difference switches live"
+    tol = WsTape("replay-live", tape_dir, live_at=3, log_dir=tmp_path / "w", tolerate_capture=True)
+    assert tol.tolerates([("depth", "x"), ("views[1].robot_mask", "y")], 2)
+    assert not tol.tolerates([("depth", "x")], 3), "at the forced frame the run goes live whatever differs"
+    assert not tol.tolerates([("depth", "x"), ("world_from_cam", "y")], 1)
+    assert not tol.tolerates([("op", "skill on the tape, plan in the replay")], 1)
+    assert "tolerate_capture" not in plain.summary(), "the summary's keys are unchanged without the flag"
+
+
 def test_seed_stamps_follow_the_formula_per_server_and_replicate(tmp_path, fake):
     assert seed_for(0, 1) == 2301 and seed_for(0, 7) == 2307 and seed_for(2, 3) == 4303
     with WsTape("record", tmp_path / "tape", replicate=2, log_dir=tmp_path / "rec") as t:

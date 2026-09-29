@@ -992,6 +992,11 @@ def add_week4_args(p: argparse.ArgumentParser) -> None:
                     help="the tape directory (default <out-dir>/wstape); a record never overwrites one")
     w4.add_argument("--wstape-live-at", type=int, default=None, metavar="N",
                     help="replay-live: go live at frame N (0-based) whether or not it matches")
+    w4.add_argument("--wstape-tolerate-capture", action="store_true",
+                    help="replay-live with --wstape-live-at N: a request before frame N that differs from the tape "
+                    "only in a capture's render outputs (depth, robot_mask, gt_masks; wstape.CAPTURE_FIELDS) is "
+                    "served from the tape and logged instead of switching live (the ladder's prefix for a task "
+                    "whose branch lies past its A/A floor); any other difference still switches")
     w4.add_argument("--replicate", type=int, default=0,
                     help="R in the stamped planner seed 2300 + 1000*R + k on every legacy request (needs a --wstape "
                     "mode: the stamp rides the websocket tape; the server seeds a legacy request with it)")
@@ -1013,6 +1018,8 @@ def check_week4_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> No
         p.error("--wstape-live-at goes with --wstape replay-live")
     if args.wstape_live_at is not None and args.wstape_live_at < 0:
         p.error("--wstape-live-at N: N is a frame index, 0 or more")
+    if args.wstape_tolerate_capture and (args.wstape != "replay-live" or args.wstape_live_at is None):
+        p.error("--wstape-tolerate-capture goes with --wstape replay-live and --wstape-live-at N")
     if args.replicate < 0:
         p.error("--replicate R: R is 0 or more")
     if args.replicate > 0 and args.wstape == "off":  # the stamp rides the websocket tape: without it the planner
@@ -1079,6 +1086,7 @@ def main(argv=None) -> None:
         wstape = WsTape(
             args.wstape, args.wstape_path or out_dir / "wstape", replicate=args.replicate,
             live_at=args.wstape_live_at, log_dir=out_dir,
+            tolerate_capture=getattr(args, "wstape_tolerate_capture", False),
         ).install()
     if instrumented(args):
         from omnigibson.tiptop.host.instruments import StepLedger
