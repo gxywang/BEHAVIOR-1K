@@ -43,6 +43,7 @@ The main inference data archive contains `plan.json` and the eight native files 
 
 ```bash
 export VISION_RUN=/path/to/comprehensive_v1
+export VISION_RELEASE_RUN="$VISION_RUN"  # Keep bound to the complete main artifact.
 export VISION_CAPTURE_PROVENANCE=/path/to/capture-provenance
 export SIM_PY=/path/to/sim/python
 mkdir -p "$VISION_RUN" "$VISION_CAPTURE_PROVENANCE"
@@ -54,6 +55,12 @@ tar -xf vision-bench-comprehensive-capture-provenance.tar -C "$VISION_CAPTURE_PR
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_driveway_recovery_verify.py verify-portable \
   --provenance "$VISION_CAPTURE_PROVENANCE" --captures "$VISION_RUN/captures" \
   --output /path/to/fresh-recovery-audit.json
+"$SIM_PY" \
+  "$VISION_CAPTURE_PROVENANCE/driveway_recovery/prior_task_retry/tools/visionbench_task_retry_portable.py" \
+  --provenance "$VISION_CAPTURE_PROVENANCE" --captures "$VISION_RELEASE_RUN/captures" \
+  --mapping driveway_recovery/prior_task_retry/portable_path_map.json \
+  --receipt driveway_recovery/prior_task_retry/publication.json \
+  --output /path/to/fresh-task-retry-audit.json
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_all_tasks_package_v3.py audit-overlay \
   --provenance "$VISION_CAPTURE_PROVENANCE" --main-captures "$VISION_RUN/captures" \
   --mount /path/to/fresh-capture-audit-mount --output /path/to/fresh-capture-audit.json
@@ -71,6 +78,13 @@ unchanged successful captures. Use the **complete main data artifact**, includin
 original overlay PNGs; an input-only inference fork omits protected capture files and
 cannot satisfy this audit. Published success receipts resolve from the companion, so
 `$VISION_RUN/captures` does not need a separate `case_receipts` directory.
+
+The exact-task retry verifier separately checks five relocated `wash_dog_toys` captures,
+11 published metadata records, their snapshots and mapped source/crash/launch/audit
+evidence. Require `ok: true` and `historical_bindings_resolved_from_portable_copies: true`.
+Its `whole_original_corpus_reverified: false` is intentional: the 8,697-file preservation
+proof remains a linked historical receipt, not a claim that the whole original corpus
+was bundled. Its historical 358/365 audit does not replace the final 365-case audit.
 
 The companion contains these paths:
 
@@ -166,6 +180,22 @@ Outputs per case are `input.json`, `input.npz`, three PNG camera images, `labels
 receipts. The model receives only the input files. Runtime asset identity, geometry
 bounds, target flags, and masks are evaluation-only labels.
 
+## Preserve the exact task-init retry
+
+The original capture produced 353 successful snapshots. A single `wash_dog_toys`
+initialization SIGSEGV (`returncode: -11`) occurred before any snapshots, task-success
+receipt or per-case failure files. One identical frozen task attempt from frame zero
+captured the same five selected snapshots, without case replacement or source changes.
+Its publication audited 358/365 captures and preserved 8,697 protected files unchanged.
+The remaining seven cases are the driveway-binding failures below.
+
+Preserve the original task-level crash/execution, exact launch/completion, successful
+outputs, five snapshots and publication evidence under
+`driveway_recovery/prior_task_retry`, with its explicit portable path map and tools.
+Do not synthesize per-case failures. The viewer's seven recovered flags correspond to
+real driveway per-case failure files; disclose the five task-retry snapshots separately.
+The final completion account is 353 + five + seven = 365, subject to the final audit.
+
 ## Recover the declared driveway binding failures
 
 The original bridge excludes driveway from `task_scope()` with floors and lawns, while
@@ -178,13 +208,16 @@ replay actions, substitute a frame, or take physics steps after snapshot restora
 Environment setup/reset occurs before restoration. Annotation targets include support
 surfaces; the driveway-only `chopping_wood` case retains its original target scope.
 
-On the capture host, `runs/vision/comprehensive_v1/driveway_recovery_v2/` contains the
-frozen amendment/configuration and `launch.json`. Read `status.json` for current phase;
-launching the continuation is not evidence that recovery or the benchmark has finished.
-The superseded V1 prelaunch revision was never executed and remains preserved.
-The continuation waits for the original supervisor and observers to finish naturally,
-then runs one recovery worker at a time on GPU1 after both assigned GPUs1/3 are idle.
-Do not launch a duplicate continuation while this one is active.
+On the capture host, `runs/vision/comprehensive_v1/driveway_recovery_v3/` is the active
+fresh preparation, preserving the earlier failed v2 attempt and the exact-task retry.
+Read `status.json` for its phase; starting the process does not mean recovery or TEST
+results have finished. The reviewed `tools/visionbench_shared_capture.py` wrapper runs
+the unchanged continuation with the scheduling-only amendment `schedule_amendment.json`,
+SHA256 `6124f02a403b336b6c72314dc78a054950a499b2969d3f77272a58b4edc01cf2`.
+It runs one recovery worker at a time on GPU1 with checked shared occupancy and at least
+40,000 MiB free. It does not require GPUs1/3 to be empty or terminate other work. Frozen
+capture/label/model sources, selection and DEV lock remain unchanged. Do not launch a
+duplicate continuation or describe shared capture wall times as controlled latency.
 
 Recovery writes into a separate directory and preserves original failed task receipts
 and the original `execution.json` with status `incomplete`. A CPU verifier checks the
@@ -200,6 +233,21 @@ finalization, extraction, portable recovery verification, and independent overla
 The original monitor/finalizer exits on incomplete execution; it does not handle this
 recovery chain. Successful publication is recorded in `publication.json`, and the final
 continuation phase is `complete`. A failure stops the continuation with preserved evidence.
+The reviewed shared wrapper then writes `shared_schedule_completion.json` (schema
+`visionbench-shared-capture-completion/1`) binding unchanged frozen sources and the final
+`status.json`. These final receipts are produced after companion archive creation;
+preserve their bytes and hashes separately in the release validation inventory. They
+must not be assumed present inside that immutable companion.
+
+The main benchmark's active controller state is `continuation_shared_v1/status.json`
+(schema remains `visionbench-continuation/3`); require `state: complete` before release.
+Its scheduling amendment SHA256 is
+`aa8b2a39f4ab01db7ec84548910d211982c7f4e1726599d3472490bd87331bf9`.
+Capture acceptance and bulk inference allow checked shared GPUs1/3 with at least 40,000
+MiB free at launch, not a per-arm reservation. Bulk timings are not controlled runtime.
+The original GPU1 exclusive latency checks and 30-second monitoring remain unchanged;
+results and model recommendations are pending until all phases and release checks pass.
+
 This recovery wrapper is bound to the original selection SHA and seven case IDs; it is
 not a general retry command for a rebased or newly selected run.
 
@@ -318,13 +366,16 @@ for a completed recovery, the equivalent manual staging command is:
 ```bash
 "$SIM_PY" OmniGibson/omnigibson/tiptop/host/visionbench_driveway_recovery_verify.py stage \
   --selection /path/to/comprehensive_v1/selection_fullcoverage.json \
-  --recovery /path/to/comprehensive_v1/driveway_recovery_v2 \
+  --recovery /path/to/comprehensive_v1/driveway_recovery_v3 \
   --sim-data "$OMNIGIBSON_DATA_PATH" \
   --stage /path/to/comprehensive_v1/capture_provenance_stage_driveway_recovery
 ```
 
-Pass that stage to the unchanged V3 `finalize` command. This includes the complete
-recovery/failure chain and fidelity diagnosis in the same checksummed companion.
+Before finalization, verify that the stage includes the `prior_task_retry` path map,
+publication receipt, portable verifier and every mapped dependency. Pass that stage to
+the unchanged V3 `finalize` command. It includes both recovery chains, the scheduling
+amendment/wrapper and fidelity diagnosis. Final `shared_schedule_completion.json` and
+`status.json` become separate hashed release receipts after archive creation.
 
 Staging and finalization copy original file bytes and record SHA-256 receipts. They
 never edit the frozen selection or active capture sources. A staging directory is not
